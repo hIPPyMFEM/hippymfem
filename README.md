@@ -40,7 +40,7 @@ Newton solve, a table lookup, and its derivatives stay exact.
 | | |
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
-| **54 times faster than hIPPYlibx** | Two Newton-CG steps at 36 million unknowns take 50 s on four L40S GPUs, against 2669 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on four CPU cores of the same node (60 times at equal CG counts) and 1409 s for hIPPyMFEM itself on those cores. At 287 million unknowns, 32 GPU ranks take 77 s against 6187 s on 32 CPU cores: 80 times. |
+| **80 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 77 s on 32 GPU ranks (16 RTX PRO 6000 Blackwell GPUs), against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) and 2859 s for hIPPyMFEM itself on 32 CPU cores, all at the same CG count. At 36 million unknowns, four L40S GPUs take 50 s against 2669 s on four CPU cores of the same node: 54 times, 60 at equal CG counts. |
 | **A billion unknowns** | One Newton-CG step at 1.09 billion unknowns (400³ P2 hexahedra) takes 197 s on 24 RTX PRO 6000 Blackwell GPUs, JAX compilation included. |
 | **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 19 minutes on four GPUs. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
