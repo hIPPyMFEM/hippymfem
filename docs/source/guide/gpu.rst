@@ -107,16 +107,30 @@ hIPPYlibx, 4 ranks, host       29.4 s         8.7 s                  13.8 s     
 hIPPYlibx, 4 ranks, host       241.0 s        71.4 s                 140.7 s                2669.0 s
 =============================  =============  =====================  =====================  ================
 
+==============================  =============  =====================  =====================  ================
+256\ :sup:`3`, 287 M unknowns   forward solve  Hessian blocks (warm)  reduced-Hessian apply  two Newton steps
+==============================  =============  =====================  =====================  ================
+32 Blackwell slices (16 cards)  8.5 s          4.2 s                  2.6 s                  **77.4 s**
+32 ranks, all host              not timed      not timed              not timed              2859.0 s
+hIPPYlibx, 32 ranks, host       423.9 s        102.4 s                378.9 s                6187.2 s
+==============================  =============  =====================  =====================  ================
+
+The 256\ :sup:`3` rows are rank for rank as well, on 32 ranks: the GPU ranks are 48 GB MIG
+slices of 16 RTX PRO 6000 Blackwell cards of a cluster, the host ranks 32 cores of the node
+above, one core per rank (with two cores per rank the hIPPyMFEM host run takes 2456 s).
+
 Four cards against four host ranks of the same library are 19x at 64\ :sup:`3` and 28x at
-128\ :sup:`3`, with the same cost functional to eight digits and the same CG counts.  The
+128\ :sup:`3`, and 32 slices against 32 host ranks 37x at 256\ :sup:`3`, with the same cost
+functional to eight digits and the same CG counts.  The
 hIPPYlibx rows are the same problem (mesh, spaces, PDE, data model, prior, Newton-CG
 settings) solved by `hIPPYlibx <https://github.com/hIPPyMFEM/hippylibx>`_ on dolfinx 0.10,
 with PETSc's CG and BoomerAMG given the same BoomerAMG options.  The two libraries draw
 different random data, so their CG counts differ (11 and 6 against 8): four cards are 42x
 and 54x faster than hIPPYlibx as measured, and 37x and 60x when it is charged the same CG
-counts.
-The host rows use four of the node's 64 cores, the same rank count as the four-card rows,
-so they are a device swap at a fixed rank count and not the machine's best host time.
+counts.  At 256\ :sup:`3` every run takes 9 CG iterations, and the 32 slices are 80x faster.
+The host rows use four of the node's 64 cores (32 at 256\ :sup:`3`), the same rank count as
+the GPU rows, so they are a device swap at a fixed rank count and not the machine's best
+host time.
 
 The first linearization point of a run pays the sparsity patterns and JAX's compilation
 once (5 s at 64\ :sup:`3` on one card, 24 s at 128\ :sup:`3` on two); a Newton run pays

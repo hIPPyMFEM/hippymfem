@@ -40,7 +40,7 @@ Newton solve, a table lookup, and its derivatives stay exact.
 | | |
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
-| **54 times faster than hIPPYlibx** | Two Newton-CG steps at 36 million unknowns take 50 s on four L40S GPUs, against 2669 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on four CPU cores of the same node (60 times at equal CG counts) and 1409 s for hIPPyMFEM itself on those cores. |
+| **54 times faster than hIPPYlibx** | Two Newton-CG steps at 36 million unknowns take 50 s on four L40S GPUs, against 2669 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on four CPU cores of the same node (60 times at equal CG counts) and 1409 s for hIPPyMFEM itself on those cores. At 287 million unknowns, 32 GPU ranks take 77 s against 6187 s on 32 CPU cores: 80 times. |
 | **A billion unknowns** | One Newton-CG step at 1.09 billion unknowns (400³ P2 hexahedra) takes 197 s on 24 RTX PRO 6000 Blackwell GPUs, JAX compilation included. |
 | **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 19 minutes on four GPUs. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
@@ -48,13 +48,14 @@ Newton solve, a table lookup, and its derivatives stay exact.
 
 ## How it compares
 
-<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at three mesh sizes: hIPPYlibx and hIPPyMFEM on four CPU ranks, and hIPPyMFEM on four L40S GPUs" width="760"></p>
+<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 18 to 80 times faster than hIPPYlibx" width="760"></p>
 
-*Two Newton-CG steps of a P2 hexahedral benchmark on one node (four L40S GPUs, two AMD EPYC 9334
-CPUs), with the same PDE, prior and BoomerAMG settings in both libraries
-([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is hIPPYlib on FEniCSx). The bars are measured
-wall times; the ratios charge each CPU run the GPU run's CG count, since the two libraries
-stop CG at different iterations.*
+*Two Newton-CG steps of a P2 hexahedral benchmark, rank for rank, with the same PDE, prior and
+BoomerAMG settings in both libraries ([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is
+hIPPYlib on FEniCSx). Up to 128³: four CPU cores against the four L40S GPUs of one node (two
+AMD EPYC 9334). At 256³: 32 cores of that node against 32 GPU ranks, the 48 GB MIG slices of
+16 RTX PRO 6000 Blackwell (BW) cards. The bars are measured wall times; the ratios charge each
+CPU run the GPU run's CG count, since the two libraries stop CG at different iterations.*
 
 ## How it scales
 

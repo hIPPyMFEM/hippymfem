@@ -143,7 +143,9 @@ one card is worth 28 ranks' worth of that, four cards 19 times four ranks.  At
 host 1409 s on four ranks (28x), with the same J and CG count.
 `hIPPYlibx <https://github.com/hIPPyMFEM/hippylibx>`_ on the same host, with the same
 BoomerAMG settings, takes 402.5 s at 64\ :sup:`3` and 2669 s at 128\ :sup:`3`
-(``benchmarks/bench_newton_hippylibx.py``); :doc:`gpu` has the per-stage table.
+(``benchmarks/bench_newton_hippylibx.py``).  At 256\ :sup:`3` (287 M unknowns) on 32 ranks,
+32 Blackwell slices take 77 s against 2859 s for the host and 6187 s for hIPPYlibx on 32
+cores (37x and 80x), all at 9 CG iterations; :doc:`gpu` has the per-stage tables.
 
 .. _hessian-blocks:
 
