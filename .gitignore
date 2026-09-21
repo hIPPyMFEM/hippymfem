@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+build/
+dist/
+wheelhouse/
+
+# outputs: benchmark and application records, ParaView and GLVis files, validation runs
+results/
+applications/*/results/
+validation/out/
+*.npz
+modelVerify.png
+
+# documentation build (the tutorials are copied into docs/source/tutorials at build time)
+docs/build/
+docs/source/tutorials/
+
+# editor and merge leftovers
+*~
+*.orig
+*.bak
+
+# local release notes, not part of the repository
+PUSH_INSTRUCTIONS.md
+
+# pytest plugins that write into the working tree
+.pymon

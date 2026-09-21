@@ -1,0 +1,39 @@
+name: Set up hIPPyMFEM
+description: >
+  Python, OpenMPI, mpi4py built against it, PyMFEM with MPI from the wheel the pymfem
+  job cached, and hIPPyMFEM itself.
+inputs:
+  python-version:
+    description: Python version
+    default: "3.12"
+  pymfem-version:
+    description: PyMFEM version
+    default: "4.8.0.1"
+  extras:
+    description: extras of the hIPPyMFEM install
+    default: "test"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: OpenMPI
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+    - name: Restore the PyMFEM wheel
+      uses: actions/cache/restore@v4
+      with:
+        path: wheelhouse
+        key: pymfem-${{ inputs.pymfem-version }}-py${{ inputs.python-version }}-${{ runner.os }}-openmpi-${{ hashFiles('tools/install_pymfem_parallel.sh', 'tools/patch_pymfem.py') }}
+        fail-on-cache-miss: true
+    - name: Install
+      shell: bash
+      env:
+        PYMFEM_VERSION: ${{ inputs.pymfem-version }}
+      run: |
+        python -m pip install --upgrade pip "numpy>=2" scipy
+        python -m pip install --no-binary mpi4py mpi4py
+        PYTHON=python bash tools/install_pymfem_parallel.sh wheelhouse
+        python -m pip install -e ".[${{ inputs.extras }}]"
+        python -c "import hippymfem as hm; print('hIPPyMFEM', hm.__version__)"

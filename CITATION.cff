@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "hIPPyMFEM: Differentiable Programming for Infinite-Dimensional Bayesian Inverse Problems Using MFEM on GPUs"
+repository-code: "https://github.com/hIPPyMFEM/hippymfem"
+url: "https://hippymfem.readthedocs.io"
+version: 0.1.0
+date-released: 2026-09-21
+license: GPL-2.0-only
+authors:
+  - family-names: "Chen"
+    given-names: "Peng"
+    affiliation: "School of Computational Science and Engineering, Georgia Institute of Technology"
+    email: "pchen402@gatech.edu"
+keywords:
+  - Bayesian inverse problems
+  - Hessian
+  - differentiable programming
+  - automatic differentiation
+  - JAX
+  - GPU
+  - MFEM
+  - hypre
+references:
+  - type: article
+    title: "hIPPYlib: An Extensible Software Framework for Large-Scale Inverse Problems Governed by PDEs; Part I: Deterministic Inversion and Linearized Bayesian Inference"
+    authors:
+      - family-names: "Villa"
+        given-names: "Umberto"
+      - family-names: "Petra"
+        given-names: "Noemi"
+      - family-names: "Ghattas"
+        given-names: "Omar"
+    journal: "ACM Transactions on Mathematical Software"
+    volume: 47
+    issue: 2
+    year: 2021
+    doi: "10.1145/3428447"
+  - type: article
+    title: "hIPPYlib: an Extensible Software Framework for Large-scale Deterministic and Bayesian Inverse Problems"
+    authors:
+      - family-names: "Villa"
+        given-names: "Umberto"
+      - family-names: "Petra"
+        given-names: "Noemi"
+      - family-names: "Ghattas"
+        given-names: "Omar"
+    journal: "Journal of Open Source Software"
+    volume: 3
+    issue: 30
+    year: 2018
+    doi: "10.21105/joss.00940"
+  - type: software
+    title: "hIPPYlibx: hIPPYlib on FEniCSx"
+    authors:
+      - name: "The hIPPYlibx developers"
+    url: "https://github.com/hIPPyMFEM/hippylibx"

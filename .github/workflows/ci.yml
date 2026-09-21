@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  PYMFEM_VERSION: "4.8.0.1"
+  OMPI_MCA_rmaps_base_oversubscribe: "1"
+
+jobs:
+  pymfem:
+    name: PyMFEM with MPI (built once, then cached)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Look for a cached wheel
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: wheelhouse
+          key: pymfem-${{ env.PYMFEM_VERSION }}-py${{ env.PYTHON_VERSION }}-${{ runner.os }}-openmpi-${{ hashFiles('tools/install_pymfem_parallel.sh', 'tools/patch_pymfem.py') }}
+      - name: Build the wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev openmpi-bin
+          python -m pip install --upgrade pip "numpy>=2" scipy
+          python -m pip install --no-binary mpi4py mpi4py
+          PYTHON=python bash tools/install_pymfem_parallel.sh wheelhouse
+
+  tests:
+    name: Test suites (1 and 2 ranks)
+    needs: pymfem
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-hippymfem
+        with:
+          extras: "ad,test"
+      - name: pytest
+        env:
+          HIPPYMFEM_TEST_RANKS: "1,2"
+        run: python -m pytest -v
+
+  notebooks:
+    name: Tutorials
+    needs: pymfem
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-hippymfem
+        with:
+          extras: "test,tutorial"
+      - name: Execute every notebook
+        run: bash .github/workflows/run_notebooks.sh
+
+  applications:
+    name: Applications (small inputs, 1 and 2 ranks)
+    needs: pymfem
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-hippymfem
+        with:
+          extras: "test,ad"
+      - name: Run the drivers
+        run: bash .github/workflows/run_applications.sh
+
+  docs:
+    name: Documentation (without PyMFEM, as on Read the Docs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build
+        run: |
+          python -m pip install -r docs/requirements.txt
+          sphinx-build -b html --keep-going docs/source docs/build/html

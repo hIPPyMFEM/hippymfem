@@ -1,0 +1,7 @@
+# Documentation build (Read the Docs installs exactly this; PyMFEM is mocked).
+sphinx>=7
+sphinx-rtd-theme>=2
+myst-nb>=1.1
+numpy
+scipy
+matplotlib

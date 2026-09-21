@@ -1,0 +1,87 @@
+COPYRIGHT
+
+hIPPyMFEM: deterministic and Bayesian inverse problems on MFEM, with the operators
+obtained by differentiating a residual density at the quadrature points (JAX) and
+the solves run through MFEM and hypre, on the host or on GPUs.
+
+Copyright (c) 2026, Peng Chen, Georgia Institute of Technology.
+
+The modules listed below are derived from hIPPYlib (https://hippylib.github.io) and
+hIPPYlibx (https://github.com/hIPPyMFEM/hippylibx): the class layout, the algorithms and
+part of the code of the inverse-problem layer (model, reduced Hessian, Newton-CG and its
+Steihaug-CG, BFGS, steepest descent, randomized eigensolvers, the low-rank Laplace
+posterior, MCMC kernels, the forward-UQ maps) come from those sources and were modified
+in 2026 for MFEM, hypre and JAX.  The following copyright applies to those files, in
+addition to the one above:
+
+  Copyright (c) 2016-2018, The University of Texas at Austin & University of
+  California, Merced.
+  Copyright (c) 2019-2020, The University of Texas at Austin, University of
+  California--Merced, Washington University in St. Louis.
+  Copyright (c) 2025-, Georgia Institute of Technology.
+
+Files derived from hIPPYlib / hIPPYlibx (each also says so in its header):
+
+  hippymfem/algorithms/NewtonCG.py
+  hippymfem/algorithms/bfgs.py
+  hippymfem/algorithms/cgsolverSteihaug.py
+  hippymfem/algorithms/lowRankOperator.py
+  hippymfem/algorithms/multivector.py
+  hippymfem/algorithms/randomizedEigensolver.py
+  hippymfem/algorithms/steepestDescent.py
+  hippymfem/common/parameterList.py
+  hippymfem/forward_uq/parameter2QoiMap.py
+  hippymfem/forward_uq/taylorApproximationQoi.py
+  hippymfem/mcmc/chain.py
+  hippymfem/mcmc/tracers.py
+  hippymfem/modeling/PDEProblem.py
+  hippymfem/modeling/PDEVariationalProblem.py
+  hippymfem/modeling/TimeDependentPDEVariationalProblem.py
+  hippymfem/modeling/__init__.py
+  hippymfem/modeling/misfit.py
+  hippymfem/modeling/model.py
+  hippymfem/modeling/modelVerify.py
+  hippymfem/modeling/posterior.py
+  hippymfem/modeling/prior.py
+  hippymfem/modeling/reducedHessian.py
+  hippymfem/modeling/timeDependentVector.py
+
+The tutorials in tutorial/ are adapted from hIPPYlib's tutorials (each notebook says
+so in its last cell), and CONTRIBUTING.md from hIPPYlib's contributing guidelines.  The
+following copyright applies to them, in addition to the one above:
+
+  Copyright (c) 2016-2018, The University of Texas at Austin & University of
+  California, Merced.
+  Copyright (c) 2019-2022, The University of Texas at Austin, University of
+  California--Merced, Washington University in St. Louis.
+  Copyright (c) 2023-, The University of Texas at Austin, University of
+  California--Merced.
+
+The finite element, assembly, automatic differentiation, device, parallel-vector,
+random-stream, plotting, application, benchmark and validation code is original to
+hIPPyMFEM.
+
+LICENSE
+
+hIPPyMFEM is free software; you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, version 2.0 dated June 1991 (GPL-2.0-only).  See the file LICENSE for
+the terms.
+
+hIPPyMFEM is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+hIPPyMFEM imports, and does not contain, MFEM and PyMFEM (BSD-3-Clause), hypre
+(Apache-2.0 or MIT), JAX (Apache-2.0), mpi4py (BSD-2-Clause) and, optionally, PETSc
+(BSD-2-Clause); each is used under its own license.
+
+CITATION
+
+If you use hIPPyMFEM, please cite it (see CITATION.cff).  Its inverse-problem layer
+derives from hIPPYlib, which is described in:
+
+  U. Villa, N. Petra, O. Ghattas.  hIPPYlib: An Extensible Software Framework for
+  Large-Scale Inverse Problems Governed by PDEs; Part I: Deterministic Inversion and
+  Linearized Bayesian Inference.  ACM Transactions on Mathematical Software 47(2),
+  16:1-16:34, 2021.  https://doi.org/10.1145/3428447

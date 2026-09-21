@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hippymfem"
+version = "0.1.0"
+description = "Deterministic and Bayesian inverse problems on MFEM, with residuals differentiated by JAX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-2.0-only"}
+authors = [{name = "Peng Chen", email = "pchen402@gatech.edu"}]
+keywords = ["inverse problems", "Bayesian inference", "uncertainty quantification",
+            "PDE-constrained optimization", "automatic differentiation", "finite elements",
+            "MFEM", "JAX", "GPU"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+# PyMFEM built with MPI ("mfem.par") is required too, but cannot be listed here: the
+# mfem wheel on PyPI is serial only.  tools/install_pymfem_parallel.sh builds it; see
+# INSTALL.md.
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "mpi4py>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/hIPPyMFEM/hippymfem"
+Documentation = "https://hippymfem.readthedocs.io"
+Repository = "https://github.com/hIPPyMFEM/hippymfem"
+Issues = "https://github.com/hIPPyMFEM/hippymfem/issues"
+Changelog = "https://github.com/hIPPyMFEM/hippymfem/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+ad = ["jax>=0.4.30"]
+viz = ["matplotlib>=3.5"]
+# optional accelerators: numba builds large sparsity patterns without a global sort
+perf = ["numba>=0.59"]
+tutorial = ["jax>=0.4.30", "matplotlib>=3.5", "jupyterlab", "nbconvert", "ipykernel"]
+test = ["pytest>=7", "matplotlib>=3.5", "nbformat", "nbconvert", "ipykernel"]
+docs = ["sphinx>=7", "sphinx-rtd-theme>=2", "myst-nb>=1.1", "matplotlib>=3.5"]
+all = ["hippymfem[ad,viz,tutorial,test]"]
+
+[tool.setuptools.packages.find]
+include = ["hippymfem*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
