@@ -67,12 +67,14 @@ Exact solves, including in parallel
 
 :class:`~hippymfem.algorithms.linSolvers.LUSolver` is the stand-in for hIPPYlib's
 ``PETScLUSolver``.  On one rank it factorizes in place with scipy's SuperLU; in
-parallel it gathers the matrix onto every rank and factorizes it there.  That is
-exact and rank-count independent, verified to 1e-15 by comparing a functional of
-the solution across 1, 2 and 4 rank runs, at the price of a redundant
-factorization: one serial factorization in time, ``O(nnz(L+U))`` per rank in memory.
-It refuses matrices above ``max_global_size`` (400 000 unknowns by default) rather
-than silently exhausting memory.
+parallel it gathers the matrix onto rank 0, factorizes it there and scatters each
+solution (``replicate=True`` factorizes on every rank instead, so that no rank waits
+on rank 0).  That is exact and rank-count independent, verified to 1e-15 by
+comparing a functional of the solution across 1, 2 and 4 rank runs, at the price of
+a serial factorization: one factorization of the whole matrix in time,
+``O(nnz(L+U))`` on rank 0 in memory.  It refuses matrices above
+``max_global_size`` (400 000 unknowns by default) rather than silently exhausting
+memory.
 
 Why bother: an exact solve makes the reduced Hessian exact, so a spectrum or a
 tolerance study measures the discretization instead of a Krylov tolerance.  Before
