@@ -49,8 +49,10 @@ def singlePass(A, Omega, k, s=1, check=False):
 
     Y_pr = MultiVector(Omega)
     Y = MultiVector(Omega)
-    for _ in range(s):
+    for i in range(s):
         Y_pr.swap(Y)
+        if i:
+            Y_pr.orthogonalize()          # see doublePass: keeps the tail through the power iterations
         MatMvMult(A, Y_pr, Y)
 
     Q = MultiVector(Y)
@@ -84,7 +86,14 @@ def doublePass(A, Omega, k, s=1, check=False):
     for _ in range(s):
         MatMvMult(A, Q, Y)
         Q.swap(Y)
-    Q.orthogonalize()
+        # Orthonormalize after *every* application, not once at the end (subspace
+        # iteration): the s-th power raises the spectral ratio to its s-th power,
+        # and once that passes 1/eps the trailing directions are gone from Y before
+        # any orthonormalization can save them.  Measured on the validation case
+        # (ratio 3e6 over 40 eigenvalues): with one orthonormalization at the end a
+        # third iteration put the last twenty eigenvalues off by 30 to 90 %; with
+        # one per application every extra iteration helps.  s = 1 is unchanged.
+        Q.orthogonalize()
 
     AQ = MultiVector(Omega[0], nvec)
     MatMvMult(A, Q, AQ)
@@ -107,8 +116,10 @@ def singlePassG(A, B, Binv, Omega, k, s=1, check=False):
     Ybar = MultiVector(Omega[0], nvec)
     Y_pr = MultiVector(Omega)
     Q = MultiVector(Omega)
-    for _ in range(s):
+    for i in range(s):
         Y_pr.swap(Q)
+        if i:
+            Y_pr.Borthogonalize(B)        # see doublePass
         MatMvMult(A, Y_pr, Ybar)
         MatMvMult(_as_operator(Binv), Ybar, Q)
 
@@ -141,8 +152,8 @@ def doublePassG(A, B, Binv, Omega, k, s=1, check=False):
     for _ in range(s):
         MatMvMult(A, Q, Ybar)
         MatMvMult(_as_operator(Binv), Ybar, Q)
+        Q.Borthogonalize(B)               # after every application; see doublePass
 
-    Q.Borthogonalize(B)
     AQ = MultiVector(Omega[0], nvec)
     MatMvMult(A, Q, AQ)
     T = AQ.dot_mv(Q)

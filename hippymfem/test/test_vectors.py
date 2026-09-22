@@ -346,6 +346,40 @@ def test_host_build_warns_for_device_hypre():
             os.environ["HIPPYMFEM_HYPRE_DEVICE"] = saved_env
 
 
+def test_device_auto_without_gpu():
+    """``HIPPYMFEM_DEVICE=auto`` with every GPU hidden runs on the host, without a word.
+
+    In a fresh interpreter (JAX reads its platform list once, at import), on rank 0
+    only, with the launcher's variables stripped so the child is a plain process.
+    """
+    import os
+    import subprocess
+    import sys
+
+    if RANK == 0:
+        print("HIPPYMFEM_DEVICE=auto without a visible GPU")
+    ok, detail = True, ""
+    if RANK == 0:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_"))}
+        env.update(HIPPYMFEM_DEVICE="auto", CUDA_VISIBLE_DEVICES="",
+                   ROCR_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
+        code = ("import hippymfem\nfrom hippymfem.fem import kernel\n"
+                "from hippymfem import _jaxconfig as j\n"
+                "print(j.platforms(), kernel.device().platform, hippymfem.config.device)")
+        try:
+            r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                               text=True, timeout=900)
+            lines = [l for l in r.stdout.strip().splitlines() if l.strip()]
+            last = lines[-1] if lines else ""
+            ok = r.returncode == 0 and last == "cpu cpu auto"
+            detail = "(%r)" % (last if ok else (last or r.stderr[-400:]))
+        except Exception as e:                                       # noqa: BLE001
+            ok, detail = False, "(%s)" % e
+    ok = bool(COMM.bcast(ok, root=0))
+    check("auto without a visible GPU runs on the host", ok, COMM.bcast(detail, root=0))
+
+
 def test_config_knobs():
     """Every knob of ``hm.config`` reads, and a written value arrives as the type it names.
 
@@ -386,6 +420,7 @@ if __name__ == "__main__":
     test_random_partition_independence()
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
+    test_device_auto_without_gpu()
     if RANK == 0:
         print("-" * 70)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

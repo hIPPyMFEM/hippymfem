@@ -70,7 +70,7 @@ def _bool(v):
 _KNOBS = [
     # ---------------------------------------------------------- import-time only
     _Knob("device", "HIPPYMFEM_DEVICE",
-          "where the element kernels run: unset/cpu, or gpu (JAX reads the platform list once, at import)",
+          "where the element kernels run: unset/cpu, gpu, or auto (a GPU when one is visible; JAX reads the platform list once, at import)",
           _env_only("HIPPYMFEM_DEVICE", "cpu"), when="import"),
     _Knob("hypre_device", "HIPPYMFEM_HYPRE_DEVICE",
           "MFEM and hypre on the device too (CUDA build of PyMFEM; configured at import)",

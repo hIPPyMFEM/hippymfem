@@ -104,8 +104,9 @@ def set_device(kind="cpu", index=None, comm=None):
     ----------
     kind : {"cpu", "gpu", "cuda", None}
         ``None`` resets to the default.  Asking for a GPU requires
-        ``HIPPYMFEM_DEVICE=gpu`` (or ``JAX_PLATFORMS=cuda``) in the environment
-        *before* hippymfem is imported, because JAX reads the platform list once.
+        ``HIPPYMFEM_DEVICE=gpu`` or ``auto`` (or ``JAX_PLATFORMS=cuda``) in the
+        environment *before* hippymfem is imported, because JAX reads the platform
+        list once.
     index : int, optional
         Which device.  The default assigns **one GPU per MPI rank** by the rank's
         index within its node, so the ranks of a job do not all land on device 0.
@@ -154,8 +155,9 @@ def _node_rank(comm=None):
 def device():
     """The device element kernels run on.
 
-    Honors ``HIPPYMFEM_DEVICE=gpu`` on first use, so a script only has to set the
-    environment variable; ``set_device`` overrides it.
+    Honors ``HIPPYMFEM_DEVICE=gpu`` (and ``auto``, a GPU when the process can see
+    one) on first use, so a script only has to set the environment variable;
+    ``set_device`` overrides it.
     """
     global _DEVICE
     if _DEVICE is None:

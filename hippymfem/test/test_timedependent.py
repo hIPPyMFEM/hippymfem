@@ -514,6 +514,137 @@ def test_scalar_parameters_integrate():
               "(%.15g, exact %.15g)" % (total, exact))
 
 
+def test_td_boundary_density():
+    """A Robin condition as a boundary density of the one-step residual.
+
+    Three checks.  The step Jacobian with the term is the one without it plus
+    ``alpha`` times MFEM's boundary mass matrix, to round-off.  Without an essential
+    condition, diffusion under the natural boundary condition conserves mass and the
+    Robin term drains it.  And an initial-condition inversion through the Robin
+    problem passes the finite-difference checks the Dirichlet one does.
+    """
+    if RANK == 0:
+        print("time-dependent boundary density (Robin)")
+    nx, nt, kappa, alpha = 12, 5, 0.05, 2.0
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(nx, nx, mfem.Element.TRIANGLE))
+    Vu = hm.FunctionSpace.H1(pmesh, 1)
+    Vh = [Vu, Vu, Vu]
+    t_init, t_final = 0.0, 0.5
+    dt = (t_final - t_init) / nt
+
+    def varf(u, u_old, m, p, x, t, dt_):
+        """Implicit Euler for u_t - kappa lap u = 0."""
+        return (u.val - u_old.val) / dt_ * p.val + kappa * hm.inner(u.grad, p.grad)
+
+    def robin(u, u_old, m, p, x, n, t, dt_):
+        """kappa du/dn = -alpha u on the whole boundary."""
+        return alpha * u.val * p.val
+
+    def make(bdr):
+        pde = hm.TimeDependentPDEVariationalProblem(
+            Vh, varf, None, None, Vu.vector(), t_init, t_final, dt,
+            is_fwd_linear=True, quadrature_degree=4, bdr_varf=bdr)
+        for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            if NP == 1:
+                setattr(pde, a, hm.LUSolver(COMM))
+            else:
+                s = hm.KrylovSolver(COMM, "gmres", "amg")
+                s.parameters["rel_tolerance"] = 1e-13
+                setattr(pde, a, s)
+        return pde
+
+    pde0, pde1 = make(None), make(robin)
+
+    # 1. the step Jacobian gains alpha times the boundary mass matrix
+    z = [Vu.vector() for _ in range(4)]
+    A0 = pde0._step_block(3, 0, *z, t_init + dt)
+    A1 = pde1._step_block(3, 0, *z, t_init + dt)
+    bf = mfem.ParBilinearForm(Vu.fes)
+    bf.AddBoundaryIntegrator(
+        mfem.BoundaryMassIntegrator(mfem.ConstantCoefficient(alpha)))
+    bf.Assemble()
+    bf.Finalize()
+    M = bf.ParallelAssemble()
+    hm.parRandom.set_seed(11)
+    v = Vu.vector()
+    hm.parRandom.normal(1.0, v)
+    y0, y1, ym = Vu.vector(), Vu.vector(), Vu.vector()
+    A0.Mult(v.hypre, y0.hypre)
+    A1.Mult(v.hypre, y1.hypre)
+    M.Mult(v.hypre, ym.hypre)
+    d = (y1.copy().axpy(-1.0, y0).axpy(-1.0, ym).norm("linf")
+         / max(ym.norm("linf"), 1e-300))
+    check("step Jacobian gains alpha x boundary mass", d < 1e-12, "(%.2e)" % d)
+
+    # 2. mass: conserved under the natural condition, drained by the Robin term
+    lf = mfem.ParLinearForm(Vu.fes)
+    lf.AddDomainIntegrator(mfem.DomainLFIntegrator(mfem.ConstantCoefficient(1.0)))
+    lf.Assemble()
+    hv = lf.ParallelAssemble()
+    w = np.array(hv.GetDataArray(), dtype=np.float64)     # copy: the view dangles
+    del hv
+
+    def mass(vec):
+        return COMM.allreduce(float(w @ vec.array), op=MPI.SUM)
+
+    bump = Vu.project(lambda x: np.exp(-40.0 * ((x[0] - 0.5) ** 2
+                                                + (x[1] - 0.5) ** 2)))
+    flat = Vu.vector()
+    flat.set(1.0)
+    got = {}
+    for name, pde, ic in (("natural", pde0, bump), ("robin", pde1, flat)):
+        pde.u0 = ic.copy()
+        u = pde.generate_state()
+        pde.solveFwd(u, [u, ic, None])
+        got[name] = (mass(u.view(t_init)), mass(u.view(t_final)))
+    m0, m1 = got["natural"]
+    check("natural boundary condition conserves mass",
+          abs(m1 - m0) < 1e-9 * abs(m0), "(%.2e)" % (abs(m1 - m0) / abs(m0)))
+    r0, r1 = got["robin"]
+    check("the Robin term drains mass", 0.0 < r1 < 0.9 * r0,
+          "(%.3f of the initial mass left)" % (r1 / r0))
+
+    # 3. initial-condition inversion through the Robin problem
+    prob = _ICProblem(pde1)
+    rng = np.random.default_rng(7)
+    targets = rng.uniform(0.1, 0.9, size=(80, 2))
+    B = hm.assemblePointwiseObservation(Vu, targets)
+    misfits = [None] * pde1.times.size
+    for k in range(1, pde1.times.size):
+        misfits[k] = hm.DiscreteStateObservation(B, B.createVecLeft(), None)
+    misfit = hm.MisfitTD(misfits, pde1.times)
+    gamma, delta = hm.BiLaplacianComputeCoefficients(0.25, 0.15, 2)
+    prior = hm.BiLaplacianPrior(Vu, gamma, delta,
+                                solver_type="lu" if NP == 1 else "krylov")
+    model = hm.Model(prob, prior, misfit)
+    mtrue = Vu.project(lambda x: np.exp(-60.0 * ((x[0] - 0.3) ** 2
+                                                 + (x[1] - 0.4) ** 2)))
+    utrue = prob.generate_state()
+    prob.solveFwd(utrue, [utrue, mtrue, None])
+    clean_max = 0.0
+    for k, t in enumerate(pde1.times):
+        if misfits[k] is not None:
+            B.mult(utrue.view(t), misfits[k].d)
+            clean_max = max(clean_max, misfits[k].d.norm("linf"))
+    noise_std = 0.01 * max(clean_max, 1e-30)
+    for k in range(pde1.times.size):
+        if misfits[k] is not None:
+            B.perturb(misfits[k].d, noise_std)
+            misfits[k].noise_variance = noise_std ** 2
+    m0 = Vu.project(lambda x: 0.3 * np.exp(-40.0 * ((x[0] - 0.4) ** 2
+                                                    + (x[1] - 0.4) ** 2)))
+    eps = np.power(2.0, -np.arange(2, 16))
+    e, eg, eH = hm.modelVerify(model, m0, is_quadratic=True, misfit_only=False,
+                               verbose=(RANK == 0), eps=eps)
+    sg = hm.best_slope(e, eg)
+    check("Robin problem: gradient is first order", 0.8 < sg < 1.3,
+          "(slope %.3f)" % sg)
+    scaleH = max(abs(eg[0]) / max(e[0], 1e-300), 1.0)
+    check("Robin problem: Hessian is exact (quadratic cost)",
+          eH.max() < 1e-6 * scaleH,
+          "(max err %.2e vs scale %.2e)" % (eH.max(), scaleH))
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -525,6 +656,7 @@ if __name__ == "__main__":
     test_td_gradient_and_hessian()
     test_nonlinear_time_dependent_hessian()
     test_scalar_parameters_integrate()
+    test_td_boundary_density()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

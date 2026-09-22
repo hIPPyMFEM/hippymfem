@@ -12,13 +12,16 @@ build links none of MUMPS, SuperLU_dist, STRUMPACK or PETSc, so this module
 supplies the capability from the Python side, by two exact routes:
 
 :class:`ReplicatedLUSolver`
-    Gathers the distributed matrix onto every rank and factorizes it with
-    scipy's SuperLU.  Needs nothing beyond scipy, works on any rank count, and
-    matches a distributed direct solve to round-off.  The factorization is
-    redundant: it costs one serial factorization of the whole matrix in time
-    and ``O(nnz(L+U))`` per rank in memory, the standard "redundant coarse
-    solve" trade and the right one up to a few hundred thousand unknowns.
-    Beyond that use a Krylov solver.
+    Gathers the distributed matrix onto rank 0 and factorizes it there with
+    scipy's SuperLU; a solve gathers the right-hand side, solves on rank 0 and
+    scatters the result.  Needs nothing beyond scipy, works on any rank count,
+    and matches a distributed direct solve to round-off.  It costs one serial
+    factorization of the whole matrix in time and ``O(nnz(L+U))`` on rank 0 in
+    memory, the standard "redundant coarse solve" trade and the right one up to
+    a few hundred thousand unknowns.  ``replicate=True`` factorizes on every
+    rank instead, which the name comes from: every rank then solves for itself
+    and no rank waits on rank 0, for ``O(nnz(L+U))`` on each.  Beyond that
+    size use a Krylov solver.
 
 :class:`PETScLUSolver`
     A distributed factorization when petsc4py is importable, picking the best
@@ -60,8 +63,9 @@ DEFAULT_MAX_GLOBAL_SIZE = 400000
 
 
 # ------------------------------------------------------------------- gathering
-def gather_matrix(A, comm=None, format="csc"):
-    """Assemble a distributed ``HypreParMatrix`` into a scipy matrix on every rank.
+def gather_matrix(A, comm=None, format="csc", root=None):
+    """Assemble a distributed ``HypreParMatrix`` into a scipy matrix on every rank,
+    or on ``root`` alone (``None`` on the other ranks) when a root is given.
 
     Blocks are ordered by their true row offset rather than by rank, so this does
     not assume that hypre's partition runs in rank order.
@@ -73,9 +77,11 @@ def gather_matrix(A, comm=None, format="csc"):
     loc = hypre_to_scipy(A)
     ncols = int(A.GetGlobalNumCols())
     first = int(A.GetRowPartArray()[0])
-    blocks = comm.allgather(
-        (first, loc.indptr.copy(), loc.indices.copy(), loc.data.copy(),
-         loc.shape[0]))
+    part = (first, loc.indptr.copy(), loc.indices.copy(), loc.data.copy(),
+            loc.shape[0])
+    blocks = comm.allgather(part) if root is None else comm.gather(part, root=root)
+    if blocks is None:
+        return None
     blocks.sort(key=lambda t: t[0])
     mats = [sp.csr_matrix((d, j, ip), shape=(nr, ncols))
             for _, ip, j, d, nr in blocks]
@@ -94,12 +100,16 @@ class _Base(_SolverBase):
 
 # ------------------------------------------------------------- replicated LU
 class ReplicatedLUSolver(_Base):
-    """Exact sparse LU on every rank, of the gathered matrix.
+    """Exact sparse LU of the gathered matrix, on rank 0 or on every rank.
 
     A drop-in stand-in for hIPPYlib's ``PETScLUSolver`` that needs no external
-    package.  ``solve`` gathers the right-hand side, applies the factorization
-    and keeps this rank's slice, so the result is bit-identical on every rank and
-    independent of the rank count.
+    package.  By default the matrix is gathered onto rank 0 and factorized there;
+    ``solve`` gathers the right-hand side, solves on rank 0 and scatters the
+    result, so the other ranks hold no factorization and a node's memory is
+    charged once, not once per rank.  With ``replicate=True`` every rank holds
+    the factorization and solves for itself from an all-gathered right-hand side.
+    Either way the result is independent of the rank count and the same on every
+    rank.
 
     Parameters
     ----------
@@ -107,13 +117,17 @@ class ReplicatedLUSolver(_Base):
     max_global_size : int
         Refuse matrices larger than this.  The default keeps a typo from turning
         into an out-of-memory kill; raise it deliberately if the fill fits.
+    replicate : bool
+        Factorize on every rank rather than on rank 0 alone.
     """
 
-    def __init__(self, comm=None, max_global_size=None, permc_spec=None):
+    def __init__(self, comm=None, max_global_size=None, permc_spec=None,
+                 replicate=False):
         super(ReplicatedLUSolver, self).__init__(comm)
         self.max_global_size = int(max_global_size if max_global_size is not None
                                    else DEFAULT_MAX_GLOBAL_SIZE)
         self.permc_spec = permc_spec
+        self.replicate = bool(replicate)
         self._lu = None
         self._n = None
 
@@ -129,12 +143,28 @@ class ReplicatedLUSolver(_Base):
         if n > self.max_global_size:
             raise RuntimeError(
                 "ReplicatedLUSolver refuses a %d x %d matrix: the factorization "
-                "is stored on every rank.  Raise max_global_size if the fill "
-                "fits, or use KrylovSolver(comm, 'cg', 'amg')." % (n, n))
+                "of the whole matrix is stored on %s.  Raise max_global_size if "
+                "the fill fits, or use KrylovSolver(comm, 'cg', 'amg')."
+                % (n, n, "every rank" if self.replicate else "rank 0"))
         self._n = n
-        G = gather_matrix(A, self.comm, format="csc")
+        G = gather_matrix(A, self.comm, format="csc",
+                          root=None if self.replicate else 0)
         kw = {} if self.permc_spec is None else {"permc_spec": self.permc_spec}
-        self._lu = sla.splu(G, **kw)
+        err = None
+        if G is not None:
+            try:
+                self._lu = sla.splu(G, **kw)
+            except Exception as exc:                              # noqa: BLE001
+                err = "%s: %s" % (type(exc).__name__, exc)
+        if not self.replicate:
+            # one verdict for every rank: a factorization that fails on rank 0 alone
+            # would leave the others waiting in the next solve's gather
+            err = self.comm.bcast(err, root=0)
+        if err is not None:
+            self._lu = None
+            self._n = None
+            raise RuntimeError("the LU factorization failed (%s); the matrix is "
+                               "probably singular" % err)
         self._template = ParVector(self.comm, A.Height())
         self.iterations = 1
         self.converged = True
@@ -143,19 +173,28 @@ class ReplicatedLUSolver(_Base):
     SetOperator = set_operator
 
     def _solve(self, x, b, trans):
-        if self._lu is None:
+        if self._n is None:
             raise RuntimeError("set_operator must be called before solve")
-        full = b.allgather()
-        sol = self._lu.solve(full, trans=trans)
-        if not np.isfinite(sol).all():
-            self.converged = False
-            if self.parameters["error_on_nonconvergence"]:
-                raise RuntimeError("the LU solve produced non-finite values; the "
-                                   "matrix is probably singular")
+        if self.replicate:
+            sol = self._lu.solve(b.allgather(), trans=trans)
+            ok = bool(np.isfinite(sol).all())
         else:
-            self.converged = True
-        lo, hi = x.owner_range
-        x.array[:] = sol[lo:hi]
+            full = b.gather_to_zero()
+            sol = ok = None
+            if self.comm.rank == 0:
+                sol = self._lu.solve(full, trans=trans)
+                ok = bool(np.isfinite(sol).all())
+            # one verdict for every rank, so that an error is raised on all of them
+            ok = self.comm.bcast(ok, root=0)
+        self.converged = ok
+        if not ok and self.parameters["error_on_nonconvergence"]:
+            raise RuntimeError("the LU solve produced non-finite values; the "
+                               "matrix is probably singular")
+        if self.replicate:
+            lo, hi = x.owner_range
+            x.array[:] = sol[lo:hi]
+        else:
+            x.scatter_from_zero(sol)
         return 1
 
     def solve(self, x, b):
@@ -172,7 +211,8 @@ class ReplicatedLUSolver(_Base):
         return y
 
     def __repr__(self):
-        return "ReplicatedLUSolver(n=%s, ranks=%d)" % (self._n, self.comm.size)
+        return "ReplicatedLUSolver(n=%s, ranks=%d, %s)" % (
+            self._n, self.comm.size, "replicated" if self.replicate else "on rank 0")
 
 
 # -------------------------------------------------------------------- PETSc

@@ -71,12 +71,17 @@ The full report is in `out/report_nx12_np1.txt`.
 
 ### The one loose comparison, and why
 
-The **tail** of the randomized spectrum agrees only to ~1e-1, and the quantities
-derived from it (posterior trace, posterior pointwise variance, KL divergence)
-to ~1e-4 to 1e-3.  That is not an implementation difference: by eigenvalue 40
-the spectral ratio `d[0]/d[39]` is about 5e7, the power iteration squares it,
-and the `R`-orthogonalization loses most of its digits.  Both libraries are
-round-off limited there, in different ways.
+The **tail** of the randomized spectrum (eigenvalues 15 to 40) differs between the
+two libraries by up to 0.77, and the quantities derived from it (posterior trace,
+posterior pointwise variance, KL divergence) by ~1e-4 to 3e-3.  That is a difference
+between the two randomized solvers, not between the operators: by eigenvalue 40 the
+spectral ratio `d[0]/d[39]` is 3e6, and with two power iterations that is squared.
+hIPPyMFEM's `doublePassG` re-orthonormalizes after every power iteration and its
+tail is within 1.8e-2 of the dense spectrum; hIPPYlibx's orthonormalizes once at the
+end, and its tail is round-off limited there (0.77 off at the 40th eigenvalue
+against its own dense spectrum).  `docs/source/limits.rst` has the measured errors
+against the dense spectrum for several oversamplings and power iterations.  The
+tail row is therefore reported but not held to a tolerance.
 
 This is why the harness also computes the spectrum **exactly**, by densifying
 the Hessian and the prior precision and calling `scipy.linalg.eigh`.  That

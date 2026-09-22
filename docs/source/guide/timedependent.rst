@@ -80,6 +80,9 @@ chosen times.
    problem, because Newton-CG does not use it.  A time-dependent Taylor
    approximation of a QoI would need it.
 
-   The time-dependent problem takes a **domain density only**: there is no
-   ``bdr_varf`` or ``facet_varf`` argument, so a Neumann or Robin condition has to
-   enter through the stationary problem class or be imposed on the space.
+   The time-dependent problem takes a domain density and a **boundary density**,
+   ``bdr_varf(u, u_old, m, p, x, n, t, dt)`` over the boundary elements of
+   ``bdr_attributes``, which is where a Robin condition or a prescribed flux goes
+   (``test_timedependent.py`` checks a Robin term against MFEM's boundary mass
+   matrix and through an inversion).  It takes no ``facet_varf``: DG formulations
+   are for the stationary class.

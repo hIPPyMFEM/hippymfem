@@ -48,11 +48,15 @@ models, so measure rather than assume.
 
 **How much a rank can hold.**  Not memory, but 32-bit indices: hypre addresses a rank's
 nonzeros with an ``int``, and four million P2 hexahedra on a rank carry 2.06e9 of them,
-96 % of the ceiling.  Above roughly that, add ranks.  A second limit, MFEM's int-sized
+96 % of the ceiling.  Above roughly that, add ranks; the ceiling cannot be built away,
+since MFEM does not accept a hypre built with 64-bit local indices (``--enable-bigint``),
+only one with 64-bit *global* indices (``--enable-mixedint``), which is what a run past
+2\ :sup:`31` unknowns in all needs.  A second limit, MFEM's int-sized
 vectors in its batched ``GetGeometricFactors``, is handled by building the quadrature
-geometry here in element slices instead (:ref:`gpu-memory`).  Large assemblies also need
-JAX's arena preallocated rather than grown, since one array of a sixth of the arena or
-more can fail against a cap that reads empty.
+geometry here in element slices instead (:ref:`gpu-memory`).  Large assemblies also want
+JAX's arena preallocated rather than grown (``XLA_PYTHON_CLIENT_PREALLOCATE=true``,
+sized by ``HIPPYMFEM_GPU_MEM_FRACTION``; see :ref:`gpu-memory`), since one array of a
+sixth of the arena or more can fail against a cap that reads empty.
 
 Building the sparsity pattern costs a fraction of one warm assembly (0.4 to 0.7,
 measured at P1 and P2 on quadrilaterals and hexahedra), and the whole one-time cost of
@@ -66,18 +70,41 @@ and the fallback for element families the direct scatter does not cover.
 Solvers
 -------
 
-``LUSolver`` is exact on any rank count but replicates the factorization, so it is
-refused above 400 000 unknowns by default.  A genuinely distributed direct solve
-needs either a PETSc with MUMPS/SuperLU_dist (through ``PETScLUSolver``) or an MFEM
-built with one.
+``LUSolver`` is exact on any rank count, but the factorization is serial: the
+matrix is gathered onto rank 0 and factorized there (on every rank with
+``replicate=True``, which is where the name ``ReplicatedLUSolver`` comes from), so
+it is refused above 400 000 unknowns by default.  A genuinely distributed direct
+solve needs either a PETSc with MUMPS/SuperLU_dist (through ``PETScLUSolver``) or
+an MFEM built with one.
 
 Randomized eigenvector tails
 ----------------------------
 
-Past a spectral ratio of about 1e5 the trailing eigenpairs are round-off limited, and
-the posterior trace, pointwise variance and KL divergence inherit that.  Use more
-power iterations, or the exact dense spectrum on a coarse mesh, when the tail
-matters.
+The last of the ``k`` computed eigenpairs are the least accurate, and what limits
+them is the subspace the sketch spans, not round-off.  Measured on the validation
+case (P2/P1 on a 12 x 12 mesh, 169 parameter dofs, so the dense generalized
+spectrum is exact; ``k = 40``, a spectral ratio of 3.2e6 from the first eigenvalue
+to the 40th), the relative error of the 40th eigenvalue with exact inner solves is
+
+==================  =======  =======  =======  =======
+oversampling ``p``  s = 1    s = 2    s = 3    s = 4
+==================  =======  =======  =======  =======
+10                  2.1e-1   7.1e-2   2.4e-2   7.8e-3
+25                  6.6e-2   2.0e-3   5.9e-5   2.4e-6
+60                  6.0e-3   1.4e-5   1.7e-8   4.0e-11
+==================  =======  =======  =======  =======
+
+with ``s`` the power iterations of ``doublePassG``; the 20th eigenvalue (ratio 1.4e5)
+is at 2.7e-4 with ``p = 25, s = 1`` already and at round-off from ``s = 3``.  The
+power iterations are orthonormalized after every application.  With one
+orthonormalization at the end, as the solvers did until September 2026, the third
+iteration raised the spectral ratio past 1/eps and put the last twenty of the forty
+eigenvalues off by 30 to 90 %, which is where an earlier "round-off limited beyond a
+ratio of 1e5" came from.  The inner solver's tolerance is a floor under all of this:
+at ``1e-9`` the leading eigenvalues stop at about 1e-9 and the 40th at 6e-6, whatever
+``p`` and ``s``.  The posterior trace, pointwise variance and KL divergence inherit the
+tail's error; the dense spectrum on a coarse mesh (``dense_spectrum`` in
+``validation/run_hippymfem.py``) is the way to check.
 
 Reproducibility
 ---------------

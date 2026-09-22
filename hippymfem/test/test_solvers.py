@@ -108,7 +108,9 @@ def test_exact_solve():
     A, b, V = make_operator(10, 2)
     out = {}
     for name, solver in (("LUSolver", hp.LUSolver(COMM)),
-                         ("ReplicatedLUSolver", ReplicatedLUSolver(COMM))):
+                         ("ReplicatedLUSolver", ReplicatedLUSolver(COMM)),
+                         ("ReplicatedLUSolver(replicate=True)",
+                          ReplicatedLUSolver(COMM, replicate=True))):
         solver.set_operator(A)
         x = V.vector()
         solver.solve(x, b)
@@ -127,6 +129,16 @@ def test_exact_solve():
     agree = abs(out["LUSolver"] - out["ReplicatedLUSolver"])
     check("LUSolver and ReplicatedLUSolver agree", agree < 1e-9 * max(
         abs(out["LUSolver"]), 1e-300), "(%.3e)" % agree)
+    agree = abs(out["ReplicatedLUSolver"] - out["ReplicatedLUSolver(replicate=True)"])
+    check("the rank-0 and the replicated factorization agree", agree < 1e-12 * max(
+        abs(out["ReplicatedLUSolver"]), 1e-300), "(%.3e)" % agree)
+    # by default only rank 0 holds a factorization; every rank holds one when asked
+    s0 = ReplicatedLUSolver(COMM).set_operator(A)
+    s1 = ReplicatedLUSolver(COMM, replicate=True).set_operator(A)
+    held = COMM.allreduce(int(s0._lu is not None), op=MPI.SUM)
+    held_all = COMM.allreduce(int(s1._lu is not None), op=MPI.SUM)
+    check("the factorization lives on rank 0 only by default, on every rank replicated",
+          held == 1 and held_all == NP, "(%d and %d of %d ranks)" % (held, held_all, NP))
 
     # rank-count independence: store on the first run, compare on later ones
     key = "exact_solve_bTx_n10_p2"

@@ -73,6 +73,10 @@ from .timeDependentVector import TimeDependentVector
 from .variables import ADJOINT, NVAR, PARAMETER, STATE
 from ..common.random import Random
 from ..fem.io import ParaViewWriter
+from ..fem.assemble import assembly_backend
+from ..fem.boundary import (assemble_boundary_matrix, assemble_boundary_vector,
+                            get_boundary_batches)
+from ..fem.csrassemble import _eliminate, assemble_matrix_csr
 
 #: kernel field slots of the one-step residual
 NEW = 0          #: u_n
@@ -110,6 +114,18 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
     varf_handler : callable
         ``varf(u, u_old, m, p, x, t, dt) -> scalar``, JAX-traceable, with
         :class:`~hippymfem.fem.kernel.Field` arguments for the four fields.
+    bdr_varf : callable, optional
+        ``bdr_varf(u, u_old, m, p, x, n, t, dt) -> scalar``, a boundary density of
+        the same step residual with the outward unit normal ``n``, integrated over
+        the boundary elements of ``bdr_attributes`` and added to the domain term:
+        a Robin condition, a prescribed flux, a boundary source.  Its derivative
+        blocks are added to the step blocks before the essential rows are
+        eliminated, as in :class:`~.PDEVariationalProblem.PDEVariationalProblem`.
+    bdr_attributes : "all" or sequence of int
+        Which boundary attributes ``bdr_varf`` applies to (MFEM's 1-based
+        attributes); all of them by default.
+    bdr_quadrature_degree : int, optional
+        Quadrature degree on the boundary; ``quadrature_degree`` by default.
     bc, bc0 : boundary conditions on the state, with data and homogeneous.
     u0 : ParVector
         Initial condition at ``t_init``.
@@ -125,7 +141,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
     INVARIANCE_PROBE_TOL = 1e-13
 
     def __init__(self, Vh, varf_handler, bc, bc0, u0, t_init, t_final, dt,
-                 is_fwd_linear=False, quadrature_degree=None, spd_jacobian=False):
+                 is_fwd_linear=False, quadrature_degree=None, spd_jacobian=False,
+                 bdr_varf=None, bdr_attributes="all", bdr_quadrature_degree=None):
         if len(Vh) != NVAR:
             raise ValueError("Vh must have %d entries" % NVAR)
         #: see :attr:`~.PDEProblem.PDEProblem.spd_jacobian`
@@ -160,6 +177,22 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                       self.Vh[ADJOINT]]
         self.kernel = QuadratureKernel(varf_handler, self.slots, self.batches,
                                        nparams=2)
+
+        # ------------------------------------------------------ boundary term
+        self.bdr_varf = bdr_varf
+        self.bdr_kernel = None
+        self.bdr_batches = None
+        if bdr_varf is not None:
+            from ..fem.kernel import BoundaryKernel
+
+            self.bdr_quadrature_degree = int(
+                bdr_quadrature_degree if bdr_quadrature_degree is not None
+                else self.quadrature_degree)
+            self.bdr_batches = get_boundary_batches(
+                self.mesh, self.bdr_quadrature_degree, bdr_attributes, self.comm,
+                space=self.Vh[STATE])
+            self.bdr_kernel = BoundaryKernel(bdr_varf, self.slots, self.bdr_batches,
+                                             nparams=2)
 
         # the four solvers (see PDEProblem) start unset and default on first use;
         # per-step solvers, for a step Jacobian that changes in time, live in the
@@ -214,7 +247,17 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         vecs = self.kernel.element_vectors(slot, loc, (t, self.dt))
         require_finite_arrays(vecs, self.comm, "the step residual")
         space = self.slots[slot]
-        v = assemble_vector(space, self.batches.groups, vecs, self.nelem, ess=ess)
+        if self.bdr_kernel is None:
+            v = assemble_vector(space, self.batches.groups, vecs, self.nelem, ess=ess)
+        else:
+            # the boundary part joins before the essential rows are zeroed
+            v = assemble_vector(space, self.batches.groups, vecs, self.nelem)
+            bvecs = self.bdr_kernel.element_vectors(slot, loc, (t, self.dt))
+            require_finite_arrays(bvecs, self.comm, "the boundary step residual")
+            v.axpy(1.0, assemble_boundary_vector(space, self.bdr_batches.groups,
+                                                 bvecs))
+            if ess is not None and len(ess):
+                v.array[np.asarray(ess, dtype=np.int64)] = 0.0
         if out is not None:
             out.assign(v)
             return out
@@ -226,9 +269,34 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         loc = self._slot_locals(u_new, u_old, m, p)
         mats = self.kernel.element_matrices(i, j, loc, (t, self.dt))
         require_finite_arrays(mats, self.comm, "step block (%d, %d)" % (i, j))
-        return assemble_matrix(self.slots[i], self.slots[j], self.batches.groups,
-                               mats, self.nelem, test_ess=test_ess,
-                               diag_policy=diag_policy)
+        if self.bdr_kernel is None:
+            return assemble_matrix(self.slots[i], self.slots[j], self.batches.groups,
+                                   mats, self.nelem, test_ess=test_ess,
+                                   diag_policy=diag_policy)
+        bmats = self.bdr_kernel.element_matrices(i, j, loc, (t, self.dt))
+        require_finite_arrays(bmats, self.comm,
+                              "boundary step block (%d, %d)" % (i, j))
+        return self._with_boundary(i, j, mats, bmats, test_ess, diag_policy)
+
+    def _with_boundary(self, i, j, mats, bmats, test_ess, diag_policy):
+        """Block ``(i, j)`` with its boundary part, the two summed before the
+        essential rows are eliminated (eliminating each and adding would leave 2.0
+        on the essential diagonal), as
+        :meth:`.PDEVariationalProblem.PDEVariationalProblem._domain_block` does."""
+        ti, tj = self.slots[i], self.slots[j]
+        if assembly_backend() == "csr":
+            return assemble_matrix_csr(
+                ti, tj, self.batches.groups, mats, self.nelem, test_ess=test_ess,
+                diag_policy=diag_policy,
+                boundary=(self.bdr_batches.tables(ti), self.bdr_batches.tables(tj),
+                          bmats))
+        from ..common.linalg import ParAdd
+
+        dom = assemble_matrix(ti, tj, self.batches.groups, mats, self.nelem)
+        bdr = assemble_boundary_matrix(ti, tj, self.bdr_batches.groups, bmats)
+        A = ParAdd(dom, bdr)
+        del dom, bdr
+        return _eliminate(A, ti, tj, test_ess, None, diag_policy, ti.fes is tj.fes)
 
     def _step_blocks(self, names, u_new, u_old, m, p, t):
         """Several blocks of one step from **one** differentiation pass.
@@ -241,15 +309,24 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         pairs = [(_BLOCKS[n][0], _BLOCKS[n][1]) for n in names]
         loc = self._slot_locals(u_new, u_old, m, p)
         mats = self.kernel.element_matrices_many(pairs, loc, (t, self.dt))
+        bmats = None
+        if self.bdr_kernel is not None:
+            bmats = self.bdr_kernel.element_matrices_many(pairs, loc, (t, self.dt))
         out = {}
         ess = self.bc0.ess_tdof
         for n, ij in zip(names, pairs):
             require_finite_arrays(mats[ij], self.comm, "step block %s" % n)
             _, _, elim, policy = _BLOCKS[n]
-            out[n] = assemble_matrix(self.slots[ij[0]], self.slots[ij[1]],
-                                     self.batches.groups, mats[ij], self.nelem,
-                                     test_ess=ess if elim else None,
-                                     diag_policy=policy)
+            if bmats is None:
+                out[n] = assemble_matrix(self.slots[ij[0]], self.slots[ij[1]],
+                                         self.batches.groups, mats[ij], self.nelem,
+                                         test_ess=ess if elim else None,
+                                         diag_policy=policy)
+            else:
+                require_finite_arrays(bmats[ij], self.comm,
+                                      "boundary step block %s" % n)
+                out[n] = self._with_boundary(ij[0], ij[1], mats[ij], bmats[ij],
+                                             ess if elim else None, policy)
         return out
 
     # ------------------------------------------------------------ invariance

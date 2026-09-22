@@ -40,11 +40,13 @@ Choosing ``k``
 Look at the spectrum.  The eigenvalues decay, and ``k`` should reach past where
 :math:`\lambda_i` falls below about 1, because directions with :math:`\lambda \ll 1` are
 prior-dominated and contribute almost nothing to the update.  Taking ``k`` far past
-that point does not improve the answer and does degrade it: once the spectral ratio
-exceeds about 1e5 the trailing eigenpairs are round-off limited, and quantities
-derived from them (trace, pointwise variance, KL divergence) inherit that.
-``doublePassG`` with extra oversampling and more power iterations helps; the exact
-dense spectrum on a coarse mesh is the way to check.
+that point buys little, and the trailing eigenpairs are the least accurate ones:
+their error is set by the oversampling and the power iterations (at a spectral ratio
+of 3e6 the 40th eigenvalue is off by 7 % with ``p = 10, s = 2`` and by 6e-5 with
+``p = 25, s = 3``; :doc:`../limits` has the table), and the trace, pointwise variance
+and KL divergence inherit it.  More oversampling and more power iterations both help,
+every iteration (they are re-orthonormalized); the exact dense spectrum on a coarse
+mesh is the way to check.
 
 Solvers matter here
 -------------------

@@ -15,7 +15,8 @@ be in place before the first ``import jax``, because JAX reads them once:
     section 1).
 
 ``JAX_PLATFORMS``
-    Defaults to ``"cpu"``.  Set ``HIPPYMFEM_DEVICE=gpu`` (or ``JAX_PLATFORMS``
+    Defaults to ``"cpu"``.  Set ``HIPPYMFEM_DEVICE=gpu``, or ``auto`` for a GPU
+    whenever the process can see one (or ``JAX_PLATFORMS``
     directly) to run the element kernels on the GPU; see below for why it is not
     the default and what the GPU path covers.
 
@@ -46,7 +47,33 @@ import sys
 
 def _want_gpu():
     v = os.environ.get("HIPPYMFEM_DEVICE", "").strip().lower()
+    if v == "auto":
+        return _auto_gpu()
     return v in ("gpu", "cuda", "rocm", "gpu:0")
+
+
+_AUTO_GPU = None
+
+
+def _auto_gpu():
+    """``HIPPYMFEM_DEVICE=auto``: a GPU when this process can see one, the host
+    otherwise.
+
+    Decided once and before JAX is imported (it reads its platform list once): from
+    the launcher's visible-device variable when one is set, else from the vendor
+    tool.  A node without a card, or a job that hid them, runs on the host without
+    a word, so one environment serves a laptop and a GPU node.
+    """
+    global _AUTO_GPU
+    if _AUTO_GPU is None:
+        _AUTO_GPU = _vendor() is not None
+        for name in ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                     "HIP_VISIBLE_DEVICES"):
+            v = os.environ.get(name)
+            if v is not None:
+                _AUTO_GPU = any(t.strip() not in ("", "-1") for t in v.split(","))
+                break
+    return _AUTO_GPU
 
 
 def _platforms():

@@ -11,7 +11,10 @@ setting                          what moves
 ===============================  ================================================
 ``HIPPYMFEM_DEVICE=gpu``         the element kernels, the dof gather and the
                                  scatter into the CSR structure, through JAX.
-                                 Works with any PyMFEM.
+                                 Works with any PyMFEM.  ``auto`` does the same
+                                 when the process can see a GPU and nothing
+                                 otherwise, so one environment serves a laptop
+                                 and a GPU node.
 ``HIPPYMFEM_HYPRE_DEVICE=1``     MFEM's matrices and every hypre solve as well.
                                  Needs PyMFEM built for CUDA
                                  (``tools/build_pymfem_cuda.sh``) or for HIP

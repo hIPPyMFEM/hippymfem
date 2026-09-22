@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- `TimeDependentPDEVariationalProblem` takes a boundary density (`bdr_varf`), so a Robin
+  condition or a prescribed flux enters the one-step residual as it does the stationary
+  one; checked against MFEM's boundary mass matrix and through an inversion.
+- `LUSolver` and `ReplicatedLUSolver` factorize on rank 0 and scatter the solution, so a
+  node's memory is charged once rather than once per rank; `replicate=True` restores the
+  factorization on every rank. A factorization that fails raises on every rank.
+- `HIPPYMFEM_DEVICE=auto`: the element kernels take a GPU when the process can see one and
+  the host otherwise, so one environment serves a laptop and a GPU node.
+- The randomized eigensolvers orthonormalize after every power iteration, so more
+  iterations sharpen the tail of the spectrum instead of losing it past 1/eps: at a
+  spectral ratio of 3e6, the 40th of 40 eigenvalues goes from 84 % off to 6e-5 with three
+  iterations and 25 extra vectors; one iteration is unchanged.
+- The README figure and the GPU and performance guides carry the 256^3 comparison on 32
+  ranks: 77 s on 32 Blackwell slices against 6187 s for hIPPYlibx and 2859 s for hIPPyMFEM
+  on 32 CPU cores.
+
 ## Version 0.1.0, released on September 21, 2026
 
 First public release.

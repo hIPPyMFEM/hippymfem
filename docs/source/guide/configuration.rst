@@ -38,7 +38,8 @@ assigning them says which variable to set:
 ===============================  ====================================================
 variable                         what it decides
 ===============================  ====================================================
-``HIPPYMFEM_DEVICE``             where the element kernels run (unset or ``gpu``)
+``HIPPYMFEM_DEVICE``             where the element kernels run: unset, ``gpu``, or
+                                 ``auto`` (a GPU when the process can see one)
 ``HIPPYMFEM_HYPRE_DEVICE``       MFEM and hypre on the device too (CUDA or HIP PyMFEM)
 ``HIPPYMFEM_AUTO_DEVICE``        configure MFEM's device at import (``0`` to opt out)
 ``HIPPYMFEM_GPU_MEM_FRACTION``   JAX's share of each card (the default follows the

@@ -339,8 +339,9 @@ class LUSolver(_SolverBase):
     """Sparse direct solve via scipy's SuperLU, on any number of ranks.
 
     Stands in for hIPPYlib's ``PETScLUSolver``.  On one rank this factorizes the
-    matrix in place.  In parallel it gathers the matrix onto every rank and
-    factorizes it there, which is exact and independent of the rank count; see
+    matrix in place.  In parallel it gathers the matrix onto rank 0 and
+    factorizes it there (on every rank with ``replicate=True``), which is exact
+    and independent of the rank count; see
     :class:`~hippymfem.algorithms.directSolvers.ReplicatedLUSolver`, which this
     delegates to, for the memory trade and the size guard.
 
@@ -351,13 +352,17 @@ class LUSolver(_SolverBase):
         Kept for source compatibility; ``"superlu"`` is the only factorization.
     max_global_size : int, optional
         Passed through to the replicated solver.
+    replicate : bool
+        Passed through: the factorization on every rank rather than on rank 0.
     """
 
-    def __init__(self, comm=None, method="superlu", max_global_size=None):
+    def __init__(self, comm=None, method="superlu", max_global_size=None,
+                 replicate=False):
         comm = comm if comm is not None else MPI.COMM_WORLD
         super(LUSolver, self).__init__(comm)
         self.method = method
         self.max_global_size = max_global_size
+        self.replicate = bool(replicate)
         self._lu = None
         self._replicated = None
         self._template = None
@@ -371,7 +376,8 @@ class LUSolver(_SolverBase):
             from .directSolvers import ReplicatedLUSolver
 
             self._replicated = ReplicatedLUSolver(
-                self.comm, max_global_size=self.max_global_size)
+                self.comm, max_global_size=self.max_global_size,
+                replicate=self.replicate)
             self._replicated.set_operator(A)
             self._template = self._replicated._template
         else:

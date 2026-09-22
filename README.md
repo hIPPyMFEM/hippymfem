@@ -257,19 +257,26 @@ The full list, with measurements, is in the documentation (`docs/source/limits.r
 
 1. **Interior facet terms need conforming faces**; a mesh with a hanging node is refused
    by the facet kernels with an error, and variable-order spaces are rejected. The
-   time-dependent problem class takes a domain density only.
-2. **Direct solves are exact on any number of ranks, but replicated.** `hm.LUSolver`
-   factorizes the whole matrix on every rank and refuses problems above 400 000 unknowns;
-   `hm.PETScLUSolver` factorizes in parallel when petsc4py is available, and
-   `hm.KrylovSolver` is the choice for large problems.
+   time-dependent problem class takes domain and boundary densities, not facet terms.
+2. **Direct solves are exact on any number of ranks, but serial.** `hm.LUSolver` gathers
+   the matrix onto rank 0 and factorizes it there (on every rank with `replicate=True`),
+   and refuses problems above 400 000 unknowns; `hm.PETScLUSolver` factorizes in parallel
+   when petsc4py has MUMPS or SuperLU_dist, and `hm.KrylovSolver` is the choice for large
+   problems.
 3. **A rank holds at most about four million P2 hexahedra**, because hypre addresses its
-   nonzeros with a 32-bit int; past that, add ranks. Assemblies that large also want JAX's
-   arena preallocated rather than grown ([`docs/source/guide/gpu.rst`](docs/source/guide/gpu.rst)).
-4. **GPU execution is opt-in** and pays off above roughly 10⁴ elements per rank. The kernels
+   nonzeros with a 32-bit int and MFEM does not accept hypre's 64-bit local-index build; past
+   that, add ranks. Assemblies that large also want JAX's arena preallocated rather than grown
+   (`XLA_PYTHON_CLIENT_PREALLOCATE=true`, sized by `HIPPYMFEM_GPU_MEM_FRACTION`; see
+   [`docs/source/guide/gpu.rst`](docs/source/guide/gpu.rst)).
+4. **GPU execution is a switch**: `HIPPYMFEM_DEVICE=gpu`, or `auto` for a GPU whenever the
+   process can see one, and it pays off above roughly 10⁴ elements per rank. The kernels
    move to the GPU with JAX alone; moving the solves needs a CUDA or HIP build of PyMFEM,
-   which the scripts in `tools/` produce.
-5. **Randomized eigenvector tails** are round-off limited beyond a spectral ratio of about
-   10⁵, and quantities built from them inherit that.
+   which the scripts in `tools/` produce, and `HIPPYMFEM_HYPRE_DEVICE=1`.
+5. **The tail of a randomized spectrum is its least accurate part**, and what limits it is
+   the sketch, not round-off: at a spectral ratio of 3 × 10⁶ across 40 eigenpairs, the 40th
+   eigenvalue is off by 21 % with 10 extra vectors and one power iteration, by 0.2 % with 25
+   and two, and by 6 × 10⁻⁵ with 25 and three. The trace, pointwise variance and KL
+   divergence inherit that, and the inner solver's tolerance is a floor under all of it.
 6. **Object lifetime.** PyMFEM hands raw pointers to MFEM, so a garbage-collected wrapper is a
    crash rather than an exception. The library keeps alive what it hands over; code that calls
    MFEM directly has to do the same.
