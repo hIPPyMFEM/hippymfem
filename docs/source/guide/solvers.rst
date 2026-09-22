@@ -86,8 +86,22 @@ Genuinely distributed direct solvers
 :class:`~hippymfem.algorithms.directSolvers.PETScLUSolver` uses the best
 factorization the local PETSc was built with (MUMPS, SuperLU_dist, STRUMPACK or
 PaStiX), and otherwise PETSc's ``redundant`` with an inner ``lu``, which is exact as
-well.  :class:`~hippymfem.algorithms.directSolvers.PETScKrylovSolver` exposes
-PETSc's Krylov methods and preconditioners on the same matrices.
+well but serial; ``package_used`` says which one a solver got.  The petsc4py on
+PyPI configures its PETSc without any of the four, and a conda-forge PETSc brings
+an MPI of its own that cannot share a process with the one PyMFEM links, so
+``tools/install_petsc_mumps.sh`` builds PETSc from source against the system MPI
+with MUMPS, ScaLAPACK, METIS and ParMETIS, and petsc4py against it (a venv made
+with ``--system-site-packages`` on top of the PyMFEM interpreter keeps the PyPI
+petsc4py untouched).  What MUMPS costs on a 3D problem, measured on the P2
+Laplacian-plus-mass of an :math:`n^3` hexahedral mesh with that build (system OpenMPI,
+one node): at :math:`32^3` (274 625 unknowns) on four ranks the factorization takes
+105 s and a solve 0.14 s, against 0.84 s for CG with BoomerAMG to 1e-12; at
+:math:`40^3` (531 441 unknowns) on eight ranks 189 s and 0.18 s against 0.84 s.  The
+factorization pays for itself after a few hundred solves, which a Laplace
+approximation with a hundred Hessian actions is close to, and the solve is exact
+(residual 1e-14) where the Krylov solve has a tolerance.
+:class:`~hippymfem.algorithms.directSolvers.PETScKrylovSolver` exposes PETSc's Krylov
+methods and preconditioners on the same matrices.
 
 .. warning::
 

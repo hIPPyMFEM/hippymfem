@@ -14,6 +14,9 @@
   iterations sharpen the tail of the spectrum instead of losing it past 1/eps: at a
   spectral ratio of 3e6, the 40th of 40 eigenvalues goes from 84 % off to 6e-5 with three
   iterations and 25 extra vectors; one iteration is unchanged.
+- `tools/install_petsc_mumps.sh` builds PETSc with MUMPS, ScaLAPACK, METIS and ParMETIS
+  against the system MPI and petsc4py against it, so `PETScLUSolver` factorizes in parallel
+  (`package_used == "mumps"`); the solvers guide gives the measured cost.
 - The README figure and the GPU and performance guides carry the 256^3 comparison on 32
   ranks: 77 s on 32 Blackwell slices against 6187 s for hIPPYlibx and 2859 s for hIPPyMFEM
   on 32 CPU cores.

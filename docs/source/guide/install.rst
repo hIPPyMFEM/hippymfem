@@ -17,7 +17,8 @@ JAX                 0.4.30 or later (tested with 0.5 and 0.11), for the
 NumPy, SciPy        NumPy 1.26 or 2.x; SciPy supplies the sparse direct solves
 Matplotlib          optional: plotting (``hippymfem.nb``) and the tutorials
 petsc4py            optional; adds distributed direct solvers, see
-                    :doc:`solvers`
+                    :doc:`solvers`; ``tools/install_petsc_mumps.sh`` builds a
+                    PETSc with MUMPS for it
 numba               optional; builds large sparsity patterns without a global
                     sort, several times faster (:doc:`gpu`)
 CuPy                optional; a faster device sort where the sort route runs

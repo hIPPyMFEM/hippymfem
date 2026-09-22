@@ -10,7 +10,7 @@ hIPPyMFEM is a Python package on top of [MFEM](https://mfem.org). It needs:
 | [JAX](https://docs.jax.dev) | 0.4.30 or later (tested with 0.5 and 0.11) | residual densities and their derivatives |
 | NumPy, SciPy | NumPy 1.26 or 2.x | |
 | Matplotlib | optional | plotting (`hippymfem.nb`) and the tutorials |
-| petsc4py | optional | distributed direct solvers |
+| petsc4py | optional; `tools/install_petsc_mumps.sh` builds a PETSc with MUMPS for it | distributed direct solvers (`hm.PETScLUSolver`) |
 | numba | optional (`pip install -e ".[perf]"`) | builds large sparsity patterns without a global sort, several times faster |
 
 Everything except PyMFEM is a `pip install`. The `mfem` wheel on PyPI is serial only, and
