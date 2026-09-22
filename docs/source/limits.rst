@@ -75,7 +75,11 @@ matrix is gathered onto rank 0 and factorized there (on every rank with
 ``replicate=True``, which is where the name ``ReplicatedLUSolver`` comes from), so
 it is refused above 400 000 unknowns by default.  A genuinely distributed direct
 solve needs either a PETSc with MUMPS/SuperLU_dist (through ``PETScLUSolver``) or
-an MFEM built with one.
+an MFEM built with one; the petsc4py on PyPI has neither, and
+``tools/install_petsc_mumps.sh`` builds a PETSc with MUMPS and petsc4py against it.
+The factorization is the cost: 105 s for 274 625 unknowns of a 3D P2 problem on
+four ranks, 189 s for 531 441 on eight, against 0.14 to 0.18 s a solve and 0.84 s
+for a CG+BoomerAMG solve to 1e-12 (:doc:`guide/solvers`).
 
 Randomized eigenvector tails
 ----------------------------

@@ -258,11 +258,14 @@ The full list, with measurements, is in the documentation (`docs/source/limits.r
 1. **Interior facet terms need conforming faces**; a mesh with a hanging node is refused
    by the facet kernels with an error, and variable-order spaces are rejected. The
    time-dependent problem class takes domain and boundary densities, not facet terms.
-2. **Direct solves are exact on any number of ranks, but serial.** `hm.LUSolver` gathers
-   the matrix onto rank 0 and factorizes it there (on every rank with `replicate=True`),
-   and refuses problems above 400 000 unknowns; `hm.PETScLUSolver` factorizes in parallel
-   when petsc4py has MUMPS or SuperLU_dist, and `hm.KrylovSolver` is the choice for large
-   problems.
+2. **A distributed direct solve needs a PETSc with MUMPS.** `hm.LUSolver` is exact on any
+   number of ranks but serial: it gathers the matrix onto rank 0, factorizes it there (on
+   every rank with `replicate=True`) and refuses problems above 400 000 unknowns.
+   `hm.PETScLUSolver` factorizes in parallel with MUMPS when petsc4py was built against a
+   PETSc that has it, which the one on PyPI is not; `tools/install_petsc_mumps.sh` builds
+   that pair. Measured on a 3D P2 problem, the factorization of 275 000 unknowns takes 105 s
+   on four ranks and a solve 0.14 s, against 0.84 s per CG+BoomerAMG solve, so
+   `hm.KrylovSolver` remains the choice unless hundreds of exact solves follow.
 3. **A rank holds at most about four million P2 hexahedra**, because hypre addresses its
    nonzeros with a 32-bit int and MFEM does not accept hypre's 64-bit local-index build; past
    that, add ranks. Assemblies that large also want JAX's arena preallocated rather than grown
