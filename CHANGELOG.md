@@ -17,10 +17,14 @@
 - `tools/install_petsc_mumps.sh` builds PETSc with MUMPS, ScaLAPACK, METIS and ParMETIS
   against the system MPI and petsc4py against it, so `PETScLUSolver` factorizes in parallel
   (`package_used == "mumps"`); the solvers guide gives the measured cost.
-- The 400^3 row (1.09 billion unknowns, 24 Blackwell GPUs) is quoted warm, as every other
-  row is: 68.4 s for one Newton-CG step, 194.6 s when the step also pays the first
-  Hessian-block build and its JAX compilation (the 197 s quoted before); same cost functional
-  to eleven digits and 3 CG iterations.
+- The 400^3 row (1.09 billion unknowns, 24 Blackwell GPUs) now reports two warm Newton-CG
+  steps like every other row: 190.9 s with 3 + 9 CG iterations (it quoted one step with the
+  first Hessian-block build and its JAX compilation inside, 197 s, before).
+- `benchmarks/bench_laplace.py` gains `--fields` (truth, MAP, prior and posterior pointwise
+  std and the exact variance reduction on the parameter grid, for plotting),
+  `--release-linearization` (128^3 then fits on two 45 GiB cards), and records the setup and
+  end-to-end times, the KL divergence and the fraction of dofs where the truth lies within
+  two posterior standard deviations of the MAP.
 - The README figure and the GPU and performance guides carry the 256^3 comparison on 32
   ranks: 77 s on 32 Blackwell slices against 6187 s for hIPPYlibx and 2859 s for hIPPyMFEM
   on 32 CPU cores.

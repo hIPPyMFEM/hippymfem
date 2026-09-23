@@ -41,7 +41,7 @@ Newton solve, a table lookup, and its derivatives stay exact.
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
 | **80 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 77 s on 32 GPU ranks (16 RTX PRO 6000 Blackwell GPUs), against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) and 2859 s for hIPPyMFEM itself on 32 CPU cores, all at the same CG count. At 36 million unknowns, four L40S GPUs take 50 s against 2669 s on four CPU cores of the same node: 54 times, 60 at equal CG counts. |
-| **A billion unknowns** | One Newton-CG step at 1.09 billion unknowns (400³ P2 hexahedra) takes 68 s on 24 RTX PRO 6000 Blackwell GPUs, and 195 s when it also pays the first Hessian-block build and its JAX compilation. |
+| **A billion unknowns** | Two Newton-CG steps at 1.09 billion unknowns (400³ P2 hexahedra) take 191 s on 24 RTX PRO 6000 Blackwell GPUs. |
 | **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 19 minutes on four GPUs. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
 | **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 18.7 s on one AMD MI210 and 18.5 s on one NVIDIA H100, with the same cost and CG counts. |
@@ -66,13 +66,13 @@ CPU run the GPU run's CG count, since the two libraries stop CG at different ite
 | 128³ | 36.1 M | 4 AMD Instinct MI210 | 31.9 s |
 | 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 140 s |
 | 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 77 s |
-| 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 68 s for one step |
+| 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 191 s |
 
 The Blackwell GPUs were split into two 48 GB MIG slices each, one MPI rank per slice. The
 MI210 row runs the same code with MFEM and hypre built for ROCm, on the same flags and the
 same CG count as the L40S row above it. Doubling the Blackwell cards at 256³ is 1.81×, 90 %
-of linear. The 400³ row takes one step and, like the others, is warm: the first Hessian-block
-build, 117 s with its JAX compilation, is timed before it.
+of linear. Like every row, the 400³ one is warm: the first Hessian-block build, 116 s with its
+JAX compilation, is timed before the steps.
 [`docs/source/guide/gpu.rst`](docs/source/guide/gpu.rst) has the per-stage times, the memory
 per rank, and what they depend on.
 

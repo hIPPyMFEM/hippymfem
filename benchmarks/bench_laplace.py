@@ -141,12 +141,20 @@ def main():
     ap.add_argument("--device", default=("cuda" if hm.config.hypre_device else "cpu"),
                     help="MFEM device; the default follows HIPPYMFEM_HYPRE_DEVICE")
     ap.add_argument("--symmetric-jacobian", action="store_true")
+    ap.add_argument("--release-linearization", action="store_true",
+                    help="free the Hessian blocks and their solvers whenever the point moves (a line "
+                    "search trial step), which is what lets 128^3 run on two 45 GiB cards")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dump", default=None, help="save the sample and pointwise variances (rank 0, 1 rank only)")
+    ap.add_argument("--fields", default=None,
+                    help="npz on rank 0: coordinates, truth, MAP, prior and posterior pointwise std on the "
+                    "parameter's P1 grid, and the targets (for plotting)")
     args = ap.parse_args()
     N, ORDER = args.n, args.order
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
+    COMM.Barrier()
+    t_start = time.perf_counter()
     pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON))
     Vu = hm.FunctionSpace.H1(pmesh, ORDER)
     Vm = hm.FunctionSpace.H1(pmesh, 1)
@@ -160,7 +168,8 @@ def main():
     bc = hm.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
     pde = hm.PDEVariationalProblem(Vh, pde_varf, bc, bc.homogeneous(), is_fwd_linear=True,
                                    symmetric_jacobian=(True if args.symmetric_jacobian
-                                                       else "auto"))
+                                                       else "auto"),
+                                   release_linearization_on_move=args.release_linearization)
     # the three solves the records were taken with; the adjoint keeps its default
     pde.set_solvers(hm.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=1e-12,
                     max_iter=2000, attributes=("solver", "solver_fwd_inc", "solver_adj_inc"))
@@ -185,6 +194,9 @@ def main():
     B.perturb(data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
+    COMM.Barrier()
+    t_build = time.perf_counter() - t_start
+    say("  setup through the synthetic data: %.1f s" % t_build)
 
     # ---- MAP
     params = hm.ReducedSpaceNewtonCG_ParameterList()
@@ -266,7 +278,7 @@ def main():
     var_parts = Meter.delta(meter.snapshot(), before)
     report("pointwise variance, randomized (r=%d)" % args.r, t_var, var_parts, ["prior R^-1 apply", "MultiVector dot"])
     before = meter.snapshot()
-    t_mc, (pv_mc, prv_mc, _c) = timed(lambda: post.pointwise_variance(method="MonteCarlo", n=args.samples))
+    t_mc, (pv_mc, prv_mc, corr_mc) = timed(lambda: post.pointwise_variance(method="MonteCarlo", n=args.samples))
     mc_parts = Meter.delta(meter.snapshot(), before)
     report("pointwise variance, Monte Carlo (n=%d)" % args.samples, t_mc, mc_parts, ["noise draw", "prior sample"])
     say("    prior variance, mean: randomized %.4e  Monte Carlo %.4e  (ratio %.3f; the randomized one is a truncation)"
@@ -281,6 +293,34 @@ def main():
     say("    sample variance vs pointwise variance: max rel dev %.3f over %d samples; posterior <= prior: %s"
         % (num, args.samples, below))
     meter.restore()
+    # calibration against the synthetic truth: the fraction of parameter dofs where the truth
+    # lies within two posterior standard deviations of the MAP (Monte Carlo variance, unbiased)
+    sd = np.sqrt(np.maximum(pv_mc.array, 0.0))
+    dev = np.abs(mtrue.array - x[PARAMETER].array)
+    inside = COMM.allreduce(int(np.sum(dev <= 2.0 * sd)), op=MPI.SUM)
+    total = COMM.allreduce(int(dev.size), op=MPI.SUM)
+    coverage = inside / max(total, 1)
+    kl = float(post.klDistanceFromPrior())
+    std_post = float(np.sqrt(pv_mc.sum() / pv_mc.global_size))
+    std_prior = float(np.sqrt(prv_mc.sum() / prv_mc.global_size))
+    rel_err = float(np.sqrt(COMM.allreduce(float(np.sum(dev ** 2)), op=MPI.SUM)
+                            / max(COMM.allreduce(float(np.sum(mtrue.array ** 2)), op=MPI.SUM), 1e-300)))
+    COMM.Barrier()
+    t_total = time.perf_counter() - t_start
+    say("  truth within 2 posterior std of the MAP at %.1f%% of dofs; KL %.3e; pointwise std prior %.3f -> "
+        "posterior %.3f; |m_map - m_true| / |m_true| = %.3f; end to end %.1f s"
+        % (100.0 * coverage, kl, std_prior, std_post, rel_err, t_total))
+    if args.fields:
+        xyz = Vm.coordinates()
+        # var_reduction is the low-rank correction, prior minus posterior variance, which is
+        # exact given the eigenpairs; the prior variance, and so std_post, is a Monte Carlo estimate
+        parts = COMM.gather((xyz, mtrue.array.copy(), x[PARAMETER].array.copy(), sd,
+                             np.sqrt(np.maximum(prv_mc.array, 0.0)), corr_mc.array.copy()), root=0)
+        if RANK == 0:
+            cat = [np.concatenate([q[i] for q in parts]) for i in range(6)]
+            os.makedirs(os.path.dirname(os.path.abspath(args.fields)), exist_ok=True)
+            np.savez(args.fields, xyz=cat[0], mtrue=cat[1], mmap=cat[2], std_post=cat[3], std_prior=cat[4],
+                     var_reduction=cat[5], targets=targets, d=np.asarray(d), n=N, ranks=COMM.size)
     if args.dump and COMM.size == 1:
         np.savez(args.dump, sample_var=acc, pointwise_var=pv.array, prior_var=prv.array, d=np.asarray(d),
                  U0=U[0].array, mean=x[PARAMETER].array)
@@ -288,14 +328,17 @@ def main():
     rec = {"host": platform.node(), "ranks": COMM.size, "n": N, "order": ORDER, "mfem_device": args.device,
            "kernels": str(kernel_mod.device()), "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
            "k": args.k, "p": args.p, "passes": args.passes, "single_pass": bool(args.single_pass), "samples": args.samples, "r": args.r,
-           "gauss_newton": bool(args.gauss_newton), "prior_tol": args.prior_tol, "inc_tol": args.inc_tol,
+           "gauss_newton": bool(args.gauss_newton), "symmetric_jacobian": bool(args.symmetric_jacobian),
+           "release_linearization": bool(args.release_linearization), "prior_tol": args.prior_tol, "inc_tol": args.inc_tol,
            "t_map": t_map, "newton_it": solver.it, "cg_it": solver.total_cg_iter,
            "t_hess_blocks": t_hess, "t_eig": t_eig, "eig_parts": {k: list(v) for k, v in eig_parts.items()},
            "d_max": float(d[0]), "d_min": float(d[-1]), "n_above_one": int((d > 1).sum()), "orth": orth,
            "t_samples": t_samp, "samp_parts": {k: list(v) for k, v in samp_parts.items()},
            "t_variance": t_var, "var_parts": {k: list(v) for k, v in var_parts.items()}, "t_variance_mc": t_mc, "t_trace": t_tr,
            "tr_post": tr_post, "tr_prior": tr_pr, "tr_corr": tr_corr, "sample_var_rel_dev": num,
-           "posterior_below_prior": bool(below)}
+           "posterior_below_prior": bool(below), "t_build": t_build, "t_total": t_total,
+           "coverage_2std": coverage, "kl": kl, "std_prior": std_prior, "std_post": std_post,
+           "err_m": rel_err, "eigenvalues": [float(v) for v in d]}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:
