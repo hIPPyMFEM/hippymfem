@@ -68,6 +68,15 @@ def make_mesh(kind, n=6):
     return mfem.ParMesh(COMM, m)
 
 
+def _split_mesh_n():
+    """Cells a side of a hexahedral mesh with at least 512 elements on every rank, twice
+    the chunk planner's floor, so the planner can split a rank's batch."""
+    n = 10
+    while n ** 3 < 512 * NP:
+        n += 1
+    return n
+
+
 # --------------------------------------------------------------------- tests
 def test_mass_and_diffusion(kind, order_u, order_m, qdeg=None):
     """A = d2R/dp du for r = exp(m) grad u . grad p + m^2 u p."""
@@ -503,6 +512,62 @@ def test_bc_elimination():
     check("C: essential rows eliminated", COMM.allreduce(int(ok), op=MPI.MIN) == 1)
 
 
+def test_host_batch():
+    """On the host the kernels step through the batch ``host_batch`` elements at a time
+    inside the compiled program; the element arrays must agree with the whole-batch map
+    whatever the step, one that does not divide the batch included.  Long steps have
+    matched it bit for bit, short ones (7 elements) round differently by an ulp, so the
+    test allows round-off.  The setting is read at every call."""
+    if RANK == 0:
+        print("stepping through the batch on the host")
+    from hippymfem.fem import kernel as kern
+
+    if kern.on_gpu():
+        check("host stepping (skipped: the kernels run on a GPU)", True)
+        return
+    pmesh = make_mesh("tet", 6)
+    Vu = FunctionSpace.H1(pmesh, 2)
+    Vm = FunctionSpace.H1(pmesh, 1)
+    batches = MeshBatches(pmesh, 4)
+    K = QuadratureKernel(lambda u, m, p, x: (jnp.exp(m.val) * inner(u.grad, p.grad)
+                                             + u.val ** 3 * p.val),
+                         [Vu, Vm, Vu], batches)
+    rng = np.random.default_rng(2)
+    loc = [rng.standard_normal(Vu.local_values(Vu.vector()).size),
+           rng.standard_normal(Vm.local_values(Vm.vector()).size),
+           rng.standard_normal(Vu.local_values(Vu.vector()).size)]
+    dirs = [(loc[0] * 0.5, loc[1] * 2.0, None), (None, loc[1], loc[2])]
+
+    def arrays():
+        mats = K.element_matrices(ADJOINT, STATE, loc)
+        vec = K.element_vectors(PARAMETER, loc)
+        third = K.element_third(STATE, STATE, PARAMETER, loc, loc[0], loc[1])
+        fused = K.element_third_dir(STATE, loc, dirs, [0.3, -1.1])
+        return [np.asarray(a) for part in (mats, vec, third, fused) for a in part]
+
+    saved = kern.HOST_BATCH
+    try:
+        ref = None
+        worst = 0.0
+        for batch in (0, 2048, 100, 7):
+            kern.HOST_BATCH = batch
+            got = arrays()
+            if ref is None:
+                ref = got
+                continue
+            for a, b in zip(ref, got):
+                worst = max(worst, float(np.abs(a - b).max() / max(np.abs(a).max(), 1e-300)))
+    finally:
+        kern.HOST_BATCH = saved
+    ne = pmesh.GetNE()
+    check("steps of 2048, 100 and 7 elements give the whole-batch arrays (%d elements)" % ne,
+          worst <= 1e-15, "(max rel %.1e)" % worst)
+    hp.config.host_batch = 64
+    ok = kern.HOST_BATCH == 64
+    hp.config.host_batch = saved
+    check("hm.config.host_batch sets it", ok and kern.HOST_BATCH == saved)
+
+
 def test_host_chunk_budget():
     """On the host the chunk planner plans against the node's memory, not the whole group.
 
@@ -516,8 +581,9 @@ def test_host_chunk_budget():
         print("the host chunk planner's budget")
     from hippymfem.fem import kernel as kern
 
-    # more than the planner's floor of 256 elements a launch, so a split is possible
-    pmesh = make_mesh("hex", 10)
+    # more than the planner's floor of 256 elements a launch on every rank, so a split
+    # is possible (10^3 elements on 4 ranks left 250 a rank)
+    pmesh = make_mesh("hex", _split_mesh_n())
     Vu = FunctionSpace.H1(pmesh, 2)
     Vm = FunctionSpace.H1(pmesh, 1)
     batches = MeshBatches(pmesh, 6)
@@ -587,7 +653,7 @@ def test_chunk_plan_per_pass():
 
     from hippymfem.fem import kernel as kern
 
-    pmesh = make_mesh("hex", 10)
+    pmesh = make_mesh("hex", _split_mesh_n())
     Vu = FunctionSpace.H1(pmesh, 2)
     Vm = FunctionSpace.H1(pmesh, 1)
     batches = MeshBatches(pmesh, 6)
@@ -832,6 +898,7 @@ if __name__ == "__main__":
     if RANK == 0:
         print("finite-difference consistency")
     test_finite_difference_consistency()
+    test_host_batch()
     if RANK == 0:
         print("boundary conditions")
     test_bc_elimination()

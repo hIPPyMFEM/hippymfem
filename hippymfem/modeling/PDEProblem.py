@@ -219,5 +219,25 @@ class PDEProblem(SnakeCamel):
         ``kdir``."""
         raise NotImplementedError
 
+    def apply_third_dir(self, i, x, dirs, weights, out):
+        r"""``out`` = :math:`\sum_m w_m \sum_{j,k} \delta_{ijk} F[t_{m,j}, t_{m,k}]`,
+        the weighted second directional derivatives of the slot-``i`` gradient along
+        directions ``t_m = (u, m, p)`` (``None`` for an absent component).
+
+        This default sums :meth:`apply_ijk` over the ordered pairs of nonzero
+        components; a problem that can differentiate a whole direction at once
+        overrides it.
+        """
+        out.zero()
+        work = out.copy()
+        for d, w in zip(dirs, weights):
+            for j in range(len(d)):
+                for k in range(len(d)):
+                    if d[j] is None or d[k] is None:
+                        continue
+                    self.apply_ijk(i, j, k, x, d[j], d[k], work)
+                    out.axpy(float(w), work)
+        return out
+
 
 sync_spellings(PDEProblem)

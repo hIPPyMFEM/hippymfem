@@ -82,6 +82,9 @@ class BFGS_operator:
         self.S, self.Y, self.R = [], [], []
         self.H0inv = None
         self.help = None
+        #: the two-loop recursion's work vector; :meth:`update` writes ``H y`` into
+        #: :attr:`help`, so the recursion must not work in that one too
+        self._work = None
         self.update_scaling = True
         self.parameters = (parameters if parameters is not None
                            else BFGSoperator_ParameterList())
@@ -93,18 +96,19 @@ class BFGS_operator:
     def solve(self, x, b):
         r"""``x = H_k b``, the current approximation to :math:`H^{-1}b`."""
         A = []
-        if self.help is None:
-            self.help = b.copy()
+        if self._work is None:
+            self._work = b.copy()
         else:
-            self.help.zero()
-            self.help.axpy(1.0, b)
+            self._work.zero()
+            self._work.axpy(1.0, b)
+        q = self._work
 
         for s, y, r in zip(reversed(self.S), reversed(self.Y), reversed(self.R)):
-            a = r * s.inner(self.help)
+            a = r * s.inner(q)
             A.append(a)
-            self.help.axpy(-a, y)
+            q.axpy(-a, y)
 
-        self.H0inv.solve(x, self.help)
+        self.H0inv.solve(x, q)
 
         for s, y, r, a in zip(self.S, self.Y, self.R, reversed(A)):
             bb = r * y.inner(x)
@@ -112,7 +116,14 @@ class BFGS_operator:
         return x
 
     def update(self, s, y):
-        """Add the secant pair ``(s, y)``, damping it if curvature is too small."""
+        r"""Add the secant pair ``(s, y)``, damping it if curvature is too small.
+
+        The damping needs :math:`H y`, written into :attr:`help`.  hIPPYlib's
+        version (and this one in 0.1.0) computed it with :meth:`solve` working in
+        :attr:`help` as well, so ``H0inv.solve`` got its input as its output: the
+        default rescaled identity zeroed it, :math:`y^{\!\top} H y` came out 0,
+        and a pair that needed damping was damped to ``s = 0`` and raised.
+        """
         damp = self.parameters["BFGS_damping"]
         memlim = self.parameters["memory_limit"]
         if self.help is None:

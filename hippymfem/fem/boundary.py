@@ -241,17 +241,14 @@ class BoundarySpaceTables(KeepAlive):
         a device array.  The dof map and the signs are cached on the device, so
         repeated assemblies upload only the dof values.
         """
-        from .kernel import _put
-
-        from .kernel import device
+        from .kernel import _put, device, gather_rows
 
         d = device()
         if d not in self._dev_maps:
             sg = None if self.signs.min() > 0 else _put(self.signs)
             self._dev_maps[d] = (_put(self.edofs), sg)
         idx, sg = self._dev_maps[d]
-        vals = _put(local_array)[idx]
-        return vals if sg is None else vals * sg
+        return gather_rows(_put(local_array), idx, sg)
 
     def jax_tables(self):
         return (self.N, self.G)

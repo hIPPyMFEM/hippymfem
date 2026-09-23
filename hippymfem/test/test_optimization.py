@@ -128,6 +128,101 @@ def test_cg_steihaug():
     check("trust region respected", s3.reasonid == 3 and nrm <= radius * (1 + 1e-8),
           "(reason %d, ||x||_B = %.3e <= %.1e)" % (s3.reasonid, nrm, radius))
 
+    # negative curvature inside a trust region: Steihaug steps to the boundary along
+    # the direction, at the first iteration (hIPPYlib took the whole direction, far
+    # outside a small region) and at a later one (hIPPYlib stopped inside)
+    def model_value(A_, xv):
+        xf = np.concatenate(COMM.allgather(xv.array))
+        return -float(bfull @ xf) + 0.5 * float(xf @ A_ @ xf)
+
+    for label, lam_neg in (("the first iteration", lambda l: -np.abs(l) - 1.0),
+                           ("a later iteration", None)):
+        if lam_neg is None:
+            # positive along b's main components, one negative eigenvalue that CG
+            # meets after a few steps
+            lam3 = lam.copy()
+            lam3[-1] = -50.0
+        else:
+            lam3 = lam_neg(lam)
+        A3 = Q @ np.diag(lam3) @ Q.T
+        A3 = 0.5 * (A3 + A3.T)
+        op3 = _DenseOp(A3, COMM)
+        for radius in (1e-2, 1e2):
+            s4 = hm.CGSolverSteihaug(comm=COMM)
+            s4.set_operator(op3)
+            s4.set_preconditioner(_Identity(op3))
+            s4.parameters["print_level"] = -1
+            s4.set_TR(radius, op)
+            x4 = op3.generate_vector(0)
+            s4.solve(x4, b)
+            B4 = op.generate_vector(0)
+            op.mult(x4, B4)
+            nrm = math.sqrt(max(B4.inner(x4), 0.0))
+            ok = (s4.reasonid in (2, 3) and abs(nrm - radius) <= 1e-8 * radius
+                  and model_value(A3, x4) < 0.0)
+            check("negative curvature at %s ends on the boundary (radius %g)"
+                  % (label, radius), ok,
+                  "(reason %d after %d its, ||x||_B = %.6e, m = %.3e)"
+                  % (s4.reasonid, s4.iter, nrm, model_value(A3, x4)))
+    # without a trust region the first direction is taken whole (hIPPYlib's rule)
+    A5 = Q @ np.diag(-np.abs(lam) - 1.0) @ Q.T
+    op5 = _DenseOp(0.5 * (A5 + A5.T), COMM)
+    s5 = hm.CGSolverSteihaug(comm=COMM)
+    s5.set_operator(op5)
+    s5.set_preconditioner(_Identity(op5))
+    s5.parameters["print_level"] = -1
+    x5 = op5.generate_vector(0)
+    s5.solve(x5, b)
+    e5 = x5.copy().axpy(-1.0, b).norm("l2") / b.norm("l2")
+    check("without a trust region, negative curvature at once returns the direction",
+          s5.reasonid == 2 and e5 < 1e-15, "(reason %d, |x - b|/|b| %.1e)" % (s5.reasonid, e5))
+
+
+def test_bfgs_operator():
+    """The damped BFGS update needs ``H y``, and the two-loop recursion computing it
+    used the output vector as its own work vector, so ``H0inv.solve`` got its input as
+    its output: the default rescaled identity then returned 0, a pair that needed
+    damping was damped to ``s = 0``, and the update raised.  After the fix the update
+    damps as Powell's rule says, and ``H`` satisfies the secant equation."""
+    if RANK == 0:
+        print("BFGS operator: damping and the secant equation")
+    n = 6
+    op = hm.BFGS_operator()
+    H0 = hm.RescaledIdentity()
+    H0.d0 = 2.0
+    op.set_H0inv(H0)
+    rng = np.random.default_rng(7)
+
+    def vec(values):
+        v = hm.ParVector(COMM, n if RANK == 0 else 0)
+        if RANK == 0:
+            v.array[:] = values
+        return v
+
+    s = vec(np.eye(n)[0])
+    y = vec(np.r_[-0.5, 1.0, np.zeros(n - 2)])       # s^T y < 0: must be damped
+    yHy = 2.0 * y.inner(y)
+    try:
+        theta = op.update(s.copy(), y.copy())
+        sy = 1.0 / op.R[-1]
+        want = (1.0 - 0.2) * yHy / (yHy - s.inner(y))
+        ok = abs(theta - want) <= 1e-14 and abs(sy - 0.2 * yHy) <= 1e-14 * yHy
+        detail = "(theta %.6f, want %.6f; s^T y %.6f, want %.6f)" % (
+            theta, want, sy, 0.2 * yHy)
+    except FloatingPointError as e:
+        ok, detail = False, "(raised: %s)" % e
+    check("a pair with s^T y < 0 is damped to s^T y = 0.2 y^T H y", ok, detail)
+
+    for _ in range(3):
+        sv = rng.standard_normal(n)
+        s = vec(sv)
+        y = vec(rng.standard_normal(n) + 3.0 * sv)
+        op.update(s.copy(), y.copy())
+    Hy = vec(np.zeros(n))
+    op.solve(Hy, op.Y[-1])
+    e = Hy.copy().axpy(-1.0, op.S[-1]).norm("l2") / op.S[-1].norm("l2")
+    check("H y = s for the newest pair", e < 1e-12, "(rel %.1e)" % e)
+
 
 # ------------------------------------------------- randomized eigensolvers
 def test_randomized_eig():
@@ -628,6 +723,7 @@ if __name__ == "__main__":
     test_randomized_svd()
     test_trace_estimator()
     test_trust_region()
+    test_bfgs_operator()
     test_bfgs()
     test_map_recovers_smooth_truth()
     test_laplace_approximation()

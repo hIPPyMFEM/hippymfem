@@ -104,6 +104,18 @@ TFLOP/s single precision on the same card.  A compute-class card runs fp64 at ab
 half its fp32 rate, so these speedups are a lower bound for A100/H100-class hardware
 and an upper bound for inference-class cards.
 
+The CPU column predates two changes to the host path that make it faster, so the
+speedups above overstate the card's advantage.  A whole-batch ``vmap`` holds
+intermediates the size of the batch, and on a CPU core the cost per element grew once
+they no longer fit in cache (a P1-tetrahedron Jacobian from 0.5 us at 3 072 elements to
+1.8 us at 196 608); the host now steps through the batch 2 048 elements at a time
+inside the compiled program (``HIPPYMFEM_HOST_BATCH``, ``hm.config.host_batch``; ``0``
+maps the whole batch).  And the element dof gather in front of every kernel is compiled
+rather than eager, which at 1.6e6 tetrahedra took a residual vector's assembly from
+1.11 s to 0.35 s.  The gather is exact; the stepping gave the whole-batch element
+arrays bit for bit at steps of 512 elements and more, and within an ulp at very short
+steps (``benchmarks/DESIGN_NOTES.md``, section 1).
+
 What the GPU does not accelerate
 --------------------------------
 

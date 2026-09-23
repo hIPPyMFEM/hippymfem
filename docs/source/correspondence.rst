@@ -67,6 +67,19 @@ eigenvalues agree to the accuracy of the randomized method rather than to round-
 For an exact comparison use the dense spectrum on a coarse mesh, which is what the
 validation harness does.
 
+**Negative curvature inside a trust region.**  ``CGSolverSteihaug`` with a trust
+region follows a direction of nonpositive curvature to the boundary, as Steihaug's
+method prescribes.  hIPPYlib's takes the whole first direction wherever it lands,
+outside the region when the radius is small, and stops inside the region when the
+direction appears later.  Without a trust region (Newton-CG with a line search) the
+two agree.
+
+**BFGS damping.**  Powell damping needs :math:`H y`.  hIPPYlib's ``BFGS_operator``
+computes it with the two-loop recursion working in its own output vector, so the
+initial inverse Hessian is applied in place and, for the default rescaled identity,
+returns zero: a pair that needs damping is not damped and fails the curvature
+check.  Here the recursion has a work vector of its own.
+
 Things hIPPyMFEM has that hIPPYlib does not
 -------------------------------------------
 

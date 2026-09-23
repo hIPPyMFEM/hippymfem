@@ -124,6 +124,10 @@ _KNOBS = [
     _Knob("element_chunk", "HIPPYMFEM_ELEMENT_CHUNK",
           "elements per kernel launch; 0 (default) plans the chunk from the device's free memory",
           _module_attr("fem.kernel", "ELEMENT_CHUNK"), _module_assign("fem.kernel", "ELEMENT_CHUNK", int)),
+    _Knob("host_batch", "HIPPYMFEM_HOST_BATCH",
+          "elements per step of an element kernel on the host (2048, default); 0 maps the "
+          "whole batch at once",
+          _module_attr("fem.kernel", "HOST_BATCH"), _module_assign("fem.kernel", "HOST_BATCH", int)),
     _Knob("ad_working_set", "HIPPYMFEM_AD_WORKING_SET",
           "doubles per tangent and quadrature point the chunk planner assumes (16, with a margin)",
           _module_attr("fem.kernel", "AD_DOUBLES_PER_TANGENT_QP"),

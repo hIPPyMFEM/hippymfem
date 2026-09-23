@@ -865,6 +865,59 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         out.assign(res)
         return out
 
+    def apply_third_dir(self, i, x, dirs, weights, out):
+        r"""Weighted second directional derivatives of the slot-``i`` gradient,
+        :math:`\sum_m w_m\, D^2(\partial_i R)[t_m, t_m]`.
+
+        ``dirs`` holds one direction ``t_m`` per weight ``w_m``, each a sequence
+        ``(u, m, p)`` of vectors (or longer, when :attr:`Vh` lists further
+        variables), ``None`` where the direction has no component.  It
+        equals the sum of :meth:`apply_ijk` over every ordered pair of nonzero
+        components, :math:`\sum_{j,k} R_{ijk}[t_j, t_k]`, but the quadrature
+        kernel differentiates the whole direction at once: one pass instead of up
+        to nine, which is what a second-order adjoint over many modes spends its
+        time in.
+        """
+        dirs = [tuple(d) for d in dirs]
+        weights = [float(w) for w in weights]
+        if len(dirs) != len(weights):
+            raise ValueError("apply_third_dir: %d directions, %d weights"
+                             % (len(dirs), len(weights)))
+        if not dirs:
+            out.zero()
+            return out
+        loc = self._locals(x) + self._aux_locals()
+        dl = [tuple(None if d[s] is None else self.Vh[s].local_values(d[s])
+                    for s in range(len(d))) + (None,) * (len(loc) - len(d))
+              for d in dirs]
+        vecs = self.kernel.element_third_dir(i, loc, dl, weights)
+        res = assemble_vector(self.Vh[i], self.batches.groups, vecs, self.nelem)
+        if self.bdr_kernel is not None:
+            res.axpy(1.0, assemble_boundary_vector(
+                self.Vh[i], self.bdr_batches.groups,
+                self.bdr_kernel.element_third_dir(i, loc, dl, weights)))
+        if self.facet_kernel is not None:
+            from ..fem.facets import assemble_facet_vector, facet_values
+
+            floc = self._facet_locals(x)
+            for d, w in zip(dirs, weights):
+                for j in range(len(d)):
+                    for k in range(len(d)):
+                        if d[j] is None or d[k] is None:
+                            continue
+                        vec = assemble_facet_vector(
+                            self.Vh[i], self.facet_batches.groups,
+                            self.facet_kernel.element_third(
+                                i, j, k, floc, facet_values(self.Vh[j], d[j]),
+                                facet_values(self.Vh[k], d[k])),
+                            tables=self.facet_batches.tables(self.Vh[i]))
+                        res.axpy(w, vec)
+        ess = self.bc0.ess if i in (STATE, ADJOINT) else None
+        if ess is not None and len(ess):
+            res.array[np.asarray(ess, dtype=np.int64)] = 0.0
+        out.assign(res)
+        return out
+
     # --------------------------------------------------------------- utilities
     def functional(self, x):
         """The integral of the residual density itself, ``R(u, m, p)``."""

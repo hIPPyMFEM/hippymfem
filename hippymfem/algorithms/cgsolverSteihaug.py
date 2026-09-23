@@ -13,7 +13,12 @@
 r"""Preconditioned CG with the Steihaug trust-region stopping rule.
 
 Ported from hIPPYlib, including the termination codes, so that iteration counts
-and stopping behaviour are directly comparable between the two libraries.
+and stopping behaviour are directly comparable between the two libraries, with one
+departure: with a trust region, a direction of nonpositive curvature is followed to
+the boundary, as Steihaug's method prescribes.  hIPPYlib takes the full first
+direction wherever that lands (outside the region when the radius is small) and, at
+a later iteration, stops at the current iterate.  Without a trust region the two
+agree: the first direction in full, or the current iterate.
 
 Termination reasons:
 
@@ -127,6 +132,48 @@ class CGSolverSteihaug:
         x.axpy(tau * alpha, d)
         return True
 
+    def _tau_to_boundary(self, x, d, rd, dAd):
+        r"""The step :math:`\tau` along ``d`` from ``x`` (inside the region) to the
+        trust-region boundary, of the two (one each way) the one the quadratic
+        model :math:`-\tau\, r^{\!\top} d + \tfrac12 \tau^2 d^{\!\top} A d`
+        prefers."""
+        Bd = d.duplicate()
+        self.B_op.mult(d, Bd)
+        a = Bd.inner(d)
+        b_half = Bd.inner(x)
+        self.Bx.zero()
+        self.B_op.mult(x, self.Bx)
+        c = self.Bx.inner(x) - self.TR_radius_2
+        disc = math.sqrt(max(b_half * b_half - a * c, 0.0))
+        best = None
+        for tau in ((-b_half + disc) / a, (-b_half - disc) / a):
+            m = -tau * rd + 0.5 * tau * tau * dAd
+            if best is None or m < best[0]:
+                best = (m, tau)
+        return best[1]
+
+    def _negative_curvature(self, x, first):
+        """Stop on a direction of nonpositive curvature (``self.d``, with ``self.Ad``).
+
+        With a trust region, step to its boundary along the direction; without one,
+        take the whole direction at the first iteration and stop where the iterate
+        is at a later one (hIPPYlib's rule)."""
+        self.converged = True
+        self.reasonid = 2
+        if self.TR_radius_2 is not None:
+            tau = self._tau_to_boundary(x, self.d, self.r.inner(self.d),
+                                        self.d.inner(self.Ad))
+        elif first:
+            tau = 1.0
+        else:
+            tau = 0.0
+        if tau != 0.0:
+            x.axpy(tau, self.d)
+            self.r.axpy(-tau, self.Ad)
+            self.B_solver.solve(self.z, self.r)     # else z is B^-1 r already
+        self.final_norm = math.sqrt(max(self.r.inner(self.z), 0.0))
+        self._report()
+
     # ------------------------------------------------------------------- solve
     def _report(self, extra=None):
         if self.parameters["print_level"] >= 0 and (
@@ -188,14 +235,7 @@ class CGSolverSteihaug:
         den = self.Ad.inner(self.d)
 
         if den <= 0.0:
-            self.converged = True
-            self.reasonid = 2
-            x.axpy(1.0, self.d)
-            self.r.axpy(-1.0, self.Ad)
-            self.B_solver.solve(self.z, self.r)
-            nom = self.r.inner(self.z)
-            self.final_norm = math.sqrt(max(nom, 0.0))
-            self._report()
+            self._negative_curvature(x, first=True)
             return self.iter
 
         self.iter = 1
@@ -235,10 +275,7 @@ class CGSolverSteihaug:
             den = self.d.inner(self.Ad)
 
             if den <= 0.0:
-                self.converged = True
-                self.reasonid = 2
-                self.final_norm = math.sqrt(max(nom, 0.0))
-                self._report()
+                self._negative_curvature(x, first=False)
                 break
 
             nom = betanom

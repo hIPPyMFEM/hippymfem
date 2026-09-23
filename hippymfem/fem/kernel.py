@@ -36,6 +36,7 @@ makes the adjoint gradient exact for the discretized problem rather than merely
 close.
 """
 
+import functools
 import os
 import warnings
 from typing import NamedTuple
@@ -180,6 +181,19 @@ def on_gpu():
 
 def _put(x):
     return jax.device_put(np.ascontiguousarray(x), device())
+
+
+@jax.jit
+def gather_rows(values, idx, signs=None):
+    """``values[idx]`` (times ``signs``), compiled.
+
+    The element dof gather of every assembly.  Eager indexing normalizes and checks the
+    index array with separate array operations at every call, and at 1.6e6 tetrahedra
+    it took 0.10 s a slot against 0.0036 s compiled; a gather and a sign flip are
+    exact, so the values are the same.
+    """
+    vals = values[idx]
+    return vals if signs is None else vals * signs
 
 
 def to_host(x):
@@ -464,6 +478,83 @@ def _analysed_per_element(raws, args, axes, probe):
     if not temps:
         return None
     return (max(temps) + outs) / float(probe), outs / float(probe)
+
+
+#: Elements per step of an element kernel on the host.  XLA runs a ``vmap`` over the
+#: whole batch as one program whose intermediates have the batch's size, and on a CPU
+#: core those leave the cache from about 1e4 elements on: a P1 tetrahedron's Jacobian
+#: costs 0.5 us per element in a batch of 3072 and 1.8 us in one of 196608, a third
+#: derivative 0.2 and 0.7 us.  On the host the batch is therefore mapped in steps of
+#: this many elements *inside* the compiled program (``jax.lax.map`` with
+#: ``batch_size``), which keeps the working set in cache.  Steps of 512 elements and more
+#: gave the whole-batch arrays bit for bit in every case measured; steps of a few elements
+#: round differently, by an ulp, as a chunked batch does (``benchmarks/DESIGN_NOTES.md``,
+#: section 1).  A GPU maps the whole batch, which is what it is fast at, and so does the
+#: host when the batch fits in one step.  ``0`` maps the whole batch on the host too.  Set
+#: ``HIPPYMFEM_HOST_BATCH`` or ``hm.config.host_batch``; it is read at every call, each
+#: size compiling its own program.
+HOST_BATCH = int(os.environ.get("HIPPYMFEM_HOST_BATCH", "2048") or 0)
+
+
+def _extract_mapped(args, axes, out):
+    """Append to ``out`` the subtrees of ``args`` that ``axes`` maps (``0``)."""
+    if isinstance(axes, tuple):
+        for x, ax in zip(args, axes):
+            _extract_mapped(x, ax, out)
+    elif axes is not None:
+        out.append(args)
+
+
+def _inject_mapped(args, axes, it):
+    """``args`` with each mapped subtree replaced by the next item of ``it``."""
+    if isinstance(axes, tuple):
+        vals = [_inject_mapped(x, ax, it) for x, ax in zip(args, axes)]
+        return list(vals) if isinstance(args, list) else tuple(vals)
+    if axes is None:
+        return args
+    return next(it)
+
+
+def _mapped_kernel(f, in_axes):
+    """``jax.jit(jax.vmap(f, in_axes))``, run on the host in steps of
+    :data:`HOST_BATCH` elements inside the compiled program.
+
+    The whole-batch program and the stepped ones (one per step size) are kept apart
+    and chosen at every call by the current kernel device (:func:`device`), the step
+    size and the batch, so a process that moves its kernels between the host and a
+    GPU (``set_device``) runs each with its own.  ``in_axes`` follows
+    :func:`_chunk_args`: ``0`` maps a whole argument (every array under it), ``None``
+    shares it, and a tuple recurses.
+    """
+    whole = jax.jit(jax.vmap(f, in_axes=in_axes))
+    stepped = {}
+
+    def stepped_fn(batch, *args):
+        mapped = []
+        _extract_mapped(args, in_axes, mapped)
+
+        def one(m):
+            return f(*_inject_mapped(args, in_axes, iter(m)))
+
+        return jax.lax.map(one, mapped, batch_size=batch)
+
+    def call(*args):
+        batch = HOST_BATCH
+        if batch <= 0 or on_gpu():
+            return whole(*args)
+        mapped = []
+        _extract_mapped(args, in_axes, mapped)
+        leaves = jax.tree_util.tree_leaves(mapped)
+        if not leaves or leaves[0].shape[0] <= batch:     # one step (or none: no elements)
+            return whole(*args)
+        fn = stepped.get(batch)
+        if fn is None:
+            fn = stepped[batch] = jax.jit(functools.partial(stepped_fn, batch))
+        return fn(*args)
+
+    # the chunk planner's XLA analysis (a GPU's) compiles the whole-batch program
+    call.lower = whole.lower
+    return call
 
 
 def _glued_bytes(fn, args, axes, ne):
@@ -859,7 +950,7 @@ class GroupKernel:
                 return jax.grad(lambda z: R(z, tabs, geo, params))(dofs)[i]
 
             self._cache[key] = self._chunked(
-                jax.jit(jax.vmap(f, in_axes=self._axes())), self._axes())
+                _mapped_kernel(f, self._axes()), self._axes())
         return self._cache[key]
 
     def _hess_slot(self, j):
@@ -888,8 +979,7 @@ class GroupKernel:
             # its share of the tangents
             weight = max(1.0, self.nslots * self.nd[j] / max(sum(self.nd), 1))
             self._cache[key] = self._chunked(
-                jax.jit(jax.vmap(f, in_axes=self._axes())), self._axes(),
-                weight=weight)
+                _mapped_kernel(f, self._axes()), self._axes(), weight=weight)
         return self._cache[key]
 
     def hess_block(self, i, j):
@@ -975,7 +1065,39 @@ class GroupKernel:
                 return jax.jvp(dk, (dofs,), (tj,))[1]
 
             self._cache[key] = self._chunked(
-                jax.jit(jax.vmap(f, in_axes=self._axes(3))), self._axes(3))
+                _mapped_kernel(f, self._axes(3)), self._axes(3))
+        return self._cache[key]
+
+    def third_dir_block(self, i, nmodes):
+        r"""Batched :math:`\sum_m w_m\, D^2(\partial_i R)[t_m, t_m]`: the second
+        directional derivative of the slot-``i`` gradient along directions ``t_m`` that
+        may span every slot, weighted and summed over ``nmodes`` directions.
+
+        Returns a callable ``(dofs, T, w, tabs, geo, params) -> (ne, nd_i)``, where ``T``
+        is a tuple over the slots of element dof arrays ``(ne, nmodes, nd_s)`` and ``w``
+        the ``nmodes`` weights.  With ``t = (t_j, t_k)`` over two slots it is
+        :meth:`third_block` summed over both orders and both diagonals,
+        :math:`R_{ijj}[t_j, t_j] + 2 R_{ijk}[t_j, t_k] + R_{ikk}[t_k, t_k]`, in one pass
+        instead of four; the directions share the gather of the point and the scatter.
+        """
+        key = ("td", i, int(nmodes))
+        if key not in self._cache:
+            R = self._functional()
+
+            def f(dofs, T, w, tabs, geo, params):
+                def gi(zz):
+                    return jax.grad(lambda z: R(z, tabs, geo, params))(zz)[i]
+
+                def dd(t):
+                    def dk(zz):
+                        return jax.jvp(gi, (zz,), (t,))[1]
+                    return jax.jvp(dk, (dofs,), (t,))[1]
+
+                return jnp.tensordot(w, jax.vmap(dd)(T), axes=1)
+
+            axes = (0, 0, None) + self._axes()[1:]
+            self._cache[key] = self._chunked(_mapped_kernel(f, axes), axes,
+                                             weight=max(1.0, float(nmodes)))
         return self._cache[key]
 
     def residual_value(self):
@@ -984,9 +1106,7 @@ class GroupKernel:
         if key not in self._cache:
             R = self._functional()
 
-            self._cache[key] = jax.jit(
-                jax.vmap(R, in_axes=self._axes()))
-            self._cache[key] = self._chunked(self._cache[key], self._axes())
+            self._cache[key] = self._chunked(_mapped_kernel(R, self._axes()), self._axes())
         return self._cache[key]
 
     # -------------------------------------------------------------- dispatch
@@ -1180,6 +1300,28 @@ class QuadratureKernel:
             kd = _put(gk.tables[k].gather(kdir_local))
             out.append(gk.tables[i].transform_dual_vector(_result(
                 gk.third_block(i, j, k)(dofs, jd, kd, *gk.mapped(), pr))))
+        return out
+
+    def element_third_dir(self, i, local_arrays, dir_locals, weights, params=()):
+        r"""Element vectors of :math:`\sum_m w_m\, D^2(\partial_i R)[t_m, t_m]` (see
+        :meth:`GroupKernel.third_dir_block`).
+
+        ``dir_locals`` holds one direction per weight, each a sequence over the slots of
+        local dof arrays, ``None`` where the direction has no component.
+        """
+        out = []
+        pr = _params(params)
+        m = len(dir_locals)
+        w = _put(np.asarray(weights, dtype=np.float64).reshape(m))
+        for gk in self.group_kernels:
+            dofs = gk.gather(local_arrays)
+            T = []
+            for s in range(gk.nslots):
+                cols = [jnp.zeros_like(dofs[s]) if d[s] is None
+                        else gk.tables[s].gather_device(d[s]) for d in dir_locals]
+                T.append(jnp.stack(cols, axis=1))
+            out.append(gk.tables[i].transform_dual_vector(_result(
+                gk.third_dir_block(i, m)(dofs, tuple(T), w, *gk.mapped(), pr))))
         return out
 
     def element_values(self, local_arrays, params=()):

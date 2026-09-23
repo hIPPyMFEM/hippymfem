@@ -228,9 +228,7 @@ class VectorSpaceTables(KeepAlive):
         """The same gather, performed where the kernels run."""
         import jax.numpy as jnp
 
-        from .kernel import _put
-
-        from .kernel import device
+        from .kernel import _put, device, gather_rows
 
         d = device()
         if d not in self._dev_maps:
@@ -238,9 +236,7 @@ class VectorSpaceTables(KeepAlive):
             ti = None if self.Tinv is None else _put(self.Tinv)
             self._dev_maps[d] = (_put(self.edofs), sg, ti)
         idx, sg, ti = self._dev_maps[d]
-        vals = _put(local_array)[idx]
-        if sg is not None:
-            vals = vals * sg
+        vals = gather_rows(_put(local_array), idx, sg)
         if ti is None:
             return vals
         return jnp.einsum("eij,ej->ei", ti, vals)

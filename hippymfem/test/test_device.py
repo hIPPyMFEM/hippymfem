@@ -260,7 +260,8 @@ def test_kept_accumulator():
     keep, share, chunk = pat.FUSED_KEEP, pat.FUSED_KEEP_SHARE, kern.ELEMENT_CHUNK
     pat.clear_accumulators()
     try:
-        kern.ELEMENT_CHUNK = 64                             # so the batch splits
+        # so that every rank's batch splits (216 elements on 4 ranks leave 54 a rank)
+        kern.ELEMENT_CHUNK = max(8, pm.GetNE() // 3)
         for gk in getattr(K, "group_kernels", ()):
             gk._chunk.clear()          # a remembered plan wins over ELEMENT_CHUNK
         pat.FUSED_KEEP = False
@@ -336,6 +337,17 @@ def test_multivector_sees_device_writes():
     ref_n = np.array([BU[j].norm("l2") for j in range(BU.nvec())])
     check("column norms see the device result", np.allclose(nrm, ref_n, rtol=1e-13, atol=0) and ref_n.max() > 0,
           "(max rel %.1e)" % (np.abs(nrm - ref_n).max() / max(ref_n.max(), 1e-300)))
+    # a copy reads the backing array too: it copied zeros for columns written on
+    # the device (a Taylor sketch copied that way made every eigenvalue zero)
+    BU2 = hp.MultiVector(prior.mean, 6)
+    hp.MatMvMult(prior.R, U, BU2)
+    C = hp.MultiVector(BU2)
+    ref_c = np.array([BU2[j].norm("l2") for j in range(BU2.nvec())])
+    got_c = np.array([C[j].norm("l2") for j in range(C.nvec())])
+    check("a copy of device-written columns has their values",
+          np.allclose(got_c, ref_c, rtol=1e-13, atol=0) and ref_c.max() > 0,
+          "(copy norms %.3e .. %.3e, source %.3e .. %.3e)"
+          % (got_c.min(), got_c.max(), ref_c.min(), ref_c.max()))
 
 
 def test_device_memory_flat():

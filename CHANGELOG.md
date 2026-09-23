@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- On a CPU the element kernels step through the batch 2 048 elements at a time inside the
+  compiled program (`HIPPYMFEM_HOST_BATCH`, `0` for the whole batch), which keeps each
+  step's intermediates in cache: 2.2x on a P1-tetrahedron Jacobian and 3x on a third
+  derivative at 196 608 elements, with the same element arrays. The GPU path is unchanged.
+  The CPU timings quoted elsewhere in the documentation predate it.
+- The element dof gather in front of every kernel is compiled; eager indexing spent more
+  time checking the index array than gathering (a residual-vector assembly at 64^3
+  tetrahedra: 1.11 s, now 0.35 s). The values are unchanged.
+- `PDEProblem.apply_third_dir(i, x, dirs, weights, out)`: the weighted second directional
+  derivatives of the slot-`i` gradient along directions spanning every variable, the sum of
+  the `apply_ijk` pairs of each direction in one kernel pass (`QuadratureKernel.
+  element_third_dir`); the base class sums the pairs. SOUPyMFEM's second-order adjoint uses
+  it: its quadratic Taylor gradient at 32^3 takes half the time.
+- Fixed: `MultiVector(other)` copied the backing array without syncing it, so columns hypre
+  had written on a device were copied as zeros.
+- Fixed: `ParVector.norm("linf")`, `max()`, `min()` and `MultiVector.norm("linf")` lost a
+  NaN held by a rank other than the first (MPI's MAX and MIN compare, and NaN compares
+  false); they now return NaN wherever a rank holds one.
+- Fixed: `BFGS_operator.update` computed `H y` with the two-loop recursion working in the
+  output vector, so `H0inv.solve` got its input as its output; with the default rescaled
+  identity `y^T H y` came out 0 and a pair that needed Powell damping raised. hIPPYlib has
+  the same code.
+- `CGSolverSteihaug` with a trust region follows a direction of nonpositive curvature to the
+  boundary, as Steihaug's method prescribes; it took the whole first direction wherever that
+  landed (outside a small region) and stopped inside the region at a later iteration, as
+  hIPPYlib does. Without a trust region nothing changes.
+- `test_kernels`' chunk-planner checks size their mesh by the number of ranks, and
+  `test_device`'s accumulator check its pinned chunk: on four ranks the batches did not
+  split (250 elements a rank against the planner's floor of 256, 54 against a chunk of
+  64) and the checks failed.
 - `TimeDependentPDEVariationalProblem` takes a boundary density (`bdr_varf`), so a Robin
   condition or a prescribed flux enters the one-step residual as it does the stationary
   one; checked against MFEM's boundary mass matrix and through an inversion.

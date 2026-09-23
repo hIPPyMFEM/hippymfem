@@ -49,6 +49,43 @@ chunk's share; the transfer is a few milliseconds beside a chunk that takes seco
 above `GEOMETRY_STREAM_FRACTION` of the budget the geometry stays on the host and the chunk
 loop slices it.
 
+**Stepping through the batch on the host** (`_mapped_kernel`, `HOST_BATCH`). On a CPU the
+cost of an element grew with the batch: a P1-tetrahedron Jacobian took 0.5 us an element
+at 3 072 elements and 1.73-1.83 us from 196 608 up, a third-derivative contraction 0.2 us
+and 0.7 us, once the per-element intermediates of a whole-batch `vmap` no longer fit in
+cache. So SOUPyMFEM's gap to a FEniCSx code grew with the mesh in 3D (1.7x at 4 913 dofs,
+3.0x at 274 625). The host program now walks the batch in steps of `HOST_BATCH` elements
+inside the compiled function (`jax.lax.map(..., batch_size=HOST_BATCH)`): 2.2x on the
+Jacobian kernel and 3x on the third derivative at 196 608 elements, and SOUPyMFEM's
+`bench_saa.py --dim 3 --n 32` on one pinned core went from 6.35 to 3.49 s (cost and
+gradient), 9.24 to 6.48 s (Hessian) and 30.2 to 21.2 s (quadratic Taylor gradient), with
+the same gradient norm to the last digit. Steps of 1 024, 2 048 and 4 096 are within 5 % of
+each other, 256 and 512 no better; 2 048 is the default and `HIPPYMFEM_HOST_BATCH=0` maps
+the whole batch. Steps of 512 elements and more gave the whole-batch element arrays bit
+for bit (P1 and P2 tetrahedra and P1 hexahedra; Jacobians, residual vectors and third
+derivatives); steps of 100 and of 7 elements differ by up to 6e-16 relative, since XLA
+vectorizes a short step differently, the same effect as chunking (`test_kernels.py` checks
+1e-15). A GPU keeps the whole-batch map, which is what it is fast at.
+
+**The dof gather is compiled** (`kernel.gather_rows`). The gather in front of every kernel,
+local dof vector to `(ne, nd)` element arrays, was eager JAX indexing, which normalizes and
+bounds-checks the index array with separate array operations at every call: at 1.57e6
+tetrahedra (64^3) 0.10 s a slot against 0.0036 s for the same gather compiled, and the
+five-slot gathers of a residual vector took 0.53 s beside a 0.24 s kernel. A gather is a
+copy and the sign flip exact, so the values are unchanged. A residual-vector assembly at
+64^3 went from 1.11 to 0.35 s, at 32^3 from 0.068 to 0.032 s.
+
+**Second directional derivatives in one pass** (`GroupKernel.third_dir_block`,
+`PDEVariationalProblem.apply_third_dir`). A second-order adjoint over `k` directions needs
+sums like `R_ijj[a, a] + 2 R_ijk[a, b] + R_ikk[b, b]` for every direction, which
+`apply_ijk` assembles one block at a time: in SOUPyMFEM's Taylor gradient, 14 calls per
+direction on the residual and 6 on the QoI. They are `D^2(d_i R)[t, t]` for `t = (a, b)`,
+one nested forward derivative of the slot-`i` gradient along a direction spanning every
+slot, and `apply_third_dir` takes all directions and their weights in one kernel call and
+one scatter. It equals the sum of `apply_ijk` pairs to 3e-16 (`test_modeling.py`); the
+quadratic Taylor gradient above went from 21.2 to 10.4 s. A facet density still goes pair
+by pair.
+
 **fp32 is a tool, not the solve path** (`PRECISION`, `_jaxconfig`). Measured on an L40S at
 13 824 hexahedral P2 elements per rank: the element kernel is 4.1x faster in fp32, a full
 assembly only 1.8x at one rank and 1.0x at four, because the scatter and the triple product

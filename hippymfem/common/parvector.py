@@ -43,6 +43,27 @@ def partition(comm, local_size):
     return offs, int(offs[-1])
 
 
+def allreduce_extreme(comm, loc, op):
+    """``MPI.MAX`` or ``MPI.MIN`` of floats over ``comm``, NaN wherever a rank holds one.
+
+    MPI's MAX and MIN compare, and a NaN compares false both ways: whether a rank's
+    NaN survives the reduction depends on the order the ranks' values meet in, so
+    ``norm("linf")`` of a vector with a NaN on rank 1 of 2 came out finite.  The
+    values go through with NaN replaced by the op's identity, next to a flag that
+    the same op carries to every rank, in one reduction.  ``loc`` is a float or a
+    1-D array; the result has its shape.
+    """
+    arr = np.atleast_1d(np.asarray(loc, dtype=np.float64))
+    nan = np.isnan(arr)
+    sign = 1.0 if op == MPI.MAX else -1.0
+    buf = np.concatenate([np.where(nan, -sign * np.inf, arr), sign * nan])
+    out = np.empty_like(buf)
+    comm.Allreduce(buf, out, op=op)
+    n = arr.size
+    res = np.where(sign * out[n:] > 0, np.nan, out[:n])
+    return float(res[0]) if np.ndim(loc) == 0 else res
+
+
 class Layout:
     """The global index layout of a distributed vector.
 
@@ -283,7 +304,7 @@ class ParVector(KeepAlive):
             return float(np.sqrt(max(self.inner(self), 0.0)))
         if norm_type in ("linf", "inf", np.inf, "NORM_INFINITY"):
             loc = float(np.abs(self._host()).max()) if self.local_size else 0.0
-            return self.comm.allreduce(loc, op=MPI.MAX)
+            return allreduce_extreme(self.comm, loc, MPI.MAX)
         if norm_type in ("l1", 1, "NORM_1"):
             loc = float(np.abs(self._host()).sum())
             return self.comm.allreduce(loc, op=MPI.SUM)
@@ -294,11 +315,11 @@ class ParVector(KeepAlive):
 
     def max(self):
         loc = float(self._host().max()) if self.local_size else -np.inf
-        return self.comm.allreduce(loc, op=MPI.MAX)
+        return allreduce_extreme(self.comm, loc, MPI.MAX)
 
     def min(self):
         loc = float(self._host().min()) if self.local_size else np.inf
-        return self.comm.allreduce(loc, op=MPI.MIN)
+        return allreduce_extreme(self.comm, loc, MPI.MIN)
 
     # ------------------------------------------------------------- operators
     def __iadd__(self, other):

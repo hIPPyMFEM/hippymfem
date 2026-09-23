@@ -430,6 +430,71 @@ def test_model_verify_nonlinear_inhomogeneous_bc():
     check("reduced Hessian is symmetric", rel < 1e-10, "(%.2e)" % rel)
 
 
+def test_third_dir():
+    """``apply_third_dir`` equals the sum of ``apply_ijk`` over the pairs it fuses.
+
+    The fused kernel differentiates a whole direction ``(u, m, p)`` at once; the
+    pairwise path contracts one block at a time.  Both are exact, so they agree to
+    round-off, for every output slot, with absent components, several weighted
+    directions, a nonlinear boundary term and (on an L2 space) interior facets.
+    """
+    if RANK == 0:
+        print("PDE: fused third directional derivatives against apply_ijk pairs")
+    from hippymfem.fem.facets import avg, jump
+
+    pmesh = mesh2d(6)
+    rng = np.random.default_rng(3)
+
+    def varf(u, m, p, x):
+        return (jnp.exp(m.val) * hm.inner(u.grad, p.grad)
+                + u.val ** 3 * p.val + jnp.sin(m.val) * u.val ** 2 * p.val)
+
+    def bdr(u, m, p, x, n):
+        return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
+
+    def facet(u, m, p, x, n, h):
+        return jnp.exp(avg(m)) * jump(u) ** 2 * jump(p)
+
+    def fbdr(u, m, p, x, n, h):
+        return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
+
+    cases = []
+    Vu = hm.FunctionSpace.H1(pmesh, 2)
+    Vm = hm.FunctionSpace.H1(pmesh, 1)
+    cases.append(("H1 with a boundary term", [Vu, Vm, Vu], dict(bdr_varf=bdr)))
+    Wu = hm.FunctionSpace.L2(pmesh, 1)
+    cases.append(("L2 with facets", [Wu, Vm, Wu],
+                  dict(bdr_varf=fbdr, facet_varf=facet)))
+
+    def rand(V):
+        v = V.vector()
+        v.array[:] = rng.standard_normal(v.local_size)
+        return v
+
+    for name, Vh, kw in cases:
+        pde = hm.PDEVariationalProblem(Vh, varf, None, None, is_fwd_linear=False, **kw)
+        x = [rand(Vh[0]), rand(Vh[1]), rand(Vh[2])]
+        dirs = [(rand(Vh[0]), rand(Vh[1]), None),
+                (rand(Vh[0]), rand(Vh[1]), rand(Vh[2])),
+                (None, rand(Vh[1]), None)]
+        weights = [0.7, -1.3, 2.0]
+        worst = 0.0
+        for i in (STATE, PARAMETER, ADJOINT):
+            fused = pde.apply_third_dir(i, x, dirs, weights, Vh[i].vector())
+            ref = Vh[i].vector()
+            work = Vh[i].vector()
+            for d, w in zip(dirs, weights):
+                for j in range(3):
+                    for k in range(3):
+                        if d[j] is not None and d[k] is not None:
+                            pde.apply_ijk(i, j, k, x, d[j], d[k], work)
+                            ref.axpy(w, work)
+            diff = fused.copy()
+            diff.axpy(-1.0, ref)
+            worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
+        check("fused = pairwise, %s" % name, worst < 1e-12, "(rel %.1e)" % worst)
+
+
 def test_hessian_properties():
     if RANK == 0:
         print("reduced Hessian: symmetry, positivity, FD agreement")
@@ -518,6 +583,7 @@ if __name__ == "__main__":
     test_pointwise_observation()
     test_model_verify()
     test_model_verify_nonlinear_inhomogeneous_bc()
+    test_third_dir()
     test_hessian_properties()
     if RANK == 0:
         print("-" * 74)

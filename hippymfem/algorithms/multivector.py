@@ -24,7 +24,7 @@ import numpy as np
 from mpi4py import MPI
 
 from ..common.naming import SnakeCamel, sync_spellings
-from ..common.parvector import ParVector
+from ..common.parvector import ParVector, allreduce_extreme
 
 
 class MultiVector(SnakeCamel):
@@ -47,7 +47,8 @@ class MultiVector(SnakeCamel):
             return
         if isinstance(v, MultiVector):
             self.comm = v.comm
-            self._set_data(v._data.copy(), getattr(v, "_layout", None))
+            # through the sync: a column hypre wrote on a device is stale in _data
+            self._set_data(v._host_data().copy(), getattr(v, "_layout", None))
             return
         if nvec is None:
             raise ValueError("nvec is required when initializing from a vector")
@@ -153,9 +154,7 @@ class MultiVector(SnakeCamel):
         if norm_type in ("linf", "inf", np.inf):
             d = self._host_data()
             loc = np.abs(d).max(axis=1) if d.shape[1] else np.zeros(self.nvec())
-            out = np.zeros_like(loc)
-            self.comm.Allreduce(np.ascontiguousarray(loc), out, op=MPI.MAX)
-            return out
+            return allreduce_extreme(self.comm, loc, MPI.MAX)
         raise ValueError("unknown norm type %r" % (norm_type,))
 
     # -------------------------------------------------------------- algebra

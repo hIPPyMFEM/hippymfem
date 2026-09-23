@@ -84,6 +84,32 @@ def test_parvector():
     check("scatter round-trip", close(diff, 0.0))
 
 
+def test_nan_reductions():
+    """A NaN on any one rank reaches ``norm("linf")``, ``max``, ``min`` and the
+    per-column ``MultiVector.norm("linf")`` on every rank.  MPI's MAX and MIN drop a
+    NaN that arrives second, so a NaN on the last rank came out finite."""
+    if RANK == 0:
+        print("NaN through the max/min reductions")
+    for bad in range(NP):
+        v = ParVector(COMM, 4)
+        v.array[:] = 1.0 + RANK
+        if RANK == bad:
+            v.array[1] = np.nan
+        got = (v.norm("linf"), v.max(), v.min())
+        M = MultiVector(v, 2)
+        M[0].array[:] = 1.0 + RANK
+        M[1].array[:] = v.array
+        cols = M.norm("linf")
+        ok = (all(np.isnan(g) for g in got) and not np.isnan(cols[0])
+              and np.isnan(cols[1]) and cols[0] == NP)
+        ok = COMM.allreduce(int(ok), op=MPI.MIN) == 1
+        check("NaN on rank %d reaches every rank" % bad, ok, str(got))
+    v = ParVector(COMM, 3)
+    v.array[:] = -(1.0 + RANK)
+    ok = (v.norm("linf") == NP and v.max() == -1.0 and v.min() == -float(NP))
+    check("finite values reduce as before", ok)
+
+
 def test_partition_matches_mfem():
     """The crux: our allgather partition must equal MFEM's tdof partition."""
     if RANK == 0:
@@ -414,6 +440,7 @@ if __name__ == "__main__":
         print("hIPPyMFEM vector tests on %d rank(s)" % NP)
         print("=" * 70)
     test_parvector()
+    test_nan_reductions()
     test_partition_matches_mfem()
     test_operators()
     test_multivector()
