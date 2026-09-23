@@ -17,6 +17,10 @@
 - `tools/install_petsc_mumps.sh` builds PETSc with MUMPS, ScaLAPACK, METIS and ParMETIS
   against the system MPI and petsc4py against it, so `PETScLUSolver` factorizes in parallel
   (`package_used == "mumps"`); the solvers guide gives the measured cost.
+- The 400^3 row (1.09 billion unknowns, 24 Blackwell GPUs) is quoted warm, as every other
+  row is: 68.4 s for one Newton-CG step, 194.6 s when the step also pays the first
+  Hessian-block build and its JAX compilation (the 197 s quoted before); same cost functional
+  to eleven digits and 3 CG iterations.
 - The README figure and the GPU and performance guides carry the 256^3 comparison on 32
   ranks: 77 s on 32 Blackwell slices against 6187 s for hIPPYlibx and 2859 s for hIPPyMFEM
   on 32 CPU cores.

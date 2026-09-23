@@ -150,12 +150,16 @@ mesh            unknowns     GPUs                                two Newton-CG s
 256\ :sup:`3`   287 M        8 H100                              141 s
 256\ :sup:`3`   287 M        8 RTX PRO 6000 Blackwell            140 s
 256\ :sup:`3`   287 M        16 RTX PRO 6000 Blackwell           77 s
-400\ :sup:`3`   1.09 B       24 RTX PRO 6000 Blackwell           197 s for one step,
-                                                                 compilation included
+400\ :sup:`3`   1.09 B       24 RTX PRO 6000 Blackwell           68.4 s for one step
 ==============  ===========  ==================================  =====================
 
 The Blackwell cards were split into two 48 GB MIG slices each, one rank per slice.
-Doubling them at 256\ :sup:`3` is 1.81x, 90 % of linear.
+Doubling them at 256\ :sup:`3` is 1.81x, 90 % of linear.  At 400\ :sup:`3` the step is
+warm, as every row is: forward solve 20.9 s, warm Hessian blocks 9.6 s, a reduced-Hessian
+action 7.1 s and 3 CG iterations, at 37.9 GiB per slice.  The first Hessian-block build
+carries the JAX compilation and takes 116.5 s, so a run that skips the separately timed
+stages (``--newton-only``) pays it inside the step and reports 194.6 s; the setup up to
+the synthetic data's forward solve takes 475 s.
 
 .. _smallest-kernel:
 
