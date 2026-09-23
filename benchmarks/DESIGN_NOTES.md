@@ -55,7 +55,8 @@ at 3 072 elements and 1.73-1.83 us from 196 608 up, a third-derivative contracti
 and 0.7 us, once the per-element intermediates of a whole-batch `vmap` no longer fit in
 cache. So SOUPyMFEM's gap to a FEniCSx code grew with the mesh in 3D (1.7x at 4 913 dofs,
 3.0x at 274 625). The host program now walks the batch in steps of `HOST_BATCH` elements
-inside the compiled function (`jax.lax.map(..., batch_size=HOST_BATCH)`): 2.2x on the
+inside the compiled function (a loop over windows of the arguments, the last window
+shifted back to end at the last element): 2.2x on the
 Jacobian kernel and 3x on the third derivative at 196 608 elements, and SOUPyMFEM's
 `bench_saa.py --dim 3 --n 32` on one pinned core went from 6.35 to 3.49 s (cost and
 gradient), 9.24 to 6.48 s (Hessian) and 30.2 to 21.2 s (quadratic Taylor gradient), with
@@ -65,7 +66,11 @@ the whole batch. Steps of 512 elements and more gave the whole-batch element arr
 for bit (P1 and P2 tetrahedra and P1 hexahedra; Jacobians, residual vectors and third
 derivatives); steps of 100 and of 7 elements differ by up to 6e-16 relative, since XLA
 vectorizes a short step differently, the same effect as chunking (`test_kernels.py` checks
-1e-15). A GPU keeps the whole-batch map, which is what it is fast at.
+1e-15). `jax.lax.map(..., batch_size=)` does the same stepping but compiles the body a
+second time for the remainder and copies the arguments to split it off: a first
+Jacobian call at 10 368 elements took 0.45 s with it, 0.29 s with the window loop and
+0.22 s whole, the warm calls the same. A GPU keeps the whole-batch map, which is what it
+is fast at.
 
 **The dof gather is compiled** (`kernel.gather_rows`). The gather in front of every kernel,
 local dof vector to `(ne, nd)` element arrays, was eager JAX indexing, which normalizes and

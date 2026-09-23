@@ -485,8 +485,8 @@ def _analysed_per_element(raws, args, axes, probe):
 #: core those leave the cache from about 1e4 elements on: a P1 tetrahedron's Jacobian
 #: costs 0.5 us per element in a batch of 3072 and 1.8 us in one of 196608, a third
 #: derivative 0.2 and 0.7 us.  On the host the batch is therefore mapped in steps of
-#: this many elements *inside* the compiled program (``jax.lax.map`` with
-#: ``batch_size``), which keeps the working set in cache.  Steps of 512 elements and more
+#: this many elements *inside* the compiled program (a loop over windows of the
+#: arguments), which keeps the working set in cache.  Steps of 512 elements and more
 #: gave the whole-batch arrays bit for bit in every case measured; steps of a few elements
 #: round differently, by an ulp, as a chunked batch does (``benchmarks/DESIGN_NOTES.md``,
 #: section 1).  A GPU maps the whole batch, which is what it is fast at, and so does the
@@ -530,13 +530,30 @@ def _mapped_kernel(f, in_axes):
     stepped = {}
 
     def stepped_fn(batch, *args):
+        # Windows of ``batch`` elements read in place from the arguments, the last one
+        # shifted back to end at the last element (it recomputes a few elements, with
+        # the same values).  ``jax.lax.map(..., batch_size=)`` compiles the body a
+        # second time for the remainder and copies the arguments to split them off.
         mapped = []
         _extract_mapped(args, in_axes, mapped)
+        ne = jax.tree_util.tree_leaves(mapped)[0].shape[0]
+        body = jax.vmap(lambda m: f(*_inject_mapped(args, in_axes, iter(m))))
 
-        def one(m):
-            return f(*_inject_mapped(args, in_axes, iter(m)))
+        def window(start):
+            return body(jax.tree_util.tree_map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, start, batch, 0), mapped))
 
-        return jax.lax.map(one, mapped, batch_size=batch)
+        shapes = jax.eval_shape(window, 0)
+        out = jax.tree_util.tree_map(
+            lambda sd: jnp.zeros((ne,) + sd.shape[1:], sd.dtype), shapes)
+
+        def step(k, acc):
+            start = jnp.minimum(k * batch, ne - batch)
+            return jax.tree_util.tree_map(
+                lambda o, r: jax.lax.dynamic_update_slice_in_dim(o, r, start, 0),
+                acc, window(start))
+
+        return jax.lax.fori_loop(0, -(-ne // batch), step, out)
 
     def call(*args):
         batch = HOST_BATCH
