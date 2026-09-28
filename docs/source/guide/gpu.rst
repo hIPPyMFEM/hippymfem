@@ -244,26 +244,34 @@ adjoint together): the assembled blocks and the AMG hierarchies.  That puts
 128\ :sup:`3` (36 M unknowns) on four 45 GB L40S at 17 to 19 GiB per card, on two of them
 at 29 to 35 GiB, or on one 80 GB H100 at 69 GiB.  What decides whether a given run fits:
 
-**JAX's share of the card.**  The default (0.45 with hypre on the card) is the faster
-operating point; a quarter gives memory back for a few percent of time, because it only
-makes the element kernels run in more, smaller chunks.  Two Newton-CG steps on four L40S:
+**JAX's share of the card.**  The share (0.45 of the card with hypre on it, above) is a
+ceiling, not a reservation: the pool grows as the element kernels need it, and the chunk
+planner sizes their batches from the room left under the ceiling, so a lower share means
+smaller chunks and a smaller pool, at some cost in time.  Matrix-free linearization points
+(``setLinearizationPoint(x, matrix_free=True)``; ``--matrix-free`` in
+``benchmarks/bench_newton_device.py``) leave ``C``, ``W_um`` and ``W_mm`` unassembled and
+compute their products at every Hessian apply instead.  Two Newton-CG steps at
+128\ :sup:`3` on four L40S, the peaks of the card, of what lies outside JAX (hypre's
+matrices and hierarchies, MFEM, the CUDA context) and of JAX's pool, with the same cost
+functional and CG count in every row:
 
 .. table::
    :widths: auto
 
-   ========================  ==========  ================  =========  ==========
-   ..                        assembly    two Newton steps  JAX peak   card peak
-   ========================  ==========  ================  =========  ==========
-   64\ :sup:`3`, 0.45         1.030 s     14.20 s           2.3 GB     7.1 GiB
-   64\ :sup:`3`, 0.25         1.029 s     14.36 s           2.2 GB     7.2 GiB
-   128\ :sup:`3`, 0.45        7.42 s      71.8 s            10.5 GB    30.2 GiB
-   128\ :sup:`3`, 0.25        7.49 s      74.7 s            3.8 GB     21.2 GiB
-   ========================  ==========  ================  =========  ==========
+   =====================================  ==========  ============  ==========  ================
+   ..                                     card peak   outside JAX   JAX pool    two Newton steps
+   =====================================  ==========  ============  ==========  ================
+   default                                19.1 GiB    10.1 GiB      9.0 GiB     49.1 s
+   matrix-free points                     17.2 GiB    8.2 GiB       9.0 GiB     51.3 s
+   JAX share 0.20                         15.1 GiB    10.1 GiB      5.0 GiB     52.7 s
+   JAX share 0.20, matrix-free points     13.2 GiB    8.2 GiB       5.0 GiB     63.6 s
+   =====================================  ==========  ============  ==========  ================
 
-(These rows predate later speedups; the comparison within each pair is what they show.)
-Set ``HIPPYMFEM_GPU_MEM_FRACTION=0.25`` when a run is short of card memory.
-``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is not a substitute: it reports no budget for
-the chunk planner to work from, and its card peak was higher.
+Set ``HIPPYMFEM_GPU_MEM_FRACTION=0.20`` when a run is short of card memory: 4 GiB a card
+for 7 % more time.  Matrix-free points save 1.8 GiB more, but under the lower share every
+one of their products runs in smaller chunks as well, so they are for a run that still
+does not fit.  ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is not a substitute: it reports no
+budget for the chunk planner to work from, and its card peak was higher.
 
 **What the problem class keeps.**  Three settings of
 :class:`~hippymfem.modeling.PDEVariationalProblem.PDEVariationalProblem` decide how much

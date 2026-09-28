@@ -54,6 +54,10 @@
   kernel program, column slot and device and keeps the faster, so kernels built alike take
   the same route within a run. The default stays `element`, whose results are reproducible
   bit for bit. Spaces with a Piola map and interior facets always take the element route.
+- The GPU guide's table of JAX's share of the card is re-measured on the current code, with
+  matrix-free linearization points beside it (128^3 on four L40S): a share of 0.20 takes the
+  card peak from 19.1 to 15.1 GiB for 7 % more time, and matrix-free points on top take it
+  to 13.2 GiB for 30 % more.
 - On a CPU the element kernels step through the batch 2 048 elements at a time inside the
   compiled program (`HIPPYMFEM_HOST_BATCH`, `0` for the whole batch), which keeps each
   step's intermediates in cache: 2.2x on a P1-tetrahedron Jacobian and 3x on a third
