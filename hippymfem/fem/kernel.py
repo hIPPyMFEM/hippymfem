@@ -1350,13 +1350,14 @@ class GroupKernel:
             nslots = self.nslots
 
             def f(dofs, jdir, tabs, geo, params):
-                tj = tuple(jdir if s == j else jnp.zeros_like(dofs[s])
-                           for s in range(nslots))
-
-                def gi(zz):
+                # differentiated in slot j alone: zero tangents in the other slots would
+                # be carried through the whole element, where JAX drops a slot that has
+                # none (a product into the state row costs 10x more with them)
+                def gi(zj):
+                    zz = tuple(zj if s == j else dofs[s] for s in range(nslots))
                     return jax.grad(lambda w: R(w, tabs, geo, params))(zz)[i]
 
-                return jax.jvp(gi, (dofs,), (tj,))[1]
+                return jax.jvp(gi, (dofs[j],), (jdir,))[1]
 
             self._cache[key] = self._chunked(
                 _mapped_kernel(f, self._axes(2)), self._axes(2))
@@ -1375,26 +1376,24 @@ class GroupKernel:
             nslots = self.nslots
 
             def f(dofs, jdir, kdir, tabs, geo, params):
-                def tangent(slot, vec):
-                    return tuple(vec if s == slot else jnp.zeros_like(dofs[s])
-                                 for s in range(nslots))
-
-                tj = tangent(j, jdir)
-                tk = tangent(k, kdir)
+                # differentiated in slots j and k alone (see hvp_block)
+                def put(zz, slot, v):
+                    return tuple(v if s == slot else zz[s] for s in range(nslots))
 
                 def gi(zz):
                     return jax.grad(lambda w: R(w, tabs, geo, params))(zz)[i]
 
-                def dk(zz):
-                    return jax.jvp(gi, (zz,), (tk,))[1]
+                def dk(zj):
+                    base = put(dofs, j, zj)
+                    return jax.jvp(lambda zk: gi(put(base, k, zk)), (base[k],), (kdir,))[1]
 
-                return jax.jvp(dk, (dofs,), (tj,))[1]
+                return jax.jvp(dk, (dofs[j],), (jdir,))[1]
 
             self._cache[key] = self._chunked(
                 _mapped_kernel(f, self._axes(3)), self._axes(3))
         return self._cache[key]
 
-    def third_dir_block(self, i, nmodes):
+    def third_dir_block(self, i, nmodes, present=None):
         r"""Batched :math:`\sum_m w_m\, D^2(\partial_i R)[t_m, t_m]`: the second
         directional derivative of the slot-``i`` gradient along directions ``t_m`` that
         may span every slot, weighted and summed over ``nmodes`` directions.
@@ -1405,19 +1404,32 @@ class GroupKernel:
         :meth:`third_block` summed over both orders and both diagonals,
         :math:`R_{ijj}[t_j, t_j] + 2 R_{ijk}[t_j, t_k] + R_{ikk}[t_k, t_k]`, in one pass
         instead of four; the directions share the gather of the point and the scatter.
+        ``present`` names the slots the directions have components in (every slot by
+        default), and ``T`` then holds those slots' arrays alone: the others are not
+        differentiated at all (see :meth:`hvp_block`).
         """
-        key = ("td", i, int(nmodes))
+        present = (tuple(range(self.nslots)) if present is None
+                   else tuple(sorted(int(s) for s in present)))
+        key = ("td", i, int(nmodes), present)
         if key not in self._cache:
             R = self._functional()
 
             def f(dofs, T, w, tabs, geo, params):
-                def gi(zz):
-                    return jax.grad(lambda z: R(z, tabs, geo, params))(zz)[i]
+                def at(zp):
+                    zz = list(dofs)
+                    for s, v in zip(present, zp):
+                        zz[s] = v
+                    return tuple(zz)
+
+                def gi(zp):
+                    return jax.grad(lambda z: R(z, tabs, geo, params))(at(zp))[i]
+
+                base = tuple(dofs[s] for s in present)
 
                 def dd(t):
-                    def dk(zz):
-                        return jax.jvp(gi, (zz,), (t,))[1]
-                    return jax.jvp(dk, (dofs,), (t,))[1]
+                    def dk(zp):
+                        return jax.jvp(gi, (zp,), (t,))[1]
+                    return jax.jvp(dk, (base,), (t,))[1]
 
                 return jnp.tensordot(w, jax.vmap(dd)(T), axes=1)
 
@@ -1651,15 +1663,17 @@ class QuadratureKernel:
         pr = _params(params)
         m = len(dir_locals)
         w = _put(np.asarray(weights, dtype=np.float64).reshape(m))
+        present = tuple(s for s in range(len(dir_locals[0]))
+                        if any(d[s] is not None for d in dir_locals))
         for gk in self.group_kernels:
             dofs = gk.gather(local_arrays)
             T = []
-            for s in range(gk.nslots):
+            for s in present:
                 cols = [jnp.zeros_like(dofs[s]) if d[s] is None
                         else gk.tables[s].gather_device(d[s]) for d in dir_locals]
                 T.append(jnp.stack(cols, axis=1))
             out.append(gk.tables[i].transform_dual_vector(_result(
-                gk.third_dir_block(i, m)(dofs, tuple(T), w, *gk.mapped(), pr))))
+                gk.third_dir_block(i, m, present)(dofs, tuple(T), w, *gk.mapped(), pr))))
         return out
 
     def element_values(self, local_arrays, params=()):

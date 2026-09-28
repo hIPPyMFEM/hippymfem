@@ -54,6 +54,16 @@
   kernel program, column slot and device and keeps the faster, so kernels built alike take
   the same route within a run. The default stays `element`, whose results are reproducible
   bit for bit. Spaces with a Piola map and interior facets always take the element route.
+- Fixed: the matrix-free second-derivative products (`hvp_block`, behind `element_hvp` and
+  `apply_ij_at`) and the third-derivative kernels (`third_block`, `third_dir_block`) gave
+  the slots without a direction zero tangents, which JAX carries through the whole element,
+  where differentiating in the direction's slots alone lets it drop the rest: a product
+  into the state or adjoint row paid for every field's evaluation even where it is
+  identically zero. On SOUPyMFEM's control problem at 82 944 P1 tetrahedra such products
+  take 4.2 and 2.4 ms instead of 34 and 32, and a sample-average Hessian action with 8
+  samples at 15 625 unknowns takes 1.02 s instead of 1.22 (2.16 s with assembled blocks).
+  The inverse problem of `bench_newton_device.py`, whose density couples every slot, is
+  unchanged (two Newton steps at 64^3 on one L40S: 27.1 s matrix-free, 27.5 s assembled).
 - The GPU guide's table of JAX's share of the card is re-measured on the current code, with
   matrix-free linearization points beside it (128^3 on four L40S): a share of 0.20 takes the
   card peak from 19.1 to 15.1 GiB for 7 % more time, and matrix-free points on top take it
