@@ -38,6 +38,7 @@ close.
 
 import functools
 import os
+import time
 import warnings
 from typing import NamedTuple
 
@@ -84,6 +85,50 @@ def set_precision(mode):
 
 #: Every kernel built, so :func:`set_precision` can invalidate their compiled code.
 _KERNELS = []
+
+#: How the element Hessian blocks are differentiated.  ``element`` (the default)
+#: pushes one forward tangent per element dof of the column slot through the whole
+#: element.  ``quadrature`` differentiates the density twice at each point, with respect
+#: to the fields' values and gradients (one tangent per such feature), skips the parts
+#: of that pointwise Hessian that are identically zero, and contracts the rest with the
+#: basis values and physical gradients; it is exact too, since the fields are linear in
+#: the dofs.  On a GPU it is the faster route from P2 up: a Jacobian 1.6x (Poisson, P2
+#: tetrahedra) to 4.4x (elasticity, Q2 hexahedra) faster on an L40S, a whole
+#: linearization point 1.2x to 1.7x.  On P1 the element route stays the faster (the
+#: quadrature route's Jacobian runs at 0.7x), and so it does on the host, except for
+#: vector-valued Jacobians (1.4x there).  ``auto`` times both once per kernel program,
+#: column slot and device and keeps the faster (:data:`_ROUTES`), so every kernel built
+#: alike takes the same route in a run, while which one a run takes, and its round-off,
+#: can differ from run to run.  Spaces with a Piola map and interior facets always take
+#: the element route.  Set ``HIPPYMFEM_HESSIAN`` or :func:`set_hessian_mode`.
+HESSIAN_MODE = os.environ.get("HIPPYMFEM_HESSIAN", "element").strip().lower() or "element"
+if HESSIAN_MODE not in ("element", "quadrature", "auto"):
+    warnings.warn("HIPPYMFEM_HESSIAN=%r is not element, quadrature or auto; using element"
+                  % (HESSIAN_MODE,), RuntimeWarning)
+    HESSIAN_MODE = "element"
+
+
+#: What ``auto`` chose, per kernel program (the density, the slots' shapes, the element
+#: and point counts, the precision, the column slot) and device.  Kept here rather than
+#: with a kernel's compiled code, so a cleared cache does not time again and every
+#: kernel built alike (two problems on one mesh, say) takes the same route and gives the
+#: same bits.  Keyed on the density's ``id``: a reused id costs at worst a slower route,
+#: never a wrong result.
+_ROUTES = {}
+
+
+def set_hessian_mode(mode):
+    """Choose how element Hessians are differentiated (:data:`HESSIAN_MODE`); returns
+    the old mode.  Clears every kernel's compiled Hessians."""
+    global HESSIAN_MODE
+    mode = str(mode).strip().lower()
+    if mode not in ("element", "quadrature", "auto"):
+        raise ValueError("hessian mode must be element, quadrature or auto, got %r" % (mode,))
+    old, HESSIAN_MODE = HESSIAN_MODE, mode
+    for k in _KERNELS:
+        for key in [key for key in k._cache if key and key[0] in ("hs", "h", "hcols")]:
+            del k._cache[key]
+    return old
 
 
 def _as32(tree):
@@ -684,6 +729,8 @@ class GroupKernel:
         self._cache = {}
         self._chunk = {}
         self._peak = {}
+        #: ``{(device, column slot): "element" | "quadrature"}``, what ``auto`` chose
+        self.hessian_route = {}
         self._slot_axes = tuple(tuple(t.jax_axes()) for t in self.tables)
         self._slot_eval = tuple(t.evaluator() for t in self.tables)
         # Tables and geometry are placed lazily and kept **per device**, so a
@@ -1007,25 +1054,232 @@ class GroupKernel:
         bits: XLA rounds a forward pass differently for a different number of
         tangents (``benchmarks/DESIGN_NOTES.md``, section 1).  Per slot the program
         is the same whoever asks, and selecting rows happens outside the compiled
-        function; a pass pushes ``nd_j`` tangents, only the columns asked for.
+        function; a pass pushes ``nd_j`` tangents, only the columns asked for.  Which
+        program that is, the element route or the quadrature one, is
+        :data:`HESSIAN_MODE`'s choice.
         """
         key = ("hs", int(j))
         if key not in self._cache:
-            R = self._functional()
-            nslots = self.nslots
-
-            def f(dofs, tabs, geo, params):
-                def g(zj):
-                    z = tuple(zj if s == j else dofs[s] for s in range(nslots))
-                    return jax.grad(lambda zz: R(zz, tabs, geo, params))(z)
-                return jax.jacfwd(g)(dofs[j])
-
-            # the planner's working set is per tangent, so a slot pass plans at
-            # its share of the tangents
-            weight = max(1.0, self.nslots * self.nd[j] / max(sum(self.nd), 1))
-            self._cache[key] = self._chunked(
-                _mapped_kernel(f, self._axes()), self._axes(), weight=weight)
+            mode = HESSIAN_MODE
+            if mode == "element" or not self._quadrature_route():
+                self._cache[key] = self._hess_slot_element(j)
+            elif mode == "quadrature":
+                self._cache[key] = self._hess_slot_quadrature(j)
+            else:
+                self._cache[key] = self._fastest(
+                    j, self._hess_slot_element(j), self._hess_slot_quadrature(j))
         return self._cache[key]
+
+    def _slot_weight(self, j):
+        # the planner's working set is per tangent, so a slot pass plans at its share
+        # of the tangents
+        return max(1.0, self.nslots * self.nd[j] / max(sum(self.nd), 1))
+
+    def _hess_slot_element(self, j):
+        """:meth:`_hess_slot` by forward tangents over slot ``j``'s element dofs."""
+        R = self._functional()
+        nslots = self.nslots
+
+        def f(dofs, tabs, geo, params):
+            def g(zj):
+                z = tuple(zj if s == j else dofs[s] for s in range(nslots))
+                return jax.grad(lambda zz: R(zz, tabs, geo, params))(z)
+            return jax.jacfwd(g)(dofs[j])
+
+        return self._chunked(_mapped_kernel(f, self._axes()), self._axes(),
+                             weight=self._slot_weight(j))
+
+    def _quadrature_route(self):
+        """Whether every slot evaluates its field from shared or per-element tables
+        ``(N, G)`` (H1 and L2 on elements and on the boundary); a Piola map or two
+        sides take the element route."""
+        return all(type(t).__name__ in ("SpaceTables", "BoundarySpaceTables")
+                   for t in self.tables)
+
+    def _hess_slot_quadrature(self, j):
+        """:meth:`_hess_slot` from second derivatives of the density at the points.
+
+        At each point the density is differentiated with respect to every slot's values
+        and physical gradients, forward over slot ``j``'s, which gives the pointwise
+        blocks ``D[s][r][c]``: row slot ``s``, its values or gradients ``r``, slot
+        ``j``'s values or gradients ``c``.  The fields are linear in the dofs, so the
+        element block is ``sum_q w_q Psi_r^T D Psi_c`` with ``Psi`` the basis values or
+        physical gradients, component by component.  The blocks that are identically
+        zero are found once from the density's trace (:meth:`_zero_point_blocks`) and
+        skipped, as the element route's forward tangents skip them: a residual linear
+        in the state has no state-state block, and most densities couple few of the
+        parts.  Equal to the element route to round-off.
+        """
+        evals = self._slot_eval
+        nslots = self.nslots
+        vd = [int(t.vdim) for t in self.tables]
+        nd = [int(t.nd) for t in self.tables]
+        sdim = int(np.shape(self.group.Jinv)[-1])
+        lowp = PRECISION == "fp32"
+        zero = self._zero_point_blocks(j)
+
+        def body(dofs, tabs, geo, params):
+            Jinv, wdet = geo[0], geo[1]
+            fields = [ev(d, t, Jinv) for ev, d, t in zip(evals, dofs, tabs)]
+
+            def at_point(fq, *extra):
+                return self._point_blocks(j, tuple((f.val, f.grad) for f in fq), extra,
+                                          params)
+
+            D = jax.vmap(at_point)(fields, *geo[2:])
+            nq = wdet.shape[0]
+
+            def basis(t):
+                N, G = t
+                return (N[:, None, :], jnp.einsum("qil,qlk->qki", G, Jinv))
+
+            Pj = basis(tabs[j])
+            F = (1, sdim)
+            out = []
+            for s in range(nslots):
+                Ps = basis(tabs[s])
+                E = None
+                for r in range(2):
+                    for c in range(2):
+                        if (s, r, c) in zero:
+                            continue
+                        blk = jnp.reshape(D[s][r][c], (nq, vd[s], F[r], vd[j], F[c]))
+                        T = jnp.einsum("qafbg,qgl->qafbl",
+                                       blk * wdet[:, None, None, None, None], Pj[c])
+                        e = jnp.einsum("qfk,qafbl->akbl", Ps[r], T)
+                        E = e if E is None else E + e
+                shape = (vd[s] * nd[s], vd[j] * nd[j])
+                out.append(jnp.zeros(shape, wdet.dtype) if E is None else E.reshape(shape))
+            return tuple(out)
+
+        def f(dofs, tabs, geo, params):
+            if not lowp:
+                return body(dofs, tabs, geo, params)
+            args = _as32((dofs, tabs, geo, params))
+            with jax.default_matmul_precision("highest"):
+                return tuple(o.astype(jnp.float64) for o in body(*args))
+
+        return self._chunked(_mapped_kernel(f, self._axes()), self._axes(),
+                             weight=self._slot_weight(j))
+
+    def _point_blocks(self, j, parts, extra, params, split=False):
+        """The density's second derivatives at one point, ``D[s][r][c]``, forward over
+        slot ``j``'s values and gradients (see :meth:`_hess_slot_quadrature`).
+
+        ``parts`` holds every slot's ``(value, gradient)`` at the point.  One forward
+        pass over both of slot ``j``'s parts is the faster program; ``split`` makes one
+        pass per part, so that a part no row depends on gives a block of its own that
+        the trace shows to be constant (:meth:`_zero_point_blocks`).
+        """
+        density = self.density
+        nslots = self.nslots
+
+        def dens(ps):
+            return density(*[Field(v, g) for (v, g) in ps], *extra, *params)
+
+        def grad_all(vj, gj):
+            return jax.grad(dens)(tuple((vj, gj) if s == j else parts[s]
+                                        for s in range(nslots)))
+
+        if not split:
+            return jax.jacfwd(lambda pj: grad_all(*pj))(parts[j])
+        dv = jax.jacfwd(grad_all, argnums=0)(*parts[j])
+        dg = jax.jacfwd(grad_all, argnums=1)(*parts[j])
+        return tuple(tuple((dv[s][r], dg[s][r]) for r in range(2)) for s in range(nslots))
+
+    def _zero_point_blocks(self, j):
+        """The ``(s, r, c)`` of the pointwise blocks that are identically zero.
+
+        A block is taken to be zero when the traced program computes it from none of
+        its inputs (the fields, the coordinates and the parameters) and its value is
+        zero, which holds at every point, whatever branches the density takes.  A trace
+        that cannot be read keeps every block.
+        """
+        from jax.extend import core as jcore
+
+        vd = [int(t.vdim) for t in self.tables]
+        sdim = int(np.shape(self.group.Jinv)[-1])
+        rng = np.random.default_rng(0)
+
+        def part(v):
+            shape = () if v == 1 else (v,)
+            return (jnp.asarray(rng.uniform(0.1, 0.5, shape)),
+                    jnp.asarray(rng.uniform(-0.5, 0.5, shape + (sdim,))))
+
+        parts = tuple(part(v) for v in vd)
+        extra = tuple(jnp.asarray(rng.uniform(0.1, 0.9, np.shape(getattr(self.group, n))[2:]))
+                      for n in self._geo_names[2:])
+        params = tuple(jnp.asarray(1.0) for _ in range(self.nparams))
+
+        def leaves(p, e, q):
+            return jax.tree_util.tree_leaves(self._point_blocks(j, p, e, q, split=True))
+
+        try:
+            jaxpr = jax.make_jaxpr(leaves)(parts, extra, params).jaxpr
+            dep = set(jaxpr.invars)
+            for eqn in jaxpr.eqns:
+                if any(not isinstance(v, jcore.Literal) and v in dep for v in eqn.invars):
+                    dep.update(eqn.outvars)
+            vals = leaves(parts, extra, params)
+        except Exception:                                        # noqa: BLE001
+            return frozenset()
+        keys = [(s, r, c) for s in range(self.nslots) for r in range(2) for c in range(2)]
+        return frozenset(
+            key for key, v, val in zip(keys, jaxpr.outvars, vals)
+            if (isinstance(v, jcore.Literal) or v not in dep)
+            and not np.any(np.asarray(val)))
+
+    def _route_key(self, j):
+        """The program a slot pass of this kernel compiles, as :data:`_ROUTES` keys it."""
+        wdet = self.group.wdet
+        nq = int(np.shape(wdet)[1]) if np.ndim(wdet) > 1 else 1
+        return (id(self.density),
+                tuple((type(t).__name__, int(t.nd), int(t.vdim)) for t in self.tables),
+                int(self.group.ne), nq, int(self.nparams), PRECISION, int(j))
+
+    def _fastest(self, j, a, b):
+        """``a`` or ``b`` (the element and the quadrature route of a slot), whichever
+        runs faster, timed on the device at the first call of any kernel with this
+        program (both compiled and run twice there) and kept in :data:`_ROUTES`; what
+        this kernel took is in :attr:`hessian_route`.  One route's output is held at a
+        time, so the timing needs no more memory than a pass."""
+        names = ("element", "quadrature")
+        key = self._route_key(j)
+
+        def pick(fa, fb, args):
+            d = device()
+            k = _ROUTES.get(key + (d,))
+            if k is not None:
+                self.hessian_route[(d, int(j))] = names[k]
+                return k, (fa, fb)[k](*args)
+            best, out = None, None
+            for k, fn in enumerate((fa, fb)):
+                out = None
+                jax.block_until_ready(fn(*args))                  # compile
+                t0 = time.perf_counter()
+                out = fn(*args)
+                jax.block_until_ready(out)
+                t = time.perf_counter() - t0
+                if best is None or t < best[0]:
+                    best = (t, k)
+            k = _ROUTES[key + (d,)] = best[1]
+            self.hessian_route[(d, int(j))] = names[k]
+            if k != 1:
+                out = None
+                out = fa(*args)
+            return k, out
+
+        def call(*args):
+            return pick(a, b, args)[1]
+
+        def raw(*args):
+            return pick(a._raw, b._raw, args)[1]
+
+        # the chunk planner's XLA analysis sizes the chunk by the element route's program
+        raw.lower = getattr(a._raw, "lower", None)
+        call._raw = raw
+        call._weight = a._weight
+        return call
 
     def hess_block(self, i, j):
         """Batched ``d2R/d(dofs_i) d(dofs_j)``; returns ``(ne, nd_i, nd_j)``.

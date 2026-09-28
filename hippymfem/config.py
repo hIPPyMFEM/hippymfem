@@ -121,6 +121,10 @@ _KNOBS = [
     _Knob("precision", "HIPPYMFEM_PRECISION",
           "fp64 (default) or fp32 for the element kernels (a tool, not the solve path)",
           _module_attr("fem.kernel", "PRECISION"), _module_setter("fem.kernel", "set_precision")),
+    _Knob("hessian", "HIPPYMFEM_HESSIAN",
+          "how element Hessians are differentiated: element (default), quadrature "
+          "(second derivatives at the quadrature points, faster on a GPU) or auto",
+          _module_attr("fem.kernel", "HESSIAN_MODE"), _module_setter("fem.kernel", "set_hessian_mode")),
     _Knob("element_chunk", "HIPPYMFEM_ELEMENT_CHUNK",
           "elements per kernel launch; 0 (default) plans the chunk from the device's free memory",
           _module_attr("fem.kernel", "ELEMENT_CHUNK"), _module_assign("fem.kernel", "ELEMENT_CHUNK", int)),

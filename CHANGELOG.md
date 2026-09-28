@@ -39,6 +39,21 @@
   results that depend on the partition; every form written in jumps, averages and the
   normal passes. `test_modeling`'s third-derivative check used one that did not (an odd
   power of the jumps; it compared like with like, so it passed) and now uses one that does.
+- `HIPPYMFEM_HESSIAN=quadrature` (or `hm.config.hessian`): the element Hessian blocks from
+  the density's second derivatives at the quadrature points, with respect to the fields'
+  values and gradients, contracted with the basis values and physical gradients; the
+  element route, the default, pushes one forward tangent per element dof through the whole
+  element. The parts of the pointwise Hessian that are identically zero are found once
+  from the density's trace and skipped (a residual linear in the state has no state-state
+  part, and most couple few of the others). Equal to the element route to round-off. On
+  an L40S it is the faster route from P2 up: a Jacobian 1.6x (Poisson, P2 tetrahedra),
+  1.9x (a nonlinear density), 2.6x (elasticity, P2 tetrahedra) and 4.4x (elasticity, Q2
+  hexahedra) faster, and a whole linearization point 1.2x to 1.7x. On P1 the element route
+  stays the faster (the quadrature route's Jacobian runs at 0.7x), and so it does on the
+  host, except for vector-valued Jacobians (1.4x there). `auto` times both routes once per
+  kernel program, column slot and device and keeps the faster, so kernels built alike take
+  the same route within a run. The default stays `element`, whose results are reproducible
+  bit for bit. Spaces with a Piola map and interior facets always take the element route.
 - On a CPU the element kernels step through the batch 2 048 elements at a time inside the
   compiled program (`HIPPYMFEM_HOST_BATCH`, `0` for the whole batch), which keeps each
   step's intermediates in cache: 2.2x on a P1-tetrahedron Jacobian and 3x on a third

@@ -210,6 +210,30 @@ On the same code the kernel speedup over a host core is 11x to 26x on an L40S an
 promise a speedup; :mod:`hippymfem.test.test_gpu` measures one for whatever card is
 present.
 
+**From P2 up, differentiate at the quadrature points.**  ``HIPPYMFEM_HESSIAN=quadrature``
+(or ``hm.config.hessian = "quadrature"``) builds each element Hessian block from the
+density's second derivatives at the quadrature points, with respect to the fields'
+values and gradients, contracted with the basis, where the default pushes one forward
+tangent per element dof through the whole element.  The parts of the pointwise Hessian
+that are identically zero are skipped, and the blocks agree with the default's to
+round-off.  The element kernels on one L40S and hypre on the host, a linearization point
+counting its Jacobian, the other blocks, their assembly and the AMG setup:
+
+=====================================  ==========  =====================  =====================
+element (default) / quadrature         elements    Jacobian               linearization point
+=====================================  ==========  =====================  =====================
+Poisson, P1 tetrahedra                 384 000     0.054 / 0.081 s        0.218 / 0.259 s
+Poisson, P2 tetrahedra                 82 944      0.064 / 0.040 s        0.179 / 0.154 s
+nonlinear density, P2 tetrahedra       82 944      0.124 / 0.064 s        0.387 / 0.257 s
+elasticity, P2 tetrahedra              24 576      0.121 / 0.046 s        0.262 / 0.152 s
+elasticity, Q2 hexahedra               4 096       0.139 / 0.032 s        0.305 / 0.176 s
+=====================================  ==========  =====================  =====================
+
+``auto`` times both routes once per column slot and keeps the faster; here it keeps the
+element route for P1 and for the parameter column of the P2 Poisson problem.  The default
+stays ``element``: its results are reproducible bit for bit, and on a host it is the
+faster route except for vector-valued Jacobians.
+
 .. _gpu-memory:
 
 How large a problem fits

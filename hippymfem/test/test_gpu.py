@@ -189,6 +189,45 @@ def test_blocks_agree():
           "(%.3e)" % worst)
 
 
+def test_quadrature_hessian_on_gpu():
+    """The Hessian blocks from second derivatives at the quadrature points
+    (``hm.config.hessian``, ``quadrature`` and ``auto``) on the GPU, against the element
+    route on the CPU, every block of an H1 problem nonlinear in the state."""
+    if RANK == 0:
+        print("GPU quadrature-point Hessians vs the CPU element route")
+    pairs = [(i, j) for i in (STATE, PARAMETER, ADJOINT) for j in (STATE, PARAMETER, ADJOINT)]
+    saved = K.HESSIAN_MODE
+    worst = 0.0
+    routes = set()
+    try:
+        for kind, order in (("quad", 2), ("tri", 2), ("hex", 2)):
+            n = 4 if kind == "hex" else 6
+            pm, Vu, Vm, b, kern, loc = build(kind, n, order)
+            K.set_hessian_mode("element")
+            with on("cpu"):
+                ref = [np.asarray(a) for ij in pairs for a in kern.element_matrices(*ij, loc)]
+            bad = []
+            for mode in ("quadrature", "auto"):
+                K.set_hessian_mode(mode)
+                with on("gpu"):
+                    got = [np.asarray(a) for ij in pairs
+                           for a in kern.element_matrices(*ij, loc)]
+                sc = max([float(np.abs(r).max()) for r in ref if r.size] + [1e-300])
+                e = max([float(np.abs(r - g).max()) / sc
+                         for r, g in zip(ref, got) if r.size] + [0.0])
+                worst = max(worst, e)
+                if e > 1e-13:
+                    bad.append("%s %.2e" % (mode, e))
+            routes |= {v for gk in kern.group_kernels for v in gk.hessian_route.values()}
+            check("%s order %d: quadrature and auto on the GPU agree" % (kind, order), not bad,
+                  "" if not bad else "differs: " + ", ".join(bad))
+    finally:
+        K.set_hessian_mode(saved)
+    routes = set().union(*COMM.allgather(routes))
+    check("auto chose a route for every column it timed", routes <= {"element", "quadrature"}
+          and bool(routes), "(%s; worst difference %.1e)" % (", ".join(sorted(routes)), worst))
+
+
 def test_assembled_operators_agree():
     """The assembled parallel matrices, not just the element arrays.
 
@@ -720,6 +759,7 @@ def main():
     test_device_assignment()
     test_memory_budget()
     test_blocks_agree()
+    test_quadrature_hessian_on_gpu()
     test_assembled_operators_agree()
     test_geometry_streaming()
     test_reproducible()

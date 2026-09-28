@@ -568,6 +568,144 @@ def test_host_batch():
     check("hm.config.host_batch sets it", ok and kern.HOST_BATCH == saved)
 
 
+def test_quadrature_hessian():
+    """The element Hessians from second derivatives of the density at the quadrature
+    points (``hm.config.hessian = "quadrature"``) against the element route.  Both are
+    exact, so they agree to round-off: scalar and vector spaces, a nonlinear density,
+    triangles, tetrahedra and hexahedra, a boundary density that takes the normal, and
+    single precision.  In either mode the blocks of one slot pass are the same bits
+    whoever asks for them, and ``auto`` records the route it chose."""
+    if RANK == 0:
+        print("Hessians from second derivatives at the quadrature points")
+    from hippymfem.fem import kernel as kern
+    from hippymfem.fem.boundary import BoundaryBatches, BoundaryKernel
+
+    def nonlinear(u, m, p, x):
+        return (jnp.exp(m.val) * (1.0 + u.val ** 2 + inner(u.grad, u.grad))
+                * inner(u.grad, p.grad) + m.val ** 2 * u.val * p.val * x[0])
+
+    def elastic(u, m, p, x):
+        eu, ep = sym(u.grad), sym(p.grad)
+        mu = jnp.exp(m.val)
+        return (2.0 * mu * inner(eu, ep) + 1.5 * mu * div(u.grad) * div(p.grad)
+                + 0.1 * inner(u.val, u.val) * inner(u.val, p.val))
+
+    def flux(u, m, p, x, n):
+        return jnp.exp(m.val) * jnp.dot(u.grad, n) * p.val + u.val ** 3 * p.val
+
+    def branch(u, m, p, x, t):
+        # a second derivative that is zero where the field is positive (as it is at the
+        # points the zero-block analysis traces with) and not elsewhere, and a scalar
+        # parameter: neither may be taken for an identically zero block
+        return (jnp.where(u.val < 0.0, u.val ** 2, 0.0) * m.val * p.val * t
+                + inner(u.grad, p.grad))
+
+    def loc_of(Vu, Vm, seed):
+        rng = np.random.default_rng(seed)
+        return [0.5 * rng.standard_normal(Vu.local_values(Vu.vector()).size),
+                0.5 * rng.standard_normal(Vm.local_values(Vm.vector()).size),
+                0.5 * rng.standard_normal(Vu.local_values(Vu.vector()).size)]
+
+    pairs = [(i, j) for i in (STATE, PARAMETER, ADJOINT)
+             for j in (STATE, PARAMETER, ADJOINT)]
+    cases = []
+    pm = make_mesh("tri", 5)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    cases.append(("P2 triangles, nonlinear",
+                  QuadratureKernel(nonlinear, [Vu, Vm, Vu], MeshBatches(pm, 5)),
+                  loc_of(Vu, Vm, 3)))
+    pm = make_mesh("tet", 3)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    cases.append(("P2 tetrahedra, nonlinear",
+                  QuadratureKernel(nonlinear, [Vu, Vm, Vu], MeshBatches(pm, 5)),
+                  loc_of(Vu, Vm, 4)))
+    Vv = FunctionSpace.H1(pm, 2, vdim=3)
+    cases.append(("P2 tetrahedra, vector",
+                  QuadratureKernel(elastic, [Vv, Vm, Vv], MeshBatches(pm, 5)),
+                  loc_of(Vv, Vm, 5)))
+    pm = make_mesh("hex", 2)
+    Vv, Vm = FunctionSpace.H1(pm, 2, vdim=3), FunctionSpace.H1(pm, 1)
+    cases.append(("Q2 hexahedra, vector",
+                  QuadratureKernel(elastic, [Vv, Vm, Vv], MeshBatches(pm, 6)),
+                  loc_of(Vv, Vm, 6)))
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    cases.append(("Q2 hexahedra, a branch and a parameter",
+                  QuadratureKernel(branch, [Vu, Vm, Vu], MeshBatches(pm, 5), nparams=1),
+                  loc_of(Vu, Vm, 8)))
+    pm = make_mesh("quad", 4)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    cases.append(("Q2 boundary, with the normal",
+                  BoundaryKernel(flux, [Vu, Vm, Vu],
+                                 BoundaryBatches(pm, 6, "all", COMM, space=Vu)),
+                  loc_of(Vu, Vm, 7)))
+
+    def blocks(K, loc):
+        pr = (0.7,) if K.nparams else ()
+        return [np.asarray(a) for ij in pairs for a in K.element_matrices(*ij, loc, pr)]
+
+    def worst(ref, got):
+        scale = max([float(np.abs(a).max()) for a in ref if a.size] + [1e-300])
+        return max([float(np.abs(a - b).max()) / scale
+                    for a, b in zip(ref, got) if a.size] + [0.0])
+
+    saved = kern.HESSIAN_MODE
+    try:
+        for name, K, loc in cases:
+            kern.set_hessian_mode("element")
+            ref = blocks(K, loc)
+            kern.set_hessian_mode("quadrature")
+            got = blocks(K, loc)
+            err = COMM.allreduce(worst(ref, got), op=MPI.MAX)
+            check("%s: the 9 blocks equal the element route's" % name, err <= 1e-13,
+                  "(max rel %.1e)" % err)
+            many = K.element_matrices_many(pairs, loc, (0.7,) if K.nparams else ())
+            same = all(np.array_equal(np.asarray(a), b)
+                       for a, b in zip([a for ij in pairs for a in many[ij]], got))
+            same = COMM.allreduce(same, op=MPI.LAND)
+            check("%s: the one-pass blocks are the same bits" % name, same)
+
+        name, K, loc = cases[2]
+        kern.set_hessian_mode("element")
+        ref = blocks(K, loc)
+        old = kern.set_precision("fp32")
+        try:
+            errs = []
+            for mode in ("element", "quadrature"):
+                kern.set_hessian_mode(mode)
+                errs.append(COMM.allreduce(worst(ref, blocks(K, loc)), op=MPI.MAX))
+        finally:
+            kern.set_precision(old)
+        check("%s in fp32: both routes within 1e-5 of fp64" % name, max(errs) <= 1e-5,
+              "(element %.1e, quadrature %.1e)" % tuple(errs))
+
+        kern.set_hessian_mode("auto")
+        got = blocks(K, loc)
+        err = COMM.allreduce(worst(ref, got), op=MPI.MAX)
+        routes = set(K.group_kernels[0].hessian_route.values()) if K.group_kernels else set()
+        chose = routes <= {"element", "quadrature"} and (bool(routes)
+                                                        or not K.group_kernels)
+        check("auto times both routes and keeps one per column slot",
+              chose and err <= 1e-13, "(%s, max rel %.1e)"
+              % (", ".join(sorted(routes)) or "no elements", err))
+        # the choice outlives the compiled code, and a kernel built alike shares it, so
+        # neither a cleared cache nor a second problem changes a bit
+        kern.set_hessian_mode("auto")
+        again = blocks(K, loc)
+        twin = QuadratureKernel(K.density, K.spaces, K.batches)
+        twin_blocks = blocks(twin, loc)
+        same = all(np.array_equal(a, b) and np.array_equal(a, c)
+                   for a, b, c in zip(got, again, twin_blocks))
+        same = COMM.allreduce(same, op=MPI.LAND)
+        check("auto's choice survives a cleared cache and holds for a kernel built alike",
+              same)
+    finally:
+        kern.set_hessian_mode(saved)
+    hp.config.hessian = "quadrature"
+    ok = kern.HESSIAN_MODE == "quadrature"
+    hp.config.hessian = saved
+    check("hm.config.hessian sets it", ok and kern.HESSIAN_MODE == saved)
+
+
 def test_host_chunk_budget():
     """On the host the chunk planner plans against the node's memory, not the whole group.
 
@@ -899,6 +1037,7 @@ if __name__ == "__main__":
         print("finite-difference consistency")
     test_finite_difference_consistency()
     test_host_batch()
+    test_quadrature_hessian()
     if RANK == 0:
         print("boundary conditions")
     test_bc_elimination()
