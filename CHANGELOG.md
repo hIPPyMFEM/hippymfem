@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- `PDEVariationalProblem.apply_ij_at(i, j, x, dir, out)`: a second-derivative block at `x`
+  applied to a direction, from the element kernels and without assembling the block
+  (`QuadratureKernel.element_hvp`, one forward tangent through the element gradient where
+  the assembled block takes one per element dof). Equal to `apply_ij` after
+  `setLinearizationPoint(x)` to round-off, the essential rows and columns and the
+  Jacobian's identity rows included; the cheaper route for a block applied once or twice at
+  a point (SOUPyMFEM's sample-average Hessians). As for the residual, an interior-facet
+  density must be unchanged when the sides of a face trade places (every DG form is).
+- The kernels of one mesh share a single device copy of its geometry and of each space's
+  tables; each kernel held its own, so a problem with a quadrature-kernel objective or
+  penalty (SOUPyMFEM's QoIs) held two or three copies of the largest arrays on the device
+  (873 against 454 MB of JAX arrays at 68 921 P1 unknowns).
+- `setLinearizationPoint(x, matrix_free=True)` (and `matrix_free=` on
+  `Model.setPointForHessianEvaluations` and `ReducedMap.setLinearizationPoint`) assembles
+  the Jacobian alone, which the incremental solves need, and `apply_ij` then takes the
+  products with the other blocks from the element kernels at `x` (`apply_ij_at`);
+  `matrix_free=(PARAMETER,)` does that for the blocks that involve the parameter and
+  assembles the rest. A point then costs almost nothing and holds less, and every product
+  costs a kernel pass. On the two Newton-CG steps of the GPU guide (four L40S, hypre on the
+  cards, `benchmarks/bench_newton_device.py --matrix-free`) the card peak fell from 4.9 to
+  4.6 GiB at 64^3 and from 19.1 to 17.2 GiB at 128^3 (hypre's `C`, `W_um` and `W_mm`; JAX's
+  pool and the host are unchanged), and the steps took 9.9 s instead of 9.6 and 51.3 s
+  instead of 49.1, with the same cost functional: a reduced-Hessian apply is about 40 %
+  slower and a point 0.4 s and 2.7 s cheaper, so it breaks even at about three applies per
+  point. On a CPU a reduced-Hessian apply costs about nine times the assembled one (a P1
+  Poisson inverse problem at 68 921 unknowns: 1.63 s against 0.19, the point 1.0 s against
+  2.1), so there it is for memory alone. It suits a point applied once or twice (a
+  sample-average Hessian) or a problem short of memory; the default stays assembled. A
+  residual declared linear in the state (`is_fwd_linear`) has no `W_uu` work at a
+  matrix-free point either.
+- A problem with an interior-facet density checks once that the density is unchanged when
+  the two sides of a face trade places (traces swapped, normal reversed, element measures
+  exchanged) and warns if it is not (`hippymfem.fem.facets.check_facet_symmetry`). A face
+  shared by two ranks is assembled by each from its own side, so such a density gives
+  results that depend on the partition; every form written in jumps, averages and the
+  normal passes. `test_modeling`'s third-derivative check used one that did not (an odd
+  power of the jumps; it compared like with like, so it passed) and now uses one that does.
 - On a CPU the element kernels step through the batch 2 048 elements at a time inside the
   compiled program (`HIPPYMFEM_HOST_BATCH`, `0` for the whole batch), which keeps each
   step's intermediates in cache: 2.2x on a P1-tetrahedron Jacobian and 3x on a third

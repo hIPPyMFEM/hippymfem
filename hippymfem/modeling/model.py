@@ -83,10 +83,19 @@ class ReducedMap(SnakeCamel):
     def _set_functional_point(self, x):
         self.functional.setLinearizationPoint(x)
 
-    def setLinearizationPoint(self, x, gauss_newton_approx=False):
-        """Fix the linearization point of the reduced Hessian."""
+    def setLinearizationPoint(self, x, gauss_newton_approx=False, matrix_free=False):
+        """Fix the linearization point of the reduced Hessian.
+
+        ``matrix_free`` is handed to the problem (see
+        :meth:`~hippymfem.modeling.PDEVariationalProblem.PDEVariationalProblem.setLinearizationPoint`):
+        its second-derivative products are then computed from the element kernels
+        rather than from assembled blocks."""
         self.gauss_newton_approx = bool(gauss_newton_approx)
-        self.problem.setLinearizationPoint(x, self.gauss_newton_approx)
+        if matrix_free:
+            self.problem.setLinearizationPoint(x, self.gauss_newton_approx,
+                                               matrix_free=matrix_free)
+        else:
+            self.problem.setLinearizationPoint(x, self.gauss_newton_approx)
         self._set_functional_point(x)
         return self
 
@@ -198,9 +207,10 @@ class Model(ReducedMap):
     def _set_functional_point(self, x):
         self.misfit.setLinearizationPoint(x, self.gauss_newton_approx)
 
-    def setPointForHessianEvaluations(self, x, gauss_newton_approx=False):
-        """Fix the linearization point of the reduced Hessian."""
-        return self.setLinearizationPoint(x, gauss_newton_approx)
+    def setPointForHessianEvaluations(self, x, gauss_newton_approx=False, matrix_free=False):
+        """Fix the linearization point of the reduced Hessian (``matrix_free``: see
+        :meth:`ReducedMap.setLinearizationPoint`)."""
+        return self.setLinearizationPoint(x, gauss_newton_approx, matrix_free=matrix_free)
 
     def applyR(self, dm, out):
         return self.prior.R.mult(dm, out)

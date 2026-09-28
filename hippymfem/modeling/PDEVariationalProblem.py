@@ -259,6 +259,11 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # face geometry are all that differ, so one kernel class serves both.
             self.facet_kernel = QuadratureKernel(
                 facet_varf, self.Vh + self.aux_spaces, self.facet_batches)
+            if self.comm.rank == 0:
+                from ..fem.facets import check_facet_symmetry
+
+                check_facet_symmetry(facet_varf, self.Vh + self.aux_spaces,
+                                     self.mesh.SpaceDimension())
 
         # assembled blocks, filled by setLinearizationPoint
         self.A = None
@@ -267,6 +272,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self.Wuu = None
         self.Wum = None
         self.Wmm = None
+        #: the point whose blocks are applied from the kernels, and which variables'
+        #: blocks those are (see setLinearizationPoint)
+        self._mf_point = None
+        self._mf_slots = frozenset()
 
         # the four solvers (see PDEProblem) start unset and default on first use
         self.solver = self.solver_adj = None
@@ -558,6 +567,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._release_operators("solver_fwd_inc", "solver_adj_inc")
         self.A = self.At = None
         self._lin_point = None
+        self._mf_point = None
         gc.collect()
         return self
 
@@ -674,13 +684,26 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         return out
 
     # ------------------------------------------------------ linearization point
-    def setLinearizationPoint(self, x, gauss_newton_approx=False):
-        """Assemble the blocks used by the incremental solves and the Hessian."""
+    def setLinearizationPoint(self, x, gauss_newton_approx=False, matrix_free=False):
+        """Assemble the blocks used by the incremental solves and the Hessian.
+
+        With ``matrix_free=True`` only the Jacobian is assembled (the incremental
+        solves need it), and :meth:`apply_ij` computes the products with the other
+        blocks from the element kernels at ``x`` (:meth:`apply_ij_at`); a collection
+        of variables, ``matrix_free=(PARAMETER,)`` say, does that for the blocks that
+        involve one of them and assembles the others.  No block matrices and no
+        scatter patterns for them, for one kernel pass per product: the trade for a
+        problem that is short of memory, or for a point whose blocks are applied once
+        or twice (the CG iterations of a Newton step apply them many times, and on
+        a problem that fits they are cheaper assembled).
+        """
         self._lin_point = [v.copy() if v is not None else None for v in x]
         # The previous point's blocks are replaced below; dropping them first keeps
         # the peak at one set of blocks rather than two (the Jacobian and the solvers
         # are handled the same way in ``_jacobian`` when the point has moved).
         self.C = self.Wuu = self.Wum = self.Wmm = None
+        self._mf_slots = _matrix_free_slots(matrix_free)
+        self._mf_point = self._lin_point if self._mf_slots else None
         if not self._jacobian_is_current(x):
             # A new Jacobian is coming, so the incremental solvers' operators and AMG
             # hierarchies (built on the old one) go first.  At the same point they are
@@ -702,6 +725,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             if not self.is_fwd_linear:
                 need.append((STATE, STATE))
             need += [(STATE, PARAMETER), (PARAMETER, PARAMETER)]
+        need = [ij for ij in need if not self._mf_slots.intersection(ij)]
         loc = self._locals(x) + self._aux_locals()
         streamed = None
         if len(need) > 1 and SHARE_HESSIAN_PASS and self._stream_shared_pass():
@@ -717,30 +741,23 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             mats = {ij: self.kernel.element_matrices(ij[0], ij[1], loc)
                     for ij in need}
         self.A, self.At = self._jacobian(x)
-        if streamed is not None:
-            self.C = streamed[(ADJOINT, PARAMETER)]
-        else:
-            self.C = self._block(ADJOINT, PARAMETER, x, test_ess=ess,
-                                 mats=mats[(ADJOINT, PARAMETER)], loc=loc)
+        blocks = {}
+        for ij, kw in (((ADJOINT, PARAMETER), dict(test_ess=ess)),
+                       ((STATE, STATE), dict(test_ess=ess, diag_policy="zero")),
+                       ((STATE, PARAMETER), dict(test_ess=ess)),
+                       ((PARAMETER, PARAMETER), {})):
+            if ij not in need:
+                continue                        # left to the kernels, or not needed
+            blocks[ij] = (streamed[ij] if streamed is not None else
+                          self._block(ij[0], ij[1], x, mats=mats[ij], loc=loc, **kw))
+        del mats, streamed
         # The attributes alone hold the blocks: anything else keeping them would
         # keep every linearization point's blocks alive for the life of the problem.
-        if gauss_newton_approx:
-            self.Wuu = None
-            self.Wum = None
-            self.Wmm = None
-        elif streamed is not None:
-            self.Wuu = streamed.get((STATE, STATE))
-            self.Wum = streamed[(STATE, PARAMETER)]
-            self.Wmm = streamed[(PARAMETER, PARAMETER)]
-        else:
-            self.Wuu = None if self.is_fwd_linear else self._block(
-                STATE, STATE, x, test_ess=ess, diag_policy="zero",
-                mats=mats[(STATE, STATE)], loc=loc)
-            self.Wum = self._block(STATE, PARAMETER, x, test_ess=ess,
-                                   mats=mats[(STATE, PARAMETER)], loc=loc)
-            self.Wmm = self._block(PARAMETER, PARAMETER, x,
-                                   mats=mats[(PARAMETER, PARAMETER)], loc=loc)
-        del mats, streamed
+        self.C = blocks.get((ADJOINT, PARAMETER))
+        self.Wuu = blocks.get((STATE, STATE))
+        self.Wum = blocks.get((STATE, PARAMETER))
+        self.Wmm = blocks.get((PARAMETER, PARAMETER))
+        del blocks
         fwd = self._get_solver("solver_fwd_inc")
         adj = self._get_solver("solver_adj_inc")
         _set_operator_once(fwd, self.A, share_from=self.solver)
@@ -808,6 +825,16 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         """Apply the ``(i, j)`` second-derivative block to ``dir``."""
         if self.A is None:
             raise RuntimeError("setLinearizationPoint must be called first")
+        if (getattr(self, "_mf_point", None) is not None and {i, j} != {STATE, ADJOINT}
+                and self._mf_slots.intersection((i, j))):
+            if (i, j) == (ADJOINT, ADJOINT) or (
+                    self.gauss_newton_approx and ADJOINT not in (i, j)) or (
+                    (i, j) == (STATE, STATE) and self.is_fwd_linear):
+                # linear in p; Gauss-Newton: no W; linear in u: no W_uu (the assembled
+                # point skips that block for the same reason)
+                out.zero()
+                return out
+            return self.apply_ij_at(i, j, self._mf_point, dir, out)
         KKT = {
             (ADJOINT, STATE): (self.A, False),
             (STATE, ADJOINT): (self.A, True),
@@ -835,6 +862,54 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             mat.MultTranspose(dir.hypre, out.hypre)
         else:
             mat.Mult(dir.hypre, out.hypre)
+        return out
+
+    def apply_ij_at(self, i, j, x, dir, out):
+        """The ``(i, j)`` second-derivative block at ``x`` applied to ``dir``, from the
+        element kernels and without assembling the block: what :meth:`apply_ij` gives
+        after :meth:`setLinearizationPoint` at ``x``.
+
+        The essential dofs are treated as the assembled blocks treat them: a
+        direction in the state or the adjoint loses its essential entries, the
+        product in the state or the adjoint has them zeroed, and the Jacobian's pair
+        puts the identity back on its essential rows.  One forward tangent through
+        the element gradient per product, where assembling takes a tangent per element
+        dof and a scatter: the cheaper route for a block applied once or twice at a
+        point.
+
+        Like the residual and the gradients, a product is assembled without
+        communication, each rank taking a face it shares with another from its own
+        side; so an interior-facet density must be unchanged when the two sides trade
+        places (as a DG form is, its jumps and normal changing sign together).  The
+        assembled blocks do not need that for their transposes; the products do.
+        """
+        ess = self.bc0.ess
+        dvec = dir
+        if j in (STATE, ADJOINT) and len(ess):
+            dvec = dir.copy()
+            dvec.array[np.asarray(ess, dtype=np.int64)] = 0.0
+        loc = self._locals(x) + self._aux_locals()
+        jl = self.Vh[j].local_values(dvec)
+        res = assemble_vector(self.Vh[i], self.batches.groups,
+                              self.kernel.element_hvp(i, j, loc, jl), self.nelem)
+        if self.bdr_kernel is not None:
+            res.axpy(1.0, assemble_boundary_vector(
+                self.Vh[i], self.bdr_batches.groups,
+                self.bdr_kernel.element_hvp(i, j, loc, jl)))
+        if self.facet_kernel is not None:
+            from ..fem.facets import assemble_facet_vector, facet_values
+
+            floc = self._facet_locals(x)
+            res.axpy(1.0, assemble_facet_vector(
+                self.Vh[i], self.facet_batches.groups,
+                self.facet_kernel.element_hvp(i, j, floc, facet_values(self.Vh[j], dvec)),
+                tables=self.facet_batches.tables(self.Vh[i])))
+        if i in (STATE, ADJOINT) and len(ess):
+            idx = np.asarray(ess, dtype=np.int64)
+            res.array[idx] = 0.0
+            if {i, j} == {STATE, ADJOINT}:          # the Jacobian: ones on the diagonal
+                res.array[idx] = dir.array[idx]
+        out.assign(res)
         return out
 
     def apply_ijk(self, i, j, k, x, jdir, kdir, out):
@@ -1008,6 +1083,16 @@ def _same(a, b):
     if a.local_size != b.local_size:
         return False
     return a.copy().axpy(-1.0, b).norm("linf") == 0.0
+
+
+def _matrix_free_slots(matrix_free):
+    """The variables whose second-derivative blocks are left to the kernels: every one
+    for ``True``, none for ``False`` or ``None``, else the collection given."""
+    if matrix_free is True:
+        return frozenset(range(NVAR))
+    if not matrix_free:
+        return frozenset()
+    return frozenset(int(v) for v in matrix_free)
 
 
 def _krylov_class():

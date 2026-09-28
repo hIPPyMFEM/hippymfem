@@ -183,6 +183,30 @@ def _put(x):
     return jax.device_put(np.ascontiguousarray(x), device())
 
 
+#: Device copies of the arrays every kernel on a group reads (the group's geometry,
+#: the tables of a space on it), one per (owner, attribute, device): the kernels of a
+#: problem, of its objective and of a penalty over the same mesh share them instead of
+#: holding a copy each (for an optimization-under-uncertainty problem with its QoI, a
+#: second copy of the geometry was the largest array on the device).  Keyed on the
+#: owner's identity, so an entry goes with its owner.
+_SHARED_DEVICE = None
+
+
+def _shared_put(owner, key, array):
+    """``array``, an array of ``owner`` named ``key``, on the current device: the copy
+    every kernel shares."""
+    global _SHARED_DEVICE
+    if _SHARED_DEVICE is None:
+        from ..common.identitycache import IdentityCache
+
+        _SHARED_DEVICE = IdentityCache()
+    d = device()
+    got = _SHARED_DEVICE.get((owner,), extra=(key, d))
+    if got is None:
+        got = _SHARED_DEVICE.put((owner,), _put(array), extra=(key, d))
+    return got
+
+
 @jax.jit
 def gather_rows(values, idx, signs=None):
     """``values[idx]`` (times ``signs``), compiled.
@@ -924,9 +948,13 @@ class GroupKernel:
         d = device()
         ent = self._dev.get(d)
         if ent is None:
-            tabs = tuple(tuple(_put(a) for a in t.jax_tables()) for t in self.tables)
+            # one device copy per group and per space table, whichever kernel asks
+            tabs = tuple(tuple(_shared_put(t, ("tables", k), a)
+                               for k, a in enumerate(t.jax_tables()))
+                         for t in self.tables)
             geo = None if self._stream_geometry(d) else tuple(
-                _put(getattr(self.group, n)) for n in self._geo_names)
+                _shared_put(self.group, n, getattr(self.group, n))
+                for n in self._geo_names)
             ent = self._dev[d] = (tabs, geo)
         tabs, geo = ent
         if streaming or geo is None:
@@ -1052,6 +1080,33 @@ class GroupKernel:
         """Every Hessian block at once: ``H[i][j]`` of shape ``(ne, nd_i, nd_j)``,
         :meth:`hess_cols` over every slot."""
         return self.hess_cols(range(self.nslots))
+
+    def hvp_block(self, i, j):
+        """Batched ``d2R/d_i d_j`` applied to a direction in slot ``j``.
+
+        Returns a callable ``(dofs, jdir, tabs, geo, params) -> (ne, nd_i)``: one
+        forward tangent through the slot-``i`` gradient, where the assembled block
+        takes ``nd_j`` tangents and a scatter into a matrix.  For a block applied once
+        or twice at a point (the sample loop of a sample-average Hessian) this is the
+        cheaper way to its products.
+        """
+        key = ("hv", i, j)
+        if key not in self._cache:
+            R = self._functional()
+            nslots = self.nslots
+
+            def f(dofs, jdir, tabs, geo, params):
+                tj = tuple(jdir if s == j else jnp.zeros_like(dofs[s])
+                           for s in range(nslots))
+
+                def gi(zz):
+                    return jax.grad(lambda w: R(w, tabs, geo, params))(zz)[i]
+
+                return jax.jvp(gi, (dofs,), (tj,))[1]
+
+            self._cache[key] = self._chunked(
+                _mapped_kernel(f, self._axes(2)), self._axes(2))
+        return self._cache[key]
 
     def third_block(self, i, j, k):
         """Batched ``d3R/d_i d_j d_k`` contracted with directions in slots ``j``, ``k``.
@@ -1304,6 +1359,18 @@ class QuadratureKernel:
             dofs = gk.gather(local_arrays)
             out.append(gk.tables[i].transform_dual_vector(
                 _result(gk.grad_block(i)(dofs, *gk.mapped(), pr))))
+        return out
+
+    def element_hvp(self, i, j, local_arrays, jdir_local, params=()):
+        """Element vectors of the second-derivative block ``(i, j)`` applied to a
+        direction in slot ``j``, without forming the block (:meth:`GroupKernel.hvp_block`)."""
+        out = []
+        pr = _params(params)
+        for gk in self.group_kernels:
+            dofs = gk.gather(local_arrays)
+            jd = _put(gk.tables[j].gather(jdir_local))
+            out.append(gk.tables[i].transform_dual_vector(_result(
+                gk.hvp_block(i, j)(dofs, jd, *gk.mapped(), pr))))
         return out
 
     def element_third(self, i, j, k, local_arrays, jdir_local, kdir_local,

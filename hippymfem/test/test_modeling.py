@@ -453,7 +453,7 @@ def test_third_dir():
         return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
 
     def facet(u, m, p, x, n, h):
-        return jnp.exp(avg(m)) * jump(u) ** 2 * jump(p)
+        return jnp.exp(avg(m)) * jump(u) * jump(p) * (1.0 + jump(u) ** 2)
 
     def fbdr(u, m, p, x, n, h):
         return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
@@ -493,6 +493,112 @@ def test_third_dir():
             diff.axpy(-1.0, ref)
             worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
         check("fused = pairwise, %s" % name, worst < 1e-12, "(rel %.1e)" % worst)
+
+
+def test_apply_ij_at():
+    """``apply_ij_at`` (matrix-free) equals ``apply_ij`` on the assembled blocks.
+
+    Every pair of the Hessian, the Jacobian's included, with essential dofs, a
+    nonlinear boundary term and (on an L2 space) interior facets; and two problems on
+    one mesh share the device copy of its geometry.
+    """
+    if RANK == 0:
+        print("PDE: matrix-free second-derivative products against the assembled blocks")
+    from hippymfem.fem.facets import avg, jump
+
+    pmesh = mesh2d(6)
+    rng = np.random.default_rng(5)
+
+    def varf(u, m, p, x):
+        return (jnp.exp(m.val) * (1.0 + u.val ** 2) * hm.inner(u.grad, p.grad)
+                + jnp.sin(m.val) * u.val ** 3 * p.val)
+
+    def bdr(u, m, p, x, n):
+        return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
+
+    def facet(u, m, p, x, n, h):
+        # unchanged when the two sides trade places, as a DG form is: each rank of a
+        # shared face sees it from its own side (see apply_ij_at)
+        return jnp.exp(avg(m)) * jump(u) * jump(p) * (1.0 + jump(u) ** 2)
+
+    def fbdr(u, m, p, x, n, h):
+        return jnp.exp(0.5 * m.val) * u.val ** 2 * p.val
+
+    Vu = hm.FunctionSpace.H1(pmesh, 2)
+    Vm = hm.FunctionSpace.H1(pmesh, 1)
+    bc = hm.DirichletBC(Vu, 0.0, bdr_attributes=[1, 3])
+    Wu = hm.FunctionSpace.L2(pmesh, 1)
+    cases = [("H1, essential dofs and a boundary term", [Vu, Vm, Vu], bc,
+              dict(bdr_varf=bdr)),
+             ("L2 with facets", [Wu, Vm, Wu], None, dict(bdr_varf=fbdr, facet_varf=facet))]
+
+    def rand(V):
+        v = V.vector()
+        v.array[:] = rng.standard_normal(v.local_size)
+        return v
+
+    pairs = [(ADJOINT, STATE), (STATE, ADJOINT), (ADJOINT, PARAMETER), (PARAMETER, ADJOINT),
+             (STATE, STATE), (STATE, PARAMETER), (PARAMETER, STATE), (PARAMETER, PARAMETER)]
+    for name, Vh, b, kw in cases:
+        pde = hm.PDEVariationalProblem(Vh, varf, b, b.homogeneous() if b else None,
+                                       is_fwd_linear=False, **kw)
+        x = [rand(Vh[0]), rand(Vh[1]), rand(Vh[2])]
+        pde.setLinearizationPoint(x, gauss_newton_approx=False)
+        worst = 0.0
+        for i, j in pairs:
+            d = rand(Vh[j])
+            ref = pde.apply_ij(i, j, d, Vh[i].vector())
+            got = pde.apply_ij_at(i, j, x, d, Vh[i].vector())
+            diff = got.copy()
+            diff.axpy(-1.0, ref)
+            worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
+        check("matrix-free = assembled, %s" % name, worst < 1e-12, "(rel %.1e)" % worst)
+        # a linearization point with every block, or the parameter's, left to the
+        # kernels gives the same products through apply_ij
+        for gn in (False, True):
+            pde.setLinearizationPoint(x, gauss_newton_approx=gn)
+            dirs = {v: rand(Vh[v]) for v in (STATE, PARAMETER, ADJOINT)}
+            ref = {ij: pde.apply_ij(ij[0], ij[1], dirs[ij[1]], Vh[ij[0]].vector()).copy()
+                   for ij in pairs}
+            for mode in (True, (PARAMETER,)):
+                pde.setLinearizationPoint(x, gauss_newton_approx=gn, matrix_free=mode)
+                worst = 0.0
+                for ij in pairs:
+                    got = pde.apply_ij(ij[0], ij[1], dirs[ij[1]], Vh[ij[0]].vector())
+                    diff = got.copy()
+                    diff.axpy(-1.0, ref[ij])
+                    scale = ref[ij].norm("l2")
+                    worst = max(worst, diff.norm("l2") / scale if scale > 0 else got.norm("l2"))
+                check("matrix-free point (%s%s) = assembled, %s"
+                      % ("all" if mode is True else "parameter", ", Gauss-Newton" if gn else "",
+                         name), worst < 1e-12, "(rel %.1e)" % worst)
+    # the reduced Hessian of an inverse problem at a matrix-free point
+    model, Vhm, mtrue, _u, _B = build_inverse_problem(n=8, order=2, ntargets=16)
+    xm = model.generate_vector()
+    xm[PARAMETER].assign(mtrue)
+    model.solveFwd(xm[STATE], xm)
+    model.solveAdj(xm[ADJOINT], xm)
+    dm = rand(Vhm[PARAMETER])
+    Hd = {}
+    for mf in (False, True):
+        model.setPointForHessianEvaluations(xm, matrix_free=mf)
+        H = hm.ReducedHessian(model)
+        out = Vhm[PARAMETER].vector()
+        H.mult(dm, out)
+        Hd[mf] = out
+    diff = Hd[True].copy()
+    diff.axpy(-1.0, Hd[False])
+    e = diff.norm("l2") / Hd[False].norm("l2")
+    check("reduced Hessian at a matrix-free point = assembled", e < 1e-12, "(rel %.1e)" % e)
+    # one device copy of a group's geometry, whichever problem's kernel asks
+    other = hm.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                     is_fwd_linear=False)
+    first = hm.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                     is_fwd_linear=False)
+    ga = first.kernel.group_kernels[0].mapped()[1]
+    gb = other.kernel.group_kernels[0].mapped()[1]
+    shared = ga is not None and gb is not None and all(a is b for a, b in zip(ga, gb))
+    check("kernels on one mesh share its device geometry", shared)
 
 
 def test_hessian_properties():
@@ -584,6 +690,7 @@ if __name__ == "__main__":
     test_model_verify()
     test_model_verify_nonlinear_inhomogeneous_bc()
     test_third_dir()
+    test_apply_ij_at()
     test_hessian_properties()
     if RANK == 0:
         print("-" * 74)

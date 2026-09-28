@@ -526,7 +526,43 @@ def test_facets_with_essential_bcs():
           abs(hslope - 1.0) < 0.1, "(slope %.4f)" % hslope)
 
 
+def test_facet_symmetry_check():
+    """A density that changes when the sides of a face trade places draws a warning
+    (its results would depend on the partition); DG forms do not."""
+    import warnings
+
+    from hippymfem.fem.facets import avg, avg_grad, check_facet_symmetry, jump
+
+    if RANK == 0:
+        print("facets: the side-swap check of a facet density")
+    pm = mesh(4)
+    W = FunctionSpace.L2(pm, 1)
+    Vm = FunctionSpace.H1(pm, 1)
+    cases = [
+        ("SIPG", lambda u, m, p, x, n, h: (
+            -jnp.dot(avg_grad(u), n) * jump(p) - jnp.dot(avg_grad(p), n) * jump(u)
+            + 5.0 * 0.5 * (1.0 / h[0] + 1.0 / h[1]) * jump(u) * jump(p)), False),
+        ("jump times the normal", lambda u, m, p, x, n, h: jump(u) * avg(p) * n[0], False),
+        ("an odd power of the jumps", lambda u, m, p, x, n, h:
+            jnp.exp(avg(m)) * jump(u) ** 2 * jump(p), True),
+    ]
+    for name, f, odd in cases:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            check_facet_symmetry(f, [W, Vm, W], 2)
+        warned = any(issubclass(c.category, RuntimeWarning) for c in caught)
+        check("side-swap check: %s %s" % (name, "warned" if odd else "passed"), warned == odd)
+    # and the problem runs it when it is built
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hp.PDEVariationalProblem([W, Vm, W], lambda u, m, p, x: u.val * p.val, None, None,
+                                 is_fwd_linear=True, facet_varf=cases[2][1])
+    warned = any("trade places" in str(c.message) for c in caught)
+    check("the problem checks its facet density", warned == (RANK == 0))
+
+
 def main():
+    test_facet_symmetry_check()
     test_sipg_against_mfem()
     test_nitsche_against_mfem()
     test_residual_matches_matrix()

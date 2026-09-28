@@ -98,6 +98,9 @@ def main():
     ap.add_argument("--release-linearization", action="store_true",
                     help="drop the linearization point at a forward solve for a new parameter "
                          "(safe for this line-search Newton-CG; needed for 128^3 on one 80 GB card)")
+    ap.add_argument("--matrix-free", action="store_true",
+                    help="matrix-free linearization points: assemble the Jacobian alone and take "
+                         "the products with the other Hessian blocks from the element kernels")
     ap.add_argument("--cart-part", action="store_true",
                     help="partition the box as a Cartesian grid of ranks instead of METIS on every rank")
     ap.add_argument("--newton-only", action="store_true",
@@ -134,11 +137,12 @@ def main():
     Vh = [Vu, Vm, Vu]
     say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks, %d elem/rank"
         % (N, ORDER, Vu.GlobalTrueVSize(), Vm.GlobalTrueVSize(), COMM.size, pmesh.GetNE()))
-    say("  kernels on %s (%s), MFEM on %s, assembly %s, parmat %s, pin %s"
+    say("  kernels on %s (%s), MFEM on %s, assembly %s, parmat %s, pin %s%s"
         % (kernel_mod.device(), gpu_name(), mfem_dev, asm.assembly_backend(),
            os.environ.get("HIPPYMFEM_PARMAT", "auto"),
            "rank->%s" % _jaxconfig.PINNED_DEVICE if _jaxconfig.PINNED_DEVICE is not None
-           else (_jaxconfig.PIN_SKIPPED or "launcher/single device")))
+           else (_jaxconfig.PIN_SKIPPED or "launcher/single device"),
+           ", matrix-free linearization points" if args.matrix_free else ""))
 
     pde_varf = lambda u, m, p, x: jnp.exp(m.val) * hm.inner(u.grad, p.grad)   # noqa: E731
     bc = hm.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
@@ -166,6 +170,12 @@ def main():
     B.perturb(data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
+    if args.matrix_free:
+        # every linearization point, the timed stages' and the Newton-CG solver's alike
+        import functools
+
+        model.setPointForHessianEvaluations = functools.partial(
+            model.setPointForHessianEvaluations, matrix_free=True)
 
     # ---- the pieces of a Newton-CG iteration, at the prior mean
     say("  [%.0f s] synthetic data forward solve done" % (time.perf_counter() - t_start))
@@ -243,6 +253,7 @@ def main():
            "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(), "mfem_device": mfem_dev,
            "backend": asm.assembly_backend(), "symmetric_jacobian": bool(args.symmetric_jacobian),
            "release_linearization": bool(args.release_linearization), "parmat": os.environ.get("HIPPYMFEM_PARMAT", "auto"),
+           "matrix_free": bool(args.matrix_free),
            "t_fwd": t_fwd, "t_adj": t_adj, "t_grad": t_grad, "t_hess_blocks": t_hess,
            "t_hess_blocks_warm": t_hess_warm,
            "t_hess_apply": t_apply, "t_hess_apply_cold": t_apply_cold, "steps": args.steps, "t_steps": t_step,

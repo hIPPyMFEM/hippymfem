@@ -74,6 +74,63 @@ def avg(f):
     return 0.5 * (f.minus + f.plus)
 
 
+def check_facet_symmetry(density, spaces, sdim, nparams=0, rtol=1e-9, seed=20260927):
+    """Warn if an interior-facet density changes when the two sides of a face trade
+    places; returns the relative change it found (``None`` if the density could not be
+    evaluated on the random traces it tries).
+
+    A face shared by two ranks is assembled by each from its own side (the element it
+    owns is the one the normal points out of there), and a face interior to a rank from
+    the side MFEM's orientation picks; so the density must be the same with the traces
+    swapped, the normal reversed and the two element measures exchanged, as a DG form
+    written in jumps, averages and the normal is.  One that is not gives results that
+    depend on the partition and on the face orientation (a matrix-free product of
+    :meth:`~hippymfem.modeling.PDEVariationalProblem.PDEVariationalProblem.apply_ij_at`,
+    for one, then differs from the assembled block's on more than one rank).  The check
+    evaluates the density once each way on random traces.
+    """
+    import warnings
+
+    import jax.numpy as jnp
+    from .kernel import Field
+
+    rng = np.random.default_rng(seed)
+
+    def side(v):
+        if v == 1:
+            return Field(jnp.asarray(rng.uniform(0.1, 0.5)),
+                         jnp.asarray(rng.uniform(-0.5, 0.5, sdim)))
+        return Field(jnp.asarray(rng.uniform(0.1, 0.5, v)),
+                     jnp.asarray(rng.uniform(-0.5, 0.5, (v, sdim))))
+
+    try:
+        fields = [FacetField(side(as_space(sp).vdim), side(as_space(sp).vdim))
+                  for sp in spaces]
+        x = jnp.asarray(rng.uniform(-1.0, 1.0, sdim))
+        n = rng.standard_normal(sdim)
+        n = jnp.asarray(n / np.linalg.norm(n))
+        h = jnp.asarray(rng.uniform(0.5, 2.0, 2))
+        params = [1.0] * int(nparams)
+        one = float(density(*fields, x, n, h, *params))
+        other = float(density(*[FacetField(f.plus, f.minus) for f in fields], x, -n,
+                              h[::-1], *params))
+    except Exception:                    # noqa: BLE001 - a check, never a failure
+        return None
+    if not (np.isfinite(one) and np.isfinite(other)):
+        return None
+    rel = abs(one - other) / max(abs(one), abs(other), 1e-300)
+    if rel > rtol:
+        warnings.warn(
+            "the interior-facet density changes when the two sides of a face trade "
+            "places (relative change %.1e on random traces, with the normal reversed "
+            "and the element measures exchanged).  Each rank assembles a face it shares "
+            "with another from its own side, so such a density gives results that "
+            "depend on the partition and on the face orientation; a DG form written in "
+            "jumps, averages and the normal does not change." % rel,
+            RuntimeWarning, stacklevel=3)
+    return rel
+
+
 def jump_grad(f):
     r""":math:`[\![\nabla f]\!]`."""
     return f.minus.grad - f.plus.grad
