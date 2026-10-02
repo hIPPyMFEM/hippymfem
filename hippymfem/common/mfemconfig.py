@@ -180,6 +180,7 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
     set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)
+    aware = _check_gpu_aware_mpi(comm, quiet)
     # hypre's device memory: "auto" (the default) recycles up to HYPRE_POOL_SETUP_MB of
     # it while a BoomerAMG setup runs and keeps HYPRE_POOL_KEEP_MB of the smallest blocks
     # between setups (HIPPYMFEM_HYPRE_POOL_KEEP changes that; 0 keeps nothing); a number
@@ -200,7 +201,9 @@ def configure_device(kind="gpu", comm=None, quiet=False):
         if megabytes > 0:
             set_hypre_pool(megabytes)
     if not quiet and local == 0:
-        print("hippymfem: MFEM on %s device %d of %d" % (kind, idx, n), flush=True)
+        print("hippymfem: MFEM on %s device %d of %d%s"
+              % (kind, idx, n, "; hypre hands MPI its buffers on the GPU" if aware else ""),
+              flush=True)
         from .._jaxconfig import PIN_SKIPPED
 
         if PIN_SKIPPED and n > 1:
@@ -230,6 +233,94 @@ def _hypre_library():
     except OSError:
         pass
     return None
+
+
+def hypre_gpu_aware_mpi():
+    """Whether the hypre of this process hands MPI its buffers on the GPU.
+
+    hypre exchanges the values of shared dofs at every product with a parallel matrix.
+    As PyMFEM builds it, it copies them to CPU memory, sends them from there and copies
+    what it receives back.  Configured with ``HYPRE_WITH_GPU_AWARE_MPI``
+    (``tools/rebuild_hypre_gpu_aware_mpi.sh``) it gives MPI the address of the buffer
+    on the GPU instead, which needs an MPI that can read one (:func:`mpi_gpu_support`).
+    The option is fixed when hypre is compiled; this reads what the loaded library was
+    built with.
+    """
+    lib = _hypre_library()
+    if lib is None or not hasattr(lib, "hypre_GetGpuAwareMPI"):
+        return False
+    import ctypes
+
+    try:
+        lib.hypre_GetGpuAwareMPI.restype = ctypes.c_int
+        return bool(lib.hypre_GetGpuAwareMPI())
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def mpi_gpu_support():
+    """Whether the MPI library of this process says it can send from GPU memory:
+    ``True``, ``False``, or ``None`` when it has no way of saying.
+
+    Open MPI answers through ``MPIX_Query_cuda_support``.  The MPICH family has no
+    such call; its support is switched on by ``MPICH_GPU_SUPPORT_ENABLED=1``, which is
+    what is read for it.  ``True`` says that the library can, not that the transport
+    chosen for this run does: Open MPI 4 with a UCX that was built without CUDA
+    still answers yes, and needs ``--mca pml ob1 --mca btl self,smcuda``.
+    """
+    import ctypes
+
+    try:
+        with open("/proc/self/maps") as f:
+            names = {line.split(None, 5)[-1].strip() for line in f if "/libmpi" in line}
+    except OSError:
+        names = set()
+    for name in sorted(names):
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        if hasattr(lib, "MPIX_Query_cuda_support"):
+            lib.MPIX_Query_cuda_support.restype = ctypes.c_int
+            return bool(lib.MPIX_Query_cuda_support())
+    v = os.environ.get("MPICH_GPU_SUPPORT_ENABLED")
+    if v is not None:
+        return v.strip() == "1"
+    return None
+
+
+def _check_gpu_aware_mpi(comm=None, quiet=False):
+    """Stop, with the reason, a run whose hypre would hand device addresses to an MPI
+    that reads them as CPU memory: the alternative is a segmentation fault inside MPI
+    at the first product with a parallel matrix."""
+    if not hypre_gpu_aware_mpi():
+        return False
+    if comm is None:
+        from mpi4py import MPI
+
+        comm = MPI.COMM_WORLD
+    if comm.Get_size() < 2:
+        return True
+    ok = mpi_gpu_support()
+    if ok is False:
+        raise RuntimeError(
+            "this hypre was built with HYPRE_WITH_GPU_AWARE_MPI: it gives MPI the "
+            "addresses of its buffers on the GPU, and the MPI library of this run says "
+            "it has no CUDA support, so it would read a device address as CPU memory "
+            "and crash at the first product with a parallel matrix.\n"
+            "  Run with a CUDA-aware MPI (Open MPI built --with-cuda; with Open MPI 4 "
+            "and a UCX without CUDA, 'mpirun --mca pml ob1 --mca btl self,smcuda'), or "
+            "use the libHYPRE.so that tools/build_pymfem_cuda.sh built, which stages "
+            "its buffers through CPU memory itself.")
+    if ok is None and not quiet and comm.Get_rank() == 0:
+        import warnings
+
+        warnings.warn(
+            "this hypre hands MPI its buffers on the GPU (HYPRE_WITH_GPU_AWARE_MPI), "
+            "and this MPI library does not say whether it can send from GPU memory. "
+            "If the run crashes inside MPI at its first parallel matrix-vector "
+            "product, that is why.", RuntimeWarning, stacklevel=3)
+    return True
 
 
 #: The kernel of hypre's matrix-vector products that :func:`set_hypre_spmv` chose:
