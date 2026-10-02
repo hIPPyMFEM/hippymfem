@@ -641,10 +641,12 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
     Hessian blocks made on one of sixteen instances with 2.1 million dofs, 89 % were
     under 1 MB and took 6 to 70 us each, and the 256 larger ones took 1.7 to 2.3 ms
     each (0.2 to 0.3 ms with two processes on an H100).  Replaying those recorded
-    allocations and frees under each policy (``benchmarks/DESIGN_NOTES.md``, section
-    11), the driver calls cost 1.34 s without a pool, 1.03 s with 1024 MB during a
-    setup only, 0.43 s when 512 MB are kept between setups as well and 0.34 s with
-    1024 MB kept.
+    allocations and frees under each policy (``benchmarks/hypre_pool_trace.py`` and
+    ``hypre_pool_replay.py``; ``benchmarks/DESIGN_NOTES.md``, section 11), the driver
+    calls cost 1.34 s without a pool, 1.03 s with 1024 MB during a setup only, 0.47 s
+    when 512 MB are kept between setups as well and 0.34 s with 1024 MB kept.
+    Measured, a forward solve on the sixteen instances took 2.67, 2.31 and 2.26 s
+    with 0, 512 and 1024 MB kept.
 
     :func:`configure_device` installs the scoped pool by default
     (``HIPPYMFEM_HYPRE_POOL=auto``: :data:`HYPRE_POOL_SETUP_MB` during a setup and

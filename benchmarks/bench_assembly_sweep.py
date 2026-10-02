@@ -65,6 +65,15 @@ def main():
     info = B.machine()
     info["hypre_device"] = bool(args.hypre_device)
     info["hessian_route"] = str(getattr(hm.config, "hessian", ""))
+    # what sizes the kernels' chunks: JAX's share of the card and the library's settings
+    info["env"] = {k: v for k, v in os.environ.items()
+                   if k.startswith("HIPPYMFEM_") or k.startswith("XLA_")}
+    try:
+        from hippymfem.fem import kernel as _K
+
+        info["jax_bytes_limit"] = int((_K.device().memory_stats() or {}).get("bytes_limit", 0))
+    except Exception:                                                # noqa: BLE001
+        info["jax_bytes_limit"] = 0
     B.say("host %s, GPUs %s, hypre on %s, density %s, route %s"
           % (info["host"], info["gpus"], "device" if args.hypre_device else "CPU",
              args.density, info["hessian_route"]))

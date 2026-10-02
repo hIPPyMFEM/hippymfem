@@ -12,7 +12,8 @@ CPU and GPU memory, how many bytes and how long.  It then repeats the two increm
 solves with the vectors left on the GPU (MFEM's solver called directly), so that the
 difference is the cost of the library's own vector handling: the copy of the right-hand
 side, the zeroing of the boundary entries and of the solution, and the updates between
-the operations, which run on the CPU.
+the operations.  These ran on the CPU until the vectors followed their data onto the GPU
+(``HIPPYMFEM_DEVICE_VECTORS``), which is what the counted copies show.
 
 The problem is that of ``bench_scaling.py`` and ``bench_newton_device.py``.
 """

@@ -153,6 +153,25 @@ mesh            unknowns     GPUs                                two Newton-CG s
 400\ :sup:`3`   1.09 B       24 RTX PRO 6000 Blackwell           191 s
 ==============  ===========  ==================================  =====================
 
+These rows, and the tables above them, were measured in September 2026.  Since then the
+assembled matrices and the vectors stay on the card, hypre multiplies with its own
+kernel on several ranks and recycles its device memory (`Several GPUs`_, `How the
+parallel matrix is built`_), and the same benchmark, with the same cost functional and
+CG counts, takes:
+
+==============  ==================================  ===========  =========
+mesh            GPUs                                before       now
+==============  ==================================  ===========  =========
+64\ :sup:`3`    1 H100                              18.5 s       6.1 s
+128\ :sup:`3`   1 H100                              109 s        42.9 s
+128\ :sup:`3`   4 RTX PRO 6000 Blackwell            29.7 s       18.1 s
+256\ :sup:`3`   8 RTX PRO 6000 Blackwell            140 s        101 s
+==============  ==================================  ===========  =========
+
+On the H100 at 128\ :sup:`3` the forward solve went from 21.4 to 5.6 s, the warm Hessian
+blocks from 9.6 to 2.4 s, a reduced-Hessian action from 2.0 to 1.6 s and the peak of the
+card from 68.8 to 58.7 GiB.  The other rows have not been run again.
+
 The Blackwell cards were split into two 48 GB MIG slices each, one rank per slice.
 Doubling them at 256\ :sup:`3` is 1.81x, 90 % of linear.  At 400\ :sup:`3` the two steps
 are warm, as every row is, and take 190.9 s with 3 and 9 CG iterations: forward solve
@@ -197,39 +216,45 @@ million state dofs per GPU (:ref:`several-gpus` says where the rest goes).
 
 **The speedup depends on the card and on the mesh.**  Element kernels are double
 precision throughout.  On meshes with 0.3 to 2.1 million state dofs the kernel speedup
-over a host core (one core of a Xeon Platinum 8462Y+) is 17x to 90x on an L40S and 40x to
-477x on an H100 (P1 triangles to P3 hexahedra, measured on 2026-10-02 with
-``benchmarks/bench_assembly_sweep.py``, the smallest of two or three runs on the card; in
-three dimensions 41x to 90x and 90x to 477x), so the kernels run 2.1 to 5.6 times faster
-on the H100 than on the L40S.  Small meshes mislead in both directions.  A kernel call
+over a host core (one core of a Xeon Platinum 8462Y+) is 17x to 89x on an L40S and 43x to
+537x on an H100 (P1 triangles to P3 hexahedra, measured on 2026-10-02 with
+``benchmarks/bench_assembly_sweep.py``, the smaller of two runs on the card; in three
+dimensions 41x to 89x and 95x to 537x), so the kernels run 2.3 to 6.3 times faster on
+the H100 than on the L40S.  Small meshes mislead in both directions.  A kernel call
 costs at least about 1.5 ms on a card, so 65 000 P1 triangles show 15x on an H100 where
-two million show 40x.  And the host core's time per element is not constant either: P3
+two million show 43x.  And the host core's time per element is not constant either: P3
 hexahedra took 1 025 us per element at 2 744 elements and 606 us at 32 768 (793, 1 029,
 659 and 643 us at 512, 2 744, 8 000 and 17 576 elements on another node), so the
 2 744-element mesh that this guide used before showed 737x where the larger mesh shows
-477x.  The library therefore does not promise a speedup;
+537x.  The library therefore does not promise a speedup;
 :mod:`hippymfem.test.test_gpu` measures one for whatever card is present.  (An earlier version of this guide gave matrix-multiply rates in double
 precision for the two cards.  The H100 figure had been taken with JAX's 64-bit mode off,
 so it was a single-precision rate, and the single-precision figures were TF32 rates; the
 table has been removed.)
 
-**A complete assembly gains less than its kernel, and the GPU is not why.**  With hypre on
-the card, the same cases assemble 11x to 36x faster on an L40S and 15x to 73x on an H100
-than on a host core (30x to 36x and 44x to 73x in three dimensions).  Taken apart on an
-H100 for 32 768 Q2 hexahedra, a matrix of 17 million entries
-(``benchmarks/bench_assembly_profile.py``): the kernel 12 ms, and 61 ms from the element
-matrices to the hypre matrix, of which the scatter on the card is 0.4 ms, the copy of
-the assembled values to the host 32 ms (136 MB at 4.2 GB/s), the upload of the finished
-matrix to the card about 20 ms (206 MB), and the rest the essential rows and MFEM's
-two-block constructor.  A complete assembly timed as a whole took 71 ms, so more than
-80 % of it is the passage through host memory.  The host is on the way
-because the essential rows and the ghost-row exchange are done there and because
-PyMFEM's constructors take host arrays.  On one rank the route used to be worse: the
-local matrix went through the constructor that copies and splits a row-major CSR on the
-host, 171 ms for the same matrix.  A block whose prolongations are the identity now takes
-the true-dof route as well when hypre is on a device (``HIPPYMFEM_TDOF_IDENTITY=auto``),
-which made a complete assembly on one card 1.4 to 3.2 times faster with matrices that are
-identical to round-off (the device scatter does not add in a fixed order).
+**A complete assembly costs little more than its kernel.**  With hypre on the card the
+assembled values never leave it: the scatter writes them into an accumulator in JAX's
+memory, and they are copied from there into the two blocks of the hypre matrix on the
+device (`How the parallel matrix is built`_).  The same cases assemble 18x to 84x faster
+on an L40S and 46x to 313x faster on an H100 than on a host core (40x to 84x and 92x to
+313x in three dimensions).  Taken apart on an H100 for 32 768 Q2 hexahedra, a matrix of
+17 million entries (``benchmarks/bench_assembly_profile.py``): the kernel 9.8 ms, the
+step from the element matrices to the hypre matrix 10.9 ms, a complete assembly timed as
+a whole 12.7 ms.  What the second step still spends is mostly the upload of the column
+indices, which the pattern keeps on the host.  For six of the ten cases a complete
+assembly takes 4 to 20 % longer than its kernel; for Q2 and Q3 hexahedra and Q3 and Q4
+quadrilaterals, whose matrices have the most entries per element, 1.5 to 2.1 times as
+long.
+
+Until October 2026 the values went through the host: copied down as a numpy array, handed
+to MFEM there and uploaded again when hypre first used them.  That passage was 61 of the
+71 ms of the assembly above (the copy down 32 ms, 136 MB at 4.2 GB/s; the upload about
+20 ms), and a complete assembly was 11x to 36x faster than a core on an L40S and 15x to
+73x on an H100, whatever the kernel gained.  ``HIPPYMFEM_DEVICE_BRIDGE=0`` restores that
+route.  A block whose prolongations are the identity takes the true-dof route as well
+when hypre is on a device (``HIPPYMFEM_TDOF_IDENTITY=auto``); before that, one rank
+built its matrix through the constructor that copies and splits a row-major CSR on the
+host, 171 ms for the same matrix.
 
 **From P2 up, differentiate at the quadrature points.**  ``HIPPYMFEM_HESSIAN=quadrature``
 (or ``hm.config.hessian = "quadrature"``) builds each element Hessian block from the
@@ -267,7 +292,10 @@ a V-cycle on a small subdomain, which is what this guide used to say: one card n
 the Jacobian of the model problem on MIG instances of that card, hypre 2.32 and CUDA
 12.9, measured with ``benchmarks/krylov_anatomy.py`` and the counters of
 ``tools/gpuprof.c``.  The matrix of these measurements is assembled by MFEM with the
-coefficient interpolated at the nodes, and the right-hand side is random.  The Krylov
+coefficient interpolated at the nodes, and the right-hand side is random.  (Until
+2026-10-02 the benchmark read the parameter from a host copy that the device had not
+filled, so the coefficient was 1; the iteration times below were measured again with the
+coefficient ``exp(m)`` and differ from the earlier ones by a few per cent at most.)  The Krylov
 iterations on different instances do not disturb one another: eight independent copies
 of the 64\ :sup:`3` problem needed the same time per iteration together as one alone
 (their BoomerAMG setups did disturb one another, see below).
@@ -300,19 +328,20 @@ changes nothing but the time.  Time per CG iteration in ms, cuSPARSE / hypre's k
 =========  ==========================  ============================================
 instances  64\ :sup:`3` (2.1 M dofs)   2.1 M dofs per instance (mesh)
 =========  ==========================  ============================================
-1          11.6 / 13.0                 11.6 / 13.0 (64\ :sup:`3`)
-2          11.5 / 8.7                  24.0 / 15.7 (81\ :sup:`3`)
-4          6.3 / 5.6                   23.3 / 16.3 (102\ :sup:`3`)
-8          4.1 / 3.3                   21.6 / 16.6 (128\ :sup:`3`)
-16         3.2 / 2.6                   21.2 / 17.7 (161\ :sup:`3`)
+1          11.5 / 12.9                 11.5 / 12.9 (64\ :sup:`3`)
+2          12.3 / 8.4                  23.4 / 15.6 (81\ :sup:`3`)
+4          5.5 / 5.0                   22.7 / 16.0 (102\ :sup:`3`)
+8          3.9 / 3.3                   22.2 / 16.4 (128\ :sup:`3`)
+16         3.2 / 2.6                   21.0 / 17.6 (161\ :sup:`3`)
 =========  ==========================  ============================================
 
-and a whole reduced-Hessian application (``bench_scaling.py --both-kernels``): 0.65 s on
-one instance; on two, four and eight at 64\ :sup:`3` 0.65, 0.32 and 0.22 s with cuSPARSE
-against 0.46, 0.28 and 0.18 s; at 2.1 million dofs per instance 1.27, 1.16 and 1.20 s
-against 0.86, 0.87 and 0.91 s.  Two Newton-CG steps at 128\ :sup:`3` on eight instances
-took 29.7 s with cuSPARSE and 26.1 s with hypre's kernel, same cost functional and CG
-counts.  On full H100 cards the difference is larger, because the diagonal products are
+and a whole reduced-Hessian application (``bench_scaling.py --both-kernels``): 0.59 s on
+one instance; on two, four, eight and sixteen at 64\ :sup:`3` 0.61, 0.30, 0.21 and 0.17 s
+with cuSPARSE against 0.43, 0.26, 0.17 and 0.14 s; at 2.1 million dofs per instance 1.20,
+1.09, 1.14 and 1.13 s against 0.79, 0.81, 0.84 and 0.91 s.  Two Newton-CG steps at
+128\ :sup:`3` on eight instances took 29.7 s with cuSPARSE and 26.1 s with hypre's
+kernel, same cost functional and CG counts (both before the changes described under
+`How the parallel matrix is built`_; 18.1 s now).  On full H100 cards the difference is larger, because the diagonal products are
 quicker and the off-diagonal ones are not: 16.5 against 6.2 ms per iteration on two cards
 with 2.2 million dofs each (4.4 ms on one), and at 64\ :sup:`3` two cards were *slower*
 than one with cuSPARSE (8.1 against 4.4 ms) and faster with hypre's kernel (3.8 ms).
@@ -343,62 +372,121 @@ coarsest level of 500 unknowns changed a solve by 2 % or less at 2.1 million dof
 instance; ``UCX_RNDV_THRESH=inf`` changed nothing.  So keep a million state dofs or more
 on each GPU.
 
-**cudaMalloc and cudaFree in the BoomerAMG setup.**  A hypre built without Umpire or its
-own device pool, which is what the build scripts produce, takes every device array from
-the driver.  One setup makes about 2 200 allocations and 2 000 frees (11 GB in total at
-2.1 million dofs per rank; 780 allocations and 6 GB on one rank), they are 60 to 75 % of
-the setup on two to sixteen instances, and a call takes longer the more processes of a
-node make them at once (about 70 us on one instance, 260 us on sixteen; eight
-independent single-rank setups at once spent 0.31 s in them where one alone spends
-0.11 s):
+Two builds of hypre make the exchange itself cheaper, and ``tools/rebuild_hypre.sh``
+produces either from the hypre source of an existing PyMFEM build, to be preloaded or
+copied over the installed library; neither is part of the PyMFEM build script.
 
-=========  ===========  ==============================  =======================
-instances  setup        allocations and frees           setup with a 1 GiB pool
-=========  ===========  ==============================  =======================
-1          0.16 s       0.10 s                          0.15 s
-2          0.31 s       0.18 s                          0.26 s
-4          0.50 s       0.35 s                          0.31 s
-8          0.78 s       0.57 s                          0.39 s
-16         1.47 s       1.10 s                          0.63 s
-=========  ===========  ==============================  =======================
+* ``--gpu-aware-mpi`` configures hypre with ``HYPRE_WITH_GPU_AWARE_MPI``, so that it
+  gives MPI its buffers on the device and a CUDA-aware MPI moves them.  On two H100 of
+  one node with Open MPI 4.1.8 built ``--with-cuda`` (``--mca pml ob1 --mca btl
+  self,smcuda``, which uses CUDA IPC) an iteration took 5.4 instead of 6.2 ms at 2.2
+  million dofs per card and 20.9 instead of 22.4 ms at 8.5 million.  With IPC switched
+  off, so that Open MPI stages the buffers through shared memory itself, it took 5.5 and
+  21.1 ms: most of the gain is in how the staging is done.  **Not for MIG instances.**
+  They cannot use CUDA IPC, and Open MPI's shared-memory transport is slower than the
+  UCX one the runs above use: 15.3 against 16.9 ms on two instances, 16.5 against 16.7
+  on four, 19.7 against 18.8 on eight, 21.2 against 18.1 on sixteen (2.1 million dofs
+  each), and 8.9 against 2.8 ms on sixteen at 64\ :sup:`3`.  The option is fixed when
+  hypre is compiled, and an MPI without CUDA support reads a device address as host
+  memory, so :func:`~hippymfem.common.mfemconfig.configure_device` asks the loaded hypre
+  (:func:`~hippymfem.common.mfemconfig.hypre_gpu_aware_mpi`) and the MPI library
+  (:func:`~hippymfem.common.mfemconfig.mpi_gpu_support`) and raises with the reason on
+  more than one rank instead of letting the run die inside MPI.  An Open MPI 4 whose UCX
+  was built without CUDA answers yes and still needs ``--mca pml ob1``.
+* ``--pinned-staging`` keeps hypre's own route through the host and changes its buffers
+  (``tools/hypre-2.32.0-pinned-staging.patch``).  hypre allocates two pageable host
+  buffers for every exchange and frees them at its end; the patch keeps page-locked
+  ones and reuses them.  With the MPI and transport of the runs above, the patch on and
+  off in alternation, an iteration took 17.0 instead of 18.1 ms on sixteen instances at
+  2.1 million dofs each (-5.7 %), -3.1 % on eight, -3.3 % on two, and -5.1 % on sixteen
+  at 64\ :sup:`3`.  ``HYPRE_STAGE_PINNED=0`` switches it off at run time.
 
-``HIPPYMFEM_HYPRE_POOL=<megabytes>`` (:func:`~hippymfem.common.mfemconfig.set_hypre_pool`)
-gives hypre a recycling pool through its own hook for user allocators: freed blocks are
-kept, up to that many megabytes per rank, and handed out again to requests of at most
-1.19 times less.  On sixteen instances 64 MB gave 1.08 s, 256 MB 0.86 s and 1 GiB 0.63 s
-(a C prototype of the same pool reached 0.44 s with 4 GiB and 0.24 s with no limit, which
-held 12 GiB).  It is off by default because it holds memory: at most the megabytes asked
-for, which :meth:`~hippymfem.common.mfemconfig.HyprePool.trim` returns, and which the
-pool gives up by itself when the driver refuses an allocation.
+**cudaMalloc and cudaFree, in the BoomerAMG setup and around it.**  A hypre built
+without Umpire or its own device pool, which is what the build scripts produce, takes
+every device array from the driver.  A forward solve at a new parameter on sixteen
+instances made 4 963 such calls without a pool, and they took 1.28 s of its 3.21 s.
+Recorded one by one (``benchmarks/hypre_pool_trace.py``), a rank makes 2 300 allocations
+per forward solve with its Hessian blocks; 89 % of them are under 1 MB and take 6 to
+70 us each, and the 256 above 1 MB take 1.7 to 2.3 ms each on sixteen instances (0.2 to
+0.3 ms when two processes use an H100), with frees that cost as much again.  A call
+takes longer the more processes of a node make them at once: eight independent
+single-rank setups at once spent 0.31 s in them where one alone spends 0.11 s.
+
+The library gives hypre a recycling pool through its hook for user allocators
+(:func:`~hippymfem.common.mfemconfig.set_hypre_pool`): freed blocks are kept and handed
+out again to requests of at most 1.19 times less.  By default
+(``HIPPYMFEM_HYPRE_POOL=auto``) it may hold 1 GiB while a setup runs, which serves the
+setup's own temporaries, and 512 MB between setups (``HIPPYMFEM_HYPRE_POOL_KEEP``, in
+megabytes, and never more than a quarter of the most hypre has had in use), which
+carries blocks from the hierarchy a solver gives up to the one it builds next.  When the
+pool is full a freed block displaces larger ones, so that it keeps the many small
+blocks.  The BoomerAMG setup inside a forward solve, and the forward solve, at 2.1
+million dofs per instance (``benchmarks/bench_forward_steps.py``):
+
+=========  ===================  ====================  ===================  ====================
+instances  setup, no pool       setup, default pool   forward, no pool     forward, default
+=========  ===================  ====================  ===================  ====================
+1          0.17 s               0.15 s                1.47 s               1.45 s
+2          0.31 s               0.24 s                1.77 s               1.65 s
+4          0.46 s               0.27 s                1.94 s               1.74 s
+8          0.74 s               0.36 s                2.29 s               1.93 s
+16         1.45 s               0.55 s                3.21 s               2.37 s
+=========  ===================  ====================  ===================  ====================
+
+On sixteen instances a forward solve took 2.67 s with nothing kept between setups,
+2.31 s with 512 MB and 2.26 s with 1 GiB (one job; ``HIPPYMFEM_HYPRE_POOL_KEEP=0`` is
+the first).  ``HIPPYMFEM_HYPRE_POOL=<megabytes>`` asks for one limit at all times and
+``0`` for no pool.  The pool holds what it keeps, 0.5 GB per rank here,
+:meth:`~hippymfem.common.mfemconfig.HyprePool.trim` returns it, and it is returned by
+itself when the driver refuses hypre an allocation or the element kernels run out of
+device memory.  What is left on sixteen instances is 200 driver calls and 0.5 s per
+forward solve: the largest temporaries of the setup (90 allocations of 10 GB in all),
+which only a pool of several GB would keep, and MFEM's own arrays, which do not pass
+through hypre's allocator.
 
 **What is left outside the Krylov iterations.**  A reduced-Hessian application is its two
-incremental solves for about nine tenths (``benchmarks/bench_hessian_anatomy.py``, which
-times the application as the library runs it and then MFEM's solver alone, with the
-vectors left on the card):
+incremental solves almost entirely (``benchmarks/bench_hessian_anatomy.py``, which times
+the application as the library runs it and then MFEM's solver alone):
 
 ============================================  ===========  =============  =====
 configuration                                 application  solvers alone  share
 ============================================  ===========  =============  =====
-1 instance, 64\ :sup:`3` (2.1 M dofs)         0.635 s      0.579 s        91 %
-16 instances, 161\ :sup:`3` (2.1 M each)      0.983 s      0.893 s        91 %
-16 instances, 64\ :sup:`3` (134 k each)       0.145 s      0.129 s        89 %
+1 instance, 64\ :sup:`3` (2.1 M dofs)         0.594 s      0.574 s        97 %
+16 instances, 161\ :sup:`3` (2.1 M each)      0.912 s      0.879 s        96 %
+16 instances, 64\ :sup:`3` (134 k each)       0.139 s      0.130 s        93 %
+1 H100, 64\ :sup:`3`                          0.226 s      0.215 s        95 %
 ============================================  ===========  =============  =====
 
-The other tenth is not all arithmetic on the card.  :class:`~hippymfem.common.parvector.ParVector`
-does its updates, copies and inner products with numpy on the host, so a vector that a
-solve or a product left on the card is copied down for them and up again for the next
-product; around each incremental solve the copy of the right-hand side, the zeroing of
-its essential entries and of the solution cost 8 to 11 ms at 2.1 million dofs.  The
-pointwise observation operator is applied on the host as well (11 to 25 ms inside
-``applyWuu``), and the prior's precision contains a mass solve (15 to 26 ms).  Running
-the vector operations and the observation operator on the card would remove about half
-of this tenth; it has not been done.
+The shares were 91, 91 and 89 % on the instances while
+:class:`~hippymfem.common.parvector.ParVector` did its updates, copies and inner products
+with numpy on the host and the pointwise observation operator was applied there: a
+vector that a solve had left on the card was copied down and up again around every
+incremental solve.  A vector now follows its data.  Once hypre has used it on the device
+its arithmetic runs there through MFEM, the essential entries are set there, and the
+observation operator is a hypre matrix; ``.array`` remains the way to the host and the
+point where the values are brought down.  ``HIPPYMFEM_DEVICE_VECTORS=0`` restores the
+numpy route.  Of the 33 ms that remain on sixteen instances, 26 are the prior's
+precision with its mass solve.
 
-A forward solve at a new parameter is mostly assembly.  On one instance at
-64\ :sup:`3` it took 2.3 s, of which the CG solve was 0.29 s and the BoomerAMG setup
-0.17 s; the element kernel took about 0.76 s (half a card, double precision), the
-scatter 0.13 s, the copy of the values to the host 0.3 s, MFEM's constructor 0.15 s and
-the upload of the 1.7 GB matrix 0.16 s.
+A forward solve at a new parameter is assembly, a BoomerAMG setup and one CG solve
+(``benchmarks/bench_forward_steps.py``; 2.1 million dofs per instance):
+
+==================================  ==========  ============  ========
+step                                1 instance  16 instances  1 H100
+==================================  ==========  ============  ========
+residual, twice                     57 ms       126 ms        26 ms
+Jacobian with its symmetry test     960 ms      1 153 ms      327 ms
+solve with the BoomerAMG setup      426 ms      1 075 ms      173 ms
+the rest                            4 ms        15 ms         4 ms
+forward solve                       1.45 s      2.37 s        0.53 s
+==================================  ==========  ============  ========
+
+On an instance the element kernel is most of the Jacobian (half a card, double
+precision); on the H100 the kernel and its synchronization are 176 ms, and the scatter
+with the upload of its map and the upload of the column indices about 110 ms.  Before
+the assembled values stayed on the card and the pool kept blocks between setups, the
+same forward solve took 3.22 s on one instance, 4.75 s on sixteen and 1.34 s on the H100
+(``bench_scaling.py``, which now gives 1.48 and 2.38 s on the instances).
 
 .. _gpu-memory:
 
@@ -409,6 +497,18 @@ A Newton step holds about 2 kB of device memory per unknown (state, parameter an
 adjoint together): the assembled blocks and the AMG hierarchies.  That puts
 128\ :sup:`3` (36 M unknowns) on four 45 GB L40S at 17 to 19 GiB per card, on two of them
 at 29 to 35 GiB, or on one 80 GB H100 at 69 GiB.  What decides whether a given run fits:
+
+**What the one-time setup leaves behind.**  JAX keeps what its arena has grown to, so
+the largest thing that ever ran in it sets its size for the rest of the run.  Without
+numba the two sorts of a pattern build run in the arena (`The sparsity patterns`_), and
+with one chunk as large as the budget allowed they left it at 16.9 GB on an H100 with
+2.1 million state dofs on one rank, where the element kernels need 8.7 GB: the card
+stood at 21.0 GB.  The sort now takes chunks of 2\ :sup:`26` keys at most there
+(:data:`hippymfem.fem.devsort.MAX_CHUNK_ARENA`), and the same run stands at 12.8 GB with
+the same forward solve and a pattern build that is 8 s longer; a MIG instance with the
+same dofs went from 12.7 to 8.7 GB, and two Newton-CG steps at 64\ :sup:`3` on one H100
+peak at 14.6 GiB.  With numba or CuPy installed nothing changes: the sort-free builder
+uses no device memory and CuPy's sort returns its own.
 
 **JAX's share of the card.**  The share (0.45 of the card with hypre on it, above) is a
 ceiling, not a reservation: the pool grows as the element kernels need it, and the chunk
@@ -551,15 +651,44 @@ It is used when numba is importable and the pattern has at least
 than compiling).  ``HIPPYMFEM_PATTERN_BUILDER=sort`` restores the sort route, whose sort
 runs on the card when the kernels do, through CuPy's radix sort where CuPy is importable
 and XLA's otherwise (9.2 ns a key against 24; ``HIPPYMFEM_PATTERN_SORT_KERNEL`` forces
-either).  ``HIPPYMFEM_PATTERN_TIMING=1`` prints what each phase of a build cost.
+either).  XLA's sort runs in JAX's arena and takes chunks of 2\ :sup:`26` keys at most,
+so that it does not leave the arena larger than the kernels need (`How large a problem
+fits`_; ``HIPPYMFEM_PATTERN_SORT_CHUNK`` pins a size).  ``HIPPYMFEM_PATTERN_TIMING=1``
+prints what each phase of a build cost.
 
 How the parallel matrix is built
 --------------------------------
 
-One assembly costs one host-to-device copy of the local dof vectors and one
-device-to-host copy of the assembled CSR values; the gather, the batched kernel, any
-``DofTransformation`` and the scatter all run on the device, and the ``(ne, nd, nd)``
-element-matrix array never reaches the host.
+The gather, the batched kernel, any ``DofTransformation`` and the scatter all run on the
+device, and the ``(ne, nd, nd)`` element-matrix array never reaches the host.  With
+hypre on the host, one assembly then costs one host-to-device copy of the local dof
+vectors and one device-to-host copy of the assembled CSR values.
+
+With hypre on the same card nothing of that crosses.  JAX and MFEM each own their device
+memory and neither can write into the other's, so the library joins them one level down
+(:mod:`hippymfem.common.devicebridge`): a JAX array gives the address of its buffer, MFEM
+the address of the device copy of a vector or of a matrix block, and the runtime's
+``cudaMemcpy`` or ``hipMemcpy`` copies between the two on the device.  MFEM's
+constructor for a matrix given as two blocks does not copy them; it aliases their memory
+and uploads only what is not yet valid on the device.  So the blocks are created over
+host arrays that are never filled, the assembled values are copied into their device
+copies from JAX's accumulator, and the constructor uploads the row pointers and nothing
+else.  The dof values that the kernels read and the residual and gradient vectors they
+produce pass over the same bridge.  What still leaves the card in an assembly: the
+values of rows of shared dofs that a rank does not own, which go to their owner in one
+``Alltoallv`` (4.8 MB per Jacobian at 2.1 million dofs on sixteen ranks), and an
+accumulator that needs boundary-face entries.  What still arrives from the host: the
+row pointers, the column indices (0.55 GB per Jacobian at 2.1 million dofs) and the
+scatter map, slice by slice (0.76 GB).  ``HIPPYMFEM_DEVICE_PATTERN=1`` keeps the last
+two on the device as well, for 1.3 GB at that size: a forward solve went from 551 to
+534 ms on one H100 and from 2.31 to 2.19 s on sixteen MIG instances, where sixteen ranks
+upload at once.  It is off by default because of the memory.
+
+The bridge is used when MFEM is on a GPU, the element kernels are on the same card, the
+runtime's copy function is found among the libraries the process has loaded, and eight
+numbers copied each way come back right; otherwise, and with
+``HIPPYMFEM_DEVICE_BRIDGE=0``, the values go through the host as above.  Matrices built
+the two ways agree to round-off (the device scatter does not add in a fixed order).
 
 ``HIPPYMFEM_PARMAT`` selects how the local CSR becomes the parallel matrix.  ``auto``,
 the default, assembles straight into true-dof rows whenever both prolongations are
@@ -602,7 +731,9 @@ Under a device-configured MFEM, host reads and writes of MFEM data go through
 :func:`~hippymfem.common.parvector.host_sync` and ``host_readwrite``.  Code that calls
 MFEM directly has to do the same: MFEM keeps returning the host pointer from
 ``GetDataArray()`` whether or not it is current, and the symptom is wrong numbers, not an
-error.
+error.  A :class:`~hippymfem.common.parvector.ParVector` that hypre has used has its
+current values on the device; its ``array`` brings them to the host and is the place to
+read or write them from Python.
 
 The Laplace approximation on the cards
 --------------------------------------
