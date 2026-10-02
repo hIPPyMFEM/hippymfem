@@ -688,8 +688,9 @@ def test_hypre_pool_setup_scope():
     check("the setup was served from the pool", pool.from_pool > served,
           "(%d of %d requests)" % (pool.from_pool - served, pool.requests - requests))
     check("after the first solve the pool holds no more than it may keep",
-          pool.cached <= pool.keep and pool.max_cached == pool.keep,
-          "(%d of %d bytes)" % (pool.cached, pool.keep))
+          pool.cached <= pool.max_cached <= pool.keep
+          and pool.max_cached <= pool.KEEP_SHARE * pool.peak_in_use,
+          "(%d of %d bytes; the most in use %d)" % (pool.cached, pool.keep, pool.peak_in_use))
     check("the same solve with the pool", abs(got - ref) <= 1e-8 * abs(ref),
           "(%.12e, %.12e)" % (ref, got))
     # a second solver on a new matrix of the same size: the hierarchy the first one

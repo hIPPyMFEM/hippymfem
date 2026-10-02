@@ -388,6 +388,10 @@ class HyprePool:
     #: times the size asked for
     CLASSES = 8.0
 
+    #: Between setups a scoped pool holds at most this share of the most hypre has had
+    #: in use at once (and at most ``keep``): a small problem keeps little.
+    KEEP_SHARE = 0.25
+
     def __init__(self, hypre, runtime, max_cached, max_block=None, scoped=False, keep=0):
         import ctypes
 
@@ -541,12 +545,13 @@ class HyprePool:
 
     def close(self):
         """A setup is over: a scoped pool goes back to the ``keep`` bytes it may hold
-        between setups and returns the rest, largest blocks first.  The calls are not
+        between setups, or to a quarter of the most hypre has had in use if that is
+        less, and returns the rest, largest blocks first.  The calls are not
         counted against :meth:`open`: a solver that was given an operator and never
         solved must not leave the pool at its larger limit, so the first solve of any
         solver ends the scope, and a setup still pending then runs with ``keep``."""
         if self.scoped:
-            self.max_cached = self.keep
+            self.max_cached = min(self.keep, int(self.KEEP_SHARE * self.peak_in_use))
             self._shrink()
 
     def uninstall(self):
@@ -626,7 +631,9 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
     With ``scoped=True`` the pool has two limits: ``megabytes`` while a BoomerAMG setup
     runs (between :func:`hypre_pool_open`, which a solver calls when it is given an
     operator, and :func:`hypre_pool_close`, after its first solve) and
-    ``keep_megabytes`` otherwise.  The first serves the setup's own temporaries: a
+    ``keep_megabytes`` otherwise, or a quarter of the most hypre has had in use at
+    once when that is less, so that a small problem keeps little.  The first serves
+    the setup's own temporaries: a
     setup that starts with an empty pool of 1024 MB took 0.65 s.  The second carries
     blocks from one setup to the next, and from the hierarchy a solver gives up to the
     one it builds.  When the pool is full a freed block displaces larger ones, so what

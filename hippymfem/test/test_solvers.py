@@ -366,6 +366,7 @@ def test_hypre_pool_logic():
     # the same with something kept between setups (the default on a GPU): the smallest
     # blocks stay when the setup is over
     keeper = HyprePool(hypre, runtime, max_cached=3000, max_block=2000, scoped=True, keep=800)
+    keeper.KEEP_SHARE = 1.0                     # the share of the peak is tested below
 
     def get(n):
         keeper._malloc(out, n)
@@ -389,6 +390,22 @@ def test_hypre_pool_logic():
     keeper.trim()
     check("pool: between setups a scoped pool keeps its smallest blocks, up to its limit",
           ok and keeper.cached == 0 and not live, "(%s)" % (keeper.stats(),))
+    # a small problem keeps little: no more than a quarter of the most it had in use
+    small = HyprePool(hypre, runtime, max_cached=3000, max_block=2000, scoped=True, keep=800)
+
+    def req(n):
+        small._malloc(out, n)
+        return out[0]
+
+    small.open()
+    s = [req(400), req(200), req(100), req(100)]      # 800 in use at the peak
+    for q in s:
+        small._free(q)
+    small.close()
+    ok = small.max_cached == 200 and small.cached == 200 and sorted(live.values()) == [100, 100]
+    small.trim()
+    check("pool: what is kept between setups is at most a quarter of the peak in use",
+          ok and not live, "(%s)" % (small.stats(),))
 
 
 def test_petsc():
