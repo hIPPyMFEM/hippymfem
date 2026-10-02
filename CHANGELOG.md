@@ -60,7 +60,8 @@
   `--assembly mfem` it read the parameter from a host copy that the device had not
   filled, so its matrices had the coefficient 1, and on several ranks its variant without
   a kernel was no longer cuSPARSE once the library chose hypre's. The iteration times of
-  the GPU guide were measured again and changed by a few per cent at most.
+  the GPU guide were measured again and changed by 3 % or less, except at 64^3 on two and
+  four instances (up to 13 %).
   `benchmarks/DESIGN_NOTES.md`, section 11, has the measurements.
 - **hypre's matrix-vector kernel on several GPUs** (`HIPPYMFEM_HYPRE_SPMV`,
   `hippymfem.common.mfemconfig.set_hypre_spmv`, `hm.config.hypre_spmv`). hypre multiplies

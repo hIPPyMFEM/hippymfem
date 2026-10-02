@@ -547,8 +547,10 @@ at 0.30 and at the library's 0.45 must not be mixed.
   prolongation had left on the device; the host copy was zeros, so every record of
   section 10 that the script produced is for the Laplacian with coefficient 1 and not for
   the Jacobian with `exp(m)`.  Measured again with the coefficient: the same times per
-  iteration within a few per cent (the table of the GPU guide is now from these records)
-  and the same hierarchy (operator complexity 1.234 against 1.235).  And on several ranks
+  iteration within 1 % on one H100 and on one instance, within 3 % in the table of the
+  GPU guide (which is now from these records) except at 64^3 on two and four instances,
+  where the new times differ by up to 13 %, and the same hierarchy (operator complexity
+  1.234 against 1.235).  And on several ranks
   its variant without a kernel was hypre's kernel, not cuSPARSE, once it ran against a
   library that chooses hypre's there; it now sets the kernel itself.
 - **The pattern sort and JAX's arena** (`devsort.MAX_CHUNK_ARENA`).  Without numba the

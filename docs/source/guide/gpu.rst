@@ -295,7 +295,8 @@ the Jacobian of the model problem on MIG instances of that card, hypre 2.32 and 
 coefficient interpolated at the nodes, and the right-hand side is random.  (Until
 2026-10-02 the benchmark read the parameter from a host copy that the device had not
 filled, so the coefficient was 1; the iteration times below were measured again with the
-coefficient ``exp(m)`` and differ from the earlier ones by a few per cent at most.)  The Krylov
+coefficient ``exp(m)`` and differ from the earlier ones by 3 % or less, except at
+64\ :sup:`3` on two and four instances, where they differ by up to 13 %.)  The Krylov
 iterations on different instances do not disturb one another: eight independent copies
 of the 64\ :sup:`3` problem needed the same time per iteration together as one alone
 (their BoomerAMG setups did disturb one another, see below).
