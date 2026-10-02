@@ -25,6 +25,12 @@
   hypre's two blocks, as several ranks do. A complete Jacobian assembly on one H100 or
   L40S became 1.4 to 3.2 times faster (hex P2: 5.2 -> 1.7 us per element on an H100), with
   matrices identical to round-off. The host is unchanged.
+- The GPU guide's assembly factors are now those of meshes with 0.3 to 2.1 million state
+  dofs (kernels 17x to 90x on an L40S and 40x to 477x on an H100 against one host core,
+  complete assembly 11x to 36x and 15x to 73x). The smaller meshes used before understated
+  the cheap elements (a kernel call costs about 1.5 ms on a card) and overstated the P3
+  hexahedra (the host core is 1.7 times slower per element at 2 744 elements than at
+  32 768).
 - `benchmarks/bench_hessian_anatomy.py`: a reduced-Hessian application as the library
   runs it against MFEM's solver alone, with the copies between host and device counted.
   The two solves are 89 to 91 % of an application on one and on sixteen MIG instances;

@@ -195,21 +195,27 @@ on the card the same holds for strong scaling: at 32\ :sup:`3` four cards are ba
 faster than one, at 128\ :sup:`3` two to four cards scale at 89 %, so plan for about a
 million state dofs per GPU (:ref:`several-gpus` says where the rest goes).
 
-**The speedup depends on the card.**  Element kernels are double precision throughout.
-On the same code the kernel speedup over a host core (one core of a Xeon Platinum
-8462Y+) is 10x to 143x on an L40S and 15x to 737x on an H100 (P1 triangles to P3
-hexahedra, re-measured on 2026-10-01 with ``benchmarks/bench_assembly_sweep.py``, the
-smallest of up to three runs; in three dimensions 37x to 143x and 72x to 737x), so the
-kernels run 1.5 to 5.2 times faster on the H100 than on the L40S.  The library therefore
-does not promise a speedup; :mod:`hippymfem.test.test_gpu` measures one for whatever card
-is present.  (An earlier version of this guide gave matrix-multiply rates in double
+**The speedup depends on the card and on the mesh.**  Element kernels are double
+precision throughout.  On meshes with 0.3 to 2.1 million state dofs the kernel speedup
+over a host core (one core of a Xeon Platinum 8462Y+) is 17x to 90x on an L40S and 40x to
+477x on an H100 (P1 triangles to P3 hexahedra, measured on 2026-10-02 with
+``benchmarks/bench_assembly_sweep.py``, the smallest of two or three runs on the card; in
+three dimensions 41x to 90x and 90x to 477x), so the kernels run 2.1 to 5.6 times faster
+on the H100 than on the L40S.  Small meshes mislead in both directions.  A kernel call
+costs at least about 1.5 ms on a card, so 65 000 P1 triangles show 15x on an H100 where
+two million show 40x.  And the host core's time per element is not constant either: P3
+hexahedra took 1 025 us per element at 2 744 elements and 606 us at 32 768 (793, 1 029,
+659 and 643 us at 512, 2 744, 8 000 and 17 576 elements on another node), so the
+2 744-element mesh that this guide used before showed 737x where the larger mesh shows
+477x.  The library therefore does not promise a speedup;
+:mod:`hippymfem.test.test_gpu` measures one for whatever card is present.  (An earlier version of this guide gave matrix-multiply rates in double
 precision for the two cards.  The H100 figure had been taken with JAX's 64-bit mode off,
 so it was a single-precision rate, and the single-precision figures were TF32 rates; the
 table has been removed.)
 
 **A complete assembly gains less than its kernel, and the GPU is not why.**  With hypre on
-the card, the same cases assemble 5x to 48x faster on an L40S and 5x to 76x on an H100
-than on a host core (31x to 48x and 52x to 76x in three dimensions).  Taken apart on an
+the card, the same cases assemble 11x to 36x faster on an L40S and 15x to 73x on an H100
+than on a host core (30x to 36x and 44x to 73x in three dimensions).  Taken apart on an
 H100 for 32 768 Q2 hexahedra, a matrix of 17 million entries
 (``benchmarks/bench_assembly_profile.py``): the kernel 12 ms, and 61 ms from the element
 matrices to the hypre matrix, of which the scatter on the card is 0.4 ms, the copy of
