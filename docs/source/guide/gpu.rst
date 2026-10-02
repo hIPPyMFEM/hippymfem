@@ -551,10 +551,15 @@ functional and CG count in every row:
    JAX share 0.20, matrix-free points     13.2 GiB    8.2 GiB       5.0 GiB     63.6 s
    =====================================  ==========  ============  ==========  ================
 
-Set ``HIPPYMFEM_GPU_MEM_FRACTION=0.20`` when a run is short of card memory: 4 GiB a card
-for 7 % more time.  Matrix-free points save 1.8 GiB more, but under the lower share every
-one of their products runs in smaller chunks as well, so they are for a run that still
-does not fit.  ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is not a substitute: it reports no
+That table is of September 2026.  With the matrices and vectors kept on the card
+(2026-10-02, four L40S of a cluster, two per node, peaks measured in the process), the
+same four runs take 29.2, 30.3, 33.1 and 48.0 s and peak at 20.0, 19.4, 18.1 and
+17.3 GiB (JAX pool 9.0, 9.0, 6.0 and 6.0 GiB): the lower share now buys 1.9 GiB a card
+for 13 % more time, matrix-free points 0.6 GiB for 4 %, and both 2.7 GiB for 64 %.
+
+Set ``HIPPYMFEM_GPU_MEM_FRACTION=0.20`` when a run is short of card memory.  Matrix-free
+points save a little more, but under the lower share every one of their products runs
+in smaller chunks as well, so they are for a run that still does not fit.  ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is not a substitute: it reports no
 budget for the chunk planner to work from, and its card peak was higher.
 
 **What the problem class keeps.**  Three settings of
@@ -774,7 +779,10 @@ The random stream is a vectorized Philox generator, bit-identical to numpy's and
 card when the kernels are, which is what makes a sample tens of milliseconds.  The
 ``"Randomized"`` pointwise variance is a truncated spectrum and 20-25 % low at r = 64;
 the ``"MonteCarlo"`` method (one solve per sample) is unbiased and is what the benchmark
-reports.  The incremental and prior solves can run at 1e-8 for these stages: the
+reports.  (The table is of September 2026.  With the present library, on L40S cards of a
+cluster, the eigensolver takes 10.1 s at 32\ :sup:`3`, 28.4 s at 64\ :sup:`3` and 175 s
+at 128\ :sup:`3`, and the whole workflow at 128\ :sup:`3`, MAP included, 14.4 minutes
+instead of 19.5.)  The incremental and prior solves can run at 1e-8 for these stages: the
 eigenvalues move by 6e-6 at most and the eigensolver is 1.4x faster.  At 128\ :sup:`3`
 the whole workflow, MAP included, runs in under 20 minutes on four L40S.
 
