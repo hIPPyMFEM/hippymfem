@@ -1,0 +1,167 @@
+--- a/parcsr_mv/par_csr_communication.c
++++ b/parcsr_mv/par_csr_communication.c
+@@ -337,6 +337,110 @@
+ #endif // HYPRE_USING_PERSISTENT_COMM
+ 
+ /*------------------------------------------------------------------
++ * Staging buffers for an exchange of device data (hIPPyMFEM, tools/rebuild_hypre.sh).
++ *
++ * Without a GPU-aware MPI every exchange copies its send buffer from the
++ * device to CPU memory and its receive buffer back.  hypre allocates the
++ * two CPU buffers with malloc for every exchange and frees them at its
++ * end, so the copies go to and from pageable memory.  Here they are
++ * page-locked buffers that are kept: a buffer is taken from a small set
++ * (the smallest free one that is large enough, or a new one of the next
++ * power of two) and given back at the end of the exchange.
++ * HYPRE_STAGE_PINNED=0 in the environment restores hypre's own buffers.
++ *------------------------------------------------------------------*/
++#if !defined(HYPRE_WITH_GPU_AWARE_MPI) && defined(HYPRE_USING_GPU)
++#define HM_NPIN 48
++static char  *hm_pin_ptr[HM_NPIN];
++static size_t hm_pin_cap[HM_NPIN];
++static int    hm_pin_used[HM_NPIN];
++static int    hm_pin_on = -1;
++
++static char *
++hm_pin_get( size_t n )
++{
++   int i, best = -1;
++   size_t cap;
++
++   if (hm_pin_on < 0)
++   {
++      char *e = getenv("HYPRE_STAGE_PINNED");
++      hm_pin_on = (e && e[0] == '0') ? 0 : 1;
++   }
++   if (!hm_pin_on || n == 0)
++   {
++      return NULL;
++   }
++   for (i = 0; i < HM_NPIN; i++)
++   {
++      if (!hm_pin_used[i] && hm_pin_ptr[i] && hm_pin_cap[i] >= n &&
++          (best < 0 || hm_pin_cap[i] < hm_pin_cap[best]))
++      {
++         best = i;
++      }
++   }
++   if (best < 0)
++   {
++      for (i = 0; i < HM_NPIN; i++)
++      {
++         if (!hm_pin_used[i] && !hm_pin_ptr[i]) { best = i; break; }
++      }
++      if (best < 0)
++      {
++         /* every slot holds a buffer: give up a free one that is too small */
++         for (i = 0; i < HM_NPIN; i++)
++         {
++            if (!hm_pin_used[i])
++            {
++               _hypre_TFree(hm_pin_ptr[i], hypre_MEMORY_HOST_PINNED);
++               hm_pin_ptr[i] = NULL;
++               best = i;
++               break;
++            }
++         }
++      }
++      if (best < 0)
++      {
++         return NULL;
++      }
++      cap = 65536;
++      while (cap < n) { cap *= 2; }
++      hm_pin_ptr[best] = _hypre_TAlloc(char, cap, hypre_MEMORY_HOST_PINNED);
++      if (!hm_pin_ptr[best])
++      {
++         return NULL;
++      }
++      hm_pin_cap[best] = cap;
++   }
++   hm_pin_used[best] = 1;
++   return hm_pin_ptr[best];
++}
++
++/* 1 when p was one of the kept buffers (and is free again), 0 otherwise */
++static int
++hm_pin_put( void *p )
++{
++   int i;
++   if (!p)
++   {
++      return 0;
++   }
++   for (i = 0; i < HM_NPIN; i++)
++   {
++      if (hm_pin_ptr[i] && (void *) hm_pin_ptr[i] == p)
++      {
++         hm_pin_used[i] = 0;
++         return 1;
++      }
++   }
++   return 0;
++}
++#else
++#define hm_pin_get(n) NULL
++#define hm_pin_put(p) 0
++#endif
++
++
++/*------------------------------------------------------------------
+  * hypre_ParCSRCommHandleCreate
+  *------------------------------------------------------------------*/
+ 
+@@ -442,8 +546,11 @@
+    if ( act_send_memory_location == hypre_MEMORY_DEVICE ||
+         act_send_memory_location == hypre_MEMORY_UNIFIED )
+    {
+-      //send_data = _hypre_TAlloc(char, num_send_bytes, hypre_MEMORY_HOST_PINNED);
+-      send_data = hypre_TAlloc(char, num_send_bytes, HYPRE_MEMORY_HOST);
++      send_data = hm_pin_get((size_t) num_send_bytes);
++      if (!send_data)
++      {
++         send_data = hypre_TAlloc(char, num_send_bytes, HYPRE_MEMORY_HOST);
++      }
+       hypre_GpuProfilingPushRange("MPI-D2H");
+       hypre_TMemcpy(send_data, send_data_in, char, num_send_bytes, HYPRE_MEMORY_HOST,
+                     HYPRE_MEMORY_DEVICE);
+@@ -459,8 +566,11 @@
+    if ( act_recv_memory_location == hypre_MEMORY_DEVICE ||
+         act_recv_memory_location == hypre_MEMORY_UNIFIED )
+    {
+-      //recv_data = hypre_TAlloc(char, num_recv_bytes, hypre_MEMORY_HOST_PINNED);
+-      recv_data = hypre_TAlloc(char, num_recv_bytes, HYPRE_MEMORY_HOST);
++      recv_data = hm_pin_get((size_t) num_recv_bytes);
++      if (!recv_data)
++      {
++         recv_data = hypre_TAlloc(char, num_recv_bytes, HYPRE_MEMORY_HOST);
++      }
+    }
+    else
+    {
+@@ -668,8 +778,10 @@
+    if ( act_send_memory_location == hypre_MEMORY_DEVICE ||
+         act_send_memory_location == hypre_MEMORY_UNIFIED )
+    {
+-      //hypre_HostPinnedFree(hypre_ParCSRCommHandleSendDataBuffer(comm_handle));
+-      hypre_TFree(hypre_ParCSRCommHandleSendDataBuffer(comm_handle), HYPRE_MEMORY_HOST);
++      if (!hm_pin_put(hypre_ParCSRCommHandleSendDataBuffer(comm_handle)))
++      {
++         hypre_TFree(hypre_ParCSRCommHandleSendDataBuffer(comm_handle), HYPRE_MEMORY_HOST);
++      }
+    }
+ 
+    hypre_MemoryLocation act_recv_memory_location = hypre_GetActualMemLocation(
+@@ -685,8 +797,10 @@
+                      HYPRE_MEMORY_DEVICE,
+                      HYPRE_MEMORY_HOST );
+       hypre_GpuProfilingPopRange();
+-      //hypre_HostPinnedFree(hypre_ParCSRCommHandleRecvDataBuffer(comm_handle));
+-      hypre_TFree(hypre_ParCSRCommHandleRecvDataBuffer(comm_handle), HYPRE_MEMORY_HOST);
++      if (!hm_pin_put(hypre_ParCSRCommHandleRecvDataBuffer(comm_handle)))
++      {
++         hypre_TFree(hypre_ParCSRCommHandleRecvDataBuffer(comm_handle), HYPRE_MEMORY_HOST);
++      }
+    }
+ #endif
+ 

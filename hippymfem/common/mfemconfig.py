@@ -241,7 +241,7 @@ def hypre_gpu_aware_mpi():
     hypre exchanges the values of shared dofs at every product with a parallel matrix.
     As PyMFEM builds it, it copies them to CPU memory, sends them from there and copies
     what it receives back.  Configured with ``HYPRE_WITH_GPU_AWARE_MPI``
-    (``tools/rebuild_hypre_gpu_aware_mpi.sh``) it gives MPI the address of the buffer
+    (``tools/rebuild_hypre.sh --gpu-aware-mpi``) it gives MPI the address of the buffer
     on the GPU instead, which needs an MPI that can read one (:func:`mpi_gpu_support`).
     The option is fixed when hypre is compiled; this reads what the loaded library was
     built with.
