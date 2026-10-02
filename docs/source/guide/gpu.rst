@@ -335,7 +335,7 @@ instances  64\ :sup:`3` (2.1 M dofs)   2.1 M dofs per instance (mesh)
 16         3.2 / 2.6                   21.0 / 17.6 (161\ :sup:`3`)
 =========  ==========================  ============================================
 
-and a whole reduced-Hessian application (``bench_scaling.py --both-kernels``): 0.59 s on
+and a whole reduced-Hessian application (``bench_scaling.py --both-kernels``): 0.60 s on
 one instance; on two, four, eight and sixteen at 64\ :sup:`3` 0.61, 0.30, 0.21 and 0.17 s
 with cuSPARSE against 0.43, 0.26, 0.17 and 0.14 s; at 2.1 million dofs per instance 1.20,
 1.09, 1.14 and 1.13 s against 0.79, 0.81, 0.84 and 0.91 s.  Two Newton-CG steps at
@@ -426,7 +426,7 @@ million dofs per instance (``benchmarks/bench_forward_steps.py``):
 =========  ===================  ====================  ===================  ====================
 instances  setup, no pool       setup, default pool   forward, no pool     forward, default
 =========  ===================  ====================  ===================  ====================
-1          0.17 s               0.15 s                1.47 s               1.45 s
+1          0.17 s               0.15 s                1.47 s               1.47 s
 2          0.31 s               0.24 s                1.77 s               1.65 s
 4          0.46 s               0.27 s                1.94 s               1.74 s
 8          0.74 s               0.36 s                2.29 s               1.93 s
@@ -451,7 +451,7 @@ the application as the library runs it and then MFEM's solver alone):
 ============================================  ===========  =============  =====
 configuration                                 application  solvers alone  share
 ============================================  ===========  =============  =====
-1 instance, 64\ :sup:`3` (2.1 M dofs)         0.594 s      0.574 s        97 %
+1 instance, 64\ :sup:`3` (2.1 M dofs)         0.601 s      0.579 s        96 %
 16 instances, 161\ :sup:`3` (2.1 M each)      0.912 s      0.879 s        96 %
 16 instances, 64\ :sup:`3` (134 k each)       0.139 s      0.130 s        93 %
 1 H100, 64\ :sup:`3`                          0.226 s      0.215 s        95 %
@@ -474,11 +474,11 @@ A forward solve at a new parameter is assembly, a BoomerAMG setup and one CG sol
 ==================================  ==========  ============  ========
 step                                1 instance  16 instances  1 H100
 ==================================  ==========  ============  ========
-residual, twice                     57 ms       126 ms        26 ms
-Jacobian with its symmetry test     960 ms      1 153 ms      327 ms
-solve with the BoomerAMG setup      426 ms      1 075 ms      173 ms
+residual, twice                     58 ms       126 ms        26 ms
+Jacobian with its symmetry test     976 ms      1 153 ms      327 ms
+solve with the BoomerAMG setup      430 ms      1 075 ms      173 ms
 the rest                            4 ms        15 ms         4 ms
-forward solve                       1.45 s      2.37 s        0.53 s
+forward solve                       1.47 s      2.37 s        0.53 s
 ==================================  ==========  ============  ========
 
 On an instance the element kernel is most of the Jacobian (half a card, double
