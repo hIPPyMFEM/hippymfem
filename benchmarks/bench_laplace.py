@@ -47,8 +47,9 @@ from hippymfem import _jaxconfig                                     # noqa: E40
 from hippymfem.fem import kernel as kernel_mod                       # noqa: E402
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE   # noqa: E402
 
-COMM = MPI.COMM_WORLD
-RANK = COMM.rank
+WORLD = MPI.COMM_WORLD
+COMM = WORLD                  # the communicator of the problem; COMM_SELF with --ensemble
+RANK = WORLD.rank
 
 
 def say(*a):
@@ -57,10 +58,10 @@ def say(*a):
 
 
 def timed(fn):
-    COMM.Barrier()
+    WORLD.Barrier()
     t0 = time.perf_counter()
     out = fn()
-    COMM.Barrier()
+    WORLD.Barrier()
     return time.perf_counter() - t0, out
 
 
@@ -144,6 +145,14 @@ def main():
     ap.add_argument("--release-linearization", action="store_true",
                     help="free the Hessian blocks and their solvers whenever the point moves (a line "
                     "search trial step), which is what lets 128^3 run on two 45 GiB cards")
+    ap.add_argument("--ensemble", action="store_true",
+                    help="every rank holds the whole problem on its own GPU (no domain decomposition) and "
+                    "the independent solves of the Laplace stages are divided among the ranks: the Hessian "
+                    "and prior applications of the eigensolver and the posterior samples.  The MAP point, "
+                    "the variance estimators and the traces are computed by every rank on its own, so "
+                    "their times are those of one GPU")
+    ap.add_argument("--newton-skip", action="store_true",
+                    help="no MAP computation: the Laplace stages at the prior mean (for timing them alone)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--dump", default=None, help="save the sample and pointwise variances (rank 0, 1 rank only)")
     ap.add_argument("--fields", default=None,
@@ -151,16 +160,24 @@ def main():
                     "parameter's P1 grid, and the targets (for plotting)")
     args = ap.parse_args()
     N, ORDER = args.n, args.order
+    global COMM
+    ENS = WORLD if (args.ensemble and WORLD.size > 1) else None
+    if args.ensemble:
+        COMM = MPI.COMM_SELF
 
-    hm.configure_device(args.device, COMM, quiet=(RANK != 0))
-    COMM.Barrier()
+    hm.configure_device(args.device, WORLD, quiet=(RANK != 0))
+    if args.ensemble:
+        # one rank per copy of the problem: no off-diagonal blocks, the vendor's product
+        hm.common.mfemconfig.set_hypre_spmv("auto", COMM)
+    WORLD.Barrier()
     t_start = time.perf_counter()
     pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON))
     Vu = hm.FunctionSpace.H1(pmesh, ORDER)
     Vm = hm.FunctionSpace.H1(pmesh, 1)
     Vh = [Vu, Vm, Vu]
-    say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks" %
-        (N, ORDER, Vu.GlobalTrueVSize(), Vm.GlobalTrueVSize(), COMM.size))
+    say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks%s" %
+        (N, ORDER, Vu.GlobalTrueVSize(), Vm.GlobalTrueVSize(), WORLD.size,
+         ", each with the whole problem (ensemble)" if args.ensemble else ""))
     say("  kernels on %s, MFEM on %s, k=%d p=%d passes=%d, %d samples, %d variance probes"
         % (kernel_mod.device(), args.device, args.k, args.p, args.passes, args.samples, args.r))
 
@@ -194,7 +211,7 @@ def main():
     B.perturb(data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
-    COMM.Barrier()
+    WORLD.Barrier()
     t_build = time.perf_counter() - t_start
     say("  setup through the synthetic data: %.1f s" % t_build)
 
@@ -208,9 +225,18 @@ def main():
     params["cg_max_iter"] = args.cg_max
     params["print_level"] = -1
     solver = hm.ReducedSpaceNewtonCG(model, params)
-    t_map, x = timed(lambda: solver.solve([None, prior.mean.copy(), None]))
-    say("  MAP: %.2f s, %d Newton its, %d CG its, %s" % (
-        t_map, solver.it, solver.total_cg_iter, solver.termination_reasons[solver.reason]))
+    if args.newton_skip:
+        def at_prior_mean():
+            x = [model.generate_vector(STATE), prior.mean.copy(), model.generate_vector(ADJOINT)]
+            model.solveFwd(x[STATE], x)
+            model.solveAdj(x[ADJOINT], x)
+            return x
+        t_map, x = timed(at_prior_mean)
+        say("  no MAP computation; forward and adjoint solves at the prior mean: %.2f s" % t_map)
+    else:
+        t_map, x = timed(lambda: solver.solve([None, prior.mean.copy(), None]))
+        say("  MAP: %.2f s, %d Newton its, %d CG its, %s" % (
+            t_map, solver.it, solver.total_cg_iter, solver.termination_reasons[solver.reason]))
 
     if args.inc_tol is not None:
         for attr in ("solver_fwd_inc", "solver_adj_inc"):
@@ -241,7 +267,8 @@ def main():
     hm.parRandom.normal_multivector(1.0, Omega)
     before = meter.snapshot()
     eig = hm.singlePassG if args.single_pass else hm.doublePassG
-    t_eig, (d, U) = timed(lambda: eig(Hmisfit, prior.R, prior.Rsolver, Omega, args.k, s=args.passes))
+    t_eig, (d, U) = timed(lambda: eig(Hmisfit, prior.R, prior.Rsolver, Omega, args.k, s=args.passes,
+                                      ensemble=ENS))
     eig_parts = Meter.delta(meter.snapshot(), before)
     BU = hm.MultiVector(U[0], U.nvec())
     hm.MatMvMult(prior.R, U, BU)
@@ -261,10 +288,17 @@ def main():
 
     def draw():
         acc[:] = 0.0
-        for _ in range(args.samples):
+        mine = range(args.samples)
+        if ENS is not None:
+            # each rank draws its share, from a stream of its own
+            mine = hm.algorithms.multivector.ensemble_columns(ENS, args.samples)
+            hm.parRandom.set_seed(7 + 7919 * RANK)
+        for _ in mine:
             prior.sample_noise(1.0, noise)
             post.sample(noise, s_pr, s_po, add_mean=False)
             acc[:] += s_po.array ** 2
+        if ENS is not None:
+            ENS.Allreduce(MPI.IN_PLACE, acc, op=MPI.SUM)
         acc[:] /= args.samples
     before = meter.snapshot()
     t_samp, _ = timed(draw)
@@ -305,7 +339,7 @@ def main():
     std_prior = float(np.sqrt(prv_mc.sum() / prv_mc.global_size))
     rel_err = float(np.sqrt(COMM.allreduce(float(np.sum(dev ** 2)), op=MPI.SUM)
                             / max(COMM.allreduce(float(np.sum(mtrue.array ** 2)), op=MPI.SUM), 1e-300)))
-    COMM.Barrier()
+    WORLD.Barrier()
     t_total = time.perf_counter() - t_start
     say("  truth within 2 posterior std of the MAP at %.1f%% of dofs; KL %.3e; pointwise std prior %.3f -> "
         "posterior %.3f; |m_map - m_true| / |m_true| = %.3f; end to end %.1f s"
@@ -321,16 +355,18 @@ def main():
             os.makedirs(os.path.dirname(os.path.abspath(args.fields)), exist_ok=True)
             np.savez(args.fields, xyz=cat[0], mtrue=cat[1], mmap=cat[2], std_post=cat[3], std_prior=cat[4],
                      var_reduction=cat[5], targets=targets, d=np.asarray(d), n=N, ranks=COMM.size)
-    if args.dump and COMM.size == 1:
+    if args.dump and COMM.size == 1 and RANK == 0:
         np.savez(args.dump, sample_var=acc, pointwise_var=pv.array, prior_var=prv.array, d=np.asarray(d),
                  U0=U[0].array, mean=x[PARAMETER].array)
 
-    rec = {"host": platform.node(), "ranks": COMM.size, "n": N, "order": ORDER, "mfem_device": args.device,
+    rec = {"host": platform.node(), "ranks": WORLD.size, "ensemble": bool(args.ensemble),
+           "newton_skip": bool(args.newton_skip), "n": N, "order": ORDER, "mfem_device": args.device,
            "kernels": str(kernel_mod.device()), "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
            "k": args.k, "p": args.p, "passes": args.passes, "single_pass": bool(args.single_pass), "samples": args.samples, "r": args.r,
            "gauss_newton": bool(args.gauss_newton), "symmetric_jacobian": bool(args.symmetric_jacobian),
            "release_linearization": bool(args.release_linearization), "prior_tol": args.prior_tol, "inc_tol": args.inc_tol,
-           "t_map": t_map, "newton_it": solver.it, "cg_it": solver.total_cg_iter,
+           "t_map": t_map, "newton_it": 0 if args.newton_skip else solver.it,
+           "cg_it": 0 if args.newton_skip else solver.total_cg_iter,
            "t_hess_blocks": t_hess, "t_eig": t_eig, "eig_parts": {k: list(v) for k, v in eig_parts.items()},
            "d_max": float(d[0]), "d_min": float(d[-1]), "n_above_one": int((d > 1).sum()), "orth": orth,
            "t_samples": t_samp, "samp_parts": {k: list(v) for k, v in samp_parts.items()},

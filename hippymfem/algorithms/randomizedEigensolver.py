@@ -107,8 +107,10 @@ def doublePass(A, Omega, k, s=1, check=False):
     return d, U
 
 
-def singlePassG(A, B, Binv, Omega, k, s=1, check=False):
-    r"""Single-pass solver for :math:`A u = \lambda B u`, with :math:`U^{\!\top}BU=I`."""
+def singlePassG(A, B, Binv, Omega, k, s=1, check=False, ensemble=None):
+    r"""Single-pass solver for :math:`A u = \lambda B u`, with :math:`U^{\!\top}BU=I`.
+
+    ``ensemble``: see :func:`doublePassG`."""
     nvec = Omega.nvec()
     if nvec < k:
         raise ValueError("Omega needs at least k = %d columns, has %d" % (k, nvec))
@@ -120,8 +122,8 @@ def singlePassG(A, B, Binv, Omega, k, s=1, check=False):
         Y_pr.swap(Q)
         if i:
             Y_pr.Borthogonalize(B)        # see doublePass
-        MatMvMult(A, Y_pr, Ybar)
-        MatMvMult(_as_operator(Binv), Ybar, Q)
+        MatMvMult(A, Y_pr, Ybar, ensemble)
+        MatMvMult(_as_operator(Binv), Ybar, Q, ensemble)
 
     BQ, _ = Q.Borthogonalize(B)
     Xt = Y_pr.dot_mv(BQ)
@@ -137,11 +139,17 @@ def singlePassG(A, B, Binv, Omega, k, s=1, check=False):
     return d, U
 
 
-def doublePassG(A, B, Binv, Omega, k, s=1, check=False):
+def doublePassG(A, B, Binv, Omega, k, s=1, check=False, ensemble=None):
     r"""Double-pass solver for :math:`A u = \lambda B u`, with :math:`U^{\!\top}BU=I`.
 
     ``A`` is the data-misfit Hessian, ``B`` the prior precision ``R`` and ``Binv``
     a solver for it.
+
+    ``ensemble`` is a communicator whose ranks each hold a complete copy of the problem,
+    with the same ``Omega``; the applications of ``A`` and of ``Binv`` to the columns
+    are then divided among its ranks (:func:`~hippymfem.algorithms.multivector.MatMvMult`),
+    and every rank returns the same eigenpairs.  The B-orthogonalization, which is
+    sequential in the columns, is carried out by every rank.
     """
     nvec = Omega.nvec()
     if nvec < k:
@@ -150,12 +158,12 @@ def doublePassG(A, B, Binv, Omega, k, s=1, check=False):
     Ybar = MultiVector(Omega[0], nvec)
     Q = MultiVector(Omega)
     for _ in range(s):
-        MatMvMult(A, Q, Ybar)
-        MatMvMult(_as_operator(Binv), Ybar, Q)
+        MatMvMult(A, Q, Ybar, ensemble)
+        MatMvMult(_as_operator(Binv), Ybar, Q, ensemble)
         Q.Borthogonalize(B)               # after every application; see doublePass
 
     AQ = MultiVector(Omega[0], nvec)
-    MatMvMult(A, Q, AQ)
+    MatMvMult(A, Q, AQ, ensemble)
     T = AQ.dot_mv(Q)
 
     d, V = _top_k(T, k)

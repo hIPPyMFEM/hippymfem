@@ -269,12 +269,51 @@ class MultiVector(SnakeCamel):
 
 
 # ------------------------------------------------------------------- helpers
-def MatMvMult(A, x, y):
-    """``y[i] = A x[i]`` for every column."""
+def MatMvMult(A, x, y, ensemble=None):
+    """``y[i] = A x[i]`` for every column.
+
+    ``ensemble`` is a communicator whose ranks each hold a **complete copy** of the
+    problem (operators and vectors on ``MPI.COMM_SELF``, or on a communicator of their
+    own).  The columns are then divided among its ranks, rank ``r`` applies ``A`` to
+    the columns ``r, r + size, ...``, and the results are exchanged so that every rank
+    ends with all of ``y``.  The applications are independent, so this scales with the
+    number of ranks, which a domain decomposition of a small problem over the same
+    GPUs does not (see :func:`ensemble_columns`).
+    """
     if x.nvec() != y.nvec():
         raise ValueError("MatMvMult: column counts differ")
-    for i in range(x.nvec()):
+    if ensemble is None or ensemble.size == 1:
+        for i in range(x.nvec()):
+            A.mult(x[i], y[i])
+        return y
+    for i in ensemble_columns(ensemble, x.nvec()):
         A.mult(x[i], y[i])
+    ensemble_exchange(ensemble, y)
+    return y
+
+
+def ensemble_columns(ensemble, nvec, rank=None):
+    """The columns of an ``nvec``-column MultiVector that a rank of ``ensemble`` computes."""
+    return range(ensemble.rank if rank is None else rank, nvec, ensemble.size)
+
+
+def ensemble_exchange(ensemble, y):
+    """Give every rank of ``ensemble`` all columns of ``y``, each taken from the rank that
+    computed it (:func:`ensemble_columns`).  The copies of ``y`` must have the same local
+    size on every rank, which they have when each rank holds the whole problem."""
+    size, rank, nvec = ensemble.size, ensemble.rank, y.nvec()
+    d = y.data                                   # on the host, current
+    width = d.shape[1]
+    counts = [len(ensemble_columns(ensemble, nvec, q)) * width for q in range(size)]
+    recv = np.empty((nvec, width), dtype=np.float64)
+    ensemble.Allgatherv(np.ascontiguousarray(d[rank::size]),
+                        [recv, counts, [sum(counts[:q]) for q in range(size)], MPI.DOUBLE])
+    row = 0
+    for q in range(size):
+        m = counts[q] // width if width else 0
+        if q != rank:
+            d[q::size] = recv[row:row + m]
+        row += m
     return y
 
 
