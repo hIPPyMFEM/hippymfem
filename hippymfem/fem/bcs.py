@@ -70,6 +70,38 @@ def _zero_entries(owner, ess, v):
     return v
 
 
+class _Holder:
+    """Keeps the device index array of an essential-dof set given as a bare array."""
+
+
+_HOLDERS = None
+
+
+def zero_essential(v, ess):
+    """Set the true-dof entries ``ess`` of ``v`` to zero, where ``v`` is.
+
+    For a vector MFEM holds on a GPU the write is done there, from a device copy of
+    ``ess`` that is built once and kept as long as the array ``ess`` lives (the BC
+    objects pass the same array every time).  Otherwise it is an indexed write
+    through the host array, which for a device vector would mean a copy of the whole
+    vector down and another up.
+    """
+    global _HOLDERS
+    if ess is None or not len(ess):
+        return v
+    if getattr(v, "_dev", False) and isinstance(ess, np.ndarray):
+        if _HOLDERS is None:
+            from ..common.identitycache import IdentityCache
+
+            _HOLDERS = IdentityCache()
+        holder = _HOLDERS.get((ess,))
+        if holder is None:
+            holder = _HOLDERS.put((ess,), _Holder())
+        return _zero_entries(holder, ess, v)
+    v.array[np.asarray(ess, dtype=np.int64)] = 0.0
+    return v
+
+
 class DirichletBC(KeepAlive):
     """Essential boundary condition on part of the boundary of a space.
 

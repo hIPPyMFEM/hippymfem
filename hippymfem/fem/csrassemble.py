@@ -352,7 +352,15 @@ def assemble_vector_csr(space, groups, element_vectors, nelem, ess=None,
     """
     space = as_space(space)
     pat = get_vector_pattern(space, groups)
-    out = space.assemble_dual(pat.scatter(element_vectors), out)
+    from ..common import devicebridge
+
+    # With the bridge the summed element vectors stay on the device: they are copied
+    # into MFEM's memory there, reduced by ``P^T`` there, and the essential entries are
+    # zeroed there (FunctionSpace.assemble_dual, bcs._zero_entries).
+    on_device = devicebridge.available()
+    out = space.assemble_dual(pat.scatter(element_vectors, host=not on_device), out)
     if ess is not None and len(ess):
-        out.array[np.asarray(ess, dtype=np.int64)] = 0.0
+        from .bcs import zero_essential
+
+        zero_essential(out, ess)
     return out

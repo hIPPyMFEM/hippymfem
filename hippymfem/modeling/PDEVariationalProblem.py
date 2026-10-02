@@ -31,7 +31,7 @@ from mpi4py import MPI
 from ..common.keepalive import KeepAlive
 from ..common.parvector import ParVector
 from ..fem.assemble import assemble_matrix, assemble_scalar, assemble_vector
-from ..fem.bcs import as_bcset
+from ..fem.bcs import as_bcset, zero_essential
 from ..fem.elementbatch import default_quadrature_degree, get_batches
 from ..fem.spaces import as_space
 from .PDEProblem import PDEProblem
@@ -297,6 +297,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._jac_cache = None
         #: private generator for the symmetry probe (see :meth:`_probe_symmetry`)
         self._symmetry_rng = None
+        self._symmetry_probes = None
+        #: work vector of :meth:`solveIncremental`
+        self._inc_rhs = None
 
     # ------------------------------------------------------------------ shapes
     def generate_state(self):
@@ -321,11 +324,11 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         out = []
         for i in range(NVAR):
             v = x[i] if x[i] is not None else self.Vh[i].vector()
-            out.append(self.Vh[i].local_values(v))
+            out.append(self.Vh[i].local_values(v, device=True))
         return out
 
     def _aux_locals(self):
-        return [sp.local_values(v)
+        return [sp.local_values(v, device=True)
                 for sp, v in zip(self.aux_spaces, self.aux_values)]
 
     def _facet_locals(self, x):
@@ -365,8 +368,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             out.axpy(1.0, assemble_facet_vector(
                 self.Vh[var], self.facet_batches.groups, fvecs,
                 tables=self.facet_batches.tables(self.Vh[var])))
-        if ess is not None and len(ess):
-            out.array[np.asarray(ess, dtype=np.int64)] = 0.0
+        zero_essential(out, ess)
         return out
 
     def _block(self, i, j, x, test_ess=None, diag_policy="one", mats=None,
@@ -526,22 +528,34 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
         # A private generator, never the library's ``parRandom``: drawing from the
         # shared stream here would shift every prior sample and noise vector drawn
-        # afterwards.
-        if self._symmetry_rng is None:
-            self._symmetry_rng = Random(seed=20260914)
-        rng = self._symmetry_rng
-        rng.set_seed(rng.seed)                       # same vectors at every probe
-        v, w = self.generate_state(), self.generate_state()
-        Av, Aw = self.generate_state(), self.generate_state()
-        for _ in range(self.SYMMETRY_PROBE_VECTORS):
-            rng.normal(1.0, v)
-            rng.normal(1.0, w)
-            A.Mult(v.hypre, Av.hypre)
-            A.Mult(w.hypre, Aw.hypre)
-            bound = max(w.norm("l2") * Av.norm("l2"), v.norm("l2") * Aw.norm("l2"))
+        # afterwards.  The probe uses the same vectors every time, so they are drawn
+        # once and kept with their norms: drawing them was the larger part of a probe
+        # (65 ms for 2.1 million dofs, against four products of a millisecond each on
+        # a GPU), and kept vectors stay in device memory, where the products and the
+        # inner products below then run without a copy.
+        probes = self._symmetry_probes
+        if probes is None:
+            if self._symmetry_rng is None:
+                self._symmetry_rng = Random(seed=20260914)
+            rng = self._symmetry_rng
+            rng.set_seed(rng.seed)                   # the vectors of every earlier probe
+            probes = []
+            for _ in range(self.SYMMETRY_PROBE_VECTORS):
+                v, w = self.generate_state(), self.generate_state()
+                rng.normal(1.0, v)
+                rng.normal(1.0, w)
+                probes.append((v, w, v.norm("l2"), w.norm("l2")))
+            self._symmetry_probes = (probes, self.generate_state())
+        probes, Ax = self._symmetry_probes
+        for v, w, nv, nw in probes:
+            A.Mult(v.hypre, Ax.hypre)
+            wAv, nAv = w.inner(Ax), Ax.norm("l2")
+            A.Mult(w.hypre, Ax.hypre)
+            vAw, nAw = v.inner(Ax), Ax.norm("l2")
+            bound = max(nw * nAv, nv * nAw)
             if bound == 0.0:
                 continue
-            if abs(w.inner(Av) - v.inner(Aw)) > self.SYMMETRY_PROBE_TOL * bound:
+            if abs(wAv - vAw) > self.SYMMETRY_PROBE_TOL * bound:
                 return False
         return True
 
@@ -809,7 +823,13 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
     def solveIncremental(self, out, rhs, is_adj):
         """Solve the incremental forward or adjoint system."""
-        r = rhs.copy()
+        # The right-hand side with its essential entries zeroed, in a vector that is
+        # kept: a fresh copy per solve allocates and frees a device vector each time,
+        # which on a node where sixteen processes do so costs 3 ms of a 65 ms solve.
+        r = self._inc_rhs
+        if r is None or r.local_size != rhs.local_size:
+            r = self._inc_rhs = rhs.duplicate()
+        r.assign(rhs)
         self.bc0.zero(r)
         out.zero()
         if is_adj:
@@ -906,7 +926,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             dvec = dir.copy()
             dvec.array[np.asarray(ess, dtype=np.int64)] = 0.0
         loc = self._locals(x) + self._aux_locals()
-        jl = self.Vh[j].local_values(dvec)
+        jl = self.Vh[j].local_values(dvec, device=True)
         res = assemble_vector(self.Vh[i], self.batches.groups,
                               self.kernel.element_hvp(i, j, loc, jl), self.nelem)
         if self.bdr_kernel is not None:
@@ -932,8 +952,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     def apply_ijk(self, i, j, k, x, jdir, kdir, out):
         """Third-derivative block contracted with ``jdir`` and ``kdir``."""
         loc = self._locals(x) + self._aux_locals()
-        jl = self.Vh[j].local_values(jdir)
-        kl = self.Vh[k].local_values(kdir)
+        jl = self.Vh[j].local_values(jdir, device=True)
+        kl = self.Vh[k].local_values(kdir, device=True)
         vecs = self.kernel.element_third(i, j, k, loc, jl, kl)
         res = assemble_vector(self.Vh[i], self.batches.groups, vecs, self.nelem)
         if self.bdr_kernel is not None:
@@ -953,7 +973,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 tables=self.facet_batches.tables(self.Vh[i])))
         ess = self.bc0.ess if i in (STATE, ADJOINT) else None
         if ess is not None and len(ess):
-            res.array[np.asarray(ess, dtype=np.int64)] = 0.0
+            zero_essential(res, ess)
         out.assign(res)
         return out
 
@@ -979,7 +999,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             out.zero()
             return out
         loc = self._locals(x) + self._aux_locals()
-        dl = [tuple(None if d[s] is None else self.Vh[s].local_values(d[s])
+        dl = [tuple(None if d[s] is None else self.Vh[s].local_values(d[s], device=True)
                     for s in range(len(d))) + (None,) * (len(loc) - len(d))
               for d in dirs]
         vecs = self.kernel.element_third_dir(i, loc, dl, weights)
@@ -1006,7 +1026,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                         res.axpy(w, vec)
         ess = self.bc0.ess if i in (STATE, ADJOINT) else None
         if ess is not None and len(ess):
-            res.array[np.asarray(ess, dtype=np.int64)] = 0.0
+            zero_essential(res, ess)
         out.assign(res)
         return out
 
@@ -1084,7 +1104,16 @@ def require_finite(v, what):
     that into a ``RuntimeError``, which the line searches handle by backtracking;
     the check costs one allreduce.
     """
-    ok = bool(np.isfinite(v.array).all()) if v.local_size else True
+    if not v.local_size:
+        ok = True
+    elif getattr(v, "_dev", False):
+        # A vector MFEM holds on a GPU is reduced there: its norm is not finite as
+        # soon as one entry is not, and nothing is copied to the host for the check.
+        import math
+
+        ok = math.isfinite(v.hypre.Norml2())
+    else:
+        ok = bool(np.isfinite(v._host_read()).all())
     if not v.comm.allreduce(int(ok), op=MPI.MIN):
         raise RuntimeError(
             "%s contains non-finite values; the step that produced it is too "

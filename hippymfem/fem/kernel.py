@@ -225,6 +225,11 @@ def on_gpu():
 
 
 def _put(x):
+    if isinstance(x, jax.Array):
+        # already a JAX array (the dof values a space hands over from MFEM's device
+        # memory, :meth:`~hippymfem.fem.spaces.FunctionSpace.local_values`): no trip
+        # through numpy, and no transfer when it is on this device
+        return jax.device_put(x, device())
     return jax.device_put(np.ascontiguousarray(x), device())
 
 

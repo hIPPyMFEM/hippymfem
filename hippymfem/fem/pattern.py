@@ -932,15 +932,17 @@ class VectorPattern(KeepAlive):
                 if self.sign is not None:
                     self.sign = self.sign[perm]
 
-    def scatter(self, element_vectors):
+    def scatter(self, element_vectors, host=True):
         """Local dof array holding the summed element vectors.
 
-        Reduced where the element vectors are, as in :meth:`ScatterPattern.data`.
+        Reduced where the element vectors are, as in :meth:`ScatterPattern.data`;
+        with ``host=False`` a device result is returned as the device array it is.
         """
         if not element_vectors:                 # this rank owns no such elements
             return np.zeros(self.n)
         if not all(isinstance(v, np.ndarray) for v in element_vectors):
-            return np.asarray(self._scatter_device(element_vectors))
+            out = self._scatter_device(element_vectors)
+            return out if not host else np.asarray(out)
         if len(element_vectors) == 1:
             flat = np.asarray(element_vectors[0], dtype=np.float64).reshape(-1)
         else:

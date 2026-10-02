@@ -174,15 +174,35 @@ class FunctionSpace(KeepAlive):
         gf.GetTrueDofs(v.hypre)
         return v
 
-    def local_values(self, v, out=None):
+    def local_values(self, v, out=None, device=False):
         """Local dof values of a true-dof vector, **including ghosts**, as numpy.
 
         This is ``P v``, the gather element kernels need.  A numpy array is
         returned rather than an ``mfem.Vector`` so that callers never have to
         reach for ``GetDataArray()``, whose views do not keep their owner alive
         (see :func:`hippymfem.common.parvector.to_numpy`).
+
+        With ``device=True``, for a caller that hands the values to the element
+        kernels, a JAX array on the kernels' GPU is returned instead when MFEM is on
+        that GPU as well (:mod:`hippymfem.common.devicebridge`): ``P v`` is formed on
+        the device and copied there, where the numpy route would bring it to the host
+        only for the kernels to upload it again.
         """
         n = self.fes.GetVSize()
+        if device and out is None:
+            from ..common import devicebridge as bridge
+
+            if bridge.available():
+                P = self.fes.GetProlongationMatrix()
+                if P is None:
+                    src = v.hypre
+                else:
+                    src = mfem.Vector(n)
+                    src.UseDevice(True)
+                    P.Mult(v.hypre, src)
+                address = bridge.address(src.Read())
+                bridge.synchronize()            # the product has finished
+                return bridge.copy_to_jax(address, n)
         scratch = mfem.Vector(n)
         P = self.fes.GetProlongationMatrix()
         if P is None:
@@ -202,6 +222,25 @@ class FunctionSpace(KeepAlive):
         """
         if v is None:
             v = self.vector()
+        if not isinstance(local, (np.ndarray, mfem.Vector)):
+            # A JAX array on the device (a scattered residual): its values go into
+            # MFEM's device memory by a copy on the device, and ``P^T`` is applied
+            # there, so the vector never visits the host.
+            from ..common import devicebridge as bridge
+
+            if bridge.available():
+                P = self.fes.GetProlongationMatrix()
+                if P is None:
+                    bridge.copy_from_jax(bridge.address(v.hypre.Write()), local)
+                    bridge.synchronize()
+                else:
+                    scratch = mfem.Vector(int(local.shape[0]))
+                    scratch.UseDevice(True)
+                    bridge.copy_from_jax(bridge.address(scratch.Write()), local)
+                    bridge.synchronize()
+                    P.MultTranspose(scratch, v.hypre)
+                return v
+            local = np.asarray(local, dtype=np.float64)
         if isinstance(local, np.ndarray):
             scratch = mfem.Vector(np.ascontiguousarray(local, dtype=np.float64))
         else:

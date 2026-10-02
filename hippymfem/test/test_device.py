@@ -685,6 +685,160 @@ def test_identity_route_on_device():
           "(relative difference %.1e)" % rel)
 
 
+def test_matrix_stays_on_device():
+    """A matrix finished on the device, its values copied from JAX's memory into
+    hypre's two blocks there, against the one whose values pass through the host:
+    the same matrix to round-off (the scatter's order is not fixed on a device), read
+    back to the host from the device-built one, and the same solve."""
+    from hippymfem.common import devicebridge as bridge
+    from hippymfem.common.linalg import hypre_to_scipy
+
+    old = bridge.set_device_bridge("auto")
+    mats, norms, used = {}, {}, {}
+    try:
+        usable, why = bridge.available(), bridge.why_not()
+        if not usable:
+            check("device bridge (kernels and hypre on one GPU)", True, "(skipped: %s)" % why)
+            return
+        for mode in ("0", "auto"):
+            bridge.set_device_bridge(mode)
+            pm, Vh, b, K, bc = problem(5)          # new spaces: nothing cached is shared
+            before = bridge.stats()[0]
+            A = matrix(pm, Vh, b, K, bc, seed=31)
+            used[mode] = bridge.stats()[0] - before
+            norms[mode] = amg_cg(A, iters=30)
+            mats[mode] = hypre_to_scipy(A).tocsr()
+            del A
+    finally:
+        bridge.set_device_bridge(old)
+    check("the values are copied on the device with the bridge and not without",
+          used["auto"] >= 2 and used["0"] == 0, "(%d and %d copies)" % (used["auto"], used["0"]))
+    same = mats["0"].shape == mats["auto"].shape and mats["0"].nnz == mats["auto"].nnz
+    worst = float(abs(mats["0"] - mats["auto"]).max()) if same and mats["0"].nnz else 0.0
+    scale = float(abs(mats["0"]).max()) if mats["0"].nnz else 1.0
+    check("a matrix finished on the device equals the one finished on the host",
+          same and worst <= 1e-13 * scale,
+          "(max abs difference %.1e, largest entry %.1e)" % (worst, scale))
+    rel = abs(norms["0"] - norms["auto"]) / max(abs(norms["0"]), 1e-300)
+    check("device-finished matrix: the same AMG-CG solve", rel < 1e-9,
+          "(relative difference %.1e)" % rel)
+
+
+def test_vectors_on_device():
+    """ParVector arithmetic where the vector is: every update, copy and reduction of a
+    vector hypre left on the device, done by MFEM there, against numpy on the host."""
+    from hippymfem.common import parvector as pv
+
+    pm, Vh, b, K, bc = problem(5)
+    A = matrix(pm, Vh, b, K, bc, seed=37)
+    bcz = hp.DirichletBC(Vh[0], lambda x: 1.0 + x[0], "all")
+    old = pv.set_device_vectors("auto")
+    res = {}
+    try:
+        for mode in ("0", "auto"):
+            pv.set_device_vectors(mode)
+            vs = []
+            for k in range(3):
+                v = Vh[0].vector()
+                v.array[:] = np.random.default_rng(1000 * RANK + k).normal(size=v.local_size)
+                vs.append(v)
+            x, y, z = vs
+            w = Vh[0].vector()
+            A.Mult(x.hypre, w.hypre)                 # w is with hypre now
+            flagged = w._dev
+            w.axpy(0.3, y)
+            w.scale(-1.7)
+            w.aypx(0.25, x)
+            w.axpby(0.5, 2.0, z)
+            c = w.copy()
+            c.assign(w)
+            bcz.zero(c)
+            bcz.apply(w)
+            d = c.copy()
+            d.zero()
+            res[mode] = (flagged, w.inner(x), w.norm("l2"), c.norm("l2"), w.norm("linf"),
+                         d.norm("l2"), float(np.abs(w.array).sum()))
+    finally:
+        pv.set_device_vectors(old)
+    check("a vector handed to hypre is flagged for the device only when that is on",
+          res["auto"][0] and not res["0"][0])
+    err = max(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"][1:], res["auto"][1:]))
+    check("vector arithmetic on the device agrees with numpy on the host", err < 1e-12,
+          "(largest relative difference %.1e)" % err)
+
+
+def test_observation_on_device():
+    """The pointwise observation operator as a hypre matrix on the device against the
+    numpy route, for targets inside elements and on the faces ranks share."""
+    from hippymfem.common import parvector as pv
+
+    pm, Vh, b, K, bc = problem(6)
+    rng = np.random.default_rng(5)
+    targets = np.column_stack([rng.uniform(0.05, 0.95, 40) for _ in range(3)])
+    targets[:4] = [[0.5, 0.5, 0.5], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.5, 0.25, 0.0]]
+    old = pv.set_device_vectors("auto")
+    res, used = {}, {}
+    try:
+        for mode in ("0", "auto"):
+            pv.set_device_vectors(mode)
+            B = hp.assemblePointwiseObservation(Vh[0], targets)
+            u = Vh[0].vector()
+            u.array[:] = np.random.default_rng(77 + RANK).normal(size=u.local_size)
+            d = B.createVecLeft()
+            B.mult(u, d)
+            back = Vh[0].vector()
+            B.multTranspose(d, back)
+            res[mode] = (B.gather(d), back.norm("l2"), back.inner(u))
+            used[mode] = bool(B._Bh)
+    finally:
+        pv.set_device_vectors(old)
+    check("the observation operator is a hypre matrix only with the vectors on the device",
+          used["auto"] and not used["0"])
+    e1 = float(np.abs(res["0"][0] - res["auto"][0]).max() / max(np.abs(res["0"][0]).max(), 1e-300))
+    e2 = max(abs(res["0"][k] - res["auto"][k]) / max(abs(res["0"][k]), 1e-300) for k in (1, 2))
+    check("B u and B^T d agree between the device and the host route", max(e1, e2) < 1e-12,
+          "(relative differences %.1e and %.1e)" % (e1, e2))
+
+
+def test_residual_on_device():
+    """An assembled vector that never visits the host (the summed element vectors go
+    from JAX's memory to MFEM's on the device, and the kernels read the dof values
+    from MFEM's device memory) against the one assembled through numpy."""
+    import jax.numpy as jnp
+
+    from hippymfem.common import devicebridge as bridge
+
+    old = bridge.set_device_bridge("auto")
+    res = {}
+    try:
+        if not bridge.available():
+            check("vectors over the device bridge", True, "(skipped: %s)" % bridge.why_not())
+            return
+        for mode in ("0", "auto"):
+            bridge.set_device_bridge(mode)
+            pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(5, 5, 5, mfem.Element.HEXAHEDRON))
+            Vu, Vm = hp.FunctionSpace.H1(pm, 2), hp.FunctionSpace.H1(pm, 1)
+            bc = hp.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
+            pde = hp.PDEVariationalProblem(
+                [Vu, Vm, Vu], lambda u, m, p, x: jnp.exp(m.val) * hp.inner(u.grad, p.grad),
+                bc, bc.homogeneous(), is_fwd_linear=True)
+            x = [pde.generate_state(), Vm.vector(), pde.generate_state()]
+            for k, v in enumerate(x):
+                v.array[:] = np.random.default_rng(50 + 7 * k + RANK).normal(size=v.local_size)
+            for v in (x[0], x[2]):
+                A0 = v.copy()                              # hand them to hypre once
+                A0.hypre
+            r = pde._residual(x, ADJOINT, ess=pde.bc0.ess)
+            g = pde._residual(x, 1)
+            pde.solveFwd(x[0], x)
+            res[mode] = (r.norm("l2"), g.norm("l2"), r.inner(x[2]), x[0].norm("l2"))
+    finally:
+        bridge.set_device_bridge(old)
+    err = max(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"], res["auto"]))
+    check("residual, gradient and forward solve agree with and without the bridge",
+          err < 1e-10, "(largest relative difference %.1e)" % err)
+
+
 if __name__ == "__main__":
     test_sibling_release()
     test_operator_reset()
@@ -700,6 +854,10 @@ if __name__ == "__main__":
     test_device_memory_flat()
     test_hypre_spmv_kernel()
     test_identity_route_on_device()
+    test_matrix_stays_on_device()
+    test_vectors_on_device()
+    test_observation_on_device()
+    test_residual_on_device()
     test_hypre_pool()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))
