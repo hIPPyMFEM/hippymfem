@@ -148,9 +148,9 @@ def main():
     ap.add_argument("--ensemble", action="store_true",
                     help="every rank holds the whole problem on its own GPU (no domain decomposition) and "
                     "the independent solves of the Laplace stages are divided among the ranks: the Hessian "
-                    "and prior applications of the eigensolver and the posterior samples.  The MAP point, "
-                    "the variance estimators and the traces are computed by every rank on its own, so "
-                    "their times are those of one GPU")
+                    "and prior applications of the eigensolver, the posterior samples, the variance "
+                    "estimators and the trace.  The MAP point is computed by every rank on its own, so "
+                    "its time is that of one GPU")
     ap.add_argument("--newton-skip", action="store_true",
                     help="no MAP computation: the Laplace stages at the prior mean (for timing them alone)")
     ap.add_argument("--out", default=None)
@@ -288,16 +288,23 @@ def main():
 
     def draw():
         acc[:] = 0.0
-        mine = range(args.samples)
-        if ENS is not None:
-            # each rank draws its share, from a stream of its own
-            mine = hm.algorithms.multivector.ensemble_columns(ENS, args.samples)
-            hm.parRandom.set_seed(7 + 7919 * RANK)
-        for _ in mine:
+        if ENS is None:
+            for _ in range(args.samples):
+                prior.sample_noise(1.0, noise)
+                post.sample(noise, s_pr, s_po, add_mean=False)
+                acc[:] += s_po.array ** 2
+        else:
+            # each rank draws its share; sample i is the i-th draw of the stream on whichever
+            # rank draws it, and every rank leaves the generator where one rank alone would
+            start = hm.parRandom.tell()
             prior.sample_noise(1.0, noise)
-            post.sample(noise, s_pr, s_po, add_mean=False)
-            acc[:] += s_po.array ** 2
-        if ENS is not None:
+            words = hm.parRandom.tell() - start
+            for i in hm.algorithms.multivector.ensemble_columns(ENS, args.samples):
+                hm.parRandom.seek(start + i * words)
+                prior.sample_noise(1.0, noise)
+                post.sample(noise, s_pr, s_po, add_mean=False)
+                acc[:] += s_po.array ** 2
+            hm.parRandom.seek(start + args.samples * words)
             ENS.Allreduce(MPI.IN_PLACE, acc, op=MPI.SUM)
         acc[:] /= args.samples
     before = meter.snapshot()
@@ -308,17 +315,18 @@ def main():
 
     # ---- variance and traces
     before = meter.snapshot()
-    t_var, (pv, prv, corr) = timed(lambda: post.pointwise_variance(method="Randomized", r=args.r))
+    ek = {} if ENS is None else {"ensemble": ENS}
+    t_var, (pv, prv, corr) = timed(lambda: post.pointwise_variance(method="Randomized", r=args.r, **ek))
     var_parts = Meter.delta(meter.snapshot(), before)
     report("pointwise variance, randomized (r=%d)" % args.r, t_var, var_parts, ["prior R^-1 apply", "MultiVector dot"])
     before = meter.snapshot()
-    t_mc, (pv_mc, prv_mc, corr_mc) = timed(lambda: post.pointwise_variance(method="MonteCarlo", n=args.samples))
+    t_mc, (pv_mc, prv_mc, corr_mc) = timed(lambda: post.pointwise_variance(method="MonteCarlo", n=args.samples, **ek))
     mc_parts = Meter.delta(meter.snapshot(), before)
     report("pointwise variance, Monte Carlo (n=%d)" % args.samples, t_mc, mc_parts, ["noise draw", "prior sample"])
     say("    prior variance, mean: randomized %.4e  Monte Carlo %.4e  (ratio %.3f; the randomized one is a truncation)"
         % (prv.array.mean() if prv.local_size else 0.0, prv_mc.array.mean() if prv_mc.local_size else 0.0,
            prv.sum() / max(prv_mc.sum(), 1e-300)))
-    t_tr, (tr_post, tr_pr, tr_corr) = timed(lambda: post.trace(method="Randomized", r=args.r))
+    t_tr, (tr_post, tr_pr, tr_corr) = timed(lambda: post.trace(method="Randomized", r=args.r, **ek))
     say("  traces (r=%d): %.2f s  posterior %.4e prior %.4e correction %.4e" % (args.r, t_tr, tr_post, tr_pr, tr_corr))
     # sample variance against the low-rank pointwise variance (a loose statistical check)
     num = (np.abs(acc - pv_mc.array).max() / max(np.abs(pv_mc.array).max(), 1e-300)) if pv_mc.local_size else 0.0

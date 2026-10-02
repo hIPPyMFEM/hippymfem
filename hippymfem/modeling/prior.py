@@ -415,8 +415,12 @@ class _Prior(SnakeCamel, KeepAlive):
         self.R.mult(d, out)
         return out
 
-    def trace(self, method="Exact", tol=1e-1, min_iter=20, max_iter=100, r=200):
-        r"""Trace of :math:`R^{-1} M`, i.e. the integrated prior variance."""
+    def trace(self, method="Exact", tol=1e-1, min_iter=20, max_iter=100, r=200, ensemble=None):
+        r"""Trace of :math:`R^{-1} M`, i.e. the integrated prior variance.
+
+        ``ensemble`` (``"Randomized"`` only): a communicator whose ranks each hold a
+        complete copy of the problem; the solves are divided among them
+        (:func:`~hippymfem.algorithms.multivector.MatMvMult`)."""
         op = _RinvM(self.Rsolver, self.M, self.comm)
         if method == "Exact":
             mv = op.generate_vector(0)
@@ -436,12 +440,12 @@ class _Prior(SnakeCamel, KeepAlive):
                 Solver2Operator(self.Rsolver, init_vector=self.init_vector),
                 Solver2Operator(self.Msolver, init_vector=self.init_vector),
                 _M_as_solver(self.M, self.comm),
-                Omega, r, s=1, check=False,
+                Omega, r, s=1, check=False, ensemble=ensemble,
             )
             return float(d.sum())
         raise ValueError("unknown trace method %r" % (method,))
 
-    def pointwise_variance(self, method="Exact", k=1000000, r=200, n=None):
+    def pointwise_variance(self, method="Exact", k=1000000, r=200, n=None, ensemble=None):
         r"""Diagonal of :math:`R^{-1}`, the pointwise prior variance.
 
         ``"Exact"`` applies :math:`R^{-1}` to every unit vector (small problems only).
@@ -451,6 +455,10 @@ class _Prior(SnakeCamel, KeepAlive):
         ``"MonteCarlo"`` averages the squares of ``n`` prior samples (``n`` defaults
         to ``r``): unbiased at one solve per sample, so it is the method to use when
         samples are cheap, as they are with hypre on a device.
+
+        ``ensemble`` (``"MonteCarlo"`` and ``"Randomized"``): a communicator whose ranks
+        each hold a complete copy of the problem; the samples, or the solves, are divided
+        among them, and every rank returns the field that one rank alone would compute.
         """
         pw = ParVector(self.comm, self.M.Height())
         if method == "MonteCarlo":
@@ -458,10 +466,23 @@ class _Prior(SnakeCamel, KeepAlive):
             noise = self.noise_vector()
             s = ParVector(self.comm, self.M.Height())
             acc = np.zeros(pw.local_size)
-            for _ in range(n):
+            if ensemble is not None and ensemble.size > 1:
+                # sample i is the i-th draw of the stream, whichever rank draws it
+                start = parRandom.tell()
                 self.sample_noise(1.0, noise)
-                self.sample(noise, s, add_mean=False)
-                acc += s.array ** 2
+                words = parRandom.tell() - start
+                for i in range(ensemble.rank, n, ensemble.size):
+                    parRandom.seek(start + i * words)
+                    self.sample_noise(1.0, noise)
+                    self.sample(noise, s, add_mean=False)
+                    acc += s.array ** 2
+                parRandom.seek(start + n * words)
+                ensemble.Allreduce(MPI.IN_PLACE, acc, op=MPI.SUM)
+            else:
+                for _ in range(n):
+                    self.sample_noise(1.0, noise)
+                    self.sample(noise, s, add_mean=False)
+                    acc += s.array ** 2
             pw.array[:] = acc / max(n, 1)
             return pw
         if method == "Exact":
@@ -477,7 +498,7 @@ class _Prior(SnakeCamel, KeepAlive):
             parRandom.normal_multivector(1.0, Omega)
             d, U = doublePass(
                 Solver2Operator(self.Rsolver, init_vector=self.init_vector),
-                Omega, r, s=1, check=False,
+                Omega, r, s=1, check=False, ensemble=ensemble,
             )
             pw.zero()
             for i in range(U.nvec()):

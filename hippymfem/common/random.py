@@ -78,6 +78,15 @@ class Random:
         self.seed = int(seed)
         self._stream = 0
 
+    def tell(self):
+        """The position in the stream: the number of words drawn since :meth:`set_seed`."""
+        return int(self._stream)
+
+    def seek(self, position):
+        """Move to a position of the stream (see :meth:`tell`); the draws that follow are
+        the ones a generator that had drawn ``position`` words would make."""
+        self._stream = int(position)
+
     # ------------------------------------------------------------- interface
     def normal(self, sigma, out, add=False):
         """Fill ``out`` with N(0, sigma^2) samples (or add them if ``add``)."""

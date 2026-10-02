@@ -38,10 +38,10 @@ def _top_k(T, k):
     return d[order], V[:, order]
 
 
-def singlePass(A, Omega, k, s=1, check=False):
+def singlePass(A, Omega, k, s=1, check=False, ensemble=None):
     r"""Dominant eigenpairs of ``A`` from one pass over the operator.
 
-    Returns ``(d, U)`` with :math:`U^{\!\top}U = I_k`.
+    Returns ``(d, U)`` with :math:`U^{\!\top}U = I_k`.  ``ensemble``: see :func:`doublePassG`.
     """
     nvec = Omega.nvec()
     if nvec < k:
@@ -53,7 +53,7 @@ def singlePass(A, Omega, k, s=1, check=False):
         Y_pr.swap(Y)
         if i:
             Y_pr.orthogonalize()          # see doublePass: keeps the tail through the power iterations
-        MatMvMult(A, Y_pr, Y)
+        MatMvMult(A, Y_pr, Y, ensemble)
 
     Q = MultiVector(Y)
     Q.orthogonalize()
@@ -71,11 +71,12 @@ def singlePass(A, Omega, k, s=1, check=False):
     return d, U
 
 
-def doublePass(A, Omega, k, s=1, check=False):
+def doublePass(A, Omega, k, s=1, check=False, ensemble=None):
     r"""Dominant eigenpairs of ``A`` with ``s`` power iterations and two passes.
 
     More accurate than :func:`singlePass` at the cost of ``k`` extra operator
     applications; this is the default for the Laplace approximation.
+    ``ensemble``: see :func:`doublePassG`.
     """
     nvec = Omega.nvec()
     if nvec < k:
@@ -84,7 +85,7 @@ def doublePass(A, Omega, k, s=1, check=False):
     Q = MultiVector(Omega)
     Y = MultiVector(Omega[0], nvec)
     for _ in range(s):
-        MatMvMult(A, Q, Y)
+        MatMvMult(A, Q, Y, ensemble)
         Q.swap(Y)
         # Orthonormalize after *every* application, not once at the end (subspace
         # iteration): the s-th power raises the spectral ratio to its s-th power,
@@ -96,7 +97,7 @@ def doublePass(A, Omega, k, s=1, check=False):
         Q.orthogonalize()
 
     AQ = MultiVector(Omega[0], nvec)
-    MatMvMult(A, Q, AQ)
+    MatMvMult(A, Q, AQ, ensemble)
     T = AQ.dot_mv(Q)
 
     d, V = _top_k(T, k)

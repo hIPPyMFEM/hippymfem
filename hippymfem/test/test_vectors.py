@@ -433,6 +433,52 @@ def test_config_knobs():
         c.gpu_mem_reserve, c.fused_keep = saved
 
 
+def test_ensemble():
+    """Every rank holds the whole problem (on COMM_SELF); MatMvMult and doublePassG divide
+    the columns among the ranks and must return what one rank alone computes."""
+    if RANK == 0:
+        print("ensemble (a complete problem on every rank)")
+    self_comm = MPI.COMM_SELF
+    mesh = mfem.Mesh.MakeCartesian2D(8, 8, mfem.Element.TRIANGLE)
+    pmesh = mfem.ParMesh(self_comm, mesh)
+    fec = mfem.H1_FECollection(1, 2)
+    fes = mfem.ParFiniteElementSpace(pmesh, fec)
+
+    def matrix(*integrators):
+        a = mfem.ParBilinearForm(fes)
+        for integ in integrators:
+            a.AddDomainIntegrator(integ)
+        a.Assemble()
+        a.Finalize()
+        return a.ParallelAssemble()
+    Amat, Mmat = matrix(mfem.DiffusionIntegrator(), mfem.MassIntegrator()), matrix(mfem.MassIntegrator())
+    A = hp.MatrixOperator(Amat, self_comm)
+    v = ParVector.from_fes(fes)
+    n = 7                                   # not a multiple of the rank count on 2 or 4 ranks
+    X = MultiVector(v, n)
+    X.data[:] = np.random.default_rng(11).standard_normal(X.data.shape)   # the same on every rank
+    Y1, Y2 = MultiVector(v, n), MultiVector(v, n)
+    MatMvMult(A, X, Y1)
+    MatMvMult(A, X, Y2, ensemble=COMM)
+    err = COMM.allreduce(float(np.abs(Y1.data - Y2.data).max()), op=MPI.MAX)
+    check("MatMvMult divided among the ranks == one rank", err == 0.0, "(%.2e)" % err)
+
+    # the generalized eigenproblem A u = lambda B u with a diagonal B
+    d = v.copy()
+    d.array[:] = 1.0 + 0.5 * np.cos(np.arange(d.local_size))
+    B = hp.DiagonalOperator(d)
+    Omega = MultiVector(v, 12)
+    Omega.data[:] = np.random.default_rng(12).standard_normal(Omega.data.shape)
+    d1, U1 = hp.doublePassG(A, B, B, MultiVector(Omega), 6)
+    d2, U2 = hp.doublePassG(A, B, B, MultiVector(Omega), 6, ensemble=COMM)
+    err = COMM.allreduce(float(np.abs(d2 / d1 - 1.0).max()), op=MPI.MAX)
+    check("doublePassG divided among the ranks: eigenvalues", err < 1e-12, "(%.2e)" % err)
+    err = COMM.allreduce(float(np.abs(U1.data - U2.data).max()), op=MPI.MAX)
+    check("doublePassG divided among the ranks: eigenvectors", err < 1e-10, "(%.2e)" % err)
+    spread = COMM.allreduce(float(d2[0]), op=MPI.MAX) - COMM.allreduce(float(d2[0]), op=MPI.MIN)
+    check("every rank returns the same eigenvalues", spread == 0.0, "(%.2e)" % spread)
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -444,6 +490,7 @@ if __name__ == "__main__":
     test_partition_matches_mfem()
     test_operators()
     test_multivector()
+    test_ensemble()
     test_random_partition_independence()
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
