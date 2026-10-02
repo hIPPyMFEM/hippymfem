@@ -541,7 +541,11 @@ at 0.30 and at the library's 0.45 must not be mixed.
   alternation, 17.0 instead of 18.1 ms on sixteen instances at 2.1 M dofs each (-5.7 %),
   -3.1 % on eight, -3.3 % on two, and -5.1 % on sixteen at 134 k dofs each.
   `tools/rebuild_hypre.sh` builds either variant from the hypre source of an existing
-  PyMFEM build; neither is part of the PyMFEM build script.
+  PyMFEM build; neither is part of the PyMFEM build script.  Together with the per-block
+  kernel choice of section 10 (still a prototype outside this repository) an iteration
+  on sixteen instances took 15.6 ms where the unmodified build took 18.3 in the same job
+  (-15 %; pinned buffers alone -6 %, the kernel choice alone -8 %), and 2.92 against
+  2.67 ms at 134 k dofs each, where cuSPARSE loses on every block.
 - **Two defects of `krylov_anatomy.py`**, both in the script.  With `--assembly mfem` it
   read the parameter through `GetDataArray()` from a grid function whose values the
   prolongation had left on the device; the host copy was zeros, so every record of
