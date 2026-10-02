@@ -370,8 +370,12 @@ model problem, CG + BoomerAMG with MFEM's device defaults.  The GPU guide has th
   36 % faster on two to sixteen instances and a reduced-Hessian application 1.2 to 1.5
   times; on two H100 an iteration went from 16.5 to 6.2 ms.  On one rank the vendor
   kernel stays (12 % faster on the instance; equal on an H100 at 2 M dofs, 18 % faster at
-  8.6 M).  Not done: cuSPARSE for the diagonal blocks and hypre's kernel for the rest,
-  worth another 8 to 15 %, which needs a change in hypre.
+  8.6 M).  Not in the library: cuSPARSE for the diagonal blocks and hypre's kernel for
+  the rest, which needs a change in hypre.  A prototype (cuSPARSE from 16 nonzeros per row)
+  took 14.2 / 15.5 / 15.3 / 16.3 ms on 2 / 4 / 8 / 16 instances where hypre's kernel takes
+  15.8 / 16.8 / 16.8 / 17.8, and 18.8 against 22.4 ms on two H100 at 8.5 M dofs each.
+  rocSPARSE on AMD has no such cost (two MI210 at 2.2 M dofs each: 12.5 ms against 9.2 on
+  one, and faster than hypre's kernel everywhere), so `auto` keeps the vendor on HIP.
 - **What is left is the halo exchange** through the host at every level: 23 to 31 per
   iteration, about 60 us each.  A dense solve on a coarsest level of up to 500 unknowns
   (`MaxCoarseSize`, relax type 199, set through the preloaded library since PyMFEM gives

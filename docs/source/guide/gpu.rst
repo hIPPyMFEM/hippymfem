@@ -306,7 +306,14 @@ quicker and the off-diagonal ones are not: 16.5 against 6.2 ms per iteration on 
 with 2.2 million dofs each (4.4 ms on one), and at 64\ :sup:`3` two cards were *slower*
 than one with cuSPARSE (8.1 against 4.4 ms) and faster with hypre's kernel (3.8 ms).
 hypre's kernel is slower than cuSPARSE on the big diagonal blocks, so a hypre that chose
-per block would gain another 8 to 15 %; that needs a change in hypre.
+per block would gain more.  A prototype of that choice (cuSPARSE for blocks with at least
+16 nonzeros per row, a change in ``seq_mv/csr_matvec_device.c``) took 14.2 to 16.3 ms per
+iteration on two to sixteen instances at 2.1 million dofs each, where hypre's kernel takes
+15.7 to 17.7 ms, and 18.8 against 22.4 ms on two H100 at 8.5 million dofs each; it is not
+part of this library.  On AMD cards the vendor's kernel has no such cost: with rocSPARSE
+two MI210 at 2.2 million dofs each took 12.5 ms per iteration against 9.2 ms on one, and
+rocSPARSE was faster than hypre's kernel in every case measured, which is why ``auto``
+leaves HIP builds alone.
 
 **The halo exchange, at every level, through the host.**  An iteration makes 23 to 31
 exchanges (one per product with a level matrix or an interpolation matrix, on six to
