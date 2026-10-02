@@ -297,6 +297,11 @@ def main():
                     help="one copy of the problem per rank, timed at the same moment")
     ap.add_argument("--cart-part", action="store_true",
                     help="partition the box as a Cartesian grid of ranks instead of with METIS")
+    ap.add_argument("--unit-coefficient", action="store_true",
+                    help="with --assembly mfem: the coefficient 1 instead of exp(m).  The "
+                         "records of this script up to 2026-10-02 were taken on that "
+                         "matrix, because the script read the parameter from a CPU copy "
+                         "that the GPU had not filled")
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -351,7 +356,13 @@ def main():
         t0 = time.perf_counter()
         m_gf = Vm.to_gridfunction(mtrue)
         kappa = mfem.ParGridFunction(Vm.fes)
-        kappa.Assign(np.exp(m_gf.GetDataArray()))
+        if args.unit_coefficient:
+            kappa.Assign(1.0)
+        else:
+            # the prolongation leaves the values on the GPU: bring them to the CPU before
+            # GetDataArray(), which returns the CPU copy whether or not it is current
+            m_gf.HostRead()
+            kappa.Assign(np.exp(np.array(m_gf.GetDataArray(), copy=True)))
         coef = mfem.GridFunctionCoefficient(kappa)
         form = mfem.ParBilinearForm(Vu.fes)
         form.AddDomainIntegrator(mfem.DiffusionIntegrator(coef))
@@ -373,7 +384,11 @@ def main():
 
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N,
            "order": ORDER, "tdofs": ndof, "device": args.device, "tol": args.tol,
-           "tag": args.tag, "assembly": args.assembly, "pool_mb": args.pool, "grid": list(grid) if grid else None, "t_fwd": t_fwd, "it_fwd": it_fwd,
+           "tag": args.tag, "assembly": args.assembly,
+           "coefficient": ("unit" if (args.assembly == "mfem" and args.unit_coefficient)
+                           else "exp(m)"),
+           "vendor_set": True,
+           "pool_mb": args.pool, "grid": list(grid) if grid else None, "t_fwd": t_fwd, "it_fwd": it_fwd,
            "counters": PROF.lib is not None,
            "variants": {}}
 
@@ -399,7 +414,12 @@ def main():
         say("      library inner: " + fmt_prof(r["lib_dot_prof"]))
         return r
 
+    # The library chooses hypre's own kernel on more than one rank
+    # (mfemconfig.set_hypre_spmv), so the vendor's is set here explicitly: a variant
+    # without "vendor" is then cuSPARSE on any number of ranks.
     vendor_now = 1
+    if H is not None and args.device != "cpu":
+        H.HYPRE_SetSpMVUseVendor(ctypes.c_int(1))
     rec["kernels"] = kernels("cuSPARSE" if args.device != "cpu" else "host")
 
     for name, opts in variants:
