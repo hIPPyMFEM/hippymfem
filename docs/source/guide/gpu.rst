@@ -786,6 +786,47 @@ instead of 19.5.)  The incremental and prior solves can run at 1e-8 for these st
 eigenvalues move by 6e-6 at most and the eigensolver is 1.4x faster.  At 128\ :sup:`3`
 the whole workflow, MAP included, runs in under 20 minutes on four L40S.
 
+**Several GPUs: an ensemble instead of a domain decomposition.**  Every one of these
+stages is a set of independent solves (140 Hessian applications in the eigensolver, one
+or two prior solves per sample or probe).  Dividing the *mesh* over the GPUs makes each
+solve faster by the factor of `Several GPUs`_ and no more: at 64\ :sup:`3` that is 2.0x
+on four MIG instances and 2.9x on eight for the eigensolver, and nothing at all for the
+prior solves, which have 275 000 unknowns.  When the problem fits on one GPU, divide the
+*vectors* instead.  Build the problem on ``MPI.COMM_SELF`` on every rank, so that each
+GPU holds all of it, and pass the world communicator as ``ensemble``::
+
+   d, U = hm.doublePassG(Hmisfit, prior.R, prior.Rsolver, Omega, k, ensemble=MPI.COMM_WORLD)
+   post.pointwise_variance(method="MonteCarlo", n=64, ensemble=MPI.COMM_WORLD)
+   post.trace(method="Randomized", r=64, ensemble=MPI.COMM_WORLD)
+
+Rank ``r`` applies the operator to the columns ``r, r + size, ...`` and the columns are
+exchanged, so every rank ends with the same eigenpairs; the random streams are
+partition-independent, so the ranks start from the same ``Omega``, and the Monte Carlo
+samples are the ones a single rank would draw (:meth:`~hippymfem.common.random.Random.seek`).
+``benchmarks/bench_laplace.py --ensemble`` does all of this.  Measured at 64\ :sup:`3`
+on MIG instances of RTX PRO 6000 Blackwell cards, incremental solves to 1e-8:
+
+==========================================  ==========  ===================  ===================  ===============  ===============
+after the MAP point                         1 instance  4, domain decomp.    8, domain decomp.    4, ensemble      8, ensemble
+==========================================  ==========  ===================  ===================  ===============  ===============
+eigensolver (k = 50, p = 20)                62.0 s      30.4 s               21.2 s               17.6 s           9.9 s
+64 posterior samples                        5.7 s       3.0 s                2.7 s                2.1 s            0.9 s
+pointwise variance, randomized, r = 64      5.3 s       6.0 s                5.3 s                3.7 s            3.6 s
+pointwise variance, Monte Carlo, n = 64     4.2 s       2.5 s                2.2 s                1.3 s            0.8 s
+traces, r = 64                              6.3 s       6.4 s                5.8 s                3.2 s            2.7 s
+all of them                                 83.5 s      48.2 s               37.2 s               27.8 s           17.9 s
+==========================================  ==========  ===================  ===================  ===============  ===============
+
+The eigenvalues of the ensemble agree with those of one instance to 2e-6 (the MAP
+points of two runs differ by that much).  At 32\ :sup:`3` the domain decomposition on
+four instances is slower than one instance for these stages (18.1 against 16.2 s); the
+ensemble takes 7.8 s.  What an ensemble does not speed up: the orthogonalizations, which
+are sequential in the columns and which every rank repeats (1.4 s of the eigensolver
+above, most of the randomized variance and of the trace), and the MAP point, whose CG
+iterations depend on one another.  Every rank also has to set the problem up and hold
+it, so the mesh has to fit on one GPU, and a run that computes the MAP point with a
+domain decomposition and then switches to an ensemble sets the problem up twice.
+
 Taking exactly the GPUs and cores you asked for
 -----------------------------------------------
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Independent solves as an ensemble over the GPUs** (`ensemble=` of `MatMvMult`,
+  `singlePass`, `doublePass`, `singlePassG`, `doublePassG`, and of the prior's and the
+  posterior's `trace` and `pointwise_variance`; `benchmarks/bench_laplace.py --ensemble`).
+  When the problem fits on one GPU, every rank builds it on `MPI.COMM_SELF` and the
+  columns of a MultiVector, or the Monte Carlo samples, are divided among the ranks of
+  the communicator passed as `ensemble`; the results are exchanged and every rank returns
+  what one rank alone computes (`Random.tell` / `Random.seek` keep the samples the same).
+  The stages of the Laplace approximation are sets of independent solves, and a domain
+  decomposition of a small mesh speeds each of them up very little: at 64^3 the
+  eigensolver takes 62.0 s on one MIG instance of an RTX PRO 6000 Blackwell, 30.4 s on
+  four and 21.2 s on eight with the mesh divided, and 17.6 s and 9.9 s as an ensemble;
+  all stages after the MAP point 83.5 s, 48.2 / 37.2 s and 27.8 / 17.9 s. The MAP point
+  itself cannot be computed this way.
 - **Assembled matrices and vectors stay on the GPU** (`hippymfem.common.devicebridge`;
   `HIPPYMFEM_DEVICE_BRIDGE`, `HIPPYMFEM_DEVICE_VECTORS`, `hm.config.device_bridge`,
   `hm.config.device_vectors`). With the element kernels and hypre on one card, the
