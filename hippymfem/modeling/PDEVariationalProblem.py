@@ -821,6 +821,23 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         return out
 
     # ------------------------------------------------------------- derivatives
+    def block_is_zero(self, i, j):
+        """Whether :meth:`apply_ij` for ``(i, j)`` would return zero whatever the
+        direction, at the current linearization point: a block the point does not
+        hold (Gauss-Newton, a residual linear in the state) or, without assembled
+        blocks, one that is known to vanish."""
+        if self.A is None or {i, j} == {STATE, ADJOINT}:
+            return False
+        if (getattr(self, "_mf_point", None) is not None
+                and self._mf_slots.intersection((i, j))):
+            return bool((i, j) == (ADJOINT, ADJOINT)
+                        or (self.gauss_newton_approx and ADJOINT not in (i, j))
+                        or ((i, j) == (STATE, STATE) and self.is_fwd_linear))
+        blocks = {(STATE, STATE): "Wuu", (STATE, PARAMETER): "Wum",
+                  (PARAMETER, STATE): "Wum", (PARAMETER, PARAMETER): "Wmm"}
+        name = blocks.get((i, j))
+        return name is not None and getattr(self, name, None) is None
+
     def apply_ij(self, i, j, dir, out):
         """Apply the ``(i, j)`` second-derivative block to ``dir``."""
         if self.A is None:

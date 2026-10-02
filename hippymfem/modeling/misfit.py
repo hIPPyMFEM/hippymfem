@@ -46,6 +46,12 @@ class Misfit(SnakeCamel):
     def apply_ij(self, i, j, dir, out):
         raise NotImplementedError
 
+    def block_is_zero(self, i, j):
+        """Whether the second-derivative block ``(i, j)`` vanishes identically, so
+        that a caller can skip applying and adding it.  ``False`` unless a class
+        knows better."""
+        return False
+
 
 def _check_noise_variance(nv):
     if nv is None:
@@ -90,6 +96,9 @@ class DiscreteStateObservation(Misfit, KeepAlive):
 
     def setLinearizationPoint(self, x, gauss_newton_approx=False):
         return self          # already quadratic
+
+    def block_is_zero(self, i, j):
+        return not (i == STATE and j == STATE)      # the misfit sees the state only
 
     def apply_ij(self, i, j, dir, out):
         nv = _check_noise_variance(self.noise_variance)
@@ -158,6 +167,9 @@ class MultDiscreteStateObservation(Misfit, KeepAlive):
     def setLinearizationPoint(self, x, gauss_newton_approx=False):
         self.B.mult(x[STATE], self.Bu_lin)
         return self
+
+    def block_is_zero(self, i, j):
+        return not (i == STATE and j == STATE)
 
     def apply_ij(self, i, j, dir, out):
         out.zero()
@@ -255,6 +267,9 @@ class ContinuousStateObservation(Misfit, KeepAlive):
 
     def setLinearizationPoint(self, x, gauss_newton_approx=False):
         return self
+
+    def block_is_zero(self, i, j):
+        return not (i == STATE and j == STATE)
 
     def apply_ij(self, i, j, dir, out):
         nv = _check_noise_variance(self.noise_variance)

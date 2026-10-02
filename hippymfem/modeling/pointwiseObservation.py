@@ -27,8 +27,9 @@ from mpi4py import MPI
 
 import mfem.par as mfem
 
+from ..common.linalg import own
 from ..common.operators import Operator, init_vector_like
-from ..common.parvector import ParVector
+from ..common.parvector import ParVector, _HYPRE_INT, device_vectors
 from ..fem.spaces import as_space
 
 
@@ -84,6 +85,9 @@ class PointwiseObservation(Operator):
         self._build(missing)
         self._range_template = ParVector(self.comm, self.n_owned)
         self._domain_template = self.space.vector()
+        #: ``B`` as a hypre matrix over true dofs, built on first use with MFEM on a
+        #: GPU (``None``: not asked for yet; ``False``: this space's ``P`` has weights)
+        self._Bh = None
 
     # -------------------------------------------------------------------- setup
     def _build(self, missing_policy):
@@ -149,8 +153,56 @@ class PointwiseObservation(Operator):
         tpl = self._range_template if dim == 0 else self._domain_template
         return init_vector_like(x, tpl)
 
+    def _matrix(self):
+        """``B`` as a ``HypreParMatrix`` from true dofs to owned targets, or ``None``.
+
+        With MFEM on a GPU the two products below are hypre's, on the device: the
+        numpy route would copy the state to the host for every ``B u`` and upload a
+        dof-sized vector for every ``B^T d``.  The matrix has a row per target and the
+        shape functions of one element in each, so it costs nothing to hold.  It
+        exists only for a space whose prolongation is boolean, where a local dof *is*
+        a true dof (:func:`hippymfem.fem.prolongation._boolean_prolongation`,
+        decided collectively); otherwise the numpy route stays.  Collective on first
+        use.
+        """
+        if self._Bh is None:
+            self._Bh = self._build_matrix() or False
+        return self._Bh or None
+
+    def _build_matrix(self):
+        import scipy.sparse as sp
+
+        from ..fem.prolongation import _boolean_prolongation
+
+        if not _boolean_prolongation(self.space):
+            return None
+        fes, rank = self.space.fes, self.comm.rank
+        ldofs, inv = np.unique(self._cols, return_inverse=True)
+        gt = np.array([fes.GetGlobalTDofNumber(int(l)) for l in ldofs], dtype=np.int64)
+        r_off = self._range_template.layout.offsets
+        c_off = self._domain_template.layout.offsets
+        gnr, gnc = int(r_off[-1]), int(c_off[-1])
+        M = sp.coo_matrix((self._vals, (self._rows, gt[inv] if ldofs.size else self._cols)),
+                          shape=(self.n_owned, gnc)).tocsr()
+        M.sum_duplicates()
+        M.sort_indices()
+        I = np.ascontiguousarray(M.indptr, dtype=np.int32)
+        J = np.ascontiguousarray(M.indices, dtype=_HYPRE_INT)
+        D = np.ascontiguousarray(M.data, dtype=np.float64)
+        rows = np.array([r_off[rank], r_off[rank + 1]], dtype=_HYPRE_INT)
+        cols = np.array([c_off[rank], c_off[rank + 1]], dtype=_HYPRE_INT)
+        # the constructor that copies into hypre's own memory, as tdofassemble's does
+        Bh = mfem.HypreParMatrix(self.comm, self.n_owned, gnr, gnc, [I, J, D, rows, cols])
+        Bh.CopyRowStarts()
+        Bh.CopyColStarts()
+        return own(Bh, I, J, D, rows, cols)
+
     def mult(self, u, obs):
         """``obs = B u``: evaluate the field at the owned targets."""
+        Bh = self._matrix() if device_vectors() else None
+        if Bh is not None:
+            Bh.Mult(u.hypre, obs.hypre)
+            return obs
         local = self.space.local_values(u)
         obs.zero()
         if self._rows.size:
@@ -159,6 +211,10 @@ class PointwiseObservation(Operator):
 
     def multTranspose(self, obs, u):
         """``u = B^T obs``: spread observation weights back to the dofs."""
+        Bh = self._matrix() if device_vectors() else None
+        if Bh is not None:
+            Bh.MultTranspose(obs.hypre, u.hypre)
+            return u
         local = np.zeros(self._nldof)
         if self._rows.size:
             np.add.at(local, self._cols, self._vals * obs.array[self._rows])

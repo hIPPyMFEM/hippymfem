@@ -26,6 +26,14 @@ from ..common.naming import SnakeCamel, sync_spellings
 from .variables import ADJOINT, PARAMETER, STATE
 
 
+def _is_zero(term, i, j):
+    """Whether ``term`` (the PDE problem or the functional) says its second-derivative
+    block ``(i, j)`` vanishes identically.  A zero block is then neither applied nor
+    added: with the vectors on a GPU, adding one meant uploading a vector of zeros."""
+    fn = getattr(term, "block_is_zero", None)
+    return bool(fn(i, j)) if fn is not None else False
+
+
 class ReducedMap(SnakeCamel):
     r"""A PDE problem and a functional of ``(u, m)`` reduced over the state.
 
@@ -117,7 +125,7 @@ class ReducedMap(SnakeCamel):
     def applyWuu(self, du, out):
         """``W_uu`` from the functional plus, unless Gauss-Newton, from the PDE."""
         self.functional.apply_ij(STATE, STATE, du, out)
-        if not self.gauss_newton_approx:
+        if not self.gauss_newton_approx and not _is_zero(self.problem, STATE, STATE):
             tmp = out.duplicate()
             self.problem.apply_ij(STATE, STATE, du, tmp)
             out.axpy(1.0, tmp)
@@ -129,6 +137,8 @@ class ReducedMap(SnakeCamel):
             out.zero()
             return out
         self.problem.apply_ij(i, j, d, out)
+        if _is_zero(self.functional, i, j):
+            return out
         tmp = out.duplicate()
         self.functional.apply_ij(i, j, d, tmp)
         out.axpy(1.0, tmp)

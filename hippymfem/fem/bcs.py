@@ -45,6 +45,31 @@ from ..common.keepalive import KeepAlive
 from .spaces import as_space
 
 
+def _device_dofs(owner, ess):
+    """``ess`` as an ``mfem.intArray`` that MFEM reads on the device, built once per
+    owner: what lets the essential entries of a vector that is in device memory be
+    set there, instead of copying the vector to the host for an indexed write."""
+    got = getattr(owner, "_ess_dev", None)
+    if got is None:
+        got = mfem.intArray(np.asarray(ess, dtype=np.int64).tolist())
+        # Device read access is what sets an Array's device flag (PyMFEM exposes no
+        # setter), and MFEM's indexed write runs where the index array says.
+        got.Read()
+        owner._ess_dev = got
+    return got
+
+
+def _zero_entries(owner, ess, v):
+    """Set the entries ``ess`` of the true-dof vector ``v`` to zero, where ``v`` is."""
+    if not len(ess):
+        return v
+    if getattr(v, "_dev", False):
+        v.hypre.SetSubVector(_device_dofs(owner, ess), 0.0)
+    else:
+        v.array[ess] = 0.0
+    return v
+
+
 class DirichletBC(KeepAlive):
     """Essential boundary condition on part of the boundary of a space.
 
@@ -175,14 +200,22 @@ class DirichletBC(KeepAlive):
             got = self._ess_values = (self.value, tv.array[self.ess].copy())
             del gf, coeff, tv                  # nothing downstream points at them
         if self.ess.size:
-            v.array[self.ess] = got[1]
+            if getattr(v, "_dev", False):
+                # on the device, from a copy of the values MFEM keeps there
+                dev = getattr(self, "_ess_values_dev", None)
+                if dev is None or dev[0] is not got:
+                    vals = np.ascontiguousarray(got[1], dtype=np.float64)
+                    vec = mfem.Vector(vals)
+                    vec.UseDevice(True)
+                    dev = self._ess_values_dev = (got, vec, vals)
+                v.hypre.SetSubVector(_device_dofs(self, self.ess), dev[1])
+            else:
+                v.array[self.ess] = got[1]
         return v
 
     def zero(self, v):
         """Set the essential entries of ``v`` to zero."""
-        if self.ess.size:
-            v.array[self.ess] = 0.0
-        return v
+        return _zero_entries(self, self.ess, v)
 
 
 class BCSet(KeepAlive):
@@ -227,9 +260,7 @@ class BCSet(KeepAlive):
         return v
 
     def zero(self, v):
-        if self.ess.size:
-            v.array[self.ess] = 0.0
-        return v
+        return _zero_entries(self, self.ess, v)
 
     def zero_copy(self, v, out=None):
         """A copy of ``v`` with essential entries zeroed (leaves ``v`` alone)."""

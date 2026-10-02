@@ -21,12 +21,43 @@ partition that ``ParBilinearForm.ParallelAssemble()`` produces.  That
 compatibility is asserted in the test suite rather than assumed.
 """
 
+import os
+
 import numpy as np
 from mpi4py import MPI
 
 import mfem.par as mfem
 
 from .keepalive import KeepAlive
+
+#: Where the arithmetic of a :class:`ParVector` runs when MFEM is configured on a GPU.
+#: ``"auto"`` and ``"1"``: a vector that was last handed to MFEM or hypre (through
+#: :attr:`ParVector.hypre`) is updated, copied and reduced on the device by MFEM, so
+#: that a result hypre left there is not copied to the host for an update and back for
+#: the next product; a vector last touched as a numpy array stays with numpy.  ``"0"``:
+#: always numpy on the host, as before.  The results agree to round-off (the device
+#: reductions sum in a different order).  ``HIPPYMFEM_DEVICE_VECTORS``.
+DEVICE_VECTORS = os.environ.get("HIPPYMFEM_DEVICE_VECTORS", "auto").lower()
+
+
+def set_device_vectors(mode):
+    """``"auto"``, ``"1"`` or ``"0"``; returns the previous setting."""
+    global DEVICE_VECTORS
+    mode = str(mode).lower()
+    if mode in ("true", "yes", "on"):
+        mode = "1"
+    if mode in ("false", "no", "off"):
+        mode = "0"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError("HIPPYMFEM_DEVICE_VECTORS must be auto, 0 or 1, not %r" % (mode,))
+    old, DEVICE_VECTORS = DEVICE_VECTORS, mode
+    return old
+
+
+def device_vectors():
+    """Whether vector arithmetic follows a vector onto the device (see
+    :data:`DEVICE_VECTORS`): MFEM configured on a GPU and the setting not ``"0"``."""
+    return DEVICE_VECTORS != "0" and device_active()
 
 _HYPRE_INT = np.int32 if mfem.sizeof_HYPRE_Int() == 4 else np.int64
 
@@ -131,6 +162,12 @@ class ParVector(KeepAlive):
         self._hv = mfem.HypreParVector(
             comm, self._global_size, [self._array, self._col_starts]
         )
+        #: Whether the vector was last handed to MFEM or hypre (:attr:`hypre`), so
+        #: that its current values may be in device memory only.  The arithmetic
+        #: below then runs on the device (:data:`DEVICE_VECTORS`); MFEM keeps track
+        #: of which copy is current either way, so the flag decides where an
+        #: operation runs and never whether its result is right.
+        self._dev = False
         self.keep(self._array, layout, self._hv)
 
     def _host(self):
@@ -140,7 +177,24 @@ class ParVector(KeepAlive):
         directly, so the synchronization happens once per operation.  On a host-only
         build it is a single flag test.
         """
+        self._dev = False
         host_readwrite(self._hv)
+        return self._array
+
+    def _host_read(self):
+        """The entries as numpy, current on the host, for a caller that only reads.
+
+        The device copy stays valid, so a vector hypre goes on using is not
+        uploaded again.  What is returned must not be written.
+        """
+        host_sync(self._hv)
+        return self._array
+
+    def _host_write(self):
+        """The entries as numpy for a caller that overwrites every one of them:
+        nothing is copied from the device first."""
+        self._dev = False
+        host_write(self._hv)
         return self._array
 
     # ------------------------------------------------------------------ ctors
@@ -172,7 +226,10 @@ class ParVector(KeepAlive):
     def copy(self):
         """A new vector with the same layout and the same values."""
         out = self.duplicate()
-        out._host()[:] = self._host()
+        if self._dev:
+            out.hypre.Assign(self._hv)            # on the device
+        else:
+            out._host_write()[:] = self._host_read()
         return out
 
     # ------------------------------------------------------------------ views
@@ -190,7 +247,14 @@ class ParVector(KeepAlive):
 
     @property
     def hypre(self):
-        """The ``mfem.HypreParVector`` aliasing this vector's memory."""
+        """The ``mfem.HypreParVector`` aliasing this vector's memory.
+
+        Asking for it marks the vector as handed to MFEM: with MFEM on a GPU its
+        next update, copy or inner product runs there (:data:`DEVICE_VECTORS`).
+        """
+        if not self._dev and device_vectors():
+            self._hv.UseDevice(True)
+            self._dev = True
         return self._hv
 
     @property
@@ -229,24 +293,40 @@ class ParVector(KeepAlive):
     # Each of these takes the host view once, into a local: on a device build every
     # access costs a synchronization check, and ``self.array *= a`` would try to
     # assign to the read-only property.
+    # Where ``_dev`` is set the operation is MFEM's, on the device; elsewhere it is
+    # numpy's on the host, with read access for an operand that is only read (so its
+    # device copy stays valid) and write access for a result that is overwritten.
     def zero(self):
-        self._host()[:] = 0.0
+        if self._dev:
+            self._hv.Assign(0.0)
+        else:
+            self._host_write()[:] = 0.0
         return self
 
     def set(self, alpha):
         """Set every entry to the scalar ``alpha``."""
-        self._host()[:] = alpha
+        if self._dev:
+            self._hv.Assign(float(alpha))
+        else:
+            self._host_write()[:] = alpha
         return self
 
     def scale(self, alpha):
-        a = self._host()
-        a *= alpha
+        if self._dev:
+            self._hv.Set(float(alpha), self._hv)
+        else:
+            a = self._host()
+            a *= alpha
         return self
 
     def axpy(self, alpha, y):
         """``self += alpha * y``."""
         self._check(y)
-        a, b = self._host(), y._host()
+        if self._dev:
+            self._hv.Add(float(alpha), y._hv)
+            return self
+        b = y._host_read()
+        a = self._host()
         if alpha == 1.0:
             a += b
         elif alpha == -1.0:
@@ -258,7 +338,12 @@ class ParVector(KeepAlive):
     def aypx(self, alpha, y):
         """``self = alpha * self + y``."""
         self._check(y)
-        a, b = self._host(), y._host()
+        if self._dev:
+            self._hv.Set(float(alpha), self._hv)
+            self._hv.Add(1.0, y._hv)
+            return self
+        b = y._host_read()
+        a = self._host()
         a *= alpha
         a += b
         return self
@@ -266,7 +351,12 @@ class ParVector(KeepAlive):
     def axpby(self, alpha, beta, y):
         """``self = alpha * y + beta * self``."""
         self._check(y)
-        a, b = self._host(), y._host()
+        if self._dev:
+            self._hv.Set(float(beta), self._hv)
+            self._hv.Add(float(alpha), y._hv)
+            return self
+        b = y._host_read()
+        a = self._host()
         a *= beta
         a += alpha * b
         return self
@@ -275,25 +365,38 @@ class ParVector(KeepAlive):
         """Copy values from ``other`` (a ParVector or a scalar)."""
         if isinstance(other, ParVector):
             self._check(other)
-            self._host()[:] = other._host()
+            if other is self:
+                return self
+            if other._dev:
+                self.hypre.Assign(other._hv)      # the copy is where the source is
+            else:
+                src = other._host_read()
+                self._host_write()[:] = src
+        elif self._dev and np.isscalar(other):
+            self._hv.Assign(float(other))
         else:
-            self._host()[:] = other
+            self._host_write()[:] = other
         return self
 
     def pointwise_mult(self, y):
         self._check(y)
+        b = y._host_read()
         a = self._host()
-        a *= y._host()
+        a *= b
         return self
 
     def inner(self, y):
         """Global Euclidean inner product.
 
-        Reads through ``_host`` like every other method: reading ``_array`` directly
-        after a hypre matvec on a device would return a stale value.
+        Reads through ``_host_read`` like every other method: reading ``_array``
+        directly after a hypre matvec on a device would return a stale value.  Two
+        vectors that are both with MFEM on a device are reduced there.
         """
         self._check(y)
-        loc = float(np.dot(self._host(), y._host()))
+        if self._dev and y._dev:
+            loc = float(self._hv * y._hv)
+        else:
+            loc = float(np.dot(self._host_read(), y._host_read()))
         return self.comm.allreduce(loc, op=MPI.SUM)
 
     dot = inner
@@ -303,22 +406,22 @@ class ParVector(KeepAlive):
         if norm_type in ("l2", 2, "NORM_2"):
             return float(np.sqrt(max(self.inner(self), 0.0)))
         if norm_type in ("linf", "inf", np.inf, "NORM_INFINITY"):
-            loc = float(np.abs(self._host()).max()) if self.local_size else 0.0
+            loc = float(np.abs(self._host_read()).max()) if self.local_size else 0.0
             return allreduce_extreme(self.comm, loc, MPI.MAX)
         if norm_type in ("l1", 1, "NORM_1"):
-            loc = float(np.abs(self._host()).sum())
+            loc = float(np.abs(self._host_read()).sum())
             return self.comm.allreduce(loc, op=MPI.SUM)
         raise ValueError("unknown norm type %r" % (norm_type,))
 
     def sum(self):
-        return self.comm.allreduce(float(self._host().sum()), op=MPI.SUM)
+        return self.comm.allreduce(float(self._host_read().sum()), op=MPI.SUM)
 
     def max(self):
-        loc = float(self._host().max()) if self.local_size else -np.inf
+        loc = float(self._host_read().max()) if self.local_size else -np.inf
         return allreduce_extreme(self.comm, loc, MPI.MAX)
 
     def min(self):
-        loc = float(self._host().min()) if self.local_size else np.inf
+        loc = float(self._host_read().min()) if self.local_size else np.inf
         return allreduce_extreme(self.comm, loc, MPI.MIN)
 
     # ------------------------------------------------------------- operators
@@ -367,7 +470,7 @@ class ParVector(KeepAlive):
     # ------------------------------------------------------------------- misc
     def gather_to_zero(self):
         """Gather the whole vector onto rank 0 as a numpy array (``None`` elsewhere)."""
-        parts = self.comm.gather(self._host(), root=0)
+        parts = self.comm.gather(self._host_read(), root=0)
         if self.comm.rank == 0:
             return np.concatenate(parts)
         return None
@@ -385,7 +488,7 @@ class ParVector(KeepAlive):
         off = self.layout.offsets
         counts = np.diff(off).astype("i")
         self.comm.Allgatherv(
-            [np.ascontiguousarray(self._host()), MPI.DOUBLE],
+            [np.ascontiguousarray(self._host_read()), MPI.DOUBLE],
             [out, counts, off[:-1].astype("i"), MPI.DOUBLE])
         return out
 
@@ -393,7 +496,7 @@ class ParVector(KeepAlive):
         """Inverse of :meth:`gather_to_zero`; ``full`` is read on rank 0 only."""
         full = self.comm.bcast(full if self.comm.rank == 0 else None, root=0)
         lo, hi = self.owner_range
-        self._host()[:] = np.asarray(full, dtype=np.float64)[lo:hi]
+        self._host_write()[:] = np.asarray(full, dtype=np.float64)[lo:hi]
         return self
 
 
@@ -441,6 +544,16 @@ def host_readwrite(obj):
         return obj
     return _sync(obj, ("HostReadWrite",),
                  ("HostReadWriteI", "HostReadWriteJ", "HostReadWriteData"))
+
+
+def host_write(obj):
+    """Give the host write access to an MFEM object's data **without** copying it
+    from the device: for a caller that overwrites every entry.  The device copy is
+    invalidated, as with :func:`host_readwrite`."""
+    if obj is None or not device_active():
+        return obj
+    return _sync(obj, ("HostWrite",),
+                 ("HostWriteI", "HostWriteJ", "HostWriteData"))
 
 
 def _sync(obj, single, triple):
