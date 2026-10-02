@@ -375,7 +375,11 @@ on each GPU.
 
 Two builds of hypre make the exchange itself cheaper, and ``tools/rebuild_hypre.sh``
 produces either from the hypre source of an existing PyMFEM build, to be preloaded or
-copied over the installed library; neither is part of the PyMFEM build script.
+copied over the installed library.  Neither is what ``tools/build_pymfem_cuda.sh``
+installs by default, and every time in this guide outside this paragraph is that of the
+unpatched library; ``HYPRE_PINNED_STAGING=1 tools/build_pymfem_cuda.sh ...`` adds the
+second variant at the end of a build and keeps the first library as
+``libHYPRE.so.stock``.
 
 * ``--gpu-aware-mpi`` configures hypre with ``HYPRE_WITH_GPU_AWARE_MPI``, so that it
   gives MPI its buffers on the device and a CUDA-aware MPI moves them.  On two H100 of

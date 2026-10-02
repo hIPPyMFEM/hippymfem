@@ -33,6 +33,9 @@
 #   module load <the MPI to build against>     # for --gpu-aware-mpi, one with CUDA support
 #   tools/rebuild_hypre.sh --pinned-staging <PyMFEM source tree> [<build directory>]
 #
+# (MPICC and MPICXX in the environment name the wrappers instead of the ones in PATH;
+# HYPRE_PINNED_STAGING=1 tools/build_pymfem_cuda.sh runs the first variant and installs it)
+#
 # and then either preload it,
 #
 #   mpirun -n 16 -x LD_PRELOAD=<build>/libHYPRE.so tools/mpirun_pinned.sh python script.py
@@ -67,9 +70,10 @@ SRC=$PYMFEM/external/hypre/src
 OLD=$SRC/cmbuild
 NEW=${2:-$SRC/cmbuild_exchange}
 [ -f "$OLD/CMakeCache.txt" ] || { echo "no hypre build under $OLD"; exit 1; }
-command -v mpicc >/dev/null || { echo "no mpicc in PATH: load the MPI to build against first"; exit 1; }
-MPICC=$(command -v mpicc)
-MPICXX=$(command -v mpicxx)
+# the MPI to build against: MPICC and MPICXX from the environment, or the wrappers in PATH
+MPICC=${MPICC:-$(command -v mpicc || true)}
+[ -n "$MPICC" ] && [ -x "$MPICC" ] || { echo "no mpicc (set MPICC or load the MPI to build against first)"; exit 1; }
+MPICXX=${MPICXX:-$(dirname "$MPICC")/mpicxx}
 MPIINC=$(dirname "$(dirname "$MPICC")")/include
 if [ $AWARE = 1 ] && command -v ompi_info >/dev/null; then
   ompi_info --parsable --all 2>/dev/null | grep -q "opal_built_with_cuda_support:value:true" \

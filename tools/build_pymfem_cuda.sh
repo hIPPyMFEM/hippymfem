@@ -29,10 +29,18 @@
 #   default prefix     $HOME/pymfem-cuda
 #   default cuda-arch  89   (L40S; A100 = 80, H100 = 90)
 #
+# HYPRE_PINNED_STAGING=1 in the environment adds one step at the end: hypre is built a
+# second time with page-locked, reused buffers for its exchange between GPUs
+# (tools/rebuild_hypre.sh --pinned-staging; 3 to 6 % per Krylov iteration on two to
+# sixteen GPUs) and installed over the first, which is kept as libHYPRE.so.stock.  It is
+# off by default: it is a patch of hypre 2.32.0, and the times in the documentation and
+# in the paper are those of the unpatched library.
+#
 # Select the result with:
 #   PYTHONPATH=<prefix>/PyMFEM/lib/python3.12/site-packages python ...
 set -eu
 
+TOOLS="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${1:-$HOME/pymfem-cuda}"
 ARCH="${2:-89}"
 PY="${PYTHON:-python3}"
@@ -53,6 +61,21 @@ command -v "$CUDACXX" >/dev/null || { echo "no nvcc at $CUDACXX" >&2; exit 1; }
 echo "nvcc:   $CUDACXX ($("$CUDACXX" --version | tail -1))"
 echo "mpi:    $MPICC_BIN / $MPICXX_BIN"
 echo "host++: $CUDAHOSTCXX"
+
+# Rebuild hypre with the staging patch from the source tree of the PyMFEM build <1> and
+# put it in place of the library that the build installed under <2>.  The new file is
+# moved into place, not written over the old one, so a process that has the old library
+# mapped keeps it.
+install_pinned_hypre () {
+  local src=$1 site=$2 build=${3:-$1/external/hypre/src/cmbuild_exchange} lib
+  lib=$(ls "$site"/mfem/external/lib*/libHYPRE.so 2>/dev/null | head -1)
+  [ -n "$lib" ] || { echo "  no installed libHYPRE.so under $site/mfem/external" >&2; return 1; }
+  MPICC="$MPICC_BIN" MPICXX="$MPICXX_BIN" "$TOOLS/rebuild_hypre.sh" --pinned-staging "$src" "$build" \
+    || { echo "  the patched hypre was not built; the installed library is unchanged" >&2; return 1; }
+  [ -f "$lib.stock" ] || cp -p "$lib" "$lib.stock"
+  cp "$build/libHYPRE.so" "$lib.new" && mv "$lib.new" "$lib"
+  echo "  installed $lib (the unpatched library is $lib.stock)"
+}
 
 mkdir -p "$PREFIX"
 cd "$PREFIX"
@@ -181,6 +204,12 @@ import mfem.par as m
 d = m.Device("cuda")
 d.Print()
 EOF
+if [ "${HYPRE_PINNED_STAGING:-0}" = 1 ]; then
+  echo
+  echo "=== hypre with page-locked staging buffers (tools/rebuild_hypre.sh) ==="
+  install_pinned_hypre "$SRC" "$SITE"
+fi
+
 echo
 echo "Select this build with:"
 echo "  PYTHONPATH=$SITE python ..."

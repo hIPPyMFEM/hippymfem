@@ -52,7 +52,8 @@
   20.9 instead of 22.4 ms at 8.5 million; on MIG instances, which cannot use CUDA IPC, it
   is slower than the default from four instances up. `--pinned-staging` keeps the route
   through the host with page-locked buffers that are reused: 3 to 6 % per iteration on
-  two to sixteen MIG instances. `configure_device` raises, with the reason, when the
+  two to sixteen MIG instances (`HYPRE_PINNED_STAGING=1 tools/build_pymfem_cuda.sh`
+  installs it at the end of a build; off by default). `configure_device` raises, with the reason, when the
   loaded hypre hands over device buffers and the MPI library reports no CUDA support.
 - `benchmarks/bench_forward_steps.py` (the steps of a forward solve with the driver calls
   of each), `hypre_pool_trace.py` and `hypre_pool_replay.py` (hypre's device allocations
