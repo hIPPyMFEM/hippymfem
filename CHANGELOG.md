@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **hypre's matrix-vector kernel on several GPUs** (`HIPPYMFEM_HYPRE_SPMV`,
+  `hippymfem.common.mfemconfig.set_hypre_spmv`, `hm.config.hypre_spmv`). hypre multiplies
+  with the off-diagonal blocks of its parallel matrices through cuSPARSE, whose product
+  costs a time that grows with the rows whatever the nonzeros: 5.4 ms for a block with 2.2 million rows and 701
+  nonzeros, against 2.2 ms for the diagonal block with 136 million. `auto`, the default,
+  switches hypre to its own kernel when the communicator has more than one rank (CUDA
+  builds) and keeps the vendor's on one rank, where it is the faster. A CG iteration on two
+  to sixteen MIG instances became 11 to 36 % faster and a reduced-Hessian application 1.2
+  to 1.5 times; on two H100 an iteration went from 16.5 to 6.2 ms. Results are unchanged.
+- **A recycling pool for hypre's device memory** (`HIPPYMFEM_HYPRE_POOL=<megabytes>`,
+  `set_hypre_pool`, `hm.config.hypre_pool`; off by default). A BoomerAMG setup makes about
+  2 200 `cudaMalloc` and 2 000 `cudaFree`, 60 to 75 % of its time, and the driver serves
+  the processes of a node one at a time: 0.16 s on one MIG instance, 1.47 s on sixteen.
+  With a pool that may hold 1 GiB per rank, sixteen instances took 0.63 s. The pool goes
+  through hypre's hook for user allocators, hands out exact new blocks and recycled ones
+  of at most 1.19 times the request, and empties itself when the driver refuses an
+  allocation. NVIDIA builds only.
+- **One rank with hypre on a device assembles through the true-dof route**
+  (`HIPPYMFEM_TDOF_IDENTITY`, default `auto`). A block with identity prolongations used the
+  constructor that copies and splits a row-major CSR on the host; it now hands MFEM
+  hypre's two blocks, as several ranks do. A complete Jacobian assembly on one H100 or
+  L40S became 1.4 to 3.2 times faster (hex P2: 5.2 -> 1.7 us per element on an H100), with
+  matrices identical to round-off. The host is unchanged.
+- `benchmarks/krylov_anatomy.py` and `tools/gpuprof.c`: one preconditioned Krylov
+  iteration taken apart per rank count and BoomerAMG variant, with a preloaded library
+  that counts driver allocations, copies, kernel launches, cuSPARSE products and MPI calls
+  and times every kernel on the device. `benchmarks/bench_assembly_sweep.py` and
+  `bench_assembly_profile.py`: time per element against the number of elements, and where
+  a complete assembly on a GPU spends it. `bench_scaling.py --cart-part --both-kernels`.
+  The GPU guide's new section "Several GPUs" and `benchmarks/DESIGN_NOTES.md`, section 10,
+  have the measurements.
+
 - `PDEVariationalProblem.apply_ij_at(i, j, x, dir, out)`: a second-derivative block at `x`
   applied to a direction, from the element kernels and without assembling the block
   (`QuadratureKernel.element_hvp`, one forward tangent through the element gradient where

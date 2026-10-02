@@ -272,6 +272,71 @@ def test_inverse_problem():
           "(rel %.3e)" % rel)
 
 
+def test_hypre_pool_logic():
+    """The recycling pool for hypre's device memory, against a stand-in for the driver:
+    exact new blocks, recycling within the size bound, the two limits, and trim.  The
+    pool itself needs a GPU (``test_device``); its bookkeeping does not."""
+    import ctypes
+    import types
+
+    from hippymfem.common.mfemconfig import HyprePool
+
+    live, nxt = {}, [0x10000]
+
+    class Fn:                                  # takes the place of a ctypes function
+        def __init__(self, f):
+            self.f = f
+
+        def __call__(self, *a):
+            return self.f(*a)
+
+    def dev_malloc(pp, n):
+        p = nxt[0]
+        nxt[0] += 0x100000
+        live[p] = n
+        ctypes.cast(pp, ctypes.POINTER(ctypes.c_void_p))[0] = p
+        return 0
+
+    def dev_free(p):
+        live.pop(p if isinstance(p, int) else p.value)
+        return 0
+
+    runtime = types.SimpleNamespace(cudaMalloc=Fn(dev_malloc), cudaFree=Fn(dev_free))
+    hypre = types.SimpleNamespace(hypre_SetUserDeviceMalloc=lambda f: None,
+                                  hypre_SetUserDeviceMfree=lambda f: None)
+    pool = HyprePool(hypre, runtime, max_cached=3000, max_block=2000)
+    out = (ctypes.c_void_p * 1)()
+
+    def alloc(n):
+        pool._malloc(out, n)
+        return out[0]
+
+    p1, p2 = alloc(1000), alloc(1000)
+    pool._free(p1)
+    ok = pool.cached == 1000 and pool.in_use == 1000 and live[p1] == 1000
+    p3 = alloc(900)                             # within 1.19 of a kept block: recycled
+    ok = ok and p3 == p1 and pool.from_pool == 1 and pool.cached == 0
+    pool._free(p3)
+    p4 = alloc(700)                             # too small a request for that block
+    ok = ok and p4 != p1 and live[p4] == 700
+    check("pool: new blocks are exact, kept ones are recycled within the size bound", ok)
+    pool._free(p2)
+    pool._free(p4)
+    p5 = alloc(2500)
+    pool._free(p5)                              # larger than max_block: to the driver
+    ok = p5 not in live and pool.cached == 2700
+    p6 = alloc(500)
+    pool._free(p6)                              # would exceed max_cached: to the driver
+    ok = ok and p6 not in live and pool.cached == 2700 and pool.peak_cached <= 3000
+    check("pool: the limits on a block and on the total hold", ok)
+    live[0x7f0000000000] = 1                    # a block the pool did not hand out
+    pool._free(0x7f0000000000)
+    ok = 0x7f0000000000 not in live and pool.cached == 2700
+    freed = pool.trim()
+    check("pool: a foreign block goes to the driver, and trim returns the rest",
+          ok and freed == 2700 and pool.cached == 0 and not live, "(%s)" % (pool.stats(),))
+
+
 def test_petsc():
     """PETSc, or a printed reason why not."""
     if RANK == 0:
@@ -318,6 +383,7 @@ def main():
     test_exact_solve()
     test_guards()
     test_inverse_problem()
+    test_hypre_pool_logic()
     test_petsc()
     COMM.Barrier()
     if RANK == 0:

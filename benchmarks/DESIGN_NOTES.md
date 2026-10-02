@@ -347,3 +347,59 @@ device-resident for free. Not planned while the measured share is what it is.
   damage surfaced as "corrupted size vs. prev_size" in JAX's teardown, minutes later and in
   another library. `apply_ij` checks its vectors against the block and raises.
 
+## 10. Several GPUs: what an iteration and a setup really cost (2026-10-01)
+
+Measured on PACE ICE with `benchmarks/krylov_anatomy.py` and the counters of
+`tools/gpuprof.c` (driver allocations, copies, kernel launches, cuSPARSE products and MPI
+calls per operation, and the device time of every kernel), on MIG instances of RTX PRO
+6000 Blackwell cards (half a card each), hypre 2.32.0, CUDA 12.9; the Jacobian of the
+model problem, CG + BoomerAMG with MFEM's device defaults.  The GPU guide has the tables.
+
+- **The floor on one GPU is small** (`hippymfem.common.mfemconfig.set_hypre_spmv`).  A CG
+  iteration costs 0.3 ms plus 5.3 ns per state dof on one instance (0.49 ms at 36 k dofs,
+  11.6 ms at 2.1 M), with 120 to 140 kernel launches and no device allocation.  The
+  4.6 ms "fixed cost" that an earlier fit of the L40S times produced, and that was read
+  as launch latency, is not there on one card: it appears with the second rank.
+- **cuSPARSE on the off-diagonal blocks.**  hypre 2.32 creates a cuSPARSE descriptor per
+  product (`seq_mv/csr_matvec_device.c`), and for a block with few nonzeros the time of
+  the product is unrelated to the nonzeros and grows with the rows.  Two ranks, 2.2 M rows each: the diagonal block (136 M nonzeros) 2.2 ms, the
+  off-diagonal block of the Jacobian (842 k nonzeros) 0.6 to 0.9 ms, an off-diagonal block
+  of an interpolation matrix with 701 nonzeros 5.4 ms; hypre's own kernel 2.6 ms, 0.16 ms
+  and under 0.2 ms.  The slower rank holds the other in `MPI_Waitall` (6.5 ms of a 24 ms
+  iteration).  `HYPRE_SetSpMVUseVendor(0)` on more than one rank made an iteration 11 to
+  36 % faster on two to sixteen instances and a reduced-Hessian application 1.2 to 1.5
+  times; on two H100 an iteration went from 16.5 to 6.2 ms.  On one rank the vendor
+  kernel stays (12 % faster on the instance; equal on an H100 at 2 M dofs, 18 % faster at
+  8.6 M).  Not done: cuSPARSE for the diagonal blocks and hypre's kernel for the rest,
+  worth another 8 to 15 %, which needs a change in hypre.
+- **What is left is the halo exchange** through the host at every level: 23 to 31 per
+  iteration, about 60 us each.  A dense solve on a coarsest level of up to 500 unknowns
+  (`MaxCoarseSize`, relax type 199, set through the preloaded library since PyMFEM gives
+  no solver handle) saved 2 % at 2.1 M dofs per rank and 12 % at 134 k; Chebyshev
+  smoothing needed 16 iterations instead of 25 at 1.6 times the cost each; an eager MPI
+  protocol (`UCX_RNDV_THRESH=inf`) changed nothing; `SeqThreshold` segfaults on a device.
+  None of them is in the library.
+- **The BoomerAMG setup is device allocation** (`set_hypre_pool`).  About 2 200
+  `cudaMalloc` and 2 000 `cudaFree` per setup, 60 to 75 % of its time, slower per call the
+  more processes of the node make them (27 us per allocation alone, 210 us with sixteen):
+  0.16 s on one instance, 1.47 s on sixteen at 2.1 M dofs each.  A pool behind hypre's
+  `hypre_SetUserDeviceMalloc`/`Mfree` hooks, written in Python (two thousand callbacks per
+  setup cost about 15 ms), brought sixteen instances to 1.08 s holding at most 64 MB,
+  0.86 s with 256 MB and 0.63 s with 1 GiB; a C prototype with no limit, which held
+  12 GiB, reached 0.24 s.  The few large blocks carry most of the time, which is why the
+  limit matters and why the pool is off by default.  New blocks are exact and recycled
+  ones at most 1.19 times the request, so hypre's own footprint does not grow.
+- **End to end** (`bench_newton_device.py`, 128^3 on eight instances, two Newton-CG
+  steps, the same cost functional and CG counts): 29.7 s with cuSPARSE on all ranks,
+  26.1 s with hypre's kernel, 24.9 s with the pool of 1 GiB as well; a reduced-Hessian
+  application 1.21 -> 0.91 s, a forward solve 3.7 -> 3.0 s.
+- **One rank on a device took the slow constructor** (`csrassemble.TDOF_IDENTITY`).  With
+  identity prolongations the local matrix is the result, and on a device it was built by
+  the constructor that copies and splits a row-major CSR on the host: 171 ms for the
+  17 M entries of 32 768 Q2 hexahedra on an H100, where the kernel takes 12 ms, the
+  scatter 0.4 ms and the copy of the values to the host 32 ms.  Such a block now takes the
+  true-dof route when hypre is on a device (61 ms for the scatter-to-matrix step instead
+  of 240), with matrices identical to round-off; on the host nothing changes, since MFEM
+  aliases the local arrays there.  What remains of a complete assembly on one H100 is
+  80 % host: the values' copy and MFEM's two-block constructor.
+

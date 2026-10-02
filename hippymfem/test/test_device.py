@@ -578,6 +578,113 @@ def test_coordinates_on_device():
           "(max abs diff %.1e)" % worst)
 
 
+def test_hypre_spmv_kernel():
+    """hypre's matrix-vector kernel: the vendor's on one rank, hypre's own on several
+    (CUDA builds), and the same product and the same solve with either."""
+    from hippymfem.common import mfemconfig as cfg
+
+    chosen = cfg.set_hypre_spmv("auto", COMM)
+    want = "hypre" if (COMM.size > 1 and mfem_gpu_backend() == "cuda") else "vendor"
+    check("kernel chosen for %d rank(s)" % COMM.size, chosen == want and cfg.HYPRE_SPMV == want,
+          "(%s)" % chosen)
+    pm, Vh, b, K, bc = problem(6)
+    A = matrix(pm, Vh, b, K, bc, seed=21)
+    x = hp.ParVector(COMM, A.Width())
+    hp.parRandom.set_seed(21)
+    hp.parRandom.normal(1.0, x)
+    out, sol = {}, {}
+    for kernel in ("vendor", "hypre"):
+        cfg.set_hypre_spmv(kernel, COMM)
+        y = hp.ParVector(COMM, A.Height())
+        A.Mult(x.hypre, y.hypre)
+        out[kernel] = y
+        sol[kernel] = amg_cg(A, iters=30)
+    cfg.set_hypre_spmv("auto", COMM)
+    d = out["vendor"].copy()
+    d.axpy(-1.0, out["hypre"])
+    rel = d.norm("l2") / max(out["vendor"].norm("l2"), 1e-300)
+    check("the two kernels give the same product", rel < 1e-13, "(relative difference %.1e)" % rel)
+    rel = abs(sol["vendor"] - sol["hypre"]) / max(abs(sol["vendor"]), 1e-300)
+    check("the two kernels give the same AMG-CG solve", rel < 1e-9, "(relative difference %.1e)" % rel)
+    try:
+        cfg.set_hypre_spmv("fastest", COMM)
+        bad = False
+    except ValueError:
+        bad = True
+    check("an unknown kernel name is refused", bad)
+
+
+def test_hypre_pool():
+    """hypre's device memory through the recycling pool: the same solve, blocks served
+    from the pool, never more held than allowed, nothing held after a trim."""
+    from hippymfem.common import mfemconfig as cfg
+
+    if mfem_gpu_backend() != "cuda":
+        check("hypre device pool (NVIDIA builds only)", True, "(skipped)")
+        return
+    pm, Vh, b, K, bc = problem(6)
+    A = matrix(pm, Vh, b, K, bc, seed=22)
+    ref = amg_cg(A, iters=30)
+    had = cfg.HYPRE_POOL is not None and cfg.HYPRE_POOL.installed
+    caps = (cfg.HYPRE_POOL.max_cached, cfg.HYPRE_POOL.max_block) if had else None
+    pool = cfg.set_hypre_pool(32.0)
+    check("pool installed", pool is not None and pool.installed)
+    if pool is None:
+        return
+    first = amg_cg(A, iters=30)             # a setup, its hierarchy freed on return
+    served = pool.from_pool
+    second = amg_cg(A, iters=30)            # the same setup again, from the pool
+    ok = (abs(first - ref) <= 1e-12 * abs(ref)) and (abs(second - ref) <= 1e-12 * abs(ref))
+    check("the same solve through the pool", ok, "(%.15e, %.15e, %.15e)" % (ref, first, second))
+    check("the second setup is served from the pool", pool.from_pool > served,
+          "(%d of %d requests, %d driver allocations)"
+          % (pool.from_pool, pool.requests, pool.driver_allocs))
+    check("the pool holds no more than it may", pool.peak_cached <= 32 * 2 ** 20,
+          "(peak %.1f MiB)" % (pool.peak_cached / 2 ** 20))
+    gc.collect()
+    pool.trim()
+    check("nothing held after a trim", pool.cached == 0)
+    third = amg_cg(A, iters=30)
+    check("the same solve after a trim", abs(third - ref) <= 1e-12 * abs(ref))
+    if had:
+        pool.max_cached, pool.max_block = caps
+    else:
+        pool.uninstall()
+        fourth = amg_cg(A, iters=30)
+        check("the same solve with hypre's own allocator back",
+              abs(fourth - ref) <= 1e-12 * abs(ref) and not pool.installed)
+
+
+def test_identity_route_on_device():
+    """A block with identity prolongations (one rank) through the true-dof route and
+    through the copying constructor: the same matrix.  Entry for entry up to round-off
+    only, because the scatter on a device adds an entry's contributions in an order
+    that is not fixed (on the host the two are identical)."""
+    from hippymfem.common.linalg import hypre_to_scipy
+
+    old = csr.TDOF_IDENTITY
+    mats, norms = {}, {}
+    try:
+        for mode in ("0", "1"):
+            csr.TDOF_IDENTITY = mode
+            pm, Vh, b, K, bc = problem(5)          # new spaces: nothing cached is shared
+            A = matrix(pm, Vh, b, K, bc, seed=23)
+            mats[mode] = hypre_to_scipy(A).tocsr()
+            norms[mode] = amg_cg(A, iters=30)
+            del A
+    finally:
+        csr.TDOF_IDENTITY = old
+    same_shape = mats["0"].shape == mats["1"].shape and mats["0"].nnz == mats["1"].nnz
+    worst = float(abs(mats["0"] - mats["1"]).max()) if same_shape and mats["0"].nnz else 0.0
+    scale = float(abs(mats["0"]).max()) if mats["0"].nnz else 1.0
+    check("identity prolongation: true-dof route equals the copying constructor",
+          same_shape and worst <= 1e-13 * scale,
+          "(max abs difference %.1e, largest entry %.1e)" % (worst, scale))
+    rel = abs(norms["0"] - norms["1"]) / max(abs(norms["0"]), 1e-300)
+    check("identity prolongation: the same AMG-CG solve", rel < 1e-9,
+          "(relative difference %.1e)" % rel)
+
+
 if __name__ == "__main__":
     test_sibling_release()
     test_operator_reset()
@@ -591,6 +698,9 @@ if __name__ == "__main__":
     test_reductions_after_matvec()
     test_multivector_sees_device_writes()
     test_device_memory_flat()
+    test_hypre_spmv_kernel()
+    test_identity_route_on_device()
+    test_hypre_pool()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))
     sys.exit(1 if FAILS else 0)

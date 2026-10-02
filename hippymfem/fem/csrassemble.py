@@ -53,6 +53,7 @@ is what pays off in an inverse problem, where a Newton-CG run reassembles ``A``,
 :func:`hippymfem.fem.assemble.set_assembly_backend` to use the callback route.
 """
 
+import os
 import numpy as np
 from .spaces import as_space
 from .prolongation import (  # noqa: F401  (re-exported, see below)
@@ -130,6 +131,27 @@ __all__ = [
 
 
 # ------------------------------------------------------------------- assembly
+#: Whether a block whose prolongations are the identity (a run on one rank, or a
+#: space without shared dofs) also takes the true-dof route.  On the host it has no
+#: reason to: the local matrix is the result and MFEM aliases its arrays.  With hypre
+#: on a device that matrix is built by the constructor that copies and splits a
+#: row-major CSR on the host, which took 5.2 us per quadratic hexahedron on one H100
+#: (171 ms for 17 million entries), where the true-dof route hands MFEM hypre's two
+#: blocks as they are (0.6 to 1.3 us).  ``"auto"`` takes the true-dof route on a
+#: device only; ``"1"`` always, ``"0"`` never.  Set ``HIPPYMFEM_TDOF_IDENTITY``.
+TDOF_IDENTITY = os.environ.get("HIPPYMFEM_TDOF_IDENTITY", "auto").lower()
+
+
+def _tdof_identity():
+    if TDOF_IDENTITY in ("1", "true", "yes", "on"):
+        return True
+    if TDOF_IDENTITY in ("0", "false", "no", "off"):
+        return False
+    from ..common.parvector import device_active
+
+    return device_active()
+
+
 class BlockPlan:
     """Everything about a block's assembly that does not depend on the values.
 
@@ -174,7 +196,8 @@ def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
         p.Pr, r_ident = _prolongation(trial_space)
     p.escapes = t_ident and r_ident
     p.tpat = None
-    if not p.escapes and _tdof_route(test_space, trial_space, p.same):
+    if ((not p.escapes or _tdof_identity())
+            and _tdof_route(test_space, trial_space, p.same)):
         from .tdofassemble import get_tdof_pattern
 
         p.tpat = get_tdof_pattern(p.pattern, test_space, trial_space)

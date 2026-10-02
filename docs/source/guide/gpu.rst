@@ -193,7 +193,7 @@ cost and which one dominates depends on the local element count.  Above about
 :math:`10^4` elements per rank the device wins on every case measured.  With the solves
 on the card the same holds for strong scaling: at 32\ :sup:`3` four cards are barely
 faster than one, at 128\ :sup:`3` two to four cards scale at 89 %, so plan for about a
-million state dofs per GPU.
+million state dofs per GPU (:ref:`several-gpus` says where the rest goes).
 
 **Double precision varies by two orders of magnitude across cards.**  Element kernels
 are double precision throughout.  Measured with a 4096-cubed matrix multiply:
@@ -205,10 +205,27 @@ L40S                1.25 TFLOP/s         125 TFLOP/s
 H100 80GB HBM3      349 TFLOP/s          381 TFLOP/s
 ==================  ===================  ===================
 
-On the same code the kernel speedup over a host core is 11x to 26x on an L40S and 11x to
-114x on an H100 (quadrilateral P1 to hexahedral P3).  The library therefore does not
-promise a speedup; :mod:`hippymfem.test.test_gpu` measures one for whatever card is
-present.
+On the same code the kernel speedup over a host core is 10x to 142x on an L40S and 15x to
+723x on an H100 (P1 triangles to P3 hexahedra, re-measured on 2026-10-01 with
+``benchmarks/bench_assembly_sweep.py``; in three dimensions 38x to 142x and 74x to 723x).
+The library therefore does not promise a speedup; :mod:`hippymfem.test.test_gpu` measures
+one for whatever card is present.
+
+**A complete assembly gains less than its kernel, and the GPU is not why.**  With hypre on
+the card, the same cases assemble 6x to 49x faster on an L40S and 6x to 80x on an H100
+than on a host core (18x to 49x and 54x to 80x in three dimensions).  Taken apart on an
+H100 for 32 768 Q2 hexahedra, a matrix of 17 million entries
+(``benchmarks/bench_assembly_profile.py``): the kernel 12 ms, the scatter on the card
+0.4 ms, the copy of the assembled values to the host 32 ms (136 MB at 4.2 GB/s), and
+MFEM's construction of the hypre matrix from them 20 to 42 ms with the two-block
+constructor, after which hypre moves the matrix to the card.  The host is on the way
+because the essential rows and the ghost-row exchange are done there and because
+PyMFEM's constructors take host arrays.  On one rank the route used to be worse: the
+local matrix went through the constructor that copies and splits a row-major CSR on the
+host, 171 ms for the same matrix.  A block whose prolongations are the identity now takes
+the true-dof route as well when hypre is on a device (``HIPPYMFEM_TDOF_IDENTITY=auto``),
+which made a complete assembly on one card 1.4 to 3.2 times faster with matrices that are
+identical to round-off (the device scatter does not add in a fixed order).
 
 **From P2 up, differentiate at the quadrature points.**  ``HIPPYMFEM_HESSIAN=quadrature``
 (or ``hm.config.hessian = "quadrature"``) builds each element Hessian block from the
@@ -233,6 +250,100 @@ elasticity, Q2 hexahedra               4 096       0.139 / 0.032 s        0.305 
 element route for P1 and for the parameter column of the P2 Poisson problem.  The default
 stays ``element``: its results are reproducible bit for bit, and on a host it is the
 faster route except for vector-valued Jacobians.
+
+.. _several-gpus:
+
+Several GPUs
+------------
+
+Three things cost parallel efficiency on GPUs, and none of them is the launch latency of
+a V-cycle on a small subdomain, which is what this guide used to say: one card needs
+0.3 ms plus 5.3 ns per state dof for a CG iteration with a BoomerAMG V-cycle (0.49 ms at
+36 000 dofs, 11.7 ms at 2.1 million, on half an RTX PRO 6000).  All numbers below are for
+the Jacobian of the model problem on MIG instances of that card, hypre 2.32 and CUDA
+12.9, measured with ``benchmarks/krylov_anatomy.py`` and the counters of
+``tools/gpuprof.c``.  The instances do not disturb one another: eight independent copies
+of the 64\ :sup:`3` problem ran as fast together as one alone.
+
+**cuSPARSE on hypre's off-diagonal blocks.**  hypre keeps a parallel matrix as a diagonal
+block and an off-diagonal block per rank, and by default multiplies with both through
+cuSPARSE, creating a matrix descriptor for every product.  For a block with few nonzeros
+the time of that product is unrelated to the nonzeros and grows with the *rows*, and an
+off-diagonal block has every row and almost no nonzeros.  On two ranks with 2.2 million rows each:
+
+==========================================  ============  ============  ==============
+block                                       nonzeros      cuSPARSE      hypre's kernel
+==========================================  ============  ============  ==============
+diagonal block of the Jacobian              136 million   2.2 ms        2.6 ms
+its off-diagonal block                      842 000       0.6-0.9 ms    0.16 ms
+an off-diagonal block of an interpolation   701           5.4 ms        under 0.2 ms
+==========================================  ============  ============  ==============
+
+One rank has no off-diagonal blocks, so the loss appears at the step from one card to
+two.  ``HIPPYMFEM_HYPRE_SPMV`` chooses the kernel (:func:`~hippymfem.common.mfemconfig.set_hypre_spmv`):
+``auto``, the default, is hypre's own on more than one rank of a CUDA build and the
+vendor's on one, where it is the faster (12 % per iteration here, none on an H100 at 2
+million dofs, 18 % at 8.6 million).  It is a run-time switch of hypre and changes
+nothing but the time.  Time per CG iteration in ms, cuSPARSE / hypre's kernel:
+
+=========  ==========================  ============================================
+instances  64\ :sup:`3` (2.1 M dofs)   2.1 M dofs per instance (mesh)
+=========  ==========================  ============================================
+1          11.7 / 13.0                 11.7 / 13.0 (64\ :sup:`3`)
+2          11.5 / 8.7                  24.0 / 15.7 (81\ :sup:`3`)
+4          6.3 / 5.6                   23.3 / 16.3 (102\ :sup:`3`)
+8          4.1 / 3.3                   21.6 / 16.6 (128\ :sup:`3`)
+16         3.2 / 2.6                   21.2 / 17.7 (161\ :sup:`3`)
+=========  ==========================  ============================================
+
+and a whole reduced-Hessian application (``bench_scaling.py --both-kernels``): 0.65 s on
+one instance; on two, four and eight at 64\ :sup:`3` 0.65, 0.32 and 0.22 s with cuSPARSE
+against 0.46, 0.28 and 0.18 s; at 2.1 million dofs per instance 1.27, 1.16 and 1.20 s
+against 0.86, 0.87 and 0.91 s.  Two Newton-CG steps at 128\ :sup:`3` on eight instances
+took 29.7 s with cuSPARSE and 26.1 s with hypre's kernel, same cost functional and CG
+counts.  On full H100 cards the difference is larger, because the diagonal products are
+quicker and the off-diagonal ones are not: 16.5 against 6.2 ms per iteration on two cards
+with 2.2 million dofs each (4.4 ms on one), and at 64\ :sup:`3` two cards were *slower*
+than one with cuSPARSE (8.1 against 4.4 ms) and faster with hypre's kernel (3.8 ms).
+hypre's kernel is slower than cuSPARSE on the big diagonal blocks, so a hypre that chose
+per block would gain another 8 to 15 %; that needs a change in hypre.
+
+**The halo exchange, at every level, through the host.**  An iteration makes 23 to 31
+exchanges (one per product with a level matrix or an interpolation matrix, on six to
+eight levels), and without a GPU-aware MPI each one packs on the card, copies to the
+host, sends, and copies back: about 60 us whatever the level's size, 2 ms per iteration.
+That is what is left of the weak-scaling loss (66 to 74 % efficiency at 2.1 million dofs
+per instance) and what bounds strong scaling: at 64\ :sup:`3` on sixteen instances an
+iteration takes 2.6 ms where a sixteenth of one instance's time is 0.7 ms.  Chebyshev
+smoothing (16 iterations instead of 25, each 1.6 times the cost) and a dense solve of a
+coarsest level of 500 unknowns changed a solve by 2 % or less at 2.1 million dofs per
+instance; ``UCX_RNDV_THRESH=inf`` changed nothing.  So keep a million state dofs or more
+on each GPU.
+
+**cudaMalloc and cudaFree in the BoomerAMG setup.**  A hypre built without Umpire or its
+own device pool, which is what the build scripts produce, takes every device array from
+the driver.  One setup makes about 2 200 allocations and 2 000 frees (11 GB in total at
+2.1 million dofs per rank), they are 60 to 75 % of the setup, and the driver serves the
+processes of a node one at a time:
+
+=========  ===========  ==============================  =======================
+instances  setup        allocations and frees           setup with a 1 GiB pool
+=========  ===========  ==============================  =======================
+1          0.16 s       0.10 s                          0.15 s
+2          0.31 s       0.18 s                          0.26 s
+4          0.50 s       0.35 s                          0.31 s
+8          0.78 s       0.57 s                          0.39 s
+16         1.47 s       1.10 s                          0.63 s
+=========  ===========  ==============================  =======================
+
+``HIPPYMFEM_HYPRE_POOL=<megabytes>`` (:func:`~hippymfem.common.mfemconfig.set_hypre_pool`)
+gives hypre a recycling pool through its own hook for user allocators: freed blocks are
+kept, up to that many megabytes per rank, and handed out again to requests of at most
+1.19 times less.  On sixteen instances 64 MB gave 1.08 s, 256 MB 0.86 s and 1 GiB 0.63 s
+(a C prototype of the same pool reached 0.44 s with 4 GiB and 0.24 s with no limit, which
+held 12 GiB).  It is off by default because it holds memory: at most the megabytes asked
+for, which :meth:`~hippymfem.common.mfemconfig.HyprePool.trim` returns, and which the
+pool gives up by itself when the driver refuses an allocation.
 
 .. _gpu-memory:
 

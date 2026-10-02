@@ -101,18 +101,35 @@ def main():
     ap.add_argument("--amg-theta", type=float, default=-1.0, help="strength threshold; -1 = MFEM default (0.25)")
     ap.add_argument("--tag", default="", help="label written into the record")
     ap.add_argument("--cg-tol", type=float, default=1e-12, help="relative tolerance of every Krylov solve")
+    ap.add_argument("--both-kernels", action="store_true",
+                    help="time the Hessian action a second time with hypre's other "
+                         "matrix-vector kernel (vendor library or hypre's own)")
+    ap.add_argument("--cart-part", action="store_true",
+                    help="partition the box as a Cartesian grid of ranks instead of with METIS")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
 
     N, ORDER = args.n, args.order
-    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON))
+    serial = mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON)
+    if args.cart_part:
+        # the most cubic grid of ranks that divides the rank count (bench_newton_device.py)
+        p = COMM.size
+        grid = min(((a, b, p // (a * b)) for a in range(1, p + 1) if p % a == 0
+                    for b in range(a, p // a + 1) if (p // a) % b == 0 and b <= p // (a * b)),
+                   key=lambda g: max(g) / min(g))
+        nxyz = mfem.intArray(list(grid))
+        pmesh = mfem.ParMesh(COMM, serial, serial.CartesianPartitioning(nxyz.GetData()))
+    else:
+        pmesh = mfem.ParMesh(COMM, serial)
+    del serial
     Vu = hm.FunctionSpace.H1(pmesh, ORDER)
     Vm = hm.FunctionSpace.H1(pmesh, 1)
     say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks, %d elem/rank, kernels on %s (%s)"
         % (N, ORDER, Vu.GlobalTrueVSize(), Vm.GlobalTrueVSize(), COMM.size, pmesh.GetNE(),
            kernel_mod.device(), gpu_name()))
+    say("  hypre matrix-vector kernel: %s" % hm.common.mfemconfig.HYPRE_SPMV)
 
     pde_varf = lambda u, m, p, x: jnp.exp(m.val) * hm.inner(u.grad, p.grad)   # noqa: E731
     bc = hm.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
@@ -170,6 +187,30 @@ def main():
                          model.generate_vector(PARAMETER))
     names = ["applyC", "solveFwdInc", "applyWuu", "applyWum", "solveAdjInc",
              "applyWmm", "applyCt", "applyWmu", "applyR"]
+
+    def action_profile():
+        """The nine operations of a Hessian action, timed ``--repeats`` times: the
+        medians, and the iteration counts of the two incremental solves."""
+        rr, ii = [], []
+        for _ in range(args.repeats):
+            t = {}
+            t["applyC"], _ = timed(lambda: model.applyC(v, rhs_fwd), rhs_fwd)
+            t["solveFwdInc"], _ = timed(lambda: model.solveFwdIncremental(uhat, rhs_fwd), uhat)
+            it_f = iters(pde.solver_fwd_inc)
+            t["applyWuu"], _ = timed(lambda: model.applyWuu(uhat, rhs_adj), rhs_adj)
+            t["applyWum"], _ = timed(lambda: model.applyWum(v, rhs_adj2), rhs_adj2)
+            rhs_adj.axpy(-1.0, rhs_adj2)
+            t["solveAdjInc"], _ = timed(lambda: model.solveAdjIncremental(phat, rhs_adj), phat)
+            it_a = iters(pde.solver_adj_inc)
+            t["applyWmm"], _ = timed(lambda: model.applyWmm(v, w), w)
+            t["applyCt"], _ = timed(lambda: model.applyCt(phat, yhelp), yhelp)
+            t["applyWmu"], _ = timed(lambda: model.applyWmu(uhat, yhelp), yhelp)
+            t["applyR"], _ = timed(lambda: model.applyR(v, yhelp), yhelp)
+            rr.append(t)
+            ii.append((it_f, it_a))
+        return ({k: float(np.median([r[k] for r in rr])) for k in names},
+                int(np.median([a for a, _ in ii])), int(np.median([b for _, b in ii])))
+
     runs, it_runs = [], []
     for _ in range(args.repeats):
         t = {}
@@ -207,10 +248,27 @@ def main():
            "mfem_device": args.device, "amg_relax_type": args.amg_relax_type, "cg_tol": args.cg_tol,
            "amg_max_levels": args.amg_max_levels, "amg_agg_levels": args.amg_agg_levels,
            "amg_theta": args.amg_theta, "tag": args.tag,
+           "hypre_spmv": hm.common.mfemconfig.HYPRE_SPMV, "cart_part": bool(args.cart_part),
            "t_fwd": t_fwd, "it_fwd": it_fwd, "t_adj": t_adj, "it_adj": it_adj, "t_grad": t_grad,
            "t_blocks": t_blocks, "t_blocks_cold": t_blocks_cold,
            "t_action": t_action, "op": op, "it_fwd_inc": it_fwd_inc, "it_adj_inc": it_adj_inc,
            "repeats": args.repeats}
+    if args.both_kernels and hm.common.mfemconfig.HYPRE_SPMV is not None:
+        # the same Hessian action with hypre's other matrix-vector kernel: a global
+        # switch, so the matrices, the hierarchies and the vectors stay as they are
+        first = hm.common.mfemconfig.HYPRE_SPMV
+        other = "hypre" if first == "vendor" else "vendor"
+        hm.common.mfemconfig.set_hypre_spmv(other, COMM)
+        H.mult(v, w)                                               # warm the other kernel
+        op2, itf2, ita2 = action_profile()
+        t2 = sum(op2.values())
+        hm.common.mfemconfig.set_hypre_spmv(first, COMM)
+        say("  with the %s kernel: Hessian action %.4f s; incremental solves fwd %d it "
+            "(%.2f ms/it), adj %d it (%.2f ms/it)"
+            % (other, t2, itf2, 1e3 * op2["solveFwdInc"] / max(itf2, 1),
+               ita2, 1e3 * op2["solveAdjInc"] / max(ita2, 1)))
+        rec["other_kernel"] = {"hypre_spmv": other, "t_action": t2, "op": op2,
+                               "it_fwd_inc": itf2, "it_adj_inc": ita2}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:

@@ -260,6 +260,9 @@ def main():
            "newton_it": solver.it, "cg_it": solver.total_cg_iter, "J": solver.final_cost,
            "gradnorm": solver.final_grad_norm, "err_m": err,
            "cart_part": bool(args.cart_part), "newton_only": bool(args.newton_only),
+           "hypre_spmv": hm.common.mfemconfig.HYPRE_SPMV,
+           "hypre_pool": (hm.common.mfemconfig.HYPRE_POOL.stats()
+                          if hm.common.mfemconfig.HYPRE_POOL is not None else None),
            "warm_up": bool(args.warm_up)}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

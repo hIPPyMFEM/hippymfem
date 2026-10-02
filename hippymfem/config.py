@@ -31,6 +31,13 @@ def _module_attr(module, attr):
     return get
 
 
+def _module_call(module, fn):
+    def get():
+        return getattr(importlib.import_module("hippymfem." + module), fn)()
+    get.module = "hippymfem." + module
+    return get
+
+
 def _module_setter(module, fn):
     def put(value):
         getattr(importlib.import_module("hippymfem." + module), fn)(value)
@@ -100,6 +107,9 @@ _KNOBS = [
     _Knob("parmat_device", "HIPPYMFEM_PARMAT_DEVICE",
           "with hypre on a device: block (hypre's two blocks directly, default) or copy",
           _module_attr("fem.tdofassemble", "DEVICE_PARMAT"), _module_setter("fem.tdofassemble", "set_device_parmat")),
+    _Knob("tdof_identity", "HIPPYMFEM_TDOF_IDENTITY",
+          "true-dof route also where the prolongations are the identity (one rank): auto (with hypre on a device), 1, 0",
+          _module_attr("fem.csrassemble", "TDOF_IDENTITY"), _module_assign("fem.csrassemble", "TDOF_IDENTITY", str)),
     _Knob("triple", "HIPPYMFEM_TRIPLE",
           "the triple product's form where one is formed: auto (timed once), rap, split",
           _module_attr("fem.parmat", "TRIPLE_MODE"), _module_setter("fem.parmat", "set_triple_mode")),
@@ -190,6 +200,13 @@ _KNOBS = [
           "keys per device sort chunk; 0 sizes it from the free memory",
           _module_attr("fem.devsort", "CHUNK"), _module_assign("fem.devsort", "CHUNK", int)),
     # ------------------------------------------------------------------- solvers
+    _Knob("hypre_spmv", "HIPPYMFEM_HYPRE_SPMV",
+          "hypre's matrix-vector kernel on a GPU: auto (its own on several ranks of a CUDA build), vendor, hypre",
+          _module_attr("common.mfemconfig", "HYPRE_SPMV"), _module_setter("common.mfemconfig", "set_hypre_spmv")),
+    _Knob("hypre_pool", "HIPPYMFEM_HYPRE_POOL",
+          "megabytes of freed device memory a recycling pool for hypre may hold per rank (0: no pool)",
+          _module_call("common.mfemconfig", "hypre_pool_megabytes"),
+          _module_setter("common.mfemconfig", "set_hypre_pool_megabytes")),
     _Knob("amg_relax", "HIPPYMFEM_AMG_RELAX",
           "default BoomerAMG relaxation type for new solvers; -1 keeps MFEM's (16 is Chebyshev, SPD only)",
           _env_only("HIPPYMFEM_AMG_RELAX", "-1"), _env_setter("HIPPYMFEM_AMG_RELAX")),
