@@ -499,6 +499,18 @@ def _is_oom(exc):
             or "out of memory" in text)
 
 
+def _release_for_retry():
+    """Before a retry after the device ran out of memory: whatever else holds freed
+    memory on the card gives it back (hypre's recycling pool keeps some between
+    BoomerAMG setups, :func:`hippymfem.common.mfemconfig.set_hypre_pool`)."""
+    try:
+        from ..common.mfemconfig import hypre_pool_trim
+
+        hypre_pool_trim()
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
 def _fits(exc, n):
     """Elements that should fit, from the size the failed allocation asked for.
 
@@ -847,6 +859,7 @@ class GroupKernel:
                 except Exception as exc:
                     if n <= 1 or not _is_oom(exc):
                         raise
+                    _release_for_retry()
                     # Every chunk's output stays until they are joined, and the join
                     # copies them once more.  When that alone is more than the device
                     # has, no chunk size fits, and halving down to one element would
@@ -924,6 +937,7 @@ class GroupKernel:
                 # same stretch is tried again
                 if n <= 1 or not _is_oom(exc):
                     raise
+                _release_for_retry()
                 n = max(1, min(n // 2, _fits(exc, n)))
                 self._chunk[key] = n
                 warnings.warn(

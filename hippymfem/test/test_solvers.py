@@ -325,16 +325,22 @@ def test_hypre_pool_logic():
     p5 = alloc(2500)
     pool._free(p5)                              # larger than max_block: to the driver
     ok = p5 not in live and pool.cached == 2700
-    p6 = alloc(500)
-    pool._free(p6)                              # would exceed max_cached: to the driver
+    p6 = alloc(1100)
+    pool._free(p6)                              # full, and nothing larger to give up
     ok = ok and p6 not in live and pool.cached == 2700 and pool.peak_cached <= 3000
     check("pool: the limits on a block and on the total hold", ok)
+    p7 = alloc(500)
+    pool._free(p7)                              # full: one of the larger blocks goes
+    ok = (p7 in live and pool.cached == 2200 and len(live) == 3
+          and sorted(live.values()) == [500, 700, 1000] and pool.peak_cached <= 3000)
+    check("pool: a full pool gives up a larger block for a smaller one", ok,
+          "(%s)" % (sorted(live.values()),))
     live[0x7f0000000000] = 1                    # a block the pool did not hand out
     pool._free(0x7f0000000000)
-    ok = 0x7f0000000000 not in live and pool.cached == 2700
+    ok = 0x7f0000000000 not in live and pool.cached == 2200
     freed = pool.trim()
     check("pool: a foreign block goes to the driver, and trim returns the rest",
-          ok and freed == 2700 and pool.cached == 0 and not live, "(%s)" % (pool.stats(),))
+          ok and freed == 2200 and pool.cached == 0 and not live, "(%s)" % (pool.stats(),))
     # the pool that keeps blocks during a setup only (the default on a GPU)
     scoped = HyprePool(hypre, runtime, max_cached=3000, max_block=2000, scoped=True)
 
@@ -357,6 +363,32 @@ def test_hypre_pool_logic():
     scoped._free(q4)
     check("pool: a scoped pool recycles between open and close and holds nothing outside",
           ok and held == 1000 and scoped.cached == 0 and not live, "(%s)" % (scoped.stats(),))
+    # the same with something kept between setups (the default on a GPU): the smallest
+    # blocks stay when the setup is over
+    keeper = HyprePool(hypre, runtime, max_cached=3000, max_block=2000, scoped=True, keep=800)
+
+    def get(n):
+        keeper._malloc(out, n)
+        return out[0]
+
+    keeper.open()
+    keeper.open()                               # a second solver given its operator
+    r = [get(1000), get(500), get(200), get(100)]
+    for q in r:
+        keeper._free(q)
+    ok = keeper.cached == 1800 and len(live) == 4 and keeper.max_cached == 3000
+    keeper.close()                              # the first solve of either ends the scope
+    ok = ok and keeper.cached == 800 and sorted(live.values()) == [100, 200, 500]
+    ok = ok and keeper.max_cached == 800
+    r5 = get(450)                               # served from what was kept
+    ok = ok and r5 == r[1] and keeper.from_pool == 1
+    keeper._free(r5)
+    r6 = get(1000)
+    keeper._free(r6)                            # no setup pending and no room: to the driver
+    ok = ok and r6 not in live and keeper.cached == 800
+    keeper.trim()
+    check("pool: between setups a scoped pool keeps its smallest blocks, up to its limit",
+          ok and keeper.cached == 0 and not live, "(%s)" % (keeper.stats(),))
 
 
 def test_petsc():

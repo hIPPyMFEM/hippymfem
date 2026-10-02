@@ -626,8 +626,8 @@ def test_hypre_pool():
     A = matrix(pm, Vh, b, K, bc, seed=22)
     ref = amg_cg(A, iters=30)
     had = cfg.HYPRE_POOL is not None and cfg.HYPRE_POOL.installed
-    caps = ((cfg.HYPRE_POOL.scoped, cfg.HYPRE_POOL.limit, cfg.HYPRE_POOL.max_cached,
-             cfg.HYPRE_POOL.max_block) if had else None)
+    caps = ((cfg.HYPRE_POOL.scoped, cfg.HYPRE_POOL.limit, cfg.HYPRE_POOL.keep,
+             cfg.HYPRE_POOL.max_cached, cfg.HYPRE_POOL.max_block) if had else None)
     pool = cfg.set_hypre_pool(32.0)
     check("pool installed", pool is not None and pool.installed)
     if pool is None:
@@ -649,7 +649,7 @@ def test_hypre_pool():
     check("the same solve after a trim", abs(third - ref) <= 1e-12 * abs(ref))
     if had:
         pool.trim()
-        pool.scoped, pool.limit, pool.max_cached, pool.max_block = caps
+        pool.scoped, pool.limit, pool.keep, pool.max_cached, pool.max_block = caps
     else:
         pool.uninstall()
         fourth = amg_cg(A, iters=30)
@@ -659,7 +659,8 @@ def test_hypre_pool():
 
 def test_hypre_pool_setup_scope():
     """The default pool: it recycles hypre's arrays while a solver sets its
-    preconditioner up, and holds nothing once the first solve is over."""
+    preconditioner up, and once the first solve is over it holds no more than it may
+    keep between setups."""
     from hippymfem.common import mfemconfig as cfg
 
     if mfem_gpu_backend() != "cuda":
@@ -667,7 +668,7 @@ def test_hypre_pool_setup_scope():
         return
     pool = cfg.HYPRE_POOL
     if pool is None or not pool.installed or not pool.scoped:
-        check("the default pool is the one that holds memory during a setup only", True,
+        check("the default pool is the one with a limit of its own during a setup", True,
               "(skipped: HIPPYMFEM_HYPRE_POOL=%s)" % os.environ.get("HIPPYMFEM_HYPRE_POOL", "auto"))
         return
     pm, Vh, b, K, bc = problem(6)
@@ -686,10 +687,29 @@ def test_hypre_pool_setup_scope():
     check("the pool is open between set_operator and the first solve", open_now)
     check("the setup was served from the pool", pool.from_pool > served,
           "(%d of %d requests)" % (pool.from_pool - served, pool.requests - requests))
-    check("nothing is held after the first solve", pool.cached == 0 and pool.max_cached == 0,
-          "(%d bytes)" % pool.cached)
+    check("after the first solve the pool holds no more than it may keep",
+          pool.cached <= pool.keep and pool.max_cached == pool.keep,
+          "(%d of %d bytes)" % (pool.cached, pool.keep))
     check("the same solve with the pool", abs(got - ref) <= 1e-8 * abs(ref),
           "(%.12e, %.12e)" % (ref, got))
+    # a second solver on a new matrix of the same size: the hierarchy the first one
+    # gives up and the blocks kept serve its setup
+    del s
+    gc.collect()
+    driver = pool.driver_allocs
+    served = pool.from_pool
+    s2 = hp.KrylovSolver(COMM, "cg", "amg")
+    s2.parameters["rel_tolerance"] = 1e-12
+    s2.parameters["max_iter"] = 200
+    s2.set_operator(A)
+    x.zero()
+    s2.solve(x, rhs)
+    got2 = float(x.hypre.Norml2())
+    check("a second setup is served from the pool and gives the same solve",
+          pool.from_pool > served and abs(got2 - ref) <= 1e-8 * abs(ref),
+          "(%d served, %d from the driver)" % (pool.from_pool - served, pool.driver_allocs - driver))
+    freed = cfg.hypre_pool_trim()
+    check("a trim returns what was kept", pool.cached == 0, "(%d bytes)" % freed)
 
 
 def test_identity_route_on_device():

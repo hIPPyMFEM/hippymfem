@@ -219,8 +219,8 @@ _KNOBS = [
           _module_attr("common.mfemconfig", "HYPRE_SPMV"), _module_setter("common.mfemconfig", "set_hypre_spmv")),
     _Knob("hypre_pool", "HIPPYMFEM_HYPRE_POOL",
           "megabytes of freed device memory a recycling pool for hypre may hold per rank between "
-          "BoomerAMG setups (0 here: none; the default pool, HIPPYMFEM_HYPRE_POOL=auto, recycles "
-          "during a setup only and holds nothing afterwards)",
+          "BoomerAMG setups (the default pool, HIPPYMFEM_HYPRE_POOL=auto, may hold 1024 during a "
+          "setup and HIPPYMFEM_HYPRE_POOL_KEEP, 512, between setups; 0 removes the pool)",
           _module_call("common.mfemconfig", "hypre_pool_megabytes"),
           _module_setter("common.mfemconfig", "set_hypre_pool_megabytes")),
     _Knob("amg_relax", "HIPPYMFEM_AMG_RELAX",

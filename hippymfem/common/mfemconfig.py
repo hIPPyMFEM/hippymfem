@@ -180,12 +180,18 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
     set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)
-    # hypre's device memory: "auto" (the default) recycles it during a BoomerAMG setup
-    # only and holds nothing afterwards; a number of megabytes keeps that much between
-    # setups as well; "0" leaves every allocation to the driver.
+    # hypre's device memory: "auto" (the default) recycles up to HYPRE_POOL_SETUP_MB of
+    # it while a BoomerAMG setup runs and keeps HYPRE_POOL_KEEP_MB of the smallest blocks
+    # between setups (HIPPYMFEM_HYPRE_POOL_KEEP changes that; 0 keeps nothing); a number
+    # of megabytes keeps that much at all times; "0" leaves every allocation to the
+    # driver.
     pool = (os.environ.get("HIPPYMFEM_HYPRE_POOL", "auto") or "auto").strip().lower()
     if pool == "auto":
-        set_hypre_pool(HYPRE_POOL_SETUP_MB, scoped=True)
+        try:
+            keep = float(os.environ.get("HIPPYMFEM_HYPRE_POOL_KEEP", HYPRE_POOL_KEEP_MB))
+        except ValueError:
+            keep = HYPRE_POOL_KEEP_MB
+        set_hypre_pool(HYPRE_POOL_SETUP_MB, scoped=True, keep_megabytes=max(keep, 0.0))
     else:
         try:
             megabytes = float(pool)
@@ -291,14 +297,15 @@ class HyprePool:
     #: times the size asked for
     CLASSES = 8.0
 
-    def __init__(self, hypre, runtime, max_cached, max_block=None, scoped=False):
+    def __init__(self, hypre, runtime, max_cached, max_block=None, scoped=False, keep=0):
         import ctypes
 
-        #: ``True``: the pool keeps freed blocks only between :meth:`open` and
-        #: :meth:`close`, that is, during a BoomerAMG setup, and holds nothing
-        #: outside it.  ``False``: it keeps them at all times, up to ``max_cached``.
+        #: ``True``: the pool keeps up to ``limit`` bytes of freed blocks between
+        #: :meth:`open` and :meth:`close`, that is, while a BoomerAMG setup runs, and up
+        #: to ``keep`` bytes outside it.  ``False``: up to ``max_cached`` at all times.
         self.scoped = bool(scoped)
         self.limit = int(max_cached)
+        self.keep = int(keep) if self.scoped else int(max_cached)
 
         self._ct = ctypes
         self._dev_malloc = runtime.cudaMalloc
@@ -307,7 +314,7 @@ class HyprePool:
         self._dev_free = runtime.cudaFree
         self._dev_free.argtypes = [ctypes.c_void_p]
         self._dev_free.restype = ctypes.c_int
-        self.max_cached = 0 if self.scoped else int(max_cached)
+        self.max_cached = self.keep
         self.max_block = int(max_block if max_block is not None else max_cached)
         self._bins = {}                    # size class -> [(pointer, size), ...]
         self._size = {}                    # pointer -> size, for the blocks handed out
@@ -378,15 +385,52 @@ class HyprePool:
         s = self._size.pop(p, 0)
         if s:
             self.in_use -= s
-            if s <= self.max_block and self.cached + s <= self.max_cached:
-                self._bins.setdefault(self._class(s), []).append((p, s))
-                self.cached += s
-                if self.cached > self.peak_cached:
-                    self.peak_cached = self.cached
-                return
+            if s <= self.max_block:
+                if self.cached + s > self.max_cached:
+                    self._make_room(s)
+                if self.cached + s <= self.max_cached:
+                    self._bins.setdefault(self._class(s), []).append((p, s))
+                    self.cached += s
+                    if self.cached > self.peak_cached:
+                        self.peak_cached = self.cached
+                    return
         # not handed out by this pool, too large, or the pool is full
         self._dev_free(p)
         self.driver_frees += 1
+
+    def _largest(self):
+        """The size class of the largest block held, or ``None``."""
+        top = None
+        for k, blocks in self._bins.items():
+            if blocks and (top is None or k > top):
+                top = k
+        return top
+
+    def _make_room(self, s):
+        """The pool is full: give larger blocks back to the driver, largest first, until
+        a block of ``s`` bytes fits.  Blocks no larger than ``s`` stay, so the pool ends
+        up holding the small blocks, which are most of the calls and little of the
+        memory."""
+        c = self._class(s)
+        while self.cached + s > self.max_cached:
+            top = self._largest()
+            if top is None or top <= c:
+                return
+            p, big = self._bins[top].pop()
+            self.cached -= big
+            self._dev_free(p)
+            self.driver_frees += 1
+
+    def _shrink(self):
+        """Give blocks back to the driver, largest first, down to ``max_cached``."""
+        while self.cached > self.max_cached:
+            top = self._largest()
+            if top is None:
+                break
+            p, big = self._bins[top].pop()
+            self.cached -= big
+            self._dev_free(p)
+            self.driver_frees += 1
 
     def trim(self):
         """Return every block the pool holds to the driver; returns the bytes freed."""
@@ -400,15 +444,19 @@ class HyprePool:
         return freed
 
     def open(self):
-        """Start keeping freed blocks (a scoped pool; the others always do)."""
+        """A setup is about to run: a scoped pool may now hold ``limit`` bytes."""
         if self.scoped:
             self.max_cached = self.limit
 
     def close(self):
-        """Stop keeping freed blocks and return those held (a scoped pool only)."""
+        """A setup is over: a scoped pool goes back to the ``keep`` bytes it may hold
+        between setups and returns the rest, largest blocks first.  The calls are not
+        counted against :meth:`open`: a solver that was given an operator and never
+        solved must not leave the pool at its larger limit, so the first solve of any
+        solver ends the scope, and a setup still pending then runs with ``keep``."""
         if self.scoped:
-            self.max_cached = 0
-            self.trim()
+            self.max_cached = self.keep
+            self._shrink()
 
     def uninstall(self):
         """Give hypre its own allocator back and release what the pool holds.  Blocks
@@ -433,6 +481,9 @@ HYPRE_POOL = None
 #: Megabytes the default pool may hold while a BoomerAMG setup is running.
 HYPRE_POOL_SETUP_MB = 1024.0
 
+#: Megabytes the default pool may hold between setups (``HIPPYMFEM_HYPRE_POOL_KEEP``).
+HYPRE_POOL_KEEP_MB = 512.0
+
 
 def hypre_pool_open():
     """A BoomerAMG setup is about to run: let a scoped pool recycle its arrays."""
@@ -441,12 +492,21 @@ def hypre_pool_open():
 
 
 def hypre_pool_close():
-    """The setup is over: a scoped pool returns what it holds and keeps nothing."""
+    """The setup is over: a scoped pool returns all but what it keeps between setups."""
     if HYPRE_POOL is not None and HYPRE_POOL.installed:
         HYPRE_POOL.close()
 
 
-def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False):
+def hypre_pool_trim():
+    """Return everything the pool holds to the driver (for a caller that is short of
+    device memory); returns the bytes freed."""
+    if HYPRE_POOL is not None and HYPRE_POOL.installed:
+        return HYPRE_POOL.trim()
+    return 0
+
+
+def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
+                   keep_megabytes=0.0):
     """Let hypre recycle its device memory through a pool that may hold ``megabytes``.
 
     A hypre built without Umpire and without its own device pool, which is what the
@@ -460,35 +520,50 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False):
 
     hypre lets the application supply the two functions, and this supplies a pair that
     keeps freed blocks and hands them out again.  A new block has exactly the size
-    asked for; a freed one is kept unless the pool already holds ``megabytes`` or the
-    block is larger than ``max_block_megabytes`` (default: the same), in which case it
-    goes back to the driver; a request is served by a kept block of at most 1.19 times
-    its size.  So the pool costs at most ``megabytes`` of device memory per rank beyond
-    what hypre is using, and :meth:`HyprePool.trim` returns that at any time.  If the
-    driver refuses an allocation the pool is emptied and the allocation retried.
+    asked for; a freed one is kept unless it is larger than ``max_block_megabytes``
+    (default: ``megabytes``) or the pool already holds ``megabytes``, in which case
+    larger blocks are given back to the driver to make room for it, and it goes back
+    itself when there are none; a request is served by a kept block of at most 1.19
+    times its size.  So the pool costs at most ``megabytes`` of device memory per rank
+    beyond what hypre is using, and :meth:`HyprePool.trim` returns that at any time.
+    If the driver refuses an allocation the pool is emptied and the allocation retried,
+    and the element kernels empty it when they run out of device memory.
 
     With 1024 MB the setup above took 0.62 s instead of 1.47 s, and with 4096 MB
     0.44 s.  Nothing but the time of an allocation changes.
 
-    Almost all of that gain comes from reuse *within* one setup: a setup that starts
-    with an empty pool of 1024 MB took 0.65 s.  So with ``scoped=True`` the pool keeps
-    blocks only while a setup runs (between :func:`hypre_pool_open`, which a solver
-    calls when it is given an operator, and :func:`hypre_pool_close`, after its first
-    solve) and returns them when it ends: the setup is as fast and no memory is held
-    afterwards.  This is what :func:`configure_device` installs by default
-    (``HIPPYMFEM_HYPRE_POOL=auto``, :data:`HYPRE_POOL_SETUP_MB`).
-    ``HIPPYMFEM_HYPRE_POOL=<megabytes>`` asks for the pool that keeps its blocks, and
-    ``0`` for none.  NVIDIA builds only.  Returns the :class:`HyprePool`, or ``None``
-    when hypre is not on a CUDA device or the hooks are not available.
+    With ``scoped=True`` the pool has two limits: ``megabytes`` while a BoomerAMG setup
+    runs (between :func:`hypre_pool_open`, which a solver calls when it is given an
+    operator, and :func:`hypre_pool_close`, after its first solve) and
+    ``keep_megabytes`` otherwise.  The first serves the setup's own temporaries: a
+    setup that starts with an empty pool of 1024 MB took 0.65 s.  The second carries
+    blocks from one setup to the next, and from the hierarchy a solver gives up to the
+    one it builds.  When the pool is full a freed block displaces larger ones, so what
+    it keeps are the smallest: of the 2,300 allocations that a forward solve and its
+    Hessian blocks made on one of sixteen instances with 2.1 million dofs, 89 % were
+    under 1 MB and took 6 to 70 us each, and the 256 larger ones took 1.7 to 2.3 ms
+    each (0.2 to 0.3 ms with two processes on an H100).  Replaying those recorded
+    allocations and frees under each policy (``benchmarks/DESIGN_NOTES.md``, section
+    11), the driver calls cost 1.34 s without a pool, 1.03 s with 1024 MB during a
+    setup only, 0.43 s when 512 MB are kept between setups as well and 0.34 s with
+    1024 MB kept.
+
+    :func:`configure_device` installs the scoped pool by default
+    (``HIPPYMFEM_HYPRE_POOL=auto``: :data:`HYPRE_POOL_SETUP_MB` during a setup and
+    :data:`HYPRE_POOL_KEEP_MB` between setups, the latter changed by
+    ``HIPPYMFEM_HYPRE_POOL_KEEP``, in megabytes, where 0 keeps nothing).
+    ``HIPPYMFEM_HYPRE_POOL=<megabytes>`` asks for one limit at all times, and ``0`` for
+    no pool.  NVIDIA builds only.  Returns the :class:`HyprePool`, or ``None`` when
+    hypre is not on a CUDA device or the hooks are not available.
     """
     global HYPRE_POOL
     if HYPRE_POOL is not None and HYPRE_POOL.installed:
         HYPRE_POOL.scoped = bool(scoped)
         HYPRE_POOL.limit = int(megabytes * 2 ** 20)
-        HYPRE_POOL.max_cached = 0 if scoped else HYPRE_POOL.limit
+        HYPRE_POOL.keep = int(keep_megabytes * 2 ** 20) if scoped else HYPRE_POOL.limit
         HYPRE_POOL.max_block = int((max_block_megabytes or megabytes) * 2 ** 20)
-        if scoped:
-            HYPRE_POOL.trim()
+        HYPRE_POOL.max_cached = HYPRE_POOL.keep
+        HYPRE_POOL._shrink()
         return HYPRE_POOL
     if not _DEVICE or mfem_gpu_backend() != "cuda":
         return None
@@ -511,7 +586,8 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False):
         return None
     HYPRE_POOL = HyprePool(hypre, runtime, megabytes * 2 ** 20,
                            None if max_block_megabytes is None
-                           else max_block_megabytes * 2 ** 20, scoped=scoped)
+                           else max_block_megabytes * 2 ** 20, scoped=scoped,
+                           keep=keep_megabytes * 2 ** 20)
     # hypre frees its last arrays while the interpreter shuts down, when a callback
     # into Python is no longer safe: hand the allocator back before that
     atexit.register(HYPRE_POOL.uninstall)
@@ -519,11 +595,10 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False):
 
 
 def hypre_pool_megabytes():
-    """Megabytes the installed pool may hold between setups; 0 without one, and 0 for
-    the default pool, which holds memory during a setup only."""
-    if HYPRE_POOL is None or not HYPRE_POOL.installed or HYPRE_POOL.scoped:
+    """Megabytes the installed pool may hold between setups; 0 without a pool."""
+    if HYPRE_POOL is None or not HYPRE_POOL.installed:
         return 0.0
-    return HYPRE_POOL.max_cached / 2 ** 20
+    return HYPRE_POOL.keep / 2 ** 20
 
 
 def set_hypre_pool_megabytes(megabytes):
