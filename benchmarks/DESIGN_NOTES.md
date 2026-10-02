@@ -100,8 +100,10 @@ residual leaves 1e-14. XLA's default for an fp32 dot on an NVIDIA card is TF32 (
 mantissa, about 5e-4 relative): the three chained einsums of the table evaluator, not the
 AD pass, moved the operator by 1.7e-4; with `default_matmul_precision("highest")` that is
 1.1e-7 at 24^3 on a Blackwell card, for 7 % of the kernel speedup. Double precision on an
-L40S is 1.25 TFLOP/s against 125 TFLOP/s single, a factor of 100; on an A100/H100 about
-half the single rate. `test_gpu.py` reports the numbers for the card present.
+L40S was once measured at 1.25 TFLOP/s in a matrix multiply (no log survives; the
+125 TFLOP/s "single" next to it was a TF32 rate, and the H100 figure quoted with it was
+taken with JAX's 64-bit mode off).  The element kernels run 1.5 to 5.2 times faster on an
+H100 than on an L40S. `test_gpu.py` reports the numbers for the card present.
 
 ## 2. Direct CSR assembly (`hippymfem/fem/csrassemble.py`)
 
@@ -357,12 +359,14 @@ model problem, CG + BoomerAMG with MFEM's device defaults.  The GPU guide has th
 
 - **The floor on one GPU is small** (`hippymfem.common.mfemconfig.set_hypre_spmv`).  A CG
   iteration costs 0.3 ms plus 5.3 ns per state dof on one instance (0.49 ms at 36 k dofs,
-  11.6 ms at 2.1 M), with 120 to 140 kernel launches and no device allocation.  The
+  11.6 ms at 2.1 M), with 100 to 160 kernel launches and no device allocation.  The
   4.6 ms "fixed cost" that an earlier fit of the L40S times produced, and that was read
   as launch latency, is not there on one card: it appears with the second rank.
-- **cuSPARSE on the off-diagonal blocks.**  hypre 2.32 creates a cuSPARSE descriptor per
-  product (`seq_mv/csr_matvec_device.c`), and for a block with few nonzeros the time of
-  the product is unrelated to the nonzeros and grows with the rows.  Two ranks, 2.2 M rows each: the diagonal block (136 M nonzeros) 2.2 ms, the
+- **cuSPARSE on the off-diagonal blocks.**  For a block with few nonzeros the time of
+  cuSPARSE's product does not shrink with the nonzeros (0.5 to 5.4 ms among the
+  off-diagonal blocks with 2.2 M rows, the longest for the sparsest; the cause inside
+  cuSPARSE was not determined, and the descriptor that hypre 2.32 creates per product in
+  `seq_mv/csr_matvec_device.c` costs under 0.03 ms per iteration).  Two ranks, 2.2 M rows each: the diagonal block (136 M nonzeros) 2.2 ms, the
   off-diagonal block of the Jacobian (842 k nonzeros) 0.6 to 0.9 ms, an off-diagonal block
   of an interpolation matrix with 701 nonzeros 5.4 ms; hypre's own kernel 2.6 ms, 0.16 ms
   and under 0.2 ms.  The slower rank holds the other in `MPI_Waitall` (6.5 ms of a 24 ms
@@ -377,7 +381,10 @@ model problem, CG + BoomerAMG with MFEM's device defaults.  The GPU guide has th
   rocSPARSE on AMD has no such cost (two MI210 at 2.2 M dofs each: 12.5 ms against 9.2 on
   one, and faster than hypre's kernel everywhere), so `auto` keeps the vendor on HIP.
 - **What is left is the halo exchange** through the host at every level: 23 to 31 per
-  iteration, about 60 us each.  A dense solve on a coarsest level of up to 500 unknowns
+  iteration.  They were not timed one by one; an iteration on several instances takes
+  1.0 to 2.2 ms longer than on one with the same dofs up to 1.1 M dofs per instance and
+  2.5 to 5.0 ms longer at 2.1 M (40 to 160 us per exchange, off-diagonal products
+  included).  A dense solve on a coarsest level of up to 500 unknowns
   (`MaxCoarseSize`, relax type 199, set through the preloaded library since PyMFEM gives
   no solver handle) saved 2 % at 2.1 M dofs per rank and 12 % at 134 k; Chebyshev
   smoothing needed 16 iterations instead of 25 at 1.6 times the cost each; an eager MPI
@@ -393,6 +400,19 @@ model problem, CG + BoomerAMG with MFEM's device defaults.  The GPU guide has th
   12 GiB, reached 0.24 s.  The few large blocks carry most of the time, which is why the
   limit matters and why the pool is off by default.  New blocks are exact and recycled
   ones at most 1.19 times the request, so hypre's own footprint does not grow.
+- **Outside the Krylov iterations** (`bench_hessian_anatomy.py`).  The two incremental
+  solves are 91 % of a reduced-Hessian application on one instance and on sixteen at
+  2.1 M dofs each (89 % at 64^3 on sixteen).  Of the rest, 8 to 11 ms per solve are the
+  library's own handling of the vectors on the host (copy of the right-hand side, zeroing
+  of the essential entries and of the solution, each with a copy of the vector down from
+  the card or up to it), 11 to 25 ms the observation operator on the host, 15 to 26 ms
+  the prior's precision with its mass solve.  `ParVector` on the device and a device
+  observation operator would take off about half; not done.  Note for anyone reusing the
+  records of `krylov_anatomy.py`: its timed loops end with `v.hypre.Norml2()`, which runs
+  on the host for a vector MFEM has not flagged for the device, so the V-cycle and
+  product loops include one copy of a vector per loop (their per-call times are up to
+  about 0.5 ms too high at 2.1 M dofs); the CG times do not, since MFEM's CG flags its
+  solution vector and the norm is then a reduction on the card.
 - **End to end** (`bench_newton_device.py`, 128^3 on eight instances, two Newton-CG
   steps, the same cost functional and CG counts): 29.7 s with cuSPARSE on all ranks,
   26.1 s with hypre's kernel, 24.9 s with the pool of 1 GiB as well; a reduced-Hessian

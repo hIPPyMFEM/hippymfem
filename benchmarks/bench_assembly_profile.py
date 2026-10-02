@@ -8,7 +8,10 @@
 For one element type and mesh: the element kernel, the reduction of the element matrices
 to the values of the CSR matrix by several methods, the copy of the values to CPU memory,
 and the complete assembly as the library does it (with the matrix in CPU memory, or on
-the GPU with ``--hypre-device``).
+the GPU with ``--hypre-device``).  With the library of ``tools/gpuprof.c`` preloaded it
+also counts the transfers between CPU and GPU memory that MFEM and hypre make in the
+step from the element matrices to the hypre matrix, and it times that step with the
+matrix kept: its construction, its first two products and its destruction.
 
 Reductions compared, all on the GPU:
 
@@ -193,16 +196,58 @@ def main():
                                 test_ess=bc.ess_tdof)
         del A
 
+    from bench_hessian_anatomy import PROF, copies
+
+    def build_only():
+        return asm.assemble_matrix(Vu, Vu, b.groups, mats, NE, test_ess=bc.ess_tdof)
+
     for name, fn in (("library: scatter to matrix", scatter_only), ("library: complete", full)):
         fn()
         ts = []
         for _ in range(args.reps):
+            PROF.reset()
             t0 = time.perf_counter()
             fn()
             ts.append(time.perf_counter() - t0)
+            prof = PROF.read()
         t = float(np.median(ts))
         print("  %-27s %9.3f ms  %8.3f us/element" % (name, 1e3 * t, us(t)), flush=True)
+        print("      driver: " + copies(prof), flush=True)
         rec[name] = t
+        rec[name + " prof"] = prof
+    # the same step with the matrix kept: its construction, then its first product (which
+    # would move it to the GPU if the construction had not), then its destruction
+    xv, yv = Vu.vector(), Vu.vector()
+    xv.set(1.0)
+    A0 = build_only()
+    A0.Mult(xv.hypre, yv.hypre)
+    yv.norm("l2")
+    del A0
+    rows = {"build": [], "first product": [], "second product": [], "delete": []}
+    profs = {}
+    for _ in range(args.reps):
+        PROF.reset()
+        t0 = time.perf_counter()
+        A1 = build_only()
+        rows["build"].append(time.perf_counter() - t0)
+        profs["build"] = PROF.read()
+        for key in ("first product", "second product"):
+            PROF.reset()
+            t0 = time.perf_counter()
+            A1.Mult(xv.hypre, yv.hypre)
+            yv.hypre.Norml2()
+            rows[key].append(time.perf_counter() - t0)
+            profs[key] = PROF.read()
+        PROF.reset()
+        t0 = time.perf_counter()
+        del A1
+        rows["delete"].append(time.perf_counter() - t0)
+        profs["delete"] = PROF.read()
+    for key in rows:
+        t = float(np.median(rows[key]))
+        print("  matrix kept: %-15s %9.3f ms   %s" % (key, 1e3 * t, copies(profs[key])), flush=True)
+        rec["kept " + key] = t
+        rec["kept " + key + " prof"] = profs[key]
     if args.cprofile:
         import cProfile
         import pstats
