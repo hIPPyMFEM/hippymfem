@@ -19,9 +19,11 @@
   host core on an L40S and 46x to 313x on an H100 (11x to 36x and 15x to 73x before). A
   forward solve at a new parameter with 2.1 million state dofs: 3.22 -> 1.48 s on one MIG
   instance, 4.75 -> 2.38 s on sixteen with 2.1 million each, 1.34 -> 0.53 s on an H100. A reduced-Hessian application is its two solves
-  for 96 % at 2.1 million dofs per instance (91 % before). Two Newton-CG steps at 128^3 on eight MIG instances
-  24.9 -> 18.1 s and at 256^3 on sixteen 128.2 -> 101.1 s, with the same cost functional
-  to nine digits and the same CG counts. Matrices agree with the host route to round-off.
+  for 96 % at 2.1 million dofs per instance (91 % before). Two Newton-CG steps, against the times of
+  September: 128^3 on four L40S 49.5 -> 29.1 s, on one H100 109 -> 42.9 s, on four MI210
+  31.9 -> 23.6 s; 256^3 on 16 Blackwell cards 77.4 -> 46.3 s; 400^3 on 24 Blackwell cards
+  191 -> 134 s, with the same cost functional to nine digits and the same CG counts.  The
+  copy on the device also works on the HIP build (MI210). Matrices agree with the host route to round-off.
   Both switches fall back to the host route, which is also taken when the kernels and
   hypre are on different cards or the runtime's copy function is not found.
 - **hypre's recycling pool is on by default and keeps blocks between setups**

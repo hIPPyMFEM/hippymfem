@@ -162,15 +162,28 @@ CG counts, takes:
 ==============  ==================================  ===========  =========
 mesh            GPUs                                before       now
 ==============  ==================================  ===========  =========
+64\ :sup:`3`    1 L40S                              27.9 s       13.6 s
+64\ :sup:`3`    4 L40S                              9.6 s        5.7 s
+128\ :sup:`3`   4 L40S                              49.5 s       29.1 s
 64\ :sup:`3`    1 H100                              18.5 s       6.1 s
 128\ :sup:`3`   1 H100                              109 s        42.9 s
-128\ :sup:`3`   4 RTX PRO 6000 Blackwell            29.7 s       18.1 s
+64\ :sup:`3`    1 AMD MI210                         18.7 s       11.2 s
+128\ :sup:`3`   4 AMD MI210                         31.9 s       23.6 s
 256\ :sup:`3`   8 RTX PRO 6000 Blackwell            140 s        101 s
+256\ :sup:`3`   16 RTX PRO 6000 Blackwell           77 s         46.3 s
+400\ :sup:`3`   24 RTX PRO 6000 Blackwell           191 s        134 s
 ==============  ==================================  ===========  =========
 
-On the H100 at 128\ :sup:`3` the forward solve went from 21.4 to 5.6 s, the warm Hessian
-blocks from 9.6 to 2.4 s, a reduced-Hessian action from 2.0 to 1.6 s and the peak of the
-card from 68.8 to 58.7 GiB.  The other rows have not been run again.
+The L40S rows of September are from a workstation with four L40S; the new ones are from
+a cluster on which four L40S were two on each of two nodes.  On the H100 at
+128\ :sup:`3` the forward solve went from 21.4 to 5.6 s, the warm Hessian blocks from 9.6
+to 2.4 s, a reduced-Hessian action from 2.0 to 1.6 s and the peak of the card from 68.8
+to 58.7 GiB.  At 400\ :sup:`3` the setup up to the synthetic data's forward solve takes
+377 instead of 480 s and the first Hessian-block build 85 instead of 116 s, with 37.2
+instead of 38.5 GiB per slice.  Against four host ranks of the same library (measured in
+September on the workstation), four L40S are now 31x at 64\ :sup:`3` and 48x at
+128\ :sup:`3`, and 32 slices against 32 host ranks 62x at 256\ :sup:`3`.  The run on
+eight H100 at 256\ :sup:`3` has not been repeated.
 
 The Blackwell cards were split into two 48 GB MIG slices each, one rank per slice.
 Doubling them at 256\ :sup:`3` is 1.81x, 90 % of linear.  At 400\ :sup:`3` the two steps
@@ -812,7 +825,12 @@ two Newton-CG steps                          MI210   H100    L40S
 
 The answers are the NVIDIA ones: the same cost functional to nine digits and the same CG
 counts at every size, and the geothermal application at :math:`32^{3}` reproduces its
-L40S row.  :math:`128^{3}` does not fit on one 64 GB card but runs on two: 65.9 s,
+L40S row.  (The table is of September 2026.  With the matrices and vectors kept on the
+card, which works through ``hipMemcpy`` on this build as it does through ``cudaMemcpy``
+on the NVIDIA ones, one MI210 takes 11.2 s at :math:`64^{3}` and four take 23.6 s at
+:math:`128^{3}`, with an in-process peak of 14.4 and 19.9 GiB per card where it was 22.7
+and 28.4; ``test_device`` passes on one and two ranks.  The recycling pool for hypre's
+memory is for CUDA builds only.)  :math:`128^{3}` does not fit on one 64 GB card but runs on two: 65.9 s,
 against 89.4 s on two L40S with the same flags.
 
 **Kernels.**  ``HIPPYMFEM_DEVICE=gpu`` names ``rocm,cpu`` on a node whose card

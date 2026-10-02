@@ -581,8 +581,20 @@ at 0.30 and at the library's 0.45 must not be mixed.
   | 64^3, one H100 (symmetry detected) | 18.5 s in September, 11.1 s on 10-01 | 6.1 s |
   | 128^3, one H100 | 109.4 s, 68.8 GiB | 42.9 s, 58.7 GiB |
   | 128^3, eight instances (four Blackwell cards) | 29.7 s; 24.9 s with hypre's kernel and a 1 GiB pool | 18.1 s |
-  | 256^3, sixteen instances (eight cards) | 140.0 s; 128.2 s likewise | 101.1 s |
+  | 256^3, sixteen instances (eight cards) | 140.0 s; 128.2 s likewise | 101.2 s, 30.1 GiB (33.5) |
+  | 256^3, 32 instances (16 cards, two nodes) | 77.4 s | 46.3 s, 19.6 GiB (19.7) |
+  | 400^3, 48 instances (24 cards, three nodes) | 190.9 s | 133.8 s, 37.2 GiB (38.5); setup 377 s (480) |
+  | 64^3, one L40S | 27.9 s (workstation) | 13.6 s (cluster) |
+  | 64^3, four L40S | 9.6 s (workstation, one node) | 5.7 s (cluster, two per node) |
+  | 128^3, two L40S | 87.7 s | 58.4 s |
+  | 128^3, four L40S | 49.5 s | 29.1 s, 20.4 GiB (19.1) |
+  | 64^3, one MI210 (HIP) | 18.7 s, 22.7 GiB in process | 11.2 s, 14.4 GiB |
+  | 128^3, four MI210 (two nodes) | 31.9 s, 28.4 GiB | 23.6 s, 19.9 GiB |
 
+  The bridge needs nothing NVIDIA-specific: on the HIP build `test_device` passes on
+  one and two MI210 with `hipMemcpy`, and the pool, which is for CUDA builds, is simply
+  absent.  With numba installed on the cluster (2026-10-02) the patterns of these runs
+  were built by the counting procedure, not by the device sort.
   At 128^3 on the H100 the forward solve went from 21.4 to 5.6 s, the warm Hessian
   blocks from 9.6 to 2.4 s and an action from 2.0 to 1.6 s.  The instance runs are at
   JAX's share 0.30; at the library's 0.45, where the kernels plan larger chunks, 128^3
