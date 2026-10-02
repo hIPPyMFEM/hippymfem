@@ -294,6 +294,14 @@ class KrylovSolver(_SolverBase):
         if self._pc is not None:
             s.SetPreconditioner(self._pc)
         self._solver = s
+        # hypre sets a preconditioner up at its first application: until the first
+        # solve is over, a scoped pool recycles the arrays the setup allocates and
+        # frees (mfemconfig.set_hypre_pool); it holds nothing afterwards
+        self._setup_pending = self._pc is not None
+        if self._setup_pending:
+            from ..common.mfemconfig import hypre_pool_open
+
+            hypre_pool_open()
         self._held = (A, self._pc, s, getattr(self, "_pc_built_on", None))
         return self
 
@@ -318,6 +326,11 @@ class KrylovSolver(_SolverBase):
         if not self.parameters["nonzero_initial_guess"]:
             x.zero()
         self._solver.Mult(b.hypre, x.hypre)
+        if getattr(self, "_setup_pending", False):
+            from ..common.mfemconfig import hypre_pool_close
+
+            self._setup_pending = False
+            hypre_pool_close()
         self.iterations = self._solver.GetNumIterations()
         self.converged = bool(self._solver.GetConverged())
         if self.converged and not math.isfinite(x.hypre.Norml2()):

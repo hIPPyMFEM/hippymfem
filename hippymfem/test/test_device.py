@@ -626,7 +626,8 @@ def test_hypre_pool():
     A = matrix(pm, Vh, b, K, bc, seed=22)
     ref = amg_cg(A, iters=30)
     had = cfg.HYPRE_POOL is not None and cfg.HYPRE_POOL.installed
-    caps = (cfg.HYPRE_POOL.max_cached, cfg.HYPRE_POOL.max_block) if had else None
+    caps = ((cfg.HYPRE_POOL.scoped, cfg.HYPRE_POOL.limit, cfg.HYPRE_POOL.max_cached,
+             cfg.HYPRE_POOL.max_block) if had else None)
     pool = cfg.set_hypre_pool(32.0)
     check("pool installed", pool is not None and pool.installed)
     if pool is None:
@@ -647,12 +648,48 @@ def test_hypre_pool():
     third = amg_cg(A, iters=30)
     check("the same solve after a trim", abs(third - ref) <= 1e-12 * abs(ref))
     if had:
-        pool.max_cached, pool.max_block = caps
+        pool.trim()
+        pool.scoped, pool.limit, pool.max_cached, pool.max_block = caps
     else:
         pool.uninstall()
         fourth = amg_cg(A, iters=30)
         check("the same solve with hypre's own allocator back",
               abs(fourth - ref) <= 1e-12 * abs(ref) and not pool.installed)
+
+
+def test_hypre_pool_setup_scope():
+    """The default pool: it recycles hypre's arrays while a solver sets its
+    preconditioner up, and holds nothing once the first solve is over."""
+    from hippymfem.common import mfemconfig as cfg
+
+    if mfem_gpu_backend() != "cuda":
+        check("hypre device pool (NVIDIA builds only)", True, "(skipped)")
+        return
+    pool = cfg.HYPRE_POOL
+    if pool is None or not pool.installed or not pool.scoped:
+        check("the default pool is the one that holds memory during a setup only", True,
+              "(skipped: HIPPYMFEM_HYPRE_POOL=%s)" % os.environ.get("HIPPYMFEM_HYPRE_POOL", "auto"))
+        return
+    pm, Vh, b, K, bc = problem(6)
+    A = matrix(pm, Vh, b, K, bc, seed=24)
+    ref = amg_cg(A, iters=200)                 # hypre's own allocations: the pool is closed
+    served, requests = pool.from_pool, pool.requests
+    s = hp.KrylovSolver(COMM, "cg", "amg")
+    s.parameters["rel_tolerance"] = 1e-12
+    s.parameters["max_iter"] = 200
+    s.set_operator(A)
+    open_now = pool.max_cached == pool.limit
+    x, rhs = hp.ParVector(COMM, A.Height()), hp.ParVector(COMM, A.Height())
+    rhs.set(1.0)
+    s.solve(x, rhs)
+    got = float(x.hypre.Norml2())
+    check("the pool is open between set_operator and the first solve", open_now)
+    check("the setup was served from the pool", pool.from_pool > served,
+          "(%d of %d requests)" % (pool.from_pool - served, pool.requests - requests))
+    check("nothing is held after the first solve", pool.cached == 0 and pool.max_cached == 0,
+          "(%d bytes)" % pool.cached)
+    check("the same solve with the pool", abs(got - ref) <= 1e-8 * abs(ref),
+          "(%.12e, %.12e)" % (ref, got))
 
 
 def test_identity_route_on_device():
@@ -858,6 +895,7 @@ if __name__ == "__main__":
     test_vectors_on_device()
     test_observation_on_device()
     test_residual_on_device()
+    test_hypre_pool_setup_scope()
     test_hypre_pool()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

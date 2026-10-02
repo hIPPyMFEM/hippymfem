@@ -335,6 +335,28 @@ def test_hypre_pool_logic():
     freed = pool.trim()
     check("pool: a foreign block goes to the driver, and trim returns the rest",
           ok and freed == 2700 and pool.cached == 0 and not live, "(%s)" % (pool.stats(),))
+    # the pool that keeps blocks during a setup only (the default on a GPU)
+    scoped = HyprePool(hypre, runtime, max_cached=3000, max_block=2000, scoped=True)
+
+    def take(n):
+        scoped._malloc(out, n)
+        return out[0]
+
+    q1 = take(1000)
+    scoped._free(q1)                            # closed: straight back to the driver
+    ok = q1 not in live and scoped.cached == 0
+    scoped.open()
+    q2 = take(1000)
+    scoped._free(q2)                            # open: kept, and handed out again
+    q3 = take(950)
+    ok = ok and q3 == q2 and scoped.from_pool == 1
+    scoped._free(q3)
+    held = scoped.cached
+    scoped.close()                              # closed again: nothing held, nothing kept
+    q4 = take(1000)
+    scoped._free(q4)
+    check("pool: a scoped pool recycles between open and close and holds nothing outside",
+          ok and held == 1000 and scoped.cached == 0 and not live, "(%s)" % (scoped.stats(),))
 
 
 def test_petsc():
