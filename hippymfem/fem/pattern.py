@@ -56,6 +56,25 @@ FUSED_KEEP = os.environ.get("HIPPYMFEM_FUSED_KEEP", "1").lower() not in (
 #: ``HIPPYMFEM_FUSED_KEEP_SHARE``.
 FUSED_KEEP_SHARE = float(os.environ.get("HIPPYMFEM_FUSED_KEEP_SHARE", "0.25") or 0.25)
 
+#: Keep a pattern's index arrays on the device: the slot of every element-matrix entry
+#: (4 bytes per entry, which the fused scatter otherwise uploads chunk by chunk at
+#: every assembly) and the column indices of the two blocks of its true-dof matrix
+#: (4 bytes per nonzero, which a matrix built on the device otherwise uploads once per
+#: matrix).  For the Jacobian of 2.1 million quadratic-hexahedron dofs that is 0.76 GB
+#: and 0.54 GB of JAX's arena, and it saves 0.11 s of a 0.55 s forward solve on an H100.
+#: Off by default, since device memory is the scarcer resource.  Set
+#: ``HIPPYMFEM_DEVICE_PATTERN=1``.
+DEVICE_PATTERN = os.environ.get("HIPPYMFEM_DEVICE_PATTERN", "0").lower() in (
+    "1", "true", "yes", "on")
+
+
+def set_device_pattern(flag):
+    """Turn the device copies of the index arrays on or off; returns the old setting."""
+    global DEVICE_PATTERN
+    old, DEVICE_PATTERN = DEVICE_PATTERN, bool(flag)
+    return old
+
+
 #: Doubles of zeros written per in-place update when an accumulator is reset.
 _ZERO_BLOCK = 1 << 22
 
@@ -733,21 +752,27 @@ class ScatterPattern(KeepAlive):
     def _fused_maps(self, d):
         """Entry offsets, and the slot and sign maps a chunk is sliced from.
 
-        These stay on the **host**.  Like the geometry, they are indexed one chunk
-        at a time, so keeping them resident on the device buys nothing and costs a
-        great deal: ``slot`` is one int32 per element-matrix entry, gigabytes on a
-        large mesh, while a chunk's share transfers in milliseconds beside a chunk
-        that takes seconds.
+        These stay on the **host** by default.  Like the geometry, they are indexed
+        one chunk at a time, and ``slot`` is one int32 per element-matrix entry,
+        gigabytes on a large mesh; a chunk's share is uploaded with the chunk.  On a
+        fast GPU that upload is no longer small beside the chunk's kernel (48 MB
+        against 5 ms of kernel for 16,000 quadratic hexahedra on an H100), so
+        :data:`DEVICE_PATTERN` keeps the maps on the device for those who have the
+        memory.
         """
-        got = self._fused.get(d)
+        key = (d, DEVICE_PATTERN)
+        got = self._fused.get(key)
         if got is None:
             base, n = [], 0
             for size in self.sizes:
                 base.append(n)
                 n += int(size)
-            got = self._fused[d] = {
-                "slot": self.slot,
-                "sign": self.sign,
+            slot, sign = self.slot, self.sign
+            if DEVICE_PATTERN and getattr(d, "platform", "cpu") != "cpu":
+                slot, _perm, sign = self._device_maps()
+            got = self._fused[key] = {
+                "slot": slot,
+                "sign": sign,
                 "base": base,
                 "nent": [int(a) * int(b) for _, a, b in self.shapes],
             }

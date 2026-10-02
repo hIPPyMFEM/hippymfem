@@ -110,6 +110,20 @@ _KNOBS = [
     _Knob("tdof_identity", "HIPPYMFEM_TDOF_IDENTITY",
           "true-dof route also where the prolongations are the identity (one rank): auto (with hypre on a device), 1, 0",
           _module_attr("fem.csrassemble", "TDOF_IDENTITY"), _module_assign("fem.csrassemble", "TDOF_IDENTITY", str)),
+    _Knob("device_bridge", "HIPPYMFEM_DEVICE_BRIDGE",
+          "with the kernels and hypre on one GPU, matrix values and assembled vectors cross between "
+          "JAX's memory and MFEM's on the device instead of through the host: auto, 1, 0",
+          _module_attr("common.devicebridge", "DEVICE_BRIDGE"),
+          _module_setter("common.devicebridge", "set_device_bridge")),
+    _Knob("device_vectors", "HIPPYMFEM_DEVICE_VECTORS",
+          "with MFEM on a GPU, a vector last handed to MFEM or hypre is updated, copied and reduced "
+          "on the device instead of with numpy on the host: auto, 1, 0",
+          _module_attr("common.parvector", "DEVICE_VECTORS"),
+          _module_setter("common.parvector", "set_device_vectors")),
+    _Knob("device_pattern", "HIPPYMFEM_DEVICE_PATTERN",
+          "keep a pattern's index arrays on the device (4 bytes per element-matrix entry and per "
+          "nonzero) so that an assembly uploads nothing but the row pointers",
+          _module_attr("fem.pattern", "DEVICE_PATTERN"), _module_setter("fem.pattern", "set_device_pattern")),
     _Knob("triple", "HIPPYMFEM_TRIPLE",
           "the triple product's form where one is formed: auto (timed once), rap, split",
           _module_attr("fem.parmat", "TRIPLE_MODE"), _module_setter("fem.parmat", "set_triple_mode")),

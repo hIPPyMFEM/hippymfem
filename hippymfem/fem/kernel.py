@@ -673,6 +673,34 @@ def _chunk_args(args, axes, a, b):
     return jax.tree_util.tree_map(lambda z: z[a:b], args)
 
 
+_SLICE = {}
+
+
+def _chunk_slices(args, axes, a, b):
+    """:func:`_chunk_args` for the chunk loops, in one compiled call on a GPU.
+
+    Sliced eagerly, every element-mapped array of a chunk is an operation of its own
+    (the dof arrays of each slot, the geometry, the weights: a dozen for a diffusion
+    residual), each a dispatch of a few tenths of a millisecond, and a chunk cost
+    1.4 to 2 ms before its kernel started.  That is what made small chunks slow and
+    large ones, with the working memory they need, the faster choice.  Here one
+    program cuts them all, with the start as an argument, so every chunk of one
+    length reuses it.
+    """
+    mapped = []
+    _extract_mapped(args, axes, mapped)
+    leaves, treedef = jax.tree_util.tree_flatten(mapped)
+    if not leaves or not on_gpu() or not all(isinstance(z, jax.Array) for z in leaves):
+        return _chunk_args(args, axes, a, b)
+    n = int(b - a)
+    fn = _SLICE.get(n)
+    if fn is None:
+        fn = _SLICE[n] = jax.jit(
+            lambda zs, start: [jax.lax.dynamic_slice_in_dim(z, start, n, 0) for z in zs])
+    cut = treedef.unflatten(fn(leaves, a))
+    return _inject_mapped(args, axes, iter(cut))
+
+
 def _takes(density, n):
     """Whether ``density`` accepts ``n`` positional arguments.
 
@@ -812,7 +840,7 @@ class GroupKernel:
                 try:
                     if n >= ne:
                         return fn(*args)
-                    parts = [fn(*_chunk_args(args, axes, a, min(a + n, ne)))
+                    parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne)))
                              for a in range(0, ne, n)]
                     return jax.tree_util.tree_map(
                         lambda *p: jnp.concatenate(p, axis=0), *parts)
@@ -889,7 +917,7 @@ class GroupKernel:
         while a < ne:
             bnd = min(a + n, ne)
             try:
-                out = raw(*_chunk_args(args, axes, a, bnd))
+                out = raw(*_chunk_slices(args, axes, a, bnd))
             except Exception as exc:
                 # the streaming path had no retry: a chunk that does not fit is
                 # shrunk from what the allocator asked for, as _chunked does, and the

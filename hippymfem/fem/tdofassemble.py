@@ -59,23 +59,6 @@ from .pattern import host_writable
 DEVICE_PARMAT = os.environ.get("HIPPYMFEM_PARMAT_DEVICE", "block").lower()
 
 
-#: Keep the column indices of a pattern's two blocks on the device, so that a matrix
-#: built there copies them on the device instead of uploading them from the host each
-#: time.  It costs 4 bytes per nonzero of JAX's arena for every pattern in use (0.5 GB
-#: for the Jacobian of 2.1 million quadratic-hexahedron dofs) and saves the upload,
-#: 54 ms of a 0.58 s forward solve for that case on an H100.  Off by default, since
-#: device memory is the scarcer resource.  ``HIPPYMFEM_DEVICE_PATTERN=1``.
-DEVICE_PATTERN = os.environ.get("HIPPYMFEM_DEVICE_PATTERN", "0").lower() in (
-    "1", "true", "yes", "on")
-
-
-def set_device_pattern(flag):
-    """Turn the device copy of the column indices on or off; returns the old setting."""
-    global DEVICE_PATTERN
-    old, DEVICE_PATTERN = DEVICE_PATTERN, bool(flag)
-    return old
-
-
 def device_finish():
     """Whether a matrix is finished on the device from a device accumulator: hypre on
     a device, its two blocks built directly (:data:`DEVICE_PARMAT`), and the bridge
@@ -334,7 +317,7 @@ class TrueDofPattern:
         self.cols_t = np.array([self.c0, self.c1], dtype=_HYPRE_INT)
         self._kill = IdentityCache()
         self._diag = IdentityCache()
-        self._dev_J = {}                   # device copies of J (DEVICE_PATTERN)
+        self._dev_J = {}                   # device copies of J (pattern.DEVICE_PATTERN)
 
         # The scatter target: the ldof pattern with the composed slot map, the
         # accumulator widened by the send buffer, and its per-device caches reset.
@@ -526,8 +509,9 @@ class TrueDofPattern:
 
     def _copy_columns(self, bridge, pointer, block, J):
         """Fill the device copy of a block's column indices: from the pattern's host
-        array, or on the device from a copy kept there (:data:`DEVICE_PATTERN`)."""
-        if not DEVICE_PATTERN:
+        array, or on the device from a copy kept there
+        (:data:`hippymfem.fem.pattern.DEVICE_PATTERN`)."""
+        if not _pattern.DEVICE_PATTERN:           # see pattern.DEVICE_PATTERN
             bridge.copy_from_host(bridge.address(pointer), J)
             return
         from .kernel import _put, device
