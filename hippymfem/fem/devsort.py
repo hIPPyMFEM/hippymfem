@@ -38,6 +38,16 @@ MIN_DEVICE = int(os.environ.get("HIPPYMFEM_PATTERN_SORT_MIN", str(2 ** 22)) or 0
 #: Set ``HIPPYMFEM_PATTERN_SORT_CHUNK``.
 CHUNK = int(os.environ.get("HIPPYMFEM_PATTERN_SORT_CHUNK", "0") or 0)
 MAX_CHUNK = 2 ** 28
+#: The largest chunk when the sort runs in JAX's arena (XLA's sort, which is the one
+#: used without CuPy).  JAX keeps what its arena has grown to, so a sort that takes
+#: more than the element kernels need later costs that memory for the rest of the run.
+#: Measured on an H100 with 2.1 million Q2 state dofs on one rank (191 million keys):
+#: one sort of the whole array, padded to 2^28 keys, left the arena at 16.9 GB and the
+#: card at 21.0 GB; chunks of 2^26 keys left them at 8.7 and 12.8 GB, which is what the
+#: kernels take, for 8 s more in the pattern build (the bucketing is host work) and the
+#: same forward solve.  CuPy's sort returns its memory and keeps :data:`MAX_CHUNK`, and
+#: the sort-free builder (numba) uses no device memory at all.
+MAX_CHUNK_ARENA = 2 ** 26
 PAD = 2 ** 22
 #: Device bytes per key at the peak of a sort (measured about 35, with margin).
 BYTES_PER_KEY = 40
@@ -54,8 +64,10 @@ def chunk_limit():
 
     The bucketed path costs about what the host sort costs (its gathers and the
     bucketing are host work), while one device call is a few times faster, so the
-    limit is as large as the budget allows.  The budget is JAX's share of the card,
-    and the pattern is built before the kernels take theirs.
+    limit is as large as the budget allows, up to :data:`MAX_CHUNK` for CuPy's sort
+    and :data:`MAX_CHUNK_ARENA` for XLA's, whose memory JAX does not give back.  The
+    budget is JAX's share of the card, and the pattern is built before the kernels
+    take theirs.
     """
     if CHUNK:
         return int(CHUNK)
@@ -64,9 +76,11 @@ def chunk_limit():
         free = int(stats["bytes_limit"]) - int(stats.get("bytes_in_use", 0))
     except Exception:
         return 2 ** 26
-    per_key = BYTES_PER_KEY_CUPY if _cupy_usable() else BYTES_PER_KEY
+    cupy = _cupy_usable()
+    per_key = BYTES_PER_KEY_CUPY if cupy else BYTES_PER_KEY
+    cap = MAX_CHUNK if cupy else MAX_CHUNK_ARENA
     m = 2 ** 24
-    while m * 2 * per_key <= 0.8 * free and m * 2 <= MAX_CHUNK:
+    while m * 2 * per_key <= 0.8 * free and m * 2 <= cap:
         m *= 2
     return m
 

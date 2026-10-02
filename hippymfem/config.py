@@ -211,7 +211,7 @@ _KNOBS = [
           "smallest key array the device sort is used for",
           _module_attr("fem.devsort", "MIN_DEVICE"), _module_assign("fem.devsort", "MIN_DEVICE", int)),
     _Knob("pattern_sort_chunk", "HIPPYMFEM_PATTERN_SORT_CHUNK",
-          "keys per device sort chunk; 0 sizes it from the free memory",
+          "keys per device sort chunk; 0 sizes it from the free memory, up to 2^26 in JAX's arena",
           _module_attr("fem.devsort", "CHUNK"), _module_assign("fem.devsort", "CHUNK", int)),
     # ------------------------------------------------------------------- solvers
     _Knob("hypre_spmv", "HIPPYMFEM_HYPRE_SPMV",
