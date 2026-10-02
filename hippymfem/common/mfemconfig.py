@@ -126,6 +126,7 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     """
     import mfem.par as mfem
 
+    global DEVICE_INDEX
     if _DEVICE:
         # MFEM allows one Device per process, so a second call (say, after the
         # import-time configuration) returns the first.
@@ -177,6 +178,7 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     idx = local % max(n, 1)
     dev = mfem.Device(kind, idx)
     _DEVICE.append(dev)
+    DEVICE_INDEX = idx
     set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)
     try:
         megabytes = float(os.environ.get("HIPPYMFEM_HYPRE_POOL", "0") or 0)
@@ -196,6 +198,11 @@ def configure_device(kind="gpu", comm=None, quiet=False):
 
 
 _DEVICE = []
+
+#: The index of the GPU that :func:`configure_device` put MFEM and hypre on, among the
+#: GPUs this process may use; ``None`` on the host.  The element kernels pick the same
+#: one, which :mod:`.devicebridge` checks before it copies between the two on the device.
+DEVICE_INDEX = None
 
 
 def _hypre_library():

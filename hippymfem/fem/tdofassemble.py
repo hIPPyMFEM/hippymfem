@@ -59,6 +59,17 @@ from .pattern import host_writable
 DEVICE_PARMAT = os.environ.get("HIPPYMFEM_PARMAT_DEVICE", "block").lower()
 
 
+def device_finish():
+    """Whether a matrix is finished on the device from a device accumulator: hypre on
+    a device, its two blocks built directly (:data:`DEVICE_PARMAT`), and the bridge
+    between JAX and MFEM memory usable (:mod:`hippymfem.common.devicebridge`)."""
+    if DEVICE_PARMAT != "block":
+        return False
+    from ..common import devicebridge
+
+    return devicebridge.available()
+
+
 def set_device_parmat(mode):
     """Choose the device matrix constructor, returning the previous choice."""
     global DEVICE_PARMAT
@@ -385,7 +396,17 @@ class TrueDofPattern:
         a device each matrix gets private copies of the index arrays instead: MFEM
         aliases them there and keys the device mirror on the host pointer, so two live
         matrices must not share them.
+
+        An accumulator that is still a device array is finished on the device
+        (:meth:`_finish_device`): only the entries of rows owned by other ranks pass
+        through the host, for the exchange.
         """
+        if not isinstance(acc, np.ndarray):
+            if device_finish():
+                return self._finish_device(acc, diagonal)
+            dev, acc = acc, host_writable(acc)
+            self.target.give_back(dev)
+            del dev
         acc = host_writable(acc)
         if self.exchange:                  # collective decision, see __init__
             rbuf = np.empty(self.nrecv, dtype=np.float64)
@@ -419,6 +440,71 @@ class TrueDofPattern:
             return self._finish_copy(acc)
         return self._finish_block(acc, self.I_diag, self.J_diag,
                                   self.I_offd, self.J_offd)
+
+    def _finish_device(self, acc, diagonal=None):
+        """:meth:`finish` for an accumulator in device memory, without a host copy of it.
+
+        What :meth:`finish` does on the host is done here on the device: the entries
+        received from other ranks are added and the eliminated rows' diagonal is
+        written by updates that write into the accumulator, and the values then go
+        from the accumulator to the device copies of the two blocks' ``data`` arrays
+        by a copy on the device (:mod:`hippymfem.common.devicebridge`).  MFEM's block
+        constructor finds those copies valid and uploads nothing for them.  The
+        column indices are copied to the device from the pattern's own arrays, and
+        only the row pointers, one integer per row, take MFEM's usual route.
+
+        What still passes through the host is the send buffer, the entries of rows
+        that other ranks own: a percent or two of the matrix, and nothing on one rank.
+
+        The host arrays the two blocks are given for ``J`` and ``data`` are never
+        written.  They are what MFEM keys the device copies on, and where it would
+        put the values if something asked for the matrix on the host.
+        """
+        from ..common import devicebridge as bridge
+        from .kernel import _put
+        from .pattern import _device_set, _fused_add
+
+        tp = self.target
+        if self.exchange:                  # collective decision, see __init__
+            sbuf = (np.ascontiguousarray(np.asarray(acc[self.nnz_t:]), dtype=np.float64)
+                    if self.nsend else np.zeros(0, dtype=np.float64))
+            rbuf = np.empty(self.nrecv, dtype=np.float64)
+            self.comm.Alltoallv([sbuf, self.scnt, self.sdsp, MPI.DOUBLE],
+                                [rbuf, self.rcnt, self.rdsp, MPI.DOUBLE])
+            if self.nrecv:
+                acc = _fused_add(acc, _put(rbuf), tp._device_zero(self.slot_recv), None)
+        if diagonal is not None:
+            slots, value = diagonal
+            if len(slots):
+                acc = _device_set(acc, tp._device_zero(slots), float(value))
+        nd, no = self.nnz_diag, self.nnz_t - self.nnz_diag
+        # row pointers: private host copies, as in the block route (they are small)
+        I_d, I_o = self.I_diag.copy(), self.I_offd.copy()
+        # An empty block keeps the host route's arrays (see ``_finish_block``).
+        J_d = np.empty(nd, dtype=np.int32) if nd else self.J_diag.copy()
+        J_o = np.empty(no, dtype=np.int32) if no else self.J_offd.copy()
+        d_diag = np.empty(nd, dtype=np.float64) if nd else np.zeros(1)
+        d_offd = np.empty(no, dtype=np.float64) if no else np.zeros(1)
+        diag = mfem.SparseMatrix([I_d, J_d, d_diag, self.ntd, self.c1 - self.c0],
+                                 False, False, True)
+        offd = mfem.SparseMatrix([I_o, J_o, d_offd, self.ntd, self.n_offd],
+                                 False, False, True)
+        if nd:
+            bridge.copy_from_host(bridge.address(diag.WriteJ()), self.J_diag)
+            bridge.copy_from_jax(bridge.address(diag.WriteData()), acc, 0, nd)
+        if no:
+            bridge.copy_from_host(bridge.address(offd.WriteJ()), self.J_offd)
+            bridge.copy_from_jax(bridge.address(offd.WriteData()), acc, nd, no)
+        bridge.synchronize()               # the values are in MFEM's memory now
+        tp.give_back(acc)
+        del acc
+        A = mfem.HypreParMatrix(self.comm, self.gnr, self.gnc, self.ia_rows.GetData(),
+                                self.ia_cols.GetData(), diag, offd,
+                                self.ia_cmap.GetData())
+        A.CopyRowStarts()
+        A.CopyColStarts()
+        return own(A, d_diag, d_offd, diag, offd, I_d, J_d, I_o, J_o,
+                   self.ia_rows, self.ia_cols, self.ia_cmap)
 
     def _finish_block(self, acc, I_d, J_d, I_o, J_o):
         """The diag/offd constructor: the two blocks as views of the accumulator.

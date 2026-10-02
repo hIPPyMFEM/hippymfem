@@ -166,7 +166,7 @@ class BlockPlan:
 
     __slots__ = ("test_space", "trial_space", "pattern", "same", "test_ess",
                  "trial_ess", "diag_policy", "fold", "kill", "Pt", "Pr", "escapes",
-                 "tpat", "target", "zero")
+                 "tpat", "target", "zero", "device")
 
 
 def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
@@ -203,6 +203,14 @@ def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
         p.tpat = get_tdof_pattern(p.pattern, test_space, trial_space)
     p.target = p.tpat.target if p.tpat is not None else p.pattern
     p.zero = p.tpat.kill(p.kill) if p.tpat is not None else p.kill
+    # Whether the scattered values can stay on the device until they are in the
+    # matrix: the true-dof route with the elimination folded into the scatter, and
+    # the bridge between JAX's memory and MFEM's (tdofassemble.device_finish).
+    p.device = False
+    if p.tpat is not None and (p.fold or (test_ess is None and trial_ess is None)):
+        from .tdofassemble import device_finish
+
+        p.device = device_finish()
     return p
 
 
@@ -262,7 +270,8 @@ def scatter_many(plans, chunks):
         for k, p in plans.items():
             acc, maps = state[k]
             state[k] = (p.target.fused_add(acc, maps, g, a, bnd, mats[k]), maps)
-    return {k: p.target.fused_end(state[k][0], p.zero) for k, p in plans.items()}
+    return {k: p.target.fused_end(state[k][0], p.zero, host=not p.device)
+            for k, p in plans.items()}
 
 
 def add_boundary_entries(p, acc, boundary):
@@ -278,6 +287,12 @@ def add_boundary_entries(p, acc, boundary):
     (``PDEVariationalProblem._blocks_streamed``).
     """
     test_tables, trial_tables, mats = boundary
+    if not isinstance(acc, np.ndarray):
+        # A device accumulator comes to the host here: the boundary entries are
+        # added with numpy, and the matrix is then built on the host route.
+        dev, acc = acc, host_writable(acc)
+        p.target.give_back(dev)
+        del dev
     acc = host_writable(acc)        # the device routes return a device array
     for tt, tr, m in zip(test_tables, trial_tables, mats):
         if int(tt.group.ne) == 0:
@@ -314,12 +329,13 @@ def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem
     """
     p = plan_block(test_space, trial_space, groups, test_ess, trial_ess,
                    diag_policy)
+    host = not p.device or boundary is not None
     if callable(element_matrices):
         # A thunk instead of the arrays: the caller is letting the scatter drive
         # the kernel, so the full (ne, nd, nd) array is never formed.
-        acc = p.target.data_fused(element_matrices(), zero_slots=p.zero)
+        acc = p.target.data_fused(element_matrices(), zero_slots=p.zero, host=host)
     else:
-        acc = p.target.data(element_matrices, zero_slots=p.zero)
+        acc = p.target.data(element_matrices, zero_slots=p.zero, host=host)
     if boundary is not None:
         acc = add_boundary_entries(p, acc, boundary)
     return finish_block(p, acc)

@@ -119,6 +119,17 @@ def _fused_add(acc, flat, slot, sign):
 _FUSED_ADD = {}
 
 
+def _device_set(acc, idx, value):
+    """``acc[idx] = value`` on the device, in place (the accumulator is donated)."""
+    import jax
+
+    fn = _FUSED_ADD.get("set")
+    if fn is None:
+        fn = _FUSED_ADD["set"] = jax.jit(lambda a, i, v: a.at[i].set(v),
+                                         donate_argnums=(0,))
+    return fn(acc, idx, value)
+
+
 def _acc_keepable(d, n):
     """Whether an ``n``-double accumulator on ``d`` is worth keeping.
 
@@ -585,12 +596,15 @@ class ScatterPattern(KeepAlive):
                             None if self.sign is None else _put(self.sign))
         return self._dev[d]
 
-    def data(self, element_matrices, zero_slots=None):
+    def data(self, element_matrices, zero_slots=None, host=True):
         """CSR ``data`` array for one set of element matrices.
 
         The reduction runs where the element matrices are: when the kernels ran on
         a GPU the scatter happens there and only the ``nnz`` assembled values come
-        back, so the ``(ne, nd, nd)`` array never touches the host.
+        back, so the ``(ne, nd, nd)`` array never touches the host.  With
+        ``host=False`` they do not come back either: the device array is returned as
+        it is, for a consumer that builds the matrix on the device
+        (:meth:`hippymfem.fem.tdofassemble.TrueDofPattern.finish`).
         """
         if len(element_matrices) != len(self.shapes):
             raise ValueError("expected %d element arrays, got %d"
@@ -599,7 +613,8 @@ class ScatterPattern(KeepAlive):
             return np.zeros(0)
         on_device = not all(isinstance(E, np.ndarray) for E in element_matrices)
         if on_device:
-            return host_writable(self._data_device(element_matrices, zero_slots))
+            out = self._data_device(element_matrices, zero_slots)
+            return host_writable(out) if host else out
         if len(element_matrices) == 1:
             flat = np.asarray(element_matrices[0], dtype=np.float64).reshape(-1)
         else:
@@ -627,7 +642,7 @@ class ScatterPattern(KeepAlive):
         """
         return self.perm is None and self.nnz > 0
 
-    def data_fused(self, chunks, zero_slots=None):
+    def data_fused(self, chunks, zero_slots=None, host=True):
         """Scatter each chunk of element matrices as it arrives.
 
         The chunks are never glued into one ``(ne, nd, nd)`` array, which only the
@@ -641,7 +656,7 @@ class ScatterPattern(KeepAlive):
         acc, maps = self.fused_begin()
         for g, a, bnd, arr in chunks:
             acc = self.fused_add(acc, maps, g, a, bnd, arr)
-        return self.fused_end(acc, zero_slots)
+        return self.fused_end(acc, zero_slots, host=host)
 
     def fused_begin(self):
         """A zeroed accumulator on the current device, and the maps to feed it.
@@ -679,14 +694,19 @@ class ScatterPattern(KeepAlive):
         return _fused_add(acc, flat, maps["slot"][lo:hi],
                           None if maps["sign"] is None else maps["sign"][lo:hi])
 
-    def fused_end(self, acc, zero_slots=None):
+    def fused_end(self, acc, zero_slots=None, host=True):
         """Bring the accumulator to the host and zero the eliminated slots there.
 
-        Zeroing on the device would allocate a second accumulator, eagerly and even
-        in a jitted update that donates the buffer, while the host copy is made
-        anyway and zeros are exact wherever they are written.  The copy comes back
-        writeable (:func:`host_writable`), as :meth:`data`'s does.
+        The host copy comes back writeable (:func:`host_writable`), as :meth:`data`'s
+        does.  With ``host=False`` nothing is copied: the eliminated slots are zeroed
+        on the device, by a jitted update that is given the accumulator and writes
+        into it, and the device array is returned.  Its consumer hands the buffer
+        back with :meth:`give_back` once it has taken the values.
         """
+        if not host and not isinstance(acc, np.ndarray):
+            if zero_slots is not None and zero_slots.size:
+                acc = _device_set(acc, self._device_zero(zero_slots), 0.0)
+            return acc
         out = host_writable(acc)
         if zero_slots is not None and zero_slots.size:
             out[zero_slots] = 0.0
@@ -699,6 +719,16 @@ class ScatterPattern(KeepAlive):
                 # assembly of this pattern (or any other of the same nnz).
                 _acc_give(d, self.nnz, acc)
         return out
+
+    def give_back(self, acc):
+        """Return a device accumulator whose values have been taken, so that the next
+        assembly of this size reuses the buffer (:data:`FUSED_KEEP`)."""
+        if FUSED_KEEP and not isinstance(acc, np.ndarray):
+            from .kernel import device
+
+            d = device()
+            if int(acc.shape[0]) == self.nnz and _acc_keepable(d, self.nnz):
+                _acc_give(d, self.nnz, acc)
 
     def _fused_maps(self, d):
         """Entry offsets, and the slot and sign maps a chunk is sliced from.
