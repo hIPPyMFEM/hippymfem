@@ -455,11 +455,20 @@ def main():
     test_guards()
     test_inverse_problem()
     test_hypre_pool_logic()
+    test_single_precision_solves()
     test_petsc()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)
     return 1 if FAILS else 0
+
+
+def test_single_precision_solves():
+    """The solves in a single-precision hypre (``HIPPYMFEM_HYPRE_SINGLE``) against the
+    double-precision ones; skipped when no library is named."""
+    from hippymfem.test import single_case
+
+    single_case.run(check, COMM)
 
 
 if __name__ == "__main__":

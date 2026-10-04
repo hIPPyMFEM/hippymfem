@@ -228,7 +228,8 @@ faster than one, at 128\ :sup:`3` two to four cards scale at 89 %, so plan for a
 million state dofs per GPU (:ref:`several-gpus` says where the rest goes).
 
 **The speedup depends on the card and on the mesh.**  Element kernels are double
-precision throughout.  On meshes with 0.3 to 2.1 million state dofs the kernel speedup
+precision unless asked otherwise (:ref:`single-precision`), and so are the figures of
+this section.  On meshes with 0.3 to 2.1 million state dofs the kernel speedup
 over a host core (one core of a Xeon Platinum 8462Y+) is 17x to 89x on an L40S and 43x to
 537x on an H100 (P1 triangles to P3 hexahedra, measured on 2026-10-02 with
 ``benchmarks/bench_assembly_sweep.py``, the smaller of two runs on the card; in three
@@ -292,6 +293,121 @@ elasticity, Q2 hexahedra               4 096       0.139 / 0.032 s        0.305 
 element route for P1 and for the parameter column of the P2 Poisson problem.  The default
 stays ``element``: its results are reproducible bit for bit, and on a host it is the
 faster route except for vector-valued Jacobians.
+
+.. _single-precision:
+
+Single precision
+----------------
+
+Three things can run in single precision, each on its own switch, and none of them
+changes what is computed: the state, the adjoint, the gradient and the MAP point come
+out as in double precision.
+
+**The element matrices** (``HIPPYMFEM_PRECISION=mixed``, ``hm.config.precision``).
+The matrix kernels run in single precision and the vector kernels (residuals, gradients,
+matrix-free products) in double.  A single-precision element matrix is wrong by the same
+rounding in every element of a mesh of like elements, an error that a solve multiplies by
+the condition number, so the Jacobian's element matrices are corrected to act on the
+constants as the double-precision ones do, by one or two double-precision tangents per
+element, and symmetric blocks are made symmetric to the last bit.  The forward and the
+adjoint solve are then refined against double-precision residuals from the vector
+kernels: two passes, the iterations of one solve.  With 2.1 million state dofs the state
+differed from the double-precision one by 3e-13, the gradient by 3e-13 and a Hessian
+action by 4e-9 to 1e-7, with the same Newton and CG counts.  ``fp32`` puts the vector
+kernels in single precision too and is for experiments only: the state is then wrong by
+1e-6 and the gradient by 4e-5 on a mesh of 16\ :sup:`3` elements, more on a finer one,
+and the optimizers stop at that floor.
+
+**The linear solves** (``HIPPYMFEM_HYPRE_SINGLE=/path/to/libHYPRE_single.so``,
+``hm.config.hypre_single``).  hypre is compiled for one precision, and MFEM and PyMFEM
+use a double-precision one.  ``tools/build_hypre_single.sh <PyMFEM tree> <directory>``
+builds the same hypre in single precision, in about three minutes, with the options of
+the installed build; the library loads it next to the other one.  The Jacobian of a PDE
+problem is then assembled into that library and exists there alone, with its BoomerAMG
+hierarchy, and the CG solves with it run there
+(:mod:`hippymfem.algorithms.singlesolve`).  A single-precision solve reaches a relative
+residual near 1e-5.  The forward and the adjoint solve are therefore refined against
+double-precision residuals (three passes and the iterations of one double-precision
+solve to reach 1e-12; the state agreed with the double-precision one to 1e-12), and the
+incremental solves of a Hessian action are used as they are, which the reorthogonalized
+CG of a Newton step allows (:doc:`optimization`).  It applies when the three solvers
+that hold the Jacobian are CG with BoomerAMG and the Jacobian is symmetric; any other
+problem keeps its double-precision solves.
+
+**The tolerance of the incremental solves** is the third and the largest: with the
+reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
+
+Newton-CG to a relative gradient norm of 1e-6 on the model problem with 2.1 million state
+dofs (64\ :sup:`3` Q2 hexahedra), one GPU or MIG instance unless said otherwise.  Every
+row but the first took twelve Newton steps and 131 CG iterations and gave the same cost
+functional to nine digits; the first took 193 to 210 CG iterations:
+
+.. table::
+   :widths: auto
+
+   ==================================================  ========  ========  ===========  ================
+   ..                                                  H100      L40S      Blackwell    four Blackwell
+                                                                           instance     instances
+   ==================================================  ========  ========  ===========  ================
+   the library of 2 October 2026                       63.8 s    161.5 s   163.3 s      81.7 s
+   reorthogonalized CG, incremental solves to 1e-6     32.0 s    73.3 s    83.8 s       39.0 s
+   and hypre's own PCG (:doc:`solvers`)                29.6 s    65.0 s    76.0 s       36.0 s
+   and single-precision element matrices               29.0 s    61.8 s    62.0 s       32.9 s
+   single-precision solves, double-precision kernels   25.7 s    50.6 s    60.6 s       30.9 s
+   single-precision solves and element matrices        24.8 s    45.9 s    46.8 s       26.8 s
+   ==================================================  ========  ========  ===========  ================
+
+The last row is 2.6, 3.5, 3.5 and 3.0 times faster than the first.  What single
+precision itself gives, stage by stage: double-precision kernels and solves against
+single-precision element matrices and solves, the solves in both by hypre's PCG, the
+incremental ones to 1e-6 and to the 1e-5 that single precision reaches:
+
+.. table::
+   :widths: auto
+
+   =========================================  ================  ================  ====================
+   ..                                         H100              L40S              Blackwell instance
+   =========================================  ================  ================  ====================
+   one CG iteration with BoomerAMG            3.69 / 3.19 ms    9.46 / 7.24 ms    9.52 / 6.93 ms
+   BoomerAMG setup                            0.069 / 0.075 s   0.156 / 0.156 s   0.151 / 0.124 s
+   Jacobian element kernel                    67 / 39 ms        339 / 124 ms      588 / 111 ms
+   complete Jacobian assembly                 104 / 87 ms       380 / 166 ms      623 / 147 ms
+   forward solve at a new parameter           0.41 / 0.38 s     1.00 / 0.74 s     1.26 / 0.71 s
+   adjoint solve                              0.10 / 0.12 s     0.24 / 0.28 s     0.25 / 0.29 s
+   blocks of a linearization point            0.27 / 0.23 s     0.39 / 0.28 s     0.99 / 0.30 s
+   Hessian action                             0.107 / 0.078 s   0.260 / 0.162 s   0.265 / 0.160 s
+   =========================================  ================  ================  ====================
+
+So single precision pays most where the card has least double-precision throughput
+(the kernels, five times on a Blackwell instance) and where an iteration is bound by
+memory traffic (a CG iteration, 1.16 to 1.37 times), and it does not help a BoomerAMG
+setup.  The adjoint solve does not gain: its three passes take the iterations of one
+double-precision solve, each a little cheaper, and two or three evaluations of the
+residual by the element kernels on top.  The Hessian action gains most, because its two
+solves need no refinement.
+
+**Memory.**  A matrix entry is twelve bytes in double precision (value and column index)
+and eight in single, so the Jacobian and its hierarchy take two thirds of what they
+took, and no double-precision copy of the Jacobian is made at any time.  On the H100 the
+card held 10.4 GiB outside the element kernels' pool at the peak of that Newton-CG solve
+with double-precision solves and 9.1 GiB with single-precision ones (card peak 26.9 and
+25.6 GiB); on four Blackwell instances the busiest one peaked at 7.5 and 6.9 GiB.  The
+other blocks of a linearization point stay in double precision, and so does everything
+in the element kernels' pool, whose size is set by the chunk planner and the pattern
+build, not by the precision of the matrices.
+
+What to set, for a symmetric problem solved by CG with BoomerAMG:
+
+.. code-block:: bash
+
+   tools/build_hypre_single.sh /path/to/PyMFEM /path/to/hypre_single     # once
+   export HIPPYMFEM_HYPRE_SINGLE=/path/to/hypre_single/libHYPRE_single.so
+   export HIPPYMFEM_PRECISION=mixed
+
+and a loose tolerance on the two incremental solvers (:doc:`optimization`).  The
+single-precision library is used on a host build as well (``tools/build_hypre_single.sh``
+on that PyMFEM tree); it was not timed there.  ``test_solvers`` and ``test_device`` check
+the single-precision solves against the double-precision ones when the variable is set.
 
 .. _several-gpus:
 

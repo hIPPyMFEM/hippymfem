@@ -587,6 +587,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: many Krylov iterations.
     REFINE_MAX_STEPS = 5
     REFINE_INNER_TOL = 1e-6
+    #: The last pass of a refinement is not followed by an evaluation of the residual
+    #: when the passes before it predict, with this margin, that it reaches the goal:
+    #: a pass leaves of its right-hand side the tolerance it is asked for times a ratio
+    #: that the measured passes give.  ``REFINE_PREDICT = False`` measures every pass.
+    REFINE_PREDICT = True
+    REFINE_MARGIN = 3.0
 
     def _probe_symmetry(self, A):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -693,6 +699,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
         prm = self.newton_parameters
         solver = self._get_solver("solver")
+        self._refine_measured = True
         du = self.Vh[STATE].vector()
         r = self._residual([u, m, p], ADJOINT, ess=self.bc0.ess)
         require_finite(r, "the forward residual")
@@ -737,7 +744,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                     "forward Newton solve did not converge: ||r|| = %.3e, "
                     "tolerance %.3e after %d iterations" % (rnew, tol, maxit)
                 )
-        if self.is_fwd_linear:
+        if self.is_fwd_linear and getattr(self, "_refine_measured", True):
             rn = r.norm("l2")
             # The floor is the element kernel's precision, not the solver's: with
             # everything in single precision one Newton step on a linear residual
@@ -823,23 +830,49 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                    self.newton_parameters["abs_tolerance"])
         dx = x.duplicate()
         rk, floor, steps = r0, self.REFINE_INNER_TOL, 0
+        # what the solver can reach at best (a single-precision one stops near 1e-5), and
+        # how much more of its right-hand side a pass leaves than the tolerance it was
+        # asked for: measured in every pass whose residual is evaluated
+        low = float(getattr(solver, "tolerance_floor", 0.0) or 0.0)
+        ratio = None
+        self._refine_measured = True
         if r0 == 0.0:
             return 0, r
+        verbose = self.newton_parameters["print_level"] >= 0 and self.comm.rank == 0
         try:
             for steps in range(1, 2 + int(self.REFINE_MAX_STEPS)):
+                inner = None
                 if tight is not None:
-                    prm["rel_tolerance"] = min(0.1, max(tight, 0.3 * goal / rk, floor))
+                    target = 0.3 * goal / rk
+                    if self.REFINE_PREDICT and ratio is not None:
+                        # tight enough for the prediction below to hold
+                        target = min(target, 0.9 * goal / (self.REFINE_MARGIN * ratio * rk))
+                    inner = min(0.1, max(tight, target, floor))
+                    prm["rel_tolerance"] = inner
                 if negate:
                     r.scale(-1.0)
                 solver.solve(dx, r)
                 x.axpy(1.0, dx)
+                if self.REFINE_PREDICT and ratio is not None and inner is not None:
+                    # The residual is an assembly of the element kernels.  When the
+                    # earlier passes say that this one reached the goal with a margin,
+                    # it is the last and its residual is not evaluated.
+                    expected = self.REFINE_MARGIN * ratio * max(inner, low) * rk
+                    if expected <= goal:
+                        self._refine_measured = False
+                        if verbose:
+                            print("  %s refinement %d: not measured, at most %.1e of the "
+                                  "first expected" % (what, steps, expected / r0), flush=True)
+                        break
                 r = residual()
                 rn = r.norm("l2")
-                if self.newton_parameters["print_level"] >= 0 and self.comm.rank == 0:
+                if verbose:
                     print("  %s refinement %d: ||r|| = %.6e (%.1e of the first)"
                           % (what, steps, rn, rn / r0), flush=True)
                 if rn <= goal or rn > 0.5 * rk:
                     break
+                if inner is not None:
+                    ratio = max(ratio or 1.0, rn / (rk * max(inner, low)))
                 # the reduction this pass achieved bounds what the next one can
                 floor, rk = 0.1 * rn / rk, rn
         finally:

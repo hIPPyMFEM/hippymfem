@@ -16,7 +16,7 @@ Inexact Newton-CG
 
 The Newton system is solved with conjugate gradients against the matrix-free reduced
 Hessian, truncated by the Eisenstat-Walker criterion so early iterations do not pay
-for accuracy they cannot use.  The prior precision is the preconditioner, which is
+for accuracy they cannot use (`The CG of a Newton step`_).  The prior precision is the preconditioner, which is
 what makes the iteration count depend on the information content of the data rather
 than on the mesh.
 
@@ -31,6 +31,58 @@ The Gauss-Newton approximation, the full Hessian with the terms involving the
 second derivative of the forward operator dropped, is used for the first
 ``GN_iter`` iterations, because it is positive definite everywhere while the full
 Hessian is legitimately indefinite away from a minimum.
+
+The CG of a Newton step
+-----------------------
+
+The CG iteration keeps every new residual orthogonal to all the earlier ones
+explicitly (``cg_reorthogonalize``, on by default;
+:class:`~hippymfem.algorithms.cgsolverSteihaug.CGSolverSteihaug`,
+``reorthogonalize``).  The recurrence of CG gives that orthogonality only for one
+symmetric operator in exact arithmetic.  A prior-preconditioned Hessian has a few
+large, well separated eigenvalues, for which rounding destroys it within a few tens of
+iterations, and a Hessian action computed with inexact solves is not one symmetric
+operator at all.  In both cases the recurrence alone is delayed, and by an amount that
+changes with the last digit of the operands: the model problem of the benchmarks with
+2.1 million state dofs took 193 to 210 CG iterations for its twelve Newton steps,
+depending on the GPU and the number of ranks, and with the incremental solves stopped
+at ``1e-8`` instead of ``1e-12`` a third more.  With the residuals orthogonalized it
+took 131 on every GPU and rank count, and still 131 with the incremental solves stopped
+at ``1e-6``.  The cost is ``k`` inner products and updates of parameter vectors at
+iteration ``k`` and two stored vectors per iteration, nothing next to a Hessian action.
+
+Two consequences.  The incremental solves of a Hessian action need a loose tolerance
+only, which halves their iterations:
+
+.. code-block:: python
+
+   pde.set_solvers(hm.auto_solver, Vu, comm, max_direct=0, rel_tolerance=1e-12)
+   for name in ("solver_fwd_inc", "solver_adj_inc"):
+       getattr(pde, name).parameters["rel_tolerance"] = 1e-6
+
+The forward and adjoint solves keep their tolerance: they give the gradient, which must
+be exact for Newton to converge to the MAP point, while the Hessian only shapes the
+steps.  Newton-CG to a relative gradient norm of ``1e-6`` on that problem, the same
+twelve Newton steps and the same cost functional to nine digits in every column:
+
+==============================================  ========  ========  =====================
+..                                              H100      L40S      Blackwell instance
+==============================================  ========  ========  =====================
+recurrence alone, incremental solves to 1e-12   63.8 s    161.5 s   163.3 s
+residuals orthogonalized                        47.4 s    110.5 s   122.2 s
+and incremental solves to 1e-6                  32.0 s    73.3 s    83.8 s
+==============================================  ========  ========  =====================
+
+(one GPU each, or one MIG instance of an RTX PRO 6000 Blackwell; at ``1e-4`` the H100
+took 27.8 s, but one of the three GPUs then needed a thirteenth Newton step, so
+``1e-6`` is the tolerance to use.)  And single precision becomes usable for those
+solves (:ref:`single-precision` in the GPU guide), since their rounding no longer
+disturbs the iteration.
+
+``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by
+step.  The low-rank eigensolvers of the Laplace approximation are not Krylov
+recurrences and never had this sensitivity; their Hessian actions want incremental
+solves to about ``1e-8`` for the accuracy of the small eigenvalues.
 
 Gradient norms
 --------------

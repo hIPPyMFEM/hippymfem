@@ -72,6 +72,65 @@ def gpu_name():
         return "unknown"
 
 
+class CardMemory:
+    """The memory in use on this rank's GPU while a block runs, sampled from a thread:
+    the peak of the card, and the peak of what lies outside the element kernels' pool
+    (hypre's matrices, hierarchies and vectors, MFEM, the CUDA context)."""
+
+    def __init__(self, interval=0.2):
+        self.interval, self.peak, self.outside = interval, 0, 0
+        self._stop = None
+
+    def _sample(self):
+        from hippymfem.common import devicebridge as bridge
+
+        got = bridge.device_memory()
+        if got is None:
+            return
+        try:
+            pool = int((km.device().memory_stats() or {}).get("pool_bytes", 0))
+        except Exception:                                             # noqa: BLE001
+            pool = 0
+        self.peak = max(self.peak, got[0])
+        self.outside = max(self.outside, got[0] - pool)
+
+    def __enter__(self):
+        import threading
+
+        # The thread cannot run while the interpreter is inside a call of MFEM (a
+        # BoomerAMG setup is one such call), so the card is also read whenever hypre
+        # takes a block from the driver, which is when its memory grows: both hypre
+        # libraries allocate through the library's pool.
+        self._pool = mfemconfig.HYPRE_POOL
+        if self._pool is not None and self._pool.installed:
+            self._driver_malloc = self._pool._driver_malloc
+
+            def take(size):
+                p = self._driver_malloc(size)
+                self._sample()
+                return p
+            self._pool._driver_malloc = take
+        else:
+            self._pool = None
+        self._stop = threading.Event()
+
+        def loop():
+            while not self._stop.is_set():
+                self._sample()
+                self._stop.wait(self.interval)
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join()
+        if self._pool is not None:
+            self._pool._driver_malloc = self._driver_malloc
+        self._sample()
+        return False
+
+
 def clock(fn, reps=1):
     """Seconds per call of ``fn``, over ``reps`` calls, all ranks."""
     COMM.Barrier()
@@ -121,8 +180,9 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     modes = [m for m in args.modes.split(",") if m]
-    if modes[0] != "fp64":
-        raise SystemExit("the first mode must be fp64: the others are compared with it")
+    # (without fp64 as the first mode nothing is compared: for the memory of one mode
+    # alone, since the pool of the element kernels never shrinks within a process)
+    compare = modes[0] == "fp64"
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
     N, ORDER = args.n, args.order
@@ -244,7 +304,8 @@ def main():
         cur = {"u": x[STATE].copy(), "p": x[ADJOINT].copy(), "g": g.copy(), "Hd": Hd.copy()}
         if mode == "fp64":
             ref = cur
-        out.update({"err_" + k: (0.0 if mode == "fp64" else rel(cur[k], ref[k])) for k in cur})
+        out.update({"err_" + k: (0.0 if (mode == "fp64" or not compare) else rel(cur[k], ref[k]))
+                    for k in cur})
         out["cost"] = [float(c) for c in model.cost(x)]
         say("  kernel %.4f s | assembly %.4f s | forward %.3f s (%s passes) | adjoint %.3f s (%s) | gradient %.4f s"
             " | Hessian blocks %.3f s | Hessian action %.3f s"
@@ -277,7 +338,8 @@ def main():
                     solver = hm.ReducedSpaceNewtonCG(model, params)
                     calls0 = dict(pde.n_calls)
                     first = out.get("newton_first_wall")
-                    wall, xs = clock(lambda: solver.solve([None, prior.mean.copy(), None]))
+                    with CardMemory() as card:
+                        wall, xs = clock(lambda: solver.solve([None, prior.mean.copy(), None]))
                     if first is None:
                         out["newton_first_wall"] = wall
             except Exception as exc:                                  # noqa: BLE001
@@ -305,9 +367,15 @@ def main():
                                                                op=MPI.MAX) / 2 ** 20
             except Exception:                                         # noqa: BLE001
                 pass
-            if "hypre_peak_mib" in out["newton"]:
-                say("  device memory at its peak: hypre %.0f MiB, element kernels %.0f MiB (of the process so far)"
-                    % (out["newton"]["hypre_peak_mib"], out["newton"].get("jax_peak_mib", float("nan"))))
+            if card.peak:
+                # the card of the busiest rank during the last solve, and what of it lay
+                # outside the element kernels' pool
+                out["newton"]["card_peak_mib"] = COMM.allreduce(card.peak, op=MPI.MAX) / 2 ** 20
+                out["newton"]["outside_kernels_peak_mib"] = COMM.allreduce(card.outside, op=MPI.MAX) / 2 ** 20
+                say("  device memory during the solve, busiest rank: card %.0f MiB at its peak, %.0f MiB of it "
+                    "outside the element kernels' pool (hypre, MFEM, the CUDA context); kernels' pool peak %.0f MiB "
+                    "in use" % (out["newton"]["card_peak_mib"], out["newton"]["outside_kernels_peak_mib"],
+                                out["newton"].get("jax_peak_mib", float("nan"))))
             r = out["newton"]
             say("  Newton-CG: %.2f s, %d Newton and %d CG iterations, J %.10e, |g| %.3e (%s); "
                 "MAP against fp64 %s; %s"
@@ -316,8 +384,8 @@ def main():
                    ", ".join("%s %d" % kv for kv in sorted(r["calls"].items()))))
     km.set_precision("fp64")
 
-    base = rec["modes"]["fp64"]
-    for mode in modes[1:]:
+    base = rec["modes"].get("fp64")
+    for mode in (modes[1:] if compare else []):
         o = rec["modes"][mode]
         say("%s against fp64: kernel %.2fx, assembly %.2fx, forward %.2fx, adjoint %.2fx, blocks %.2fx, "
             "action %.2fx%s"

@@ -196,7 +196,11 @@ def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
         p.Pr, r_ident = _prolongation(trial_space)
     p.escapes = t_ident and r_ident
     p.tpat = None
-    if ((not p.escapes or _tdof_identity())
+    from .tdofassemble import single_requested
+
+    # (a matrix for the single-precision hypre is made on the true-dof route, also
+    # where the prolongation is the identity and the host would not take it)
+    if ((not p.escapes or _tdof_identity() or single_requested())
             and _tdof_route(test_space, trial_space, p.same)):
         from .tdofassemble import get_tdof_pattern
 

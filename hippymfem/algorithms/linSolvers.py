@@ -360,6 +360,17 @@ class KrylovSolver(_SolverBase):
 
     SetOperator = set_operator
 
+    @property
+    def tolerance_floor(self):
+        """The relative residual below which a solve with the present operator does not
+        go, whatever tolerance is asked: that of single precision for a matrix of the
+        single-precision hypre, zero otherwise."""
+        if getattr(self, "_single", False):
+            from .singlesolve import SINGLE_TOL_FLOOR
+
+            return SINGLE_TOL_FLOOR
+        return 0.0
+
     def can_solve_single(self):
         """Whether this solver could run in the single-precision hypre: CG with a plain
         BoomerAMG, the only combination set up there."""

@@ -244,6 +244,38 @@ def copy_to_jax(src, count, dtype=np.float64):
     return out
 
 
+_MEMINFO = []
+
+
+def device_memory():
+    """``(used, total)`` bytes of the GPU (or MIG instance) of this process, from the
+    runtime's ``cudaMemGetInfo`` / ``hipMemGetInfo``: everything every library of this
+    process and any other process holds on it.  ``None`` without a GPU runtime."""
+    if not _MEMINFO:
+        fn = None
+        for name, symbol in (("libcudart.so", "cudaMemGetInfo"), ("libamdhip64.so", "hipMemGetInfo")):
+            try:
+                with open("/proc/self/maps") as f:
+                    for line in f:
+                        if name in line:
+                            fn = getattr(ctypes.CDLL(line.split(None, 5)[-1].strip()), symbol)
+                            break
+            except (OSError, AttributeError):
+                fn = None
+            if fn is not None:
+                fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+                fn.restype = ctypes.c_int
+                break
+        _MEMINFO.append(fn)
+    fn = _MEMINFO[0]
+    if fn is None:
+        return None
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    if fn(ctypes.byref(free), ctypes.byref(total)) != 0:
+        return None
+    return int(total.value) - int(free.value), int(total.value)
+
+
 def synchronize():
     """Wait for the copies queued so far (and everything else on the device)."""
     rc = _STATE["sync"]()

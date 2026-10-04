@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
+  of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
+  recurrence of CG loses that orthogonality to rounding on a prior-preconditioned
+  Hessian, and to the error of the incremental solves when these are inexact: the model
+  problem with 2.1 million state dofs took 193 to 210 CG iterations for its twelve Newton
+  steps, depending on the GPU and the rank count, and a third more with incremental
+  solves stopped at 1e-8. With every residual made orthogonal to the earlier ones it
+  takes 131 on every GPU and rank count, and still 131 with incremental solves stopped
+  at 1e-6, which halves their iterations. One H100: 63.8 s -> 47.4 s -> 32.0 s with
+  incremental solves to 1e-6; one L40S 161.5 -> 110.5 -> 73.3 s; four MIG instances of
+  two RTX PRO 6000 Blackwell 81.7 -> 39.0 s. The cost functional agrees to nine digits.
+  `cg_reorthogonalize = False` gives hIPPYlib's iteration. **Iteration counts and times
+  of a Newton-CG run change with this default.**
+- **CG with a hypre preconditioner runs in hypre's own PCG** (`HIPPYMFEM_HYPRE_PCG`,
+  `hm.config.hypre_pcg`, on by default). The iteration is the same as MFEM's `CGSolver`
+  from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
+  which saves the first relaxation of a V-cycle its matrix-vector product on the finest
+  level: a solve of 2.1 million dofs to 1e-12 in 24 iterations took 0.103 -> 0.089 s on
+  an H100 and 0.274 -> 0.227 s on an L40S; the Newton-CG run above 32.0 -> 29.6 s and
+  73.3 -> 65.0 s. The solvers of one operator share one PCG object.
+- **Single precision** in three places, none of which changes the state, the gradient or
+  the MAP point (`docs/source/guide/gpu.rst`, "Single precision").
+  `HIPPYMFEM_PRECISION=mixed` computes the element matrices in single precision, corrects
+  the Jacobian's to act on the constants as the double-precision ones do, and refines
+  the forward and adjoint solves against double-precision residuals: the Jacobian's
+  kernel is 1.7 (H100), 2.7 (L40S) and 5.3 (Blackwell instance) times faster, a complete
+  assembly 1.2, 2.3 and 4.2 times. `HIPPYMFEM_HYPRE_SINGLE=<libHYPRE_single.so>`
+  (`tools/build_hypre_single.sh`, `hippymfem.algorithms.singlesolve`) loads a
+  single-precision build of hypre next to the double-precision one: the Jacobian is
+  assembled into it and exists there alone, with its BoomerAMG hierarchy, the forward
+  and adjoint solves are refined against double-precision residuals, and the
+  incremental solves of a Hessian action stop at 1e-5 and are used as they are. A CG
+  iteration is 1.16 (H100), 1.31 (L40S) and 1.37 (Blackwell instance) times faster, a
+  Hessian action 1.4 and 1.6 times, a BoomerAMG setup no faster, and the card holds
+  1.3 GiB less at 2.1 million state dofs. With both, the Newton-CG run above takes
+  24.8 s on the H100, 45.9 s on the L40S, 46.8 s on a Blackwell instance and 26.8 s on
+  four: 2.6, 3.5, 3.5 and 3.0 times faster than before these three changes.
+  `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
+  experiments: the optimizers now stop at the floor of that precision instead of
+  failing in a line search.
 - **Independent solves as an ensemble over the GPUs** (`ensemble=` of `MatMvMult`,
   `singlePass`, `doublePass`, `singlePassG`, `doublePassG`, and of the prior's and the
   posterior's `trace` and `pointwise_variance`; `benchmarks/bench_laplace.py --ensemble`).

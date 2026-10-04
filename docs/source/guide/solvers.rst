@@ -53,6 +53,24 @@ SPD operator on L40S cards, on one card and on four alike, with half the CG
 iterations.  It is not the default because it needs an SPD operator (the geothermal
 model's Jacobian is not) and the gain is a constant, not a change in scaling.
 
+CG with a hypre preconditioner runs in hypre's own PCG (MFEM's ``HyprePCG``), not in
+MFEM's ``CGSolver`` (``HIPPYMFEM_HYPRE_PCG=0`` or ``hm.config.hypre_pcg = False`` for the
+latter).  The two make the same iteration: the same iterates, counts and stopping test
+from a zero initial guess.  The difference is in the V-cycle.  hypre's PCG marks the
+vector it hands to BoomerAMG as zero, and the first relaxation on the finest level then
+skips its matrix-vector product; MFEM zeroes the vector without saying so.  With
+l1-Jacobi relaxation on a GPU that is one product of four per iteration: a solve of 2.1
+million dofs to ``1e-12`` in 24 iterations took 0.103 s with MFEM's CG and 0.089 s with
+hypre's on an H100, and 0.274 and 0.227 s on an L40S.  The solvers of one operator (the
+forward and the two incremental ones) share one PCG object, which sets the
+preconditioner up once.  A solve from a nonzero initial guess, a preconditioner kept
+from an older matrix (``pc_reuse``) and a transposed operator keep MFEM's CG.
+
+With a single-precision build of hypre next to the double-precision one
+(``HIPPYMFEM_HYPRE_SINGLE``), the Jacobian of a PDE problem, its BoomerAMG hierarchy and
+the CG solves with it live in that library; :ref:`single-precision` in the GPU guide
+has the measurements and the build.
+
 One behaviour differs deliberately from MFEM's default.  MFEM's hypre wrappers use
 ``ABORT_HYPRE_ERRORS``, so a failed AMG setup ends the whole MPI job.  Inside an
 optimizer that is the wrong response: a line search routinely proposes a parameter
