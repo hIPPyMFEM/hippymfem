@@ -674,6 +674,85 @@ def test_hessian_properties():
     check("ReducedHessian == FDHessian", e < 1e-5, "(%.2e)" % e)
 
 
+def test_mixed_precision():
+    """``HIPPYMFEM_PRECISION=mixed``: element matrices in single precision, and the state,
+    the adjoint and the gradient of double precision all the same."""
+    from hippymfem.fem import kernel as km
+
+    if RANK == 0:
+        print("mixed precision of the element kernels")
+    model, Vh, mtrue, utrue, B = build_inverse_problem(n=10, order=2, ntargets=25)
+    pde = model.problem
+    m0 = Vh[PARAMETER].project(lambda x: np.sin(3.0 * x[0]) * np.cos(2.0 * x[1]))
+    d = Vh[PARAMETER].project(lambda x: np.cos(x[0] + 2.0 * x[1]))      # smooth directions
+    e = Vh[PARAMETER].project(lambda x: np.sin(2.0 * x[0] - x[1]))
+
+    def rel(a, b):
+        return a.copy().axpy(-1.0, b).norm("l2") / max(b.norm("l2"), 1e-300)
+
+    res, sums = {}, {}
+    old = km.PRECISION
+    try:
+        for mode in ("fp64", "mixed", "fp32"):
+            km.set_precision(mode)
+            pde.invalidate_jacobian()
+            pde.release_linearization_point()
+            x = [model.generate_vector(STATE), m0.copy(), model.generate_vector(ADJOINT)]
+            model.solveFwd(x[STATE], x)
+            model.solveAdj(x[ADJOINT], x)
+            g = model.generate_vector(PARAMETER)
+            model.evalGradientParameter(x, g)
+            model.setPointForHessianEvaluations(x)
+            H = hm.ReducedHessian(model)
+            Hd, He = model.generate_vector(PARAMETER), model.generate_vector(PARAMETER)
+            H.mult(d, Hd)
+            H.mult(e, He)
+            a, b = Hd.inner(e), He.inner(d)
+            res[mode] = (x[STATE].copy(), x[ADJOINT].copy(), g.copy(), Hd.copy(),
+                         abs(a - b) / max(abs(a), abs(b), 1e-300))
+            # the Jacobian's element matrices: as the forward solve gets them, and plain
+            loc = pde._locals(x) + pde._aux_locals()
+            sums[mode] = [np.asarray(K) for K in pde.kernel.element_matrices(
+                ADJOINT, STATE, loc, consistent="symmetric")]
+            if mode == "mixed":
+                sums["plain"] = [np.asarray(K) for K in pde.kernel.element_matrices(ADJOINT, STATE, loc)]
+                sums["two-sided"] = [np.asarray(K) for K in pde.kernel.element_matrices(
+                    ADJOINT, STATE, loc, consistent="two-sided")]
+    finally:
+        km.set_precision(old)
+        pde.invalidate_jacobian()
+        pde.release_linearization_point()
+
+    ref = res["fp64"]
+    eu, ep, eg, eH = (rel(res["mixed"][k], ref[k]) for k in range(4))
+    check("mixed: the state is the double-precision one", eu < 1e-10, "(%.1e)" % eu)
+    check("mixed: the adjoint is the double-precision one", ep < 1e-9, "(%.1e)" % ep)
+    check("mixed: the gradient is the double-precision one", eg < 1e-9, "(%.1e)" % eg)
+    check("mixed: a Hessian action to single precision", eH < 1e-5, "(%.1e)" % eH)
+    check("mixed: the reduced Hessian is symmetric to rounding",
+          res["mixed"][4] < 100 * max(ref[4], 1e-15), "(%.1e, double %.1e)" % (res["mixed"][4], ref[4]))
+    eu32, eg32 = rel(res["fp32"][0], ref[0]), rel(res["fp32"][2], ref[2])
+    check("fp32: uncorrected, the state is off at single precision", 1e-9 < eu32 < 1e-3, "(%.1e)" % eu32)
+    check("fp32: the gradient too", 1e-9 < eg32 < 1e-2, "(%.1e)" % eg32)
+
+    def worst(f):
+        v = [f(*Ks) for Ks in zip(*[sums[k] for k in ("fp64", "plain", "mixed", "two-sided")])]
+        return COMM.allreduce(max(v) if v else 0.0, op=MPI.MAX)
+
+    scale = COMM.allreduce(max([np.abs(K).sum(axis=2).max() for K in sums["fp64"]] or [0.0]), op=MPI.MAX)
+    plain = worst(lambda K64, Kp, Ks, Kt: np.abs(Kp.sum(axis=2) - K64.sum(axis=2)).max()) / scale
+    fixed = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks.sum(axis=2) - K64.sum(axis=2)).max()) / scale
+    both = worst(lambda K64, Kp, Ks, Kt: max(np.abs(Kt.sum(axis=2) - K64.sum(axis=2)).max(),
+                                             np.abs(Kt.sum(axis=1) - K64.sum(axis=1)).max())) / scale
+    asym = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks - np.swapaxes(Ks, 1, 2)).max()) / scale
+    entry = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks - K64).max()) / scale
+    check("single-precision element matrices: the row sums are off", plain > 1e-9, "(%.1e)" % plain)
+    check("consistent: the row sums are the double-precision ones", fixed < 1e-13, "(%.1e)" % fixed)
+    check("consistent, two-sided: row and column sums", both < 1e-13, "(%.1e)" % both)
+    check("consistent, symmetric: symmetric to the last bit", asym == 0.0, "(%.1e)" % asym)
+    check("consistent: the entries are single precision", 1e-10 < entry < 1e-5, "(%.1e)" % entry)
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -692,6 +771,7 @@ if __name__ == "__main__":
     test_third_dir()
     test_apply_ij_at()
     test_hessian_properties()
+    test_mixed_precision()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

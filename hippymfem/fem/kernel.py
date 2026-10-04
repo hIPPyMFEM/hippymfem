@@ -1085,13 +1085,18 @@ class GroupKernel:
         """``(tables, geometry)``: the mapped arguments, in the order the kernels
         expect.
 
-        With ``streaming``, the per-element geometry is left on the host and the
-        chunk loop slices it, so only a chunk's rows are transferred instead of the
-        whole ``(ne, nq, dim, sdim)`` staying resident (gigabytes on a large mesh,
-        against megabytes per chunk).  Without it the geometry is cached on the
-        device, unless :meth:`_stream_geometry` finds the batch split and the
-        geometry too large a share of the budget.  Tables are per group and stay on
-        the device either way.
+        The per-element geometry is cached on the device unless
+        :meth:`_stream_geometry` finds the batch split and the geometry too large a
+        share of the budget; it is then left on the host, and a chunk loop slices it,
+        so that only a chunk's rows are transferred instead of the whole
+        ``(ne, nq, dim, sdim)`` staying resident (gigabytes on a large mesh, against
+        megabytes per chunk).  ``streaming`` is the request of a chunk loop.  It used
+        to get the host arrays whatever was cached, which transferred the whole
+        geometry, chunk by chunk, at every assembly of a split batch although the
+        device held a copy for the other kernels: 1.7 GB for 262 144 second-order
+        hexahedra, more than half of what such an assembly took outside its kernel.
+        Now the device copy serves the chunk loop too.  Tables are per group and stay
+        on the device either way.
         """
         d = device()
         ent = self._dev.get(d)
@@ -1105,7 +1110,7 @@ class GroupKernel:
                 for n in self._geo_names)
             ent = self._dev[d] = (tabs, geo)
         tabs, geo = ent
-        if streaming or geo is None:
+        if geo is None:
             geo = tuple(getattr(self.group, n) for n in self._geo_names)
         return (tabs, geo)
 
@@ -1336,10 +1341,14 @@ class GroupKernel:
 
                 Rj = jax.vmap(lambda v: action(i, j, v), out_axes=1)(Vj)       # (nd_i, kj)
                 if symmetric:
+                    # every term symmetric bit for bit, and so is their sum
                     K = 0.5 * (K + K.T)
-                    Ri = Rj
-                else:
-                    Ri = jax.vmap(lambda v: action(j, i, v), out_axes=1)(Vi)   # (nd_j, ki)
+                    Dj = Rj - K @ Vj.T
+                    U = Dj @ Vj
+                    S = Vj @ Dj
+                    W = Vj.T @ (0.5 * (S + S.T)) @ Vj
+                    return K + (U + U.T) - 0.5 * (W + W.T)
+                Ri = jax.vmap(lambda v: action(j, i, v), out_axes=1)(Vi)       # (nd_j, ki)
                 Dj = Rj - K @ Vj.T
                 Di = Ri - K.T @ Vi.T
                 return K + Dj @ Vj + Vi.T @ Di.T - Vi.T @ (Vi @ Dj) @ Vj
