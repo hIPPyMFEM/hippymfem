@@ -65,6 +65,15 @@ DEVICE_PARMAT = os.environ.get("HIPPYMFEM_PARMAT_DEVICE", "block").lower()
 #: its Jacobian.
 _SINGLE_TARGET = [False]
 
+#: A matrix for the single-precision hypre is accumulated in single precision on the
+#: device: the accumulator, the largest allocation of an assembly, is half as large,
+#: and its values go to the matrix without a rounded copy of them in between.  The sum
+#: of an entry's element contributions is then rounded term by term instead of once,
+#: which the solves that use such a matrix (refined, or stopped at 1e-5) do not see.
+#: ``HIPPYMFEM_SINGLE_ACCUMULATE=0`` accumulates in double precision and rounds once.
+SINGLE_ACCUMULATE = os.environ.get("HIPPYMFEM_SINGLE_ACCUMULATE", "1").lower() not in (
+    "0", "no", "false", "off")
+
 
 @contextlib.contextmanager
 def single_target():

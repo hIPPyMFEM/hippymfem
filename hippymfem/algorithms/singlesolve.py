@@ -264,6 +264,20 @@ class _Library:
             raise RuntimeError("%s (on another rank)" % first)
 
 
+_FINITE = []
+
+
+def _all_finite(a):
+    """Whether every entry of a device array is finite, as one reduction on the device
+    (no array of flags is made)."""
+    if not _FINITE:
+        import jax
+        import jax.numpy as jnp
+
+        _FINITE.append(jax.jit(lambda v: jnp.all(jnp.isfinite(v))))
+    return _FINITE[0](a)
+
+
 class SingleParMatrix:
     """A parallel matrix in the single-precision library.
 
@@ -319,8 +333,10 @@ class SingleParMatrix:
             else:
                 import jax.numpy as jnp
 
-                vals = acc[:nd + no].astype(jnp.float32)
-                finite = bool(jnp.isfinite(vals).all())
+                # accumulated in single precision (tdofassemble.SINGLE_ACCUMULATE): the
+                # accumulator itself holds the values, and nothing is copied
+                vals = acc if acc.dtype == jnp.float32 else acc[:nd + no].astype(jnp.float32)
+                finite = bool(_all_finite(vals))
             # An entry beyond the range of single precision (a coefficient spanning
             # dozens of decades, as a line search may propose) becomes infinite, and
             # hypre does not return from a setup with such a matrix.  A RuntimeError,

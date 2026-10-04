@@ -78,8 +78,8 @@ def set_device_pattern(flag):
 #: Doubles of zeros written per in-place update when an accumulator is reset.
 _ZERO_BLOCK = 1 << 22
 
-_ACC_FREE = {}                     # (device, nnz) -> kept accumulators
-_ACC_ZERO = {}                     # (device, block) -> a block of zeros
+_ACC_FREE = {}                     # (device, nnz, dtype) -> kept accumulators
+_ACC_ZERO = {}                     # (device, block, dtype) -> a block of zeros
 _ACC_PUT = {}                      # the jitted in-place block write
 
 
@@ -129,7 +129,9 @@ def _fused_add(acc, flat, slot, sign):
     fn = _FUSED_ADD.get(key)
     if fn is None:
         def step(a, v, idx, sg):
-            return a.at[idx].add(v if sg is None else v * sg)
+            # in the accumulator's precision: a chunk in double precision is rounded
+            # into a single-precision accumulator, one in single precision widened
+            return a.at[idx].add((v if sg is None else v * sg).astype(a.dtype))
 
         fn = _FUSED_ADD[key] = jax.jit(step, donate_argnums=(0,))
     return fn(acc, flat, slot, sign)
@@ -149,8 +151,9 @@ def _device_set(acc, idx, value):
     return fn(acc, idx, value)
 
 
-def _acc_keepable(d, n):
-    """Whether an ``n``-double accumulator on ``d`` is worth keeping.
+def _acc_keepable(d, n, itemsize=8):
+    """Whether an accumulator of ``n`` entries of ``itemsize`` bytes on ``d`` is worth
+    keeping.
 
     Two conditions.  The allocator must have a fixed arena: under
     ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` every buffer is a driver allocation that
@@ -165,7 +168,7 @@ def _acc_keepable(d, n):
     except Exception:                                        # noqa: BLE001
         return False
     limit = stats.get("bytes_limit")
-    return bool(limit) and n * 8 >= FUSED_KEEP_SHARE * limit
+    return bool(limit) and n * itemsize >= FUSED_KEEP_SHARE * limit
 
 
 def _acc_reset(acc, n):
@@ -188,33 +191,33 @@ def _acc_reset(acc, n):
             lambda a, z, i: lax.dynamic_update_slice(a, z, (i,)),
             donate_argnums=(0,))
     blk = min(max(1, _ZERO_BLOCK), n)
-    key = (_device_key(), blk)
+    key = (_device_key(), blk, acc.dtype.name)
     z = _ACC_ZERO.get(key)
     if z is None:
-        z = _ACC_ZERO[key] = jnp.zeros(blk, dtype=jnp.float64)
+        z = _ACC_ZERO[key] = jnp.zeros(blk, dtype=acc.dtype)
     for start in range(0, n, blk):
         m = min(blk, n - start)
         acc = fn(acc, z if m == blk else z[:m], start)
     return acc
 
 
-def _acc_take(d, n):
-    """A zeroed accumulator of ``n`` doubles on ``d``, kept from an earlier assembly
-    where there is one."""
+def _acc_take(d, n, dtype=np.float64):
+    """A zeroed accumulator of ``n`` entries of ``dtype`` on ``d``, kept from an earlier
+    assembly where there is one."""
     import jax.numpy as jnp
 
-    free = _ACC_FREE.get((d, n))
+    free = _ACC_FREE.get((d, n, np.dtype(dtype).name))
     if free:
         return _acc_reset(free.pop(), n)
-    return jnp.zeros(n, dtype=jnp.float64)
+    return jnp.zeros(n, dtype=dtype)
 
 
 def _acc_give(d, n, acc):
-    """Keep ``acc`` for the next assembly of this size."""
-    _ACC_FREE.setdefault((d, n), []).append(acc)
+    """Keep ``acc`` for the next assembly of this size and precision."""
+    _ACC_FREE.setdefault((d, n, acc.dtype.name), []).append(acc)
 
 
-def _warn_if_growth_arena(d, n):
+def _warn_if_growth_arena(d, n, itemsize=8):
     """Say so once when a large accumulator is about to be asked of a *growing* arena.
 
     JAX's arena grows by carving regions from the driver, and every region it has
@@ -224,7 +227,7 @@ def _warn_if_growth_arena(d, n):
     while the same arena preallocated as one region serves it with 5.6 GiB to spare.
     The message is what the failure otherwise never says.
     """
-    if n * 8 < _GROWTH_WARN_SHARE * (_arena_limit(d) or 0) or d in _WARNED:
+    if n * itemsize < _GROWTH_WARN_SHARE * (_arena_limit(d) or 0) or d in _WARNED:
         return
     _WARNED.add(d)
     if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "").lower() in (
@@ -237,7 +240,7 @@ def _warn_if_growth_arena(d, n):
         "reading almost empty. Set XLA_PYTHON_CLIENT_PREALLOCATE=true (with "
         "HIPPYMFEM_GPU_MEM_FRACTION sized for hypre's share) to take the arena as "
         "one region, or use more ranks."
-        % (n * 8 / 2 ** 30, 100.0 * n * 8 / max(_arena_limit(d) or 1, 1)),
+        % (n * itemsize / 2 ** 30, 100.0 * n * itemsize / max(_arena_limit(d) or 1, 1)),
         RuntimeWarning, stacklevel=4)
 
 
@@ -661,7 +664,7 @@ class ScatterPattern(KeepAlive):
         """
         return self.perm is None and self.nnz > 0
 
-    def data_fused(self, chunks, zero_slots=None, host=True):
+    def data_fused(self, chunks, zero_slots=None, host=True, dtype=None):
         """Scatter each chunk of element matrices as it arrives.
 
         The chunks are never glued into one ``(ne, nd, nd)`` array, which only the
@@ -671,18 +674,21 @@ class ScatterPattern(KeepAlive):
         ``chunks`` yields ``(group, start, stop, array)``.  Written as
         :meth:`fused_begin` / :meth:`fused_add` / :meth:`fused_end` so that a loop
         over chunks that carry *several* blocks can feed several patterns at once.
+        ``dtype`` is the accumulator's (:meth:`fused_begin`).
         """
-        acc, maps = self.fused_begin()
+        acc, maps = self.fused_begin(dtype)
         for g, a, bnd, arr in chunks:
             acc = self.fused_add(acc, maps, g, a, bnd, arr)
         return self.fused_end(acc, zero_slots, host=host)
 
-    def fused_begin(self):
+    def fused_begin(self, dtype=None):
         """A zeroed accumulator on the current device, and the maps to feed it.
 
         The accumulator is the largest allocation an assembly makes, so it is
         borrowed from the buffers earlier assemblies kept and reset in place rather
-        than allocated afresh (:data:`FUSED_KEEP`).
+        than allocated afresh (:data:`FUSED_KEEP`).  It is of double precision unless
+        ``dtype`` says otherwise: a matrix that is to live in single precision is
+        accumulated in single precision (``numpy.float32``), at half the memory.
         """
         import jax.numpy as jnp
 
@@ -690,10 +696,11 @@ class ScatterPattern(KeepAlive):
 
         d = device()
         maps = self._fused_maps(d)
-        if FUSED_KEEP and _acc_keepable(d, self.nnz):
-            return _acc_take(d, self.nnz), maps
-        _warn_if_growth_arena(d, self.nnz)
-        return jnp.zeros(self.nnz, dtype=jnp.float64), maps
+        dtype = np.dtype(np.float64 if dtype is None else dtype)
+        if FUSED_KEEP and _acc_keepable(d, self.nnz, dtype.itemsize):
+            return _acc_take(d, self.nnz, dtype), maps
+        _warn_if_growth_arena(d, self.nnz, dtype.itemsize)
+        return jnp.zeros(self.nnz, dtype=dtype), maps
 
     def fused_add(self, acc, maps, g, a, bnd, arr):
         """Add one chunk's element matrices into the accumulator; returns it.
@@ -727,13 +734,16 @@ class ScatterPattern(KeepAlive):
                 acc = _device_set(acc, self._device_zero(zero_slots), 0.0)
             return acc
         out = host_writable(acc)
+        if out.dtype != np.float64:        # the host routes build double-precision matrices
+            out = out.astype(np.float64)
         if zero_slots is not None and zero_slots.size:
             out[zero_slots] = 0.0
         if FUSED_KEEP:
             from .kernel import device
 
             d = device()
-            if _acc_keepable(d, self.nnz):
+            if (not isinstance(acc, np.ndarray)
+                    and _acc_keepable(d, self.nnz, acc.dtype.itemsize)):
                 # The host copy is made; the device buffer goes back for the next
                 # assembly of this pattern (or any other of the same nnz).
                 _acc_give(d, self.nnz, acc)
@@ -746,7 +756,8 @@ class ScatterPattern(KeepAlive):
             from .kernel import device
 
             d = device()
-            if int(acc.shape[0]) == self.nnz and _acc_keepable(d, self.nnz):
+            if (int(acc.shape[0]) == self.nnz
+                    and _acc_keepable(d, self.nnz, acc.dtype.itemsize)):
                 _acc_give(d, self.nnz, acc)
 
     def _fused_maps(self, d):

@@ -146,3 +146,51 @@ def run(check, COMM=MPI.COMM_WORLD):
           and abs(got[True]["cg"] - got[False]["cg"]) <= max(2, got[False]["cg"] // 20),
           "(%d Newton and %d CG iterations, %d and %d in double; MAP differs by %.1e)"
           % (got[True]["newton"], got[True]["cg"], got[False]["newton"], got[False]["cg"], em))
+
+    # On a device the Jacobian is accumulated in single precision where it is assembled
+    # a chunk of elements at a time (the route of a mesh that does not fit whole; forced
+    # here by a small chunk).  Accumulated in double precision and rounded once it is
+    # the same matrix up to rounding.
+    from hippymfem.fem import kernel as km
+    from hippymfem.fem import pattern as pat
+    from hippymfem.fem import tdofassemble as td
+
+    if td.device_finish():
+        seen, begin = [], pat.ScatterPattern.fused_begin
+
+        def fused_begin(self, dtype=None):
+            seen.append(np.dtype(np.float64 if dtype is None else dtype).name)
+            return begin(self, dtype)
+
+        products = []
+        old_chunk, km.ELEMENT_CHUNK = km.ELEMENT_CHUNK, 128
+        # (a chunk size a kernel has planned already goes before the one set here)
+        kernels = list(getattr(pde.kernel, "group_kernels", []))
+        planned = [dict(gk._chunk) for gk in kernels]
+        for gk in kernels:
+            gk._chunk.clear()
+        pat.ScatterPattern.fused_begin = fused_begin
+        try:
+            for accumulate in (True, False):
+                old, td.SINGLE_ACCUMULATE = td.SINGLE_ACCUMULATE, accumulate
+                try:
+                    pde.invalidate_jacobian()
+                    A, _ = pde._jacobian([got[True]["u"], m, None])
+                finally:
+                    td.SINGLE_ACCUMULATE = old
+                y = Vu.vector()
+                A.Mult(rhs.hypre, y.hypre)
+                products.append((type(A).__name__, y))
+                del A
+        finally:
+            km.ELEMENT_CHUNK = old_chunk
+            pat.ScatterPattern.fused_begin = begin
+            for gk, old in zip(kernels, planned):
+                gk._chunk.clear()
+                gk._chunk.update(old)
+        pde.invalidate_jacobian()
+        d = (products[0][1].copy().axpy(-1.0, products[1][1]).norm("l2")
+             / products[1][1].norm("l2"))
+        check("accumulated in single precision the Jacobian is the one rounded from double precision",
+              products[0][0] == "SingleParMatrix" and seen == ["float32", "float64"] and d < 1e-5,
+              "(accumulators %s; a product differs by %.1e)" % (seen, d))

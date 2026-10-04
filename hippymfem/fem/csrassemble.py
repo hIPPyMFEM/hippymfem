@@ -263,6 +263,18 @@ def finish_block(p, acc):
                       p.diag_policy, p.same)
 
 
+def _accumulator_dtype(p, host):
+    """Single precision for the accumulator of a block that is finished on the device
+    as a matrix of the single-precision hypre (``tdofassemble.SINGLE_ACCUMULATE``),
+    ``None`` (double precision) for every other block."""
+    from . import tdofassemble as td
+
+    if (not host and p.tpat is not None and p.fold and td.single_requested()
+            and td.SINGLE_ACCUMULATE):
+        return np.float32
+    return None
+
+
 def scatter_many(plans, chunks):
     """One pass over chunks carrying several blocks, into every plan's target.
 
@@ -340,7 +352,8 @@ def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem
     if callable(element_matrices):
         # A thunk instead of the arrays: the caller is letting the scatter drive
         # the kernel, so the full (ne, nd, nd) array is never formed.
-        acc = p.target.data_fused(element_matrices(), zero_slots=p.zero, host=host)
+        acc = p.target.data_fused(element_matrices(), zero_slots=p.zero, host=host,
+                                  dtype=_accumulator_dtype(p, host))
     else:
         acc = p.target.data(element_matrices, zero_slots=p.zero, host=host)
     if boundary is not None:
