@@ -29,6 +29,19 @@ Termination reasons:
 
 The stopping test is on the :math:`B^{-1}`-norm of the residual, relative to its
 initial value or against an absolute floor.
+
+A second departure is optional (``reorthogonalize``).  The recurrence of CG keeps a
+residual orthogonal to the earlier ones only for one symmetric operator in exact
+arithmetic.  A prior-preconditioned Hessian has a few large, well separated eigenvalues,
+for which that orthogonality is lost to rounding within a few tens of iterations, and a
+Hessian action computed with inexact solves is not one symmetric operator at all: in
+both cases the iteration is delayed, and by an amount that changes with the last digit
+of the operands.  With ``reorthogonalize`` every new residual is made orthogonal, in the
+inner product of the preconditioner, to all the earlier ones explicitly, which costs
+``k`` inner products and updates at iteration ``k`` and two stored vectors per
+iteration.  The iteration then takes the number of steps of exact arithmetic, the same
+in every run, and keeps taking it when the operator carries an error far above
+rounding (see ``ReducedSpaceNewtonCG``, ``cg_reorthogonalize``).
 """
 
 import math
@@ -43,6 +56,10 @@ def CGSolverSteihaug_ParameterList():
         "max_iter": [1000, "maximum number of iterations"],
         "zero_initial_guess": [True, "start from 0; otherwise use the incoming x"],
         "print_level": [0, "-1 silent; 0 final residual or reason; 1 every iteration"],
+        "reorthogonalize": [False, "make every residual orthogonal to all the earlier ones "
+                                   "explicitly: the iteration count of exact arithmetic, also "
+                                   "for an operator applied inexactly; two stored vectors per "
+                                   "iteration"],
     })
 
 
@@ -219,6 +236,8 @@ class CGSolverSteihaug:
         nom0 = self.d.inner(self.r)
         nom = nom0
         self._trace(0, nom)
+        # the earlier residuals r_j, with z_j = B^-1 r_j and (r_j, z_j)
+        basis = [(self.r.copy(), self.z.copy(), nom)] if self.parameters["reorthogonalize"] else None
 
         rtol2 = nom * self.parameters["rel_tolerance"] ** 2
         atol2 = self.parameters["abs_tolerance"] ** 2
@@ -249,6 +268,9 @@ class CGSolverSteihaug:
                 break
 
             self.r.axpy(-alpha, self.Ad)
+            if basis is not None:
+                for rj, zj, rho in basis:
+                    self.r.axpy(-self.r.inner(zj) / rho, rj)
             self.B_solver.solve(self.z, self.r)
             betanom = self.r.inner(self.z)
             self._trace(self.iter, betanom)
@@ -268,6 +290,8 @@ class CGSolverSteihaug:
                 self._report()
                 break
 
+            if basis is not None:
+                basis.append((self.r.copy(), self.z.copy(), betanom))
             beta = betanom / nom
             self.d.scale(beta)
             self.d.axpy(1.0, self.z)

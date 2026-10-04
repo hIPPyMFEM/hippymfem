@@ -108,6 +108,14 @@ def main():
                     help="print the residual after every pass of a refined solve")
     ap.add_argument("--probe-tol-single", type=float, default=None,
                     help="tolerance of the symmetry probe for single-precision matrices (experiments)")
+    ap.add_argument("--cg-reorth", action="store_true",
+                    help="the CG of a Newton step keeps its residuals orthogonal explicitly "
+                    "(cg_reorthogonalize); with it the incremental solves need a loose tolerance only")
+    ap.add_argument("--solve-tol", type=float, default=1e-12,
+                    help="relative tolerance of the forward and adjoint solves")
+    ap.add_argument("--inc-tol", type=float, default=None,
+                    help="relative tolerance of the incremental solves of a Hessian action "
+                    "(default: --solve-tol)")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     modes = [m for m in args.modes.split(",") if m]
@@ -131,8 +139,11 @@ def main():
     bc0 = bc.homogeneous()
     pde = hm.PDEVariationalProblem(Vh, pde_varf, bc, bc0, is_fwd_linear=True,
                                    symmetric_jacobian=(True if args.symmetric_jacobian else "auto"))
-    pde.set_solvers(hm.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=1e-12,
+    pde.set_solvers(hm.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=args.solve_tol,
                     max_iter=2000, attributes=("solver", "solver_fwd_inc", "solver_adj_inc"))
+    if args.inc_tol is not None:
+        for attr in ("solver_fwd_inc", "solver_adj_inc"):
+            getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol
     if args.probe_tol_single is not None:
         pde.SYMMETRY_PROBE_TOL_SINGLE = args.probe_tol_single
     if args.print_refinement:
@@ -162,6 +173,8 @@ def main():
     hm.parRandom.normal(1.0, direction)
 
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
+           "solve_tol": args.solve_tol, "inc_tol": args.inc_tol if args.inc_tol is not None else args.solve_tol,
+           "cg_reorthogonalize": bool(args.cg_reorth),
            "NE_local": NE, "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
            "device": str(km.device()), "mfem_device": args.device, "modes": {}}
     ref = {}
@@ -249,6 +262,7 @@ def main():
             params["GN_iter"] = 5
             params["cg_max_iter"] = args.cg_max
             params["print_level"] = 0 if args.newton_print else -1
+            params["cg_reorthogonalize"] = bool(args.cg_reorth)
             try:
                 for _ in range(max(1, args.newton_repeats)):
                     pde.invalidate_jacobian()

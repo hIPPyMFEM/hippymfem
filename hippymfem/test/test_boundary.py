@@ -468,7 +468,7 @@ def test_streamed_pass_with_boundary():
                 for k in pairs)
     check("the streamed pass ran with a boundary residual", bool(streamed_used))
     check("streamed and plain linearization points agree with a boundary residual",
-          worst < 1e-12, "(worst rel %.1e)" % worst)
+          worst < K.matrix_tolerance(1e-12), "(worst rel %.1e)" % worst)
 
 
 def main():

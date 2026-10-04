@@ -41,7 +41,7 @@ from hippymfem.common.linalg import to_dense
 from hippymfem.fem.facets import (assemble_facet_matrix, assemble_facet_vector,
                                   avg, avg_grad, facet_values, get_facet_batches,
                                   jump, jump_grad)
-from hippymfem.fem.kernel import QuadratureKernel
+from hippymfem.fem.kernel import QuadratureKernel, matrix_tolerance
 from hippymfem.fem.spaces import FunctionSpace
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
@@ -405,7 +405,7 @@ def test_dg_solve():
     Aref = form.ParallelAssemble()
     a, b = to_dense(A, COMM), to_dense(Aref, COMM)
     e = np.abs(a - b).max() / max(np.abs(b).max(), 1e-300)
-    check("the DG Jacobian matches MFEM's assembly of the same problem", e < 1e-12,
+    check("the DG Jacobian matches MFEM's assembly of the same problem", e < matrix_tolerance(1e-12),
           "(max rel %.2e, %d dofs)" % (e, A.GetGlobalNumRows()))
 
     pde.solveFwd(u, x)

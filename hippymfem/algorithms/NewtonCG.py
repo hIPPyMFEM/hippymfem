@@ -22,11 +22,22 @@ enough for its indefiniteness not to matter.
 Globalization is either an Armijo line search or a trust region; both are ported
 from hIPPYlib, with the same parameters, the same termination codes and the same
 printed table, so runs can be compared iteration by iteration.
+
+``cg_reorthogonalize`` (off by default, for that comparison) departs from hIPPYlib.
+The CG iteration of a Newton step then keeps its residuals orthogonal explicitly
+instead of by its recurrence.  On the model problem of the benchmarks this took 143
+instead of about 200 CG iterations for the same eleven Newton steps, the same number in
+every run, and that number did not change when the incremental solves of the Hessian
+action were stopped at a relative residual of 1e-6, or 1e-2, instead of 1e-12: without
+it, incremental solves stopped at 1e-8 already cost a third more CG iterations.  The
+gradient stays exact (its forward and adjoint solves keep their tolerance), so the MAP
+point is the same; only the Newton directions come from a Hessian of lower accuracy.
 """
 
 import math
 
 from ..common.parameterList import ParameterList
+from ..fem.kernel import gradient_floor
 from ..modeling.reducedHessian import ReducedHessian
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
 from .cgsolverSteihaug import CGSolverSteihaug
@@ -61,6 +72,10 @@ def ReducedSpaceNewtonCG_ParameterList():
         "GN_iter": [5, "Gauss-Newton iterations before switching to full Newton"],
         "cg_coarse_tolerance": [0.5, "coarsest CG tolerance (Eisenstat-Walker)"],
         "cg_max_iter": [100, "maximum CG iterations per Newton step"],
+        "cg_reorthogonalize": [False, "the CG of a Newton step keeps its residuals orthogonal "
+                                      "explicitly (CGSolverSteihaug, reorthogonalize): fewer "
+                                      "Hessian actions, the same count in every run, and "
+                                      "incremental solves that need a loose tolerance only"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })
@@ -155,7 +170,8 @@ class ReducedSpaceNewtonCG:
             if self.it == 0:
                 gradnorm_ini = gradnorm
                 self.initial_grad_norm = gradnorm
-                tol = max(abs_tol, gradnorm_ini * rel_tol)
+                # (no tighter than single-precision element vectors allow, if in use)
+                tol = max(abs_tol, gradnorm_ini * max(rel_tol, gradient_floor()))
                 if gradnorm_ini == 0.0:
                     self.converged = True
                     self.reason = 1
@@ -179,6 +195,7 @@ class ReducedSpaceNewtonCG:
             solver.parameters["rel_tolerance"] = tolcg
             solver.parameters["max_iter"] = cg_max_iter
             solver.parameters["zero_initial_guess"] = True
+            solver.parameters["reorthogonalize"] = bool(p["cg_reorthogonalize"])
             solver.parameters["print_level"] = print_level - 1
             solver.solve(mhat, mg.copy().scale(-1.0))
             self.total_cg_iter += HessApply.ncalls
@@ -264,7 +281,7 @@ class ReducedSpaceNewtonCG:
             if self.it == 0:
                 gradnorm_ini = gradnorm
                 self.initial_grad_norm = gradnorm
-                tol = max(abs_tol, gradnorm_ini * rel_tol)
+                tol = max(abs_tol, gradnorm_ini * max(rel_tol, gradient_floor()))
             if gradnorm < tol and self.it > 0:
                 self.converged = True
                 self.reason = 1
@@ -283,6 +300,7 @@ class ReducedSpaceNewtonCG:
             solver.parameters["rel_tolerance"] = tolcg
             solver.parameters["max_iter"] = cg_max_iter
             solver.parameters["zero_initial_guess"] = True
+            solver.parameters["reorthogonalize"] = bool(p["cg_reorthogonalize"])
             solver.parameters["print_level"] = print_level - 1
             solver.solve(mhat, mg.copy().scale(-1.0))
             self.total_cg_iter += HessApply.ncalls

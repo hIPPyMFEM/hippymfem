@@ -62,6 +62,7 @@ are reused across all steps.
 import numpy as np
 
 from ..common.keepalive import KeepAlive
+from ..fem import kernel as _kernel
 from ..fem.assemble import assemble_matrix, assemble_vector
 from ..fem.bcs import as_bcset
 from ..fem.elementbatch import default_quadrature_degree, get_batches
@@ -398,7 +399,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             self.bc.apply(u)
             r = self._step_residual(ADJ, u, u_old, m, p0, t, ess=self.bc0.ess)
             r0 = r.norm("l2")
-            tol = max(prm["rel_tolerance"] * r0, prm["abs_tolerance"])
+            tol = max(max(prm["rel_tolerance"], _kernel.residual_floor()) * r0,
+                      prm["abs_tolerance"])
             converged = False
             for _ in range(maxit):
                 if jac is not None and jac[1]:

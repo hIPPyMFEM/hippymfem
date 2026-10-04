@@ -106,6 +106,24 @@ def residual_floor():
     return 1e-5 if vector_precision() == "fp32" else 0.0
 
 
+def gradient_floor():
+    """The relative size below which the norm of a reduced gradient cannot be driven when
+    the element vectors are in single precision: the state, the adjoint and the gradient
+    are then computed to about that accuracy (more on a fine mesh, where the errors of the
+    two solves grow with the condition number), and an optimizer that asks for less ends
+    in a line search that cannot find a decrease.  Zero in double precision and in the
+    mixed mode."""
+    return 1e-4 if vector_precision() == "fp32" else 0.0
+
+
+def matrix_tolerance(tol, single=1e-5):
+    """A tolerance for a comparison that involves assembled element matrices: ``tol`` when
+    they are computed in double precision.  In single precision an entry carries a relative
+    error near ``FP32_EPS`` and a product with the matrix somewhat more, by cancellation,
+    so that no such comparison holds tighter than ``single``."""
+    return max(float(tol), float(single)) if matrix_precision() == "fp32" else float(tol)
+
+
 def set_precision(mode):
     """Choose the element-kernel precision (``"fp64"``, ``"mixed"`` or ``"fp32"``, see
     :data:`PRECISION`); returns the old value.

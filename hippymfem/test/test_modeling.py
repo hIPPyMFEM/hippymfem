@@ -17,6 +17,7 @@ import jax.numpy as jnp
 
 import hippymfem as hm
 from hippymfem.common.linalg import operator_to_dense
+from hippymfem.fem.kernel import matrix_tolerance
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
 COMM = MPI.COMM_WORLD
@@ -508,6 +509,9 @@ def test_apply_ij_at():
 
     pmesh = mesh2d(6)
     rng = np.random.default_rng(5)
+    # the products through the kernels are double precision in the mixed mode, the
+    # assembled blocks single
+    mtol = matrix_tolerance(1e-12)
 
     def varf(u, m, p, x):
         return (jnp.exp(m.val) * (1.0 + u.val ** 2) * hm.inner(u.grad, p.grad)
@@ -552,7 +556,7 @@ def test_apply_ij_at():
             diff = got.copy()
             diff.axpy(-1.0, ref)
             worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
-        check("matrix-free = assembled, %s" % name, worst < 1e-12, "(rel %.1e)" % worst)
+        check("matrix-free = assembled, %s" % name, worst < mtol, "(rel %.1e)" % worst)
         # a linearization point with every block, or the parameter's, left to the
         # kernels gives the same products through apply_ij
         for gn in (False, True):
@@ -571,7 +575,7 @@ def test_apply_ij_at():
                     worst = max(worst, diff.norm("l2") / scale if scale > 0 else got.norm("l2"))
                 check("matrix-free point (%s%s) = assembled, %s"
                       % ("all" if mode is True else "parameter", ", Gauss-Newton" if gn else "",
-                         name), worst < 1e-12, "(rel %.1e)" % worst)
+                         name), worst < mtol, "(rel %.1e)" % worst)
     # the reduced Hessian of an inverse problem at a matrix-free point
     model, Vhm, mtrue, _u, _B = build_inverse_problem(n=8, order=2, ntargets=16)
     xm = model.generate_vector()
@@ -589,7 +593,7 @@ def test_apply_ij_at():
     diff = Hd[True].copy()
     diff.axpy(-1.0, Hd[False])
     e = diff.norm("l2") / Hd[False].norm("l2")
-    check("reduced Hessian at a matrix-free point = assembled", e < 1e-12, "(rel %.1e)" % e)
+    check("reduced Hessian at a matrix-free point = assembled", e < mtol, "(rel %.1e)" % e)
     # one device copy of a group's geometry, whichever problem's kernel asks
     other = hm.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
                                      is_fwd_linear=False)

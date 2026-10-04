@@ -26,6 +26,7 @@ mesh-independent, for the same reason it preconditions Newton-CG.
 import numpy as np
 
 from ..common.parameterList import ParameterList
+from ..fem.kernel import gradient_floor
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
 from .NewtonCG import LS_ParameterList
 from .linesearch import armijo_backtrack
@@ -223,7 +224,8 @@ class BFGS:
             gradnorm = self.model.evalGradientParameter(x, mg)
             if self.it == 0:
                 gradnorm_ini = gradnorm
-                tol = max(p["abs_tolerance"], gradnorm_ini * p["rel_tolerance"])
+                tol = max(p["abs_tolerance"],
+                          gradnorm_ini * max(p["rel_tolerance"], gradient_floor()))
             else:
                 secant_s = mhat.copy().scale(alpha)
                 secant_y = mg.copy().axpy(-1.0, mg_old)

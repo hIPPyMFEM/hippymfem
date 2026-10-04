@@ -17,6 +17,7 @@ import hippymfem as hp
 from hippymfem.algorithms.linSolvers import KrylovSolver, LUSolver
 from hippymfem.fem.bcs import BCSet, DirichletBC
 from hippymfem.fem.jaxops import inner
+from hippymfem.fem.kernel import matrix_tolerance
 from hippymfem.fem.spaces import FunctionSpace
 from hippymfem.modeling.PDEVariationalProblem import PDEVariationalProblem
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
@@ -108,7 +109,9 @@ def test_adjoint_and_incremental():
     chk = Vu.vector()
     pde.apply_ij(STATE, ADJOINT, p, chk)
     e = chk.copy().axpy(-1.0, rhs).norm("l2") / max(rhs.norm("l2"), 1e-300)
-    check("A^T p == adj_rhs", e < 1e-9, "(%.2e)" % e)
+    # the adjoint solves the equation of the double-precision operator; the assembled
+    # matrix applied here is the single-precision one in the mixed mode
+    check("A^T p == adj_rhs", e < matrix_tolerance(1e-9), "(%.2e)" % e)
 
     # incremental forward: A du == rhs
     du = Vu.vector()

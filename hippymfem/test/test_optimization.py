@@ -178,6 +178,89 @@ def test_cg_steihaug():
           s5.reasonid == 2 and e5 < 1e-15, "(reason %d, |x - b|/|b| %.1e)" % (s5.reasonid, e5))
 
 
+class _NoisyOp(_DenseOp):
+    """``A`` with an error that is not symmetric and not the same from one product to
+    the next, as a Hessian action computed with inexact solves has."""
+
+    def __init__(self, A, comm, level, seed=11):
+        super(_NoisyOp, self).__init__(A, comm)
+        self.level = float(level)
+        self.rng = np.random.default_rng(seed)
+        self.scale = float(np.linalg.norm(self.Adense, 2))
+
+    def mult(self, x, y):
+        full = np.concatenate(self.comm.allgather(x.array))
+        r = self.Adense @ full
+        if self.comm.rank == 0:
+            noise = self.rng.standard_normal(r.shape)
+            noise *= self.level * self.scale * np.linalg.norm(full) / np.linalg.norm(noise)
+        else:
+            noise = None
+        r = r + self.comm.bcast(noise, root=0)
+        lo, hi = y.owner_range
+        y.array[:] = r[lo:hi]
+        return y
+
+
+def test_cg_reorthogonalize():
+    """CG with its residuals kept orthogonal explicitly.
+
+    The spectrum is that of a prior-preconditioned Hessian: a cluster at one and thirty
+    large, well separated eigenvalues, so that exact arithmetic needs thirty-one
+    iterations.  The recurrence loses that to rounding; explicit orthogonalization keeps
+    it, also when every product carries an error far above rounding.
+    """
+    if RANK == 0:
+        print("CGSolverSteihaug with reorthogonalization")
+    n, nlarge = 150, 30
+    rng = np.random.default_rng(9)
+    Q = np.linalg.qr(rng.standard_normal((n, n)))[0]
+    lam = np.ones(n)
+    lam[:nlarge] = np.logspace(1.0, 7.0, nlarge)
+    A = Q @ np.diag(lam) @ Q.T
+    A = 0.5 * (A + A.T)
+    op = _DenseOp(A, COMM)
+    b = op.generate_vector(0)
+    hm.parRandom.set_seed(4)
+    hm.parRandom.normal(1.0, b)
+    bfull = np.concatenate(COMM.allgather(b.array))
+    exact = np.linalg.solve(A, bfull)
+
+    def run(operator, reorth, tol=1e-8):
+        solver = hm.CGSolverSteihaug(comm=COMM)
+        solver.set_operator(operator)
+        solver.set_preconditioner(_Identity(operator))
+        solver.parameters["rel_tolerance"] = tol
+        solver.parameters["max_iter"] = 400
+        solver.parameters["print_level"] = -1
+        solver.parameters["reorthogonalize"] = reorth
+        x = operator.generate_vector(0)
+        solver.solve(x, b)
+        got = np.concatenate(COMM.allgather(x.array))
+        return solver, np.linalg.norm(got - exact) / np.linalg.norm(exact)
+
+    plain, e_plain = run(op, False)
+    reo, e_reo = run(op, True)
+    check("reorthogonalized CG takes the iterations of exact arithmetic",
+          reo.converged and reo.iter <= nlarge + 2 and e_reo < 1e-6,
+          "(%d iterations for %d distinct eigenvalues, error %.1e)" % (reo.iter, nlarge + 1, e_reo))
+    check("the recurrence alone takes more", plain.converged and plain.iter > reo.iter,
+          "(%d against %d, error %.1e)" % (plain.iter, reo.iter, e_plain))
+    # an operator applied with an error of 1e-9 of its norm in every product, 10^7 times
+    # rounding: the same count, and a solution as accurate as such an operator defines it
+    # (the error of a product over the smallest eigenvalue); the recurrence alone is
+    # delayed further
+    level = 1e-9
+    noisy, e_noisy = run(_NoisyOp(A, COMM, level), True, tol=1e-4)
+    clean, e_clean = run(op, True, tol=1e-4)
+    worse, _ = run(_NoisyOp(A, COMM, level), False, tol=1e-4)
+    check("with an inexact operator the reorthogonalized count stays",
+          noisy.converged and abs(noisy.iter - clean.iter) <= 1 and e_noisy < level * lam.max() / lam.min(),
+          "(%d with an error of %.0e per product, %d without, solution to %.1e; the recurrence "
+          "alone: %d%s)" % (noisy.iter, level, clean.iter, e_noisy, worse.iter,
+                            "" if worse.converged else ", not converged"))
+
+
 def test_bfgs_operator():
     """The damped BFGS update needs ``H y``, and the two-loop recursion computing it
     used the output vector as its own work vector, so ``H0inv.solve`` got its input as
@@ -482,6 +565,56 @@ def test_newton_cg():
     return model, Vh, mtrue, x, solver
 
 
+def test_newton_cg_reorthogonalized():
+    """Newton-CG whose CG keeps its residuals orthogonal explicitly: the same MAP point
+    in no more Hessian actions, and the same count when the incremental solves of the
+    Hessian action stop at 1e-5 instead of at round-off."""
+    if RANK == 0:
+        print("ReducedSpaceNewtonCG with a reorthogonalized CG")
+    model, Vh, mtrue, B = build_problem(n=16, order=2, ntargets=50)
+    pde = model.problem
+
+    def run(reorth, inc_tol=None):
+        if inc_tol is not None:
+            for a in ("solver_fwd_inc", "solver_adj_inc"):
+                s = hm.KrylovSolver(COMM, "cg", "amg")
+                s.parameters["rel_tolerance"] = inc_tol
+                s.parameters["max_iter"] = 2000
+                setattr(pde, a, s)
+            pde.invalidate_jacobian()
+            pde.release_linearization_point()
+        params = hm.ReducedSpaceNewtonCG_ParameterList()
+        params["rel_tolerance"] = 1e-8
+        params["abs_tolerance"] = 1e-12
+        params["max_iter"] = 40
+        params["GN_iter"] = 5
+        params["print_level"] = -1
+        params["cg_reorthogonalize"] = reorth
+        solver = hm.ReducedSpaceNewtonCG(model, params)
+        x = solver.solve([None, model.prior.mean.copy(), None])
+        return solver, x[PARAMETER].copy()
+
+    plain, m_plain = run(False)
+    reo, m_reo = run(True)
+    loose, m_loose = run(True, inc_tol=1e-5)
+    scale = m_plain.norm("l2")
+    e_reo = m_reo.copy().axpy(-1.0, m_plain).norm("l2") / scale
+    e_loose = m_loose.copy().axpy(-1.0, m_plain).norm("l2") / scale
+    check("reorthogonalized Newton-CG converged to the same MAP point",
+          reo.converged and e_reo < 1e-5,
+          "(%d Newton and %d CG iterations, against %d and %d; MAP differs by %.1e)"
+          % (reo.it, reo.total_cg_iter, plain.it, plain.total_cg_iter, e_reo))
+    # (a small problem, on which the recurrence loses little; the Newton paths differ)
+    check("and in about as many Hessian actions, or fewer",
+          reo.total_cg_iter <= 1.1 * plain.total_cg_iter,
+          "(%d against %d)" % (reo.total_cg_iter, plain.total_cg_iter))
+    check("incremental solves stopped at 1e-5 leave the MAP point and the count",
+          loose.converged and e_loose < 1e-5 and loose.it == reo.it
+          and abs(loose.total_cg_iter - reo.total_cg_iter) <= max(2, reo.total_cg_iter // 20),
+          "(%d Newton and %d CG iterations; MAP differs by %.1e)"
+          % (loose.it, loose.total_cg_iter, e_loose))
+
+
 def test_map_recovers_smooth_truth():
     """With a recoverable (smooth) truth, the MAP point must beat the prior mean."""
     if RANK == 0:
@@ -718,11 +851,13 @@ if __name__ == "__main__":
         print("hIPPyMFEM optimization and posterior tests on %d rank(s)" % NP)
         print("=" * 74)
     test_cg_steihaug()
+    test_cg_reorthogonalize()
     test_randomized_eig()
     test_low_rank_operator()
     test_randomized_svd()
     test_trace_estimator()
     test_trust_region()
+    test_newton_cg_reorthogonalized()
     test_bfgs_operator()
     test_bfgs()
     test_map_recovers_smooth_truth()

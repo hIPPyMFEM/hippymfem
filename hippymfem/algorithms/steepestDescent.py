@@ -18,6 +18,7 @@ gives steps whose size changes with refinement.
 """
 
 from ..common.parameterList import ParameterList
+from ..fem.kernel import gradient_floor
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
 from .linesearch import armijo_backtrack
 
@@ -78,7 +79,8 @@ class SteepestDescent:
             gradnorm = self.model.evalGradientParameter(x, mg)
             if gradnorm_ini is None:
                 gradnorm_ini = gradnorm
-                tol = max(p["abs_tolerance"], gradnorm_ini * p["rel_tolerance"])
+                tol = max(p["abs_tolerance"],
+                          gradnorm_ini * max(p["rel_tolerance"], gradient_floor()))
             if gradnorm < tol and self.it > 0:
                 self.converged = True
                 self.reason = 1
