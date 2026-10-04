@@ -92,6 +92,14 @@ def main():
                     help="the CG of a Newton step keeps its residuals orthogonal explicitly (the library's "
                     "default since October 2026); --no-cg-reorth is the recurrence alone, with which the "
                     "records of the paper were taken")
+    ap.add_argument("--cg-prec-tol", type=float, default=None,
+                    help="accuracy of the prior's solves where they precondition the CG of a Newton step, "
+                    "as a fraction of that CG's tolerance (cg_preconditioner_tolerance; 0 = the solves as "
+                    "they are, as in the records of the paper)")
+    ap.add_argument("--cg-relax", type=float, default=None,
+                    help="the incremental solves stop at this times the CG's tolerance times |r_0|/|r_k| "
+                    "where that is looser than --inc-tol (cg_hessian_relaxation; 0 = --inc-tol throughout, "
+                    "as in the records of the paper)")
     ap.add_argument("--inc-tol", type=float, default=None,
                     help="relative tolerance of the incremental solves during the Newton-CG iteration "
                     "(default: that of the forward solve, 1e-12; 1e-6 is enough with --cg-reorth)")
@@ -252,6 +260,10 @@ def main():
     params["print_level"] = -1
     if args.cg_reorth is not None:
         params["cg_reorthogonalize"] = bool(args.cg_reorth)
+    if args.cg_prec_tol is not None:
+        params["cg_preconditioner_tolerance"] = args.cg_prec_tol
+    if args.cg_relax is not None:
+        params["cg_hessian_relaxation"] = args.cg_relax
     if args.inc_tol is not None:
         for attr in ("solver_fwd_inc", "solver_adj_inc"):
             getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol

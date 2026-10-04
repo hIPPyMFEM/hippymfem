@@ -107,13 +107,19 @@ class ReducedMap(SnakeCamel):
         self._set_functional_point(x)
         return self
 
-    def solveFwdIncremental(self, sol, rhs):
+    def solveFwdIncremental(self, sol, rhs, rel_tolerance=None):
+        """The incremental forward solve; ``rel_tolerance`` loosens the solver's own
+        tolerance for this solve (a problem whose ``solveIncremental`` takes it)."""
         self.n_inc_solve += 1
-        return self.problem.solveIncremental(sol, rhs, False)
+        if rel_tolerance is None:
+            return self.problem.solveIncremental(sol, rhs, False)
+        return self.problem.solveIncremental(sol, rhs, False, rel_tolerance=rel_tolerance)
 
-    def solveAdjIncremental(self, sol, rhs):
+    def solveAdjIncremental(self, sol, rhs, rel_tolerance=None):
         self.n_inc_solve += 1
-        return self.problem.solveIncremental(sol, rhs, True)
+        if rel_tolerance is None:
+            return self.problem.solveIncremental(sol, rhs, True)
+        return self.problem.solveIncremental(sol, rhs, True, rel_tolerance=rel_tolerance)
 
     # ------------------------------------------------------------------- blocks
     def applyC(self, dm, out):
@@ -225,7 +231,17 @@ class Model(ReducedMap):
     def applyR(self, dm, out):
         return self.prior.R.mult(dm, out)
 
-    def Rsolver(self):
+    def Rsolver(self, tolerance=None):
+        """The solver of the prior's precision.  With ``tolerance``, as the
+        preconditioner of a Krylov iteration: its solves stopped at that relative
+        tolerance (``prior.getHessianPreconditioner``)."""
+        if tolerance:
+            get = getattr(self.prior, "getHessianPreconditioner", None)
+            if get is not None:
+                try:
+                    return get(tolerance)
+                except TypeError:          # a prior written before the argument existed
+                    pass
         return self.prior.Rsolver
 
 

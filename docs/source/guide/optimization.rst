@@ -80,6 +80,46 @@ thirteenth Newton step, so ``1e-6`` is the tolerance to use.)  And single precis
 solves (:ref:`single-precision` in the GPU guide), since their rounding no longer
 disturbs the iteration.
 
+Two more solves inside that CG are cheaper than their tolerances say.
+
+**The prior's solves, where they precondition the CG, stop at 1e-6**
+(``cg_preconditioner_tolerance``, the default).  On the model problem that is eleven CG
+iterations for each of the two solves of :math:`R^{-1} = A^{-1} M A^{-1}` instead of
+twenty-one, with the same Newton and CG counts and the same gradient norm after every
+Newton step to four digits; with single-precision solves the Newton-CG solve took
+23.6 s instead of 25.3 s on an H100 and 43.2 s instead of 46.1 s on an L40S.  It cannot
+be much looser.  A solve stopped at a tolerance is not one linear map of its right-hand
+side, so what the orthogonalization removes from a residual is then not all error of
+the iterate, and the residual the CG stops on is off by about that tolerance times the
+first residual (times the iteration count to the power 1.5): at 1e-5 the twelfth
+Newton step of the model problem no longer met its tolerance.  The library never uses
+more than a thousandth of the CG's own tolerance, and it leaves the solves as they are
+without ``cg_reorthogonalize`` and in the trust-region method; ``0`` leaves them as
+they are everywhere.
+
+**The Hessian actions may lose accuracy as the CG converges**
+(``cg_hessian_relaxation``, off by default).  The error of a product enters the
+residual in proportion to the step it multiplies, and the steps shrink with the
+residual (inexact Krylov methods).  With ``cg_hessian_relaxation = c`` the two
+incremental solves of the action at CG iteration ``k`` stop at ``c`` times the CG's
+tolerance times :math:`\|r_0\| / \|r_k\|`, where that is looser than their own
+tolerance.  The prior's part of the action keeps its accuracy: a relative error of its
+mass solve is the same relative error of :math:`R x`, with nothing to damp it.  With
+``c = 1e-2`` the incremental solves of the model problem took 6.5 iterations on average
+instead of eleven, in the same Newton and CG counts at 32\ :sup:`3` and 64\ :sup:`3` with
+the gradient norm after each Newton step within two percent, and the Newton-CG solve
+with single-precision solves took 32.4 s instead of 39.9 s on an L40S; with
+``c = 1e-1`` the iteration took a different path (twelve Newton steps instead of eleven
+at 32\ :sup:`3`).
+
+**Counting the last Newton step.**  The twelve steps of the model problem at
+64\ :sup:`3` end with a gradient norm of 0.0976 against a tolerance of 0.1158, and the CG
+of the twelfth step passes its own test at its 33rd iteration by less than a percent.
+A change of the path of that size (the prior's solves at 1e-4, a relaxation of 3e-3,
+another GPU) ends that CG at its 32nd iteration and the step at 0.127, and a thirteenth
+step of 37 CG iterations follows.  Thirteen steps and 167 CG iterations in a table are
+then not a slower method: compare the gradient norms step by step.
+
 ``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by
 step.  The low-rank eigensolvers of the Laplace approximation are not Krylov
 recurrences and never had this sensitivity; their Hessian actions want incremental

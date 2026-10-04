@@ -366,7 +366,32 @@ functional to nine digits; the first took 193 to 210 CG iterations:
    ==================================================  ========  ========  ===========  ================
 
 The last row is 2.7, 3.7, 3.9 and 3.2 times faster than the first, the one before it
-2.6, 3.5, 3.6 and 3.1 times.  What single precision itself gives, stage by stage: double
+2.6, 3.5, 3.6 and 3.1 times.  Remeasured on 4 October with the solves that the CG of a
+Newton step needs made cheaper (:doc:`optimization`; the median of three solves after
+a first one; double precision throughout against single-precision element matrices and
+solves):
+
+.. table::
+   :widths: auto
+
+   ==================================================  ==================  ==================
+   ..                                                  H100                L40S
+   ==================================================  ==================  ==================
+   the prior's solves to 1e-12 in the preconditioner   29.9 / 25.3 s       \- / 46.1 s
+   to 1e-6 (``cg_preconditioner_tolerance``, default)  27.6 / 23.6 s       62.6 / 43.2 s
+   and the index arrays on the device                  25.0 / 21.1 s       \- / 39.9 s
+   and Hessian actions relaxed (``1e-2``)              \- / 18.0 s         \- / 32.4 s
+   Hessian actions relaxed, index arrays uploaded      22.8 / 20.1 s       \- / \-
+   ==================================================  ==================  ==================
+
+All with twelve Newton steps and 131 CG iterations in the last solve of each run (a
+change of a fraction of a percent in the path can add a thirteenth step to this
+problem, :doc:`optimization`).  So on the L40S single precision solved for the MAP
+point 1.45 times faster than double precision with the same settings, with all three
+of these 1.9 times faster than double precision with the default ones, and 5.0 times
+faster than the library of 2 October; on the H100 1.17, 1.5 and 3.5 times.
+
+What single precision itself gives, stage by stage: double
 precision throughout against single-precision element matrices and solves, the solves
 in both by hypre's PCG, the incremental ones to 1e-6 and to the 1e-5 that single
 precision reaches:
@@ -423,7 +448,14 @@ with single-precision element matrices and solves (``benchmarks/bench_precision.
 What lies outside the pool is hypre's matrices, hierarchies and vectors, MFEM and the
 CUDA context; a seventh of it goes.  The other blocks of a linearization point stay in
 double precision (for a forward problem that is linear in the state these are ``C`` and
-``W_um``, 0.4 GB each at this size), and so do the accumulators of the assembly.
+``W_um``, 0.4 GB each at this size).  The Jacobian's accumulator does not.  Where the
+elements are assembled a chunk at a time, the route of a mesh that does not fit the
+card whole, a matrix that goes to the single-precision library is accumulated in single
+precision (``HIPPYMFEM_SINGLE_ACCUMULATE``, on): the accumulator, the largest
+allocation of an assembly, takes four bytes a nonzero instead of eight, and its values
+pass into the matrix as they are, with no rounded copy in between.  Summed term by term
+in single precision instead of rounded once, the matrix differs in the last bit of some
+entries (a product by 4e-8).
 
 **At a larger size.**  At 128\ :sup:`3` (17.0 million state dofs) on four L40S the same
 solve took 240 s in double precision and 162 s with single-precision element matrices
@@ -433,14 +465,23 @@ same cost in ten digits.  A Hessian action took 0.72 and 0.43 s.  The busiest ca
 outside the element kernels' pool.
 
 A run that releases each linearization point before the next
-(``release_linearization_on_move``) holds less at its peak, and there the
-single-precision solves needed more, not less: in the two Newton steps of
+(``release_linearization_on_move``) holds less at its peak.  In the two Newton steps of
 ``benchmarks/bench_newton_device.py --release-linearization`` at 128\ :sup:`3` the
-busiest of four Blackwell instances held 21.9 to 23.4 GiB against 19.7 GiB in double
-precision (the steps took 28.5 s in double precision, 19.5 s with the single-precision
-solves and 13.5 s with the single-precision element matrices as well).  What coexists
-at that peak was not taken apart.  The likely place is the assembly, which holds the
-double-precision accumulator, its rounded copy and the new matrix together.
+busiest of four Blackwell instances held 20.4 GiB in double precision and 18.3 GiB with
+single-precision element matrices and solves, and the two steps took 28.3 and 13.2 s.
+With the accumulator in double precision and a rounded copy of it, as at first, the same
+run held 21.9 GiB, more than in double precision: the copy took the element kernels'
+arena past the size it had, and the arena grows by a whole region at a time, so that a
+few hundred megabytes more can show as gigabytes on the card.
+
+With the memory that single precision frees, the index arrays of the assembly can stay
+on the device (``HIPPYMFEM_DEVICE_PATTERN=1``, :ref:`gpu-memory`), which saves their
+upload from the CPU at every assembly: at 64\ :sup:`3` on the H100 the forward solve took
+0.26 s instead of 0.39 s and the Newton-CG solve 21.1 s instead of 23.6 s (25.0 s
+instead of 27.6 s in double precision), on the L40S 39.9 s instead of 43.2 s.  It is a
+trade, and at a larger size an expensive one: in the two Newton steps at
+128\ :sup:`3` on four Blackwell instances above it saved one second of 13.2 and took the
+busiest instance from 18.3 to 26.2 GiB.
 
 One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
 directions, but the eigenpairs of a Laplace approximation come out to about that

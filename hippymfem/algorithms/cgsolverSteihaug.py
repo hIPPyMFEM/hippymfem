@@ -61,6 +61,10 @@ def CGSolverSteihaug_ParameterList():
                                    "explicitly: the iteration count of exact arithmetic, also "
                                    "for an operator applied inexactly; two stored vectors per "
                                    "iteration"],
+        "relax_operator": [0.0, "an operator that can be applied to a given accuracy "
+                                "(set_accuracy) is asked for this times rel_tolerance times "
+                                "|r_0| / |r_k| at iteration k: less accurate as the "
+                                "iteration converges; 0: its own accuracy throughout"],
     })
 
 
@@ -212,6 +216,21 @@ class CGSolverSteihaug:
             print("   CG %3d  (B r, r) = %.6e" % (it, nom), flush=True)
 
     def solve(self, x, b):
+        """Solve; returns the iteration count.  With ``relax_operator`` the accuracy
+        asked of the operator is put back to its own when the solve ends."""
+        relax = float(self.parameters["relax_operator"] or 0.0)
+        self._accuracy = None
+        if relax > 0.0 and hasattr(self.A, "set_accuracy"):
+            scale = relax * float(self.parameters["rel_tolerance"])
+            self._accuracy = lambda ratio: self.A.set_accuracy(scale * ratio)
+        try:
+            return self._solve(x, b)
+        finally:
+            if self._accuracy is not None:
+                self.A.set_accuracy(None)
+                self._accuracy = None
+
+    def _solve(self, x, b):
         self.iter = 0
         self.converged = False
         self.reasonid = 0
@@ -251,6 +270,11 @@ class CGSolverSteihaug:
             self._report()
             return self.iter
 
+        # The error of a product enters the residual in proportion to the step, which
+        # shrinks with the residual: a product may be less accurate by the factor by
+        # which the residual has come down (inexact Krylov iterations).
+        if self._accuracy is not None:
+            self._accuracy(1.0)
         self.A.mult(self.d, self.Ad)
         den = self.Ad.inner(self.d)
 
@@ -296,6 +320,8 @@ class CGSolverSteihaug:
             beta = betanom / nom
             self.d.scale(beta)
             self.d.axpy(1.0, self.z)
+            if self._accuracy is not None:
+                self._accuracy(math.sqrt(nom0 / betanom))
             self.A.mult(self.d, self.Ad)
             den = self.d.inner(self.Ad)
 

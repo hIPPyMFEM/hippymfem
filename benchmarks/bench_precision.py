@@ -172,12 +172,23 @@ def main():
                     help="the CG of a Newton step keeps its residuals orthogonal explicitly "
                     "(cg_reorthogonalize, the library's default); --no-cg-reorth is the recurrence alone, "
                     "which needs incremental solves to round-off")
+    ap.add_argument("--cg-prec-tol", type=float, default=None,
+                    help="accuracy of the prior's solves where they precondition the CG of a Newton step, "
+                    "as a fraction of that CG's tolerance (cg_preconditioner_tolerance; 0 = the solves as "
+                    "they are)")
+    ap.add_argument("--cg-relax", type=float, default=None,
+                    help="the incremental solves stop at this times the CG's tolerance times |r_0|/|r_k| "
+                    "where that is looser than --inc-tol (cg_hessian_relaxation; 0 = --inc-tol throughout)")
     ap.add_argument("--single-goal", type=float, default=None,
                     help="with a single-precision hypre: the relative residual the forward and adjoint "
                     "solves are refined to (PDEVariationalProblem.SINGLE_REFINE_GOAL; 1e-9 is two passes)")
     ap.add_argument("--solves-only", action="store_true",
                     help="skip the two stages that time the Jacobian's kernel and assembly alone: for the "
                     "device memory that the solves themselves need")
+    ap.add_argument("--release-linearization", action="store_true",
+                    help="release a linearization point when the parameter moves, before the next "
+                    "Jacobian is assembled (release_linearization_on_move): the lower peak of device "
+                    "memory, for a size that does not fit otherwise")
     ap.add_argument("--pool-peaks", action="store_true",
                     help="print the largest use of the element kernels' pool after every stage")
     ap.add_argument("--solve-tol", type=float, default=1e-12,
@@ -208,7 +219,8 @@ def main():
     bc = hm.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
     bc0 = bc.homogeneous()
     pde = hm.PDEVariationalProblem(Vh, pde_varf, bc, bc0, is_fwd_linear=True,
-                                   symmetric_jacobian=(True if args.symmetric_jacobian else "auto"))
+                                   symmetric_jacobian=(True if args.symmetric_jacobian else "auto"),
+                                   release_linearization_on_move=args.release_linearization)
     pde.set_solvers(hm.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=args.solve_tol,
                     max_iter=2000, attributes=("solver", "solver_fwd_inc", "solver_adj_inc"))
     if args.inc_tol is not None:
@@ -246,7 +258,11 @@ def main():
 
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "solve_tol": args.solve_tol, "inc_tol": args.inc_tol if args.inc_tol is not None else args.solve_tol,
-           "single_goal": args.single_goal,
+           "single_goal": args.single_goal, "release_linearization": bool(args.release_linearization),
+           "cg_preconditioner_tolerance": (hm.ReducedSpaceNewtonCG_ParameterList()["cg_preconditioner_tolerance"]
+                                           if args.cg_prec_tol is None else args.cg_prec_tol),
+           "cg_hessian_relaxation": (hm.ReducedSpaceNewtonCG_ParameterList()["cg_hessian_relaxation"]
+                                     if args.cg_relax is None else args.cg_relax),
            "cg_reorthogonalize": bool(hm.ReducedSpaceNewtonCG_ParameterList()["cg_reorthogonalize"]
                                       if args.cg_reorth is None else args.cg_reorth),
            "NE_local": NE, "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
@@ -361,6 +377,10 @@ def main():
             params["print_level"] = 0 if args.newton_print else -1
             if args.cg_reorth is not None:
                 params["cg_reorthogonalize"] = bool(args.cg_reorth)
+            if args.cg_prec_tol is not None:
+                params["cg_preconditioner_tolerance"] = args.cg_prec_tol
+            if args.cg_relax is not None:
+                params["cg_hessian_relaxation"] = args.cg_relax
             try:
                 for _ in range(max(1, args.newton_repeats)):
                     pde.invalidate_jacobian()
@@ -375,6 +395,7 @@ def main():
                         wall, xs = clock(lambda: solver.solve([None, prior.mean.copy(), None]))
                     if first is None:
                         out["newton_first_wall"] = wall
+                    out.setdefault("newton_walls", []).append(wall)
             except Exception as exc:                                  # noqa: BLE001
                 out["newton"] = {"failed": str(exc).splitlines()[0][:200]}
                 say("  Newton-CG: FAILED -- %s" % out["newton"]["failed"])
@@ -388,7 +409,10 @@ def main():
                 "converged": bool(solver.converged),
                 "err_map": 0.0 if mode == "fp64" else (rel(mmap, ref["m"]) if "m" in ref else None),
                 "err_truth": rel(mmap, mtrue),
-                "calls": {k: pde.n_calls[k] - calls0.get(k, 0) for k in pde.n_calls}}
+                "calls": {k: pde.n_calls[k] - calls0.get(k, 0) for k in pde.n_calls},
+                # every repeat (the first compiles), and the median of those after it
+                "walls": list(out.get("newton_walls", [])),
+                "wall_median": float(np.median(out["newton_walls"][1:] or out["newton_walls"]))}
             # device memory of hypre (both libraries allocate through the library's pool)
             # and of the element kernels, the largest over the ranks
             pool = mfemconfig.HYPRE_POOL
@@ -415,6 +439,9 @@ def main():
                 % (r["wall"], r["newton"], r["cg"], r["J"], r["gradnorm"], r["reason"],
                    "--" if r["err_map"] is None else "%.2e" % r["err_map"],
                    ", ".join("%s %d" % kv for kv in sorted(r["calls"].items()))))
+            if len(r["walls"]) > 2:
+                say("  repeats after the first: %s s, median %.2f s"
+                    % (", ".join("%.2f" % w for w in r["walls"][1:]), r["wall_median"]))
     km.set_precision("fp64")
 
     base = rec["modes"].get("fp64")

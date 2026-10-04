@@ -34,6 +34,13 @@ recurrence, incremental solves stopped at 1e-8 already cost a third more CG iter
 The gradient stays exact (its forward and adjoint solves keep their tolerance), so the
 MAP point is the same; only the Newton directions come from a Hessian of lower accuracy.
 ``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by step.
+
+Two parameters make the solves inside that CG cheaper.  ``cg_preconditioner_tolerance``
+(1e-6 by default) stops the prior's solves where they precondition it; ``0`` leaves
+them at their own tolerance, as hIPPYlib does.  ``cg_hessian_relaxation`` (off by
+default) lets the incremental solves of a Hessian action lose accuracy as the CG
+converges.  Both are described, with what they save and why they cannot go further,
+in the guide (``docs/source/guide/optimization.rst``).
 """
 
 import math
@@ -79,6 +86,17 @@ def ReducedSpaceNewtonCG_ParameterList():
                                      "Hessian actions, the same count in every run, and "
                                      "incremental solves that need a loose tolerance only; "
                                      "False is hIPPYlib's iteration"],
+        "cg_preconditioner_tolerance": [1e-6, "relative tolerance of the prior's solves "
+                                               "where they precondition the CG of a Newton "
+                                               "step (line search with cg_reorthogonalize), "
+                                               "if looser than their own and at most a "
+                                               "thousandth of that CG's tolerance; 0: "
+                                               "their own"],
+        "cg_hessian_relaxation": [0.0, "the incremental solves of a Hessian action stop "
+                                        "at this times (the CG's tolerance) times |r_0| / "
+                                        "|r_k| at CG iteration k, where that is looser "
+                                        "than their own tolerance (line search); 0: "
+                                        "their own tolerance throughout"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })
@@ -119,6 +137,27 @@ class ReducedSpaceNewtonCG:
     @property
     def comm(self):
         return self.model.prior.comm
+
+    def _cg_preconditioner(self, tolcg):
+        """The preconditioner of the CG of a Newton step that stops at ``tolcg``.
+
+        The prior's precision solver, with its Krylov solves stopped at
+        ``cg_preconditioner_tolerance`` where that is looser than their own
+        (``prior.getHessianPreconditioner``).  A solve stopped at a tolerance is not
+        the same linear map at every application, and what the reorthogonalized CG
+        then removes from a residual is not all error of the iterate: the residual it
+        stops on is off by about that tolerance times the residual it started from.
+        The tolerance is therefore never more than a thousandth of ``tolcg``, and the
+        solves are left as they are without ``cg_reorthogonalize``."""
+        p = self.parameters
+        tol = float(p["cg_preconditioner_tolerance"] or 0.0) if p["cg_reorthogonalize"] else 0.0
+        tol = min(tol, 1e-3 * float(tolcg))
+        if tol > 0.0:
+            try:
+                return self.model.Rsolver(tol)
+            except TypeError:              # a model whose Rsolver takes no argument
+                pass
+        return self.model.Rsolver()
 
     def _rank0(self):
         return self.comm is None or self.comm.rank == 0
@@ -194,7 +233,8 @@ class ReducedSpaceNewtonCG:
             HessApply = ReducedHessian(self.model)
             solver = CGSolverSteihaug(comm=self.comm)
             solver.set_operator(HessApply)
-            solver.set_preconditioner(self.model.Rsolver())
+            solver.set_preconditioner(self._cg_preconditioner(tolcg))
+            solver.parameters["relax_operator"] = float(p["cg_hessian_relaxation"] or 0.0)
             solver.parameters["rel_tolerance"] = tolcg
             solver.parameters["max_iter"] = cg_max_iter
             solver.parameters["zero_initial_guess"] = True

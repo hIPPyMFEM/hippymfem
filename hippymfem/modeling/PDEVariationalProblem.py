@@ -1023,8 +1023,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                     plans[ij], accs[ij], self._boundary_arrays(ij[0], ij[1], bmats[ij]))
         return {ij: finish_block(plans[ij], accs[ij]) for ij in need}
 
-    def solveIncremental(self, out, rhs, is_adj):
-        """Solve the incremental forward or adjoint system."""
+    def solveIncremental(self, out, rhs, is_adj, rel_tolerance=None):
+        """Solve the incremental forward or adjoint system.  ``rel_tolerance`` replaces
+        the solver's own relative tolerance for this solve where it is the looser."""
         # The right-hand side with its essential entries zeroed, in a vector that is
         # kept: a fresh copy per solve allocates and frees a device vector each time,
         # which on a node where sixteen processes do so costs 3 ms of a 65 ms solve.
@@ -1034,12 +1035,17 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         r.assign(rhs)
         self.bc0.zero(r)
         out.zero()
-        if is_adj:
-            self.n_calls["incremental_adjoint"] += 1
-            self._get_solver("solver_adj_inc").solve(out, r)
-        else:
-            self.n_calls["incremental_forward"] += 1
-            self._get_solver("solver_fwd_inc").solve(out, r)
+        self.n_calls["incremental_adjoint" if is_adj else "incremental_forward"] += 1
+        solver = self._get_solver("solver_adj_inc" if is_adj else "solver_fwd_inc")
+        prm, own = getattr(solver, "parameters", None), None
+        if (rel_tolerance is not None and prm is not None and "rel_tolerance" in prm
+                and float(prm["rel_tolerance"]) < float(rel_tolerance)):
+            own, prm["rel_tolerance"] = prm["rel_tolerance"], float(rel_tolerance)
+        try:
+            solver.solve(out, r)
+        finally:
+            if own is not None:
+                prm["rel_tolerance"] = own
         return out
 
     # ------------------------------------------------------------- derivatives

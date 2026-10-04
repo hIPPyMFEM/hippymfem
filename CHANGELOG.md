@@ -18,6 +18,21 @@
   Newton-CG iterations (`bench_newton_device.py --steps 2`) keeps its eight CG
   iterations at 64^3 and takes 13.6 -> 11.5 s on an L40S with hypre's PCG below and the
   device geometry of the chunked assemblies.
+- **Cheaper solves inside the CG of a Newton step** (`docs/source/guide/optimization.rst`,
+  "The CG of a Newton step"). The prior's solves, where they precondition that CG, stop
+  at 1e-6 (`cg_preconditioner_tolerance` of `ReducedSpaceNewtonCG`, the default; never
+  more than a thousandth of the CG's own tolerance; `0` leaves them as they are; the
+  line search with `cg_reorthogonalize` only): eleven iterations per solve instead of
+  twenty-one on the model problem, the same Newton and CG counts and gradient norms. With
+  `cg_hessian_relaxation = c` (off by default) the incremental solves of a Hessian action
+  at CG iteration k stop at c times the CG's tolerance times |r_0| / |r_k| where that is
+  looser than their own tolerance (`relax_operator` of `CGSolverSteihaug`,
+  `ReducedHessian.set_accuracy`, `rel_tolerance` of `solveIncremental`); with c = 1e-2
+  6.5 iterations instead of eleven, the same counts. Newton-CG to 1e-6 at 64^3 with
+  single-precision solves: H100 25.3 -> 23.6 s with the first, 18.0 s with the second and
+  the index arrays on the device (`HIPPYMFEM_DEVICE_PATTERN=1`); L40S 46.1 -> 43.2 ->
+  32.4 s; in double precision on the H100 29.9 -> 27.6 s. **This default changes the times
+  of every Newton-CG run, not its counts.**
 - **CG with a hypre preconditioner runs in hypre's own PCG** (`HIPPYMFEM_HYPRE_PCG`,
   `hm.config.hypre_pcg`, on by default). The iteration is the same as MFEM's `CGSolver`
   from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
@@ -51,7 +66,13 @@
   next holds more with the single-precision solves (21.9 to 23.4 GiB against 19.7 GiB
   on the busiest of four Blackwell instances). A failure that one rank meets alone
   (hypre's error flag is per process) stops every rank: before, a BFGS line search on
-  two ranks could wait forever.
+  two ranks could wait forever. The Jacobian of the single-precision library is
+  accumulated in single precision where the elements are assembled in chunks
+  (`HIPPYMFEM_SINGLE_ACCUMULATE`, on): half the largest allocation of an assembly and no
+  rounded copy of it. In the two Newton steps at 128^3 on four Blackwell instances that
+  release each linearization point the busiest instance held 18.3 GiB with
+  single-precision kernels and solves against 20.4 GiB in double precision (21.9 GiB
+  with the accumulator in double precision and a rounded copy, as before).
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.

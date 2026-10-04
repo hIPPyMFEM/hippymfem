@@ -202,13 +202,34 @@ class _NoisyOp(_DenseOp):
         return y
 
 
+class _PerturbedIdentity(_Identity):
+    """A preconditioner that is the identity only approximately, but one symmetric
+    positive definite matrix at every application: what a fixed polynomial of the
+    prior's solves is to the exact solves."""
+
+    def __init__(self, op, level, seed=13):
+        super(_PerturbedIdentity, self).__init__(op)
+        n = op.Adense.shape[0]
+        G = np.random.default_rng(seed).standard_normal((n, n))
+        S = 0.5 * (G + G.T)
+        self.B = np.eye(n) + float(level) * S / np.linalg.norm(S, 2)
+
+    def solve(self, x, b):
+        full = np.concatenate(self.op.comm.allgather(b.array))
+        z = self.B @ full
+        lo, hi = x.owner_range
+        x.array[:] = z[lo:hi]
+        return 1
+
+
 def test_cg_reorthogonalize():
     """CG with its residuals kept orthogonal explicitly.
 
     The spectrum is that of a prior-preconditioned Hessian: a cluster at one and thirty
     large, well separated eigenvalues, so that exact arithmetic needs thirty-one
     iterations.  The recurrence loses that to rounding; explicit orthogonalization keeps
-    it, also when every product carries an error far above rounding.
+    it, also when every product carries an error far above rounding, and with a
+    preconditioner that is the inverse only approximately.
     """
     if RANK == 0:
         print("CGSolverSteihaug with reorthogonalization")
@@ -226,10 +247,10 @@ def test_cg_reorthogonalize():
     bfull = np.concatenate(COMM.allgather(b.array))
     exact = np.linalg.solve(A, bfull)
 
-    def run(operator, reorth, tol=1e-8):
+    def run(operator, reorth, tol=1e-8, pc=None):
         solver = hm.CGSolverSteihaug(comm=COMM)
         solver.set_operator(operator)
-        solver.set_preconditioner(_Identity(operator))
+        solver.set_preconditioner(_Identity(operator) if pc is None else pc)
         solver.parameters["rel_tolerance"] = tol
         solver.parameters["max_iter"] = 400
         solver.parameters["print_level"] = -1
@@ -259,6 +280,19 @@ def test_cg_reorthogonalize():
           "(%d with an error of %.0e per product, %d without, solution to %.1e; the recurrence "
           "alone: %d%s)" % (noisy.iter, level, clean.iter, e_noisy, worse.iter,
                             "" if worse.converged else ", not converged"))
+    # A preconditioner that is 1e-3 away from the one the spectrum was built for, and
+    # the same symmetric matrix at every application: the cluster at one is as wide,
+    # which costs an iteration or two at most, and the solution is as accurate.  (A
+    # preconditioner that differs from one application to the next is another matter:
+    # the orthogonalization then removes from the residual what is not an error of the
+    # iterate, and the iteration stops on a residual that is not the iterate's.)
+    tol = 1e-6
+    near, e_near = run(op, True, tol=tol, pc=_PerturbedIdentity(op, 1e-3))
+    same, e_same = run(op, True, tol=tol)
+    check("with a preconditioner 1e-3 off, but one matrix, the count and the accuracy stay",
+          near.converged and abs(near.iter - same.iter) <= 2 and e_near < 10.0 * tol,
+          "(%d iterations, %d with the exact one; solution to %.1e against %.1e)"
+          % (near.iter, same.iter, e_near, e_same))
 
 
 def test_bfgs_operator():
@@ -574,10 +608,19 @@ def test_newton_cg_reorthogonalized():
     model, Vh, mtrue, B = build_problem(n=16, order=2, ntargets=50)
     pde = model.problem
 
-    def run(reorth, inc_tol=None):
+    inc_its = [0]
+
+    class _Counting(hm.KrylovSolver):
+        def solve(self, x, b):
+            n = super(_Counting, self).solve(x, b)
+            inc_its[0] += int(self.iterations)
+            return n
+
+    def run(reorth, inc_tol=None, prec_tol=0.0, relax=0.0):
+        inc_its[0] = 0
         if inc_tol is not None:
             for a in ("solver_fwd_inc", "solver_adj_inc"):
-                s = hm.KrylovSolver(COMM, "cg", "amg")
+                s = _Counting(COMM, "cg", "amg")
                 s.parameters["rel_tolerance"] = inc_tol
                 s.parameters["max_iter"] = 2000
                 setattr(pde, a, s)
@@ -590,13 +633,16 @@ def test_newton_cg_reorthogonalized():
         params["GN_iter"] = 5
         params["print_level"] = -1
         params["cg_reorthogonalize"] = reorth
+        params["cg_preconditioner_tolerance"] = prec_tol
+        params["cg_hessian_relaxation"] = relax
         solver = hm.ReducedSpaceNewtonCG(model, params)
         x = solver.solve([None, model.prior.mean.copy(), None])
         return solver, x[PARAMETER].copy()
 
     plain, m_plain = run(False)                  # hIPPYlib's iteration
-    reo, m_reo = run(True)                       # the default
+    reo, m_reo = run(True)                       # reorthogonalized, the exact preconditioner
     loose, m_loose = run(True, inc_tol=1e-5)
+    its_loose = inc_its[0]
     scale = m_plain.norm("l2")
     e_reo = m_reo.copy().axpy(-1.0, m_plain).norm("l2") / scale
     e_loose = m_loose.copy().axpy(-1.0, m_plain).norm("l2") / scale
@@ -613,6 +659,39 @@ def test_newton_cg_reorthogonalized():
           and abs(loose.total_cg_iter - reo.total_cg_iter) <= max(2, reo.total_cg_iter // 20),
           "(%d Newton and %d CG iterations; MAP differs by %.1e)"
           % (loose.it, loose.total_cg_iter, e_loose))
+    # the prior's solves stopped at 1e-6 where they precondition the CG (the default
+    # of the Newton solver; the runs above were with the solves as they are): the same
+    # MAP point in the same count, and the prior's own solver keeps its tolerance
+    own = float(model.prior.Asolver.parameters["rel_tolerance"])
+    pcl, m_pcl = run(True, prec_tol=1e-6)
+    e_pcl = m_pcl.copy().axpy(-1.0, m_plain).norm("l2") / scale
+    pc = model.prior.getHessianPreconditioner(1e-6)
+    # (a prior solved by a factorization has nothing to loosen and returns its solver)
+    krylov = isinstance(model.prior.Asolver, hm.KrylovSolver)
+    check("the prior's solves stopped at 1e-6 as the preconditioner leave the MAP point and the count",
+          pcl.converged and e_pcl < 1e-5 and (pc is not model.prior.Rsolver) == krylov
+          and pcl.it == reo.it and abs(pcl.total_cg_iter - reo.total_cg_iter) <= max(2, reo.total_cg_iter // 20)
+          and float(model.prior.Asolver.parameters["rel_tolerance"]) == own,
+          "(%d Newton and %d CG iterations, %d and %d with the solves at %.0e; MAP differs by %.1e%s)"
+          % (pcl.it, pcl.total_cg_iter, reo.it, reo.total_cg_iter, own, e_pcl,
+             "" if krylov else "; a factorization here, nothing loosened"))
+    # Hessian actions less accurate as the CG converges: the incremental solves stop at
+    # 1e-2 of the CG's tolerance times |r_0| / |r_k| where that is looser than their own
+    # 1e-5.  The same MAP point in about as many Hessian actions, with fewer iterations
+    # of the incremental solves.  (The path is not the same to the last digit, so the
+    # last Newton step may fall on either side of the tolerance: no more actions than a
+    # tenth above, is what is asked.)
+    relaxed, m_relaxed = run(True, inc_tol=1e-5, relax=1e-2)
+    its_relaxed = inc_its[0]
+    e_relaxed = m_relaxed.copy().axpy(-1.0, m_plain).norm("l2") / scale
+    check("Hessian actions relaxed along the CG leave the MAP point and the count, in fewer solver iterations",
+          relaxed.converged and e_relaxed < 1e-5
+          and relaxed.total_cg_iter <= 1.1 * loose.total_cg_iter + 3
+          and its_relaxed < 0.95 * its_loose,
+          "(%d Newton and %d CG iterations, %d and %d without; %d iterations of the incremental "
+          "solves against %d; MAP differs by %.1e)"
+          % (relaxed.it, relaxed.total_cg_iter, loose.it, loose.total_cg_iter, its_relaxed,
+             its_loose, e_relaxed))
 
 
 def test_map_recovers_smooth_truth():

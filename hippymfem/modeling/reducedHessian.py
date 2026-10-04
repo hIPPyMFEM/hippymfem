@@ -53,9 +53,36 @@ class ReducedHessian(Operator):
         self.uhat = model.generate_vector(STATE)
         self.phat = model.generate_vector(ADJOINT)
         self.yhelp = model.generate_vector(PARAMETER)
+        #: relative tolerance of the two incremental solves of an action, where looser
+        #: than the solvers' own (:meth:`set_accuracy`); ``None``: their own
+        self.accuracy = None
+        try:
+            import inspect
+
+            self._relaxable = "rel_tolerance" in inspect.signature(
+                model.problem.solveIncremental).parameters
+        except (AttributeError, TypeError, ValueError):
+            self._relaxable = False
 
     def init_vector(self, x, dim):
         return init_vector_like(x, self.model.generate_vector(PARAMETER))
+
+    def set_accuracy(self, tolerance):
+        """Ask the next actions for incremental solves stopped at the relative
+        tolerance ``tolerance``, if that is looser than the solvers' own (``None``:
+        their own again).  A Krylov iteration can use products that become less
+        accurate as it converges (``CGSolverSteihaug``, ``relax_operator``).  The prior's
+        part of an action keeps its accuracy: a relative error of its mass solve is the
+        same relative error of ``R x``, with nothing to damp it, and at the accuracies
+        that the incremental solves tolerate it changed the path of the model problem."""
+        self.accuracy = float(tolerance) if (tolerance and self._relaxable) else None
+        return self
+
+    def _incremental(self, adjoint, sol, rhs):
+        solve = self.model.solveAdjIncremental if adjoint else self.model.solveFwdIncremental
+        if self.accuracy is None:
+            return solve(sol, rhs)
+        return solve(sol, rhs, rel_tolerance=self.accuracy)
 
     def mult(self, x, y):
         if self.gauss_newton_approx:
@@ -76,9 +103,9 @@ class ReducedHessian(Operator):
         # uhat = A^{-1} C x = -du/dm[x]; that sign cancels the adjoint source's,
         # so neither right-hand side is negated
         self.model.applyC(x, self.rhs_fwd)
-        self.model.solveFwdIncremental(self.uhat, self.rhs_fwd)
+        self._incremental(False, self.uhat, self.rhs_fwd)
         self.model.applyWuu(self.uhat, self.rhs_adj)
-        self.model.solveAdjIncremental(self.phat, self.rhs_adj)
+        self._incremental(True, self.phat, self.rhs_adj)
         self.model.applyCt(self.phat, y)
         if not self.misfit_only:
             self.model.applyR(x, self.yhelp)
@@ -87,11 +114,11 @@ class ReducedHessian(Operator):
 
     def TrueHessian(self, x, y):
         self.model.applyC(x, self.rhs_fwd)
-        self.model.solveFwdIncremental(self.uhat, self.rhs_fwd)
+        self._incremental(False, self.uhat, self.rhs_fwd)
         self.model.applyWuu(self.uhat, self.rhs_adj)
         self.model.applyWum(x, self.rhs_adj2)
         self.rhs_adj.axpy(-1.0, self.rhs_adj2)
-        self.model.solveAdjIncremental(self.phat, self.rhs_adj)
+        self._incremental(True, self.phat, self.rhs_adj)
         self.model.applyWmm(x, y)
         self.model.applyCt(self.phat, self.yhelp)
         y.axpy(1.0, self.yhelp)

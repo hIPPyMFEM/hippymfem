@@ -339,6 +339,33 @@ class _BilaplacianRsolver(KeepAlive):
         return (n1 or 0) + (n2 or 0)
 
 
+class _Loosened(KeepAlive):
+    """A solver applied with a looser tolerance in the Krylov solves it runs.
+
+    Where the prior's precision solver preconditions a Krylov iteration it need not be
+    as accurate as where it draws a sample.  ``inner`` are the Krylov solvers whose
+    relative tolerance is raised to :attr:`tolerance` while :meth:`solve` runs and put
+    back after it, so that the prior's solver keeps its tolerance for every other use.
+    """
+
+    def __init__(self, solver, inner):
+        self.solver, self.inner, self.tolerance = solver, list(inner), 0.0
+        self.keep(solver)
+
+    def init_vector(self, x, dim):
+        return self.solver.init_vector(x, dim)
+
+    def solve(self, x, b):
+        saved = [s.parameters["rel_tolerance"] for s in self.inner]
+        for s, t in zip(self.inner, saved):
+            s.parameters["rel_tolerance"] = max(float(t), self.tolerance)
+        try:
+            return self.solver.solve(x, b)
+        finally:
+            for s, t in zip(self.inner, saved):
+                s.parameters["rel_tolerance"] = t
+
+
 class _RinvM(Operator):
     r""":math:`R^{-1} M`, whose diagonal is the pointwise prior variance scaled
     by the mass matrix (used by :meth:`_Prior.trace`)."""
@@ -399,8 +426,28 @@ class _Prior(SnakeCamel, KeepAlive):
     def sample_noise(self, sigma=1.0, out=None, rng=None):
         raise NotImplementedError
 
-    def getHessianPreconditioner(self):
-        return self.Rsolver
+    def getHessianPreconditioner(self, tolerance=None):
+        """The solver that preconditions the Hessian: ``Rsolver``.
+
+        With ``tolerance``, the same solver with its Krylov solves stopped at that
+        relative tolerance where it is looser than their own.  CG stopped at a
+        tolerance is not one linear map, so this is for an iteration that does not
+        rely on the preconditioner being one, and for a tolerance well below the one
+        that iteration stops at (``ReducedSpaceNewtonCG``, ``cg_preconditioner_tolerance``).
+        A solver without Krylov solves (a factorization) is returned as it is, and the
+        solver returned for a tolerance is the same object at every call.
+        """
+        if not tolerance:
+            return self.Rsolver
+        pc = self.__dict__.get("_hessian_pc")
+        if pc is None or pc.solver is not self.Rsolver:
+            inner = [s for s in (getattr(self.Rsolver, "Asolver", None), self.Rsolver)
+                     if isinstance(s, KrylovSolver)]
+            if not inner:
+                return self.Rsolver
+            pc = self.__dict__["_hessian_pc"] = _Loosened(self.Rsolver, inner)
+        pc.tolerance = float(tolerance)
+        return pc
 
     def cost(self, m):
         r""":math:`\tfrac12 (m - \bar m)^{\!\top} R (m - \bar m)`."""
