@@ -36,6 +36,27 @@ def run(check, COMM=MPI.COMM_WORLD):
         return
     import jax.numpy as jnp
 
+    # hypre keeps its error flag per process, and an exception belongs to one rank:
+    # what one rank finds alone has to stop them all, or the others wait for it in
+    # their next exchange (a line search that backtracked on one rank only)
+    lib, last = singlesolve.library(), COMM.size - 1
+
+    def raised(call):
+        try:
+            call()
+        except RuntimeError:
+            return 1
+        return 0
+
+    stopped = [COMM.allreduce(raised(lambda: lib.check(7 if RANK == last else 0, "a probe", COMM)),
+                              op=MPI.MIN),
+               COMM.allreduce(raised(lambda: lib.agree(
+                   COMM, ValueError("a probe") if RANK == last else None)), op=MPI.MIN),
+               COMM.allreduce(raised(lambda: lib.check(0, "a probe", COMM)), op=MPI.MAX),
+               COMM.allreduce(raised(lambda: lib.agree(COMM, None)), op=MPI.MAX)]
+    check("a failure on one rank raises on every rank, and none without one",
+          stopped == [1, 1, 0, 0], "(%s, on %d rank(s))" % (stopped, COMM.size))
+
     n = 10
     pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
     Vu, Vm = hp.FunctionSpace.H1(pmesh, 2), hp.FunctionSpace.H1(pmesh, 1)

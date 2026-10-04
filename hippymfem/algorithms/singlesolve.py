@@ -240,10 +240,28 @@ class _Library:
             bridge.copy_from_jax(int(dst) + s * b.itemsize, y)
             bridge.synchronize()                    # before ``y`` is released
 
-    def check(self, code, what):
+    def check(self, code, what, comm=None):
+        """Raise for a failed call of the library.  hypre keeps its error flag per
+        process, so the verdict on a call that all ranks of ``comm`` make together is
+        reduced over them: a rank that raised alone would leave the others waiting in
+        their next exchange with it."""
+        code = int(code)
+        if comm is not None:
+            code = int(comm.allreduce(abs(code), op=MPI.MAX))
         if code:
             self.H.HYPRE_ClearAllErrors()
             raise RuntimeError("the single-precision hypre: %s returned %d" % (what, code))
+
+    @staticmethod
+    def agree(comm, error):
+        """Raise on every rank of ``comm`` when one of them holds ``error``, an exception
+        of work each rank did on its own (``None`` on a rank where it went well)."""
+        said = comm.allgather(None if error is None else str(error))
+        first = next((m for m in said if m is not None), None)
+        if error is not None:
+            raise RuntimeError(str(error)) from error
+        if first is not None:
+            raise RuntimeError("%s (on another rank)" % first)
 
 
 class SingleParMatrix:
@@ -284,10 +302,13 @@ class SingleParMatrix:
         par = H.hypre_ParCSRMatrixCreate(lib.comm(self.comm), self.global_rows, self.global_cols,
                                          self.row_starts.ctypes.data, self.col_starts.ctypes.data,
                                          n_offd, nd, no)
-        if not par:
-            raise RuntimeError("the single-precision hypre could not create a matrix")
-        self.par = ctypes.c_void_p(par)
+        self.par = ctypes.c_void_p(par) if par else None
+        # What follows is each rank's own work, up to the exchanges at the end.  A rank
+        # that fails keeps its exception until all have finished, and then all raise.
+        failed, vals = None, None
         try:
+            if not par:
+                raise RuntimeError("the single-precision hypre could not create a matrix")
             lib.check(H.hypre_ParCSRMatrixInitialize_v2(self.par, DEVICE if lib.device else HOST),
                       "ParCSRMatrixInitialize")
             on_host = isinstance(acc, np.ndarray)
@@ -302,10 +323,9 @@ class SingleParMatrix:
                 finite = bool(jnp.isfinite(vals).all())
             # An entry beyond the range of single precision (a coefficient spanning
             # dozens of decades, as a line search may propose) becomes infinite, and
-            # hypre does not return from a setup with such a matrix.  Collective, so
-            # that every rank raises, and a RuntimeError, which a line search takes for
-            # a failed solve and answers by backtracking.
-            if not self.comm.allreduce(finite, op=MPI.LAND):
+            # hypre does not return from a setup with such a matrix.  A RuntimeError,
+            # which a line search takes for a failed solve and answers by backtracking.
+            if not finite:
                 raise RuntimeError("the matrix has entries beyond the range of single "
                                    "precision (or not finite)")
             for name, block, I, J, start, count in (("par_diag", "diag", tp.I_diag, tp.J_diag, 0, nd),
@@ -331,10 +351,15 @@ class SingleParMatrix:
                 ctypes.memmove(lib.pointer(par, "par_col_map_offd"), cm.ctypes.data, cm.nbytes)
             if lib.device:
                 bridge.synchronize()               # before ``vals`` is released
-            del vals
-            lib.check(H.hypre_ParCSRMatrixSetNumNonzeros(self.par), "ParCSRMatrixSetNumNonzeros")
+        except Exception as e:                                   # noqa: BLE001
+            failed = e
+        del vals
+        try:
+            lib.agree(self.comm, failed)
+            lib.check(H.hypre_ParCSRMatrixSetNumNonzeros(self.par), "ParCSRMatrixSetNumNonzeros",
+                      self.comm)
             H.hypre_ParCSRMatrixSetDNumNonzeros(self.par)
-            lib.check(H.hypre_MatvecCommPkgCreate(self.par), "MatvecCommPkgCreate")
+            lib.check(H.hypre_MatvecCommPkgCreate(self.par), "MatvecCommPkgCreate", self.comm)
         except Exception:
             self.destroy()
             raise
@@ -370,13 +395,15 @@ class SingleParMatrix:
         """``y = A x`` on two of MFEM's vectors, the product in single precision."""
         vx, vy = self._work()
         vx.set(x)
-        self.lib.check(self.lib.H.hypre_ParCSRMatrixMatvec(1.0, self.par, vx.par, 0.0, vy.par), "Matvec")
+        self.lib.check(self.lib.H.hypre_ParCSRMatrixMatvec(1.0, self.par, vx.par, 0.0, vy.par),
+                       "Matvec", self.comm)
         vy.get(y)
 
     def MultTranspose(self, x, y):
         vx, vy = self._work()
         vy.set(x)
-        self.lib.check(self.lib.H.hypre_ParCSRMatrixMatvecT(1.0, self.par, vy.par, 0.0, vx.par), "MatvecT")
+        self.lib.check(self.lib.H.hypre_ParCSRMatrixMatvecT(1.0, self.par, vy.par, 0.0, vx.par),
+                       "MatvecT", self.comm)
         vx.get(y)
 
     def destroy(self):
@@ -472,7 +499,9 @@ class SingleEngine:
                               ctypes.cast(H.HYPRE_BoomerAMGSetup, ctypes.c_void_p), amg)
         mfemconfig.hypre_pool_open()
         try:
-            lib.check(H.HYPRE_ParCSRPCGSetup(pcg, S.par, self.b.par, self.x.par), "PCGSetup")
+            # the setup of one rank can fail alone (its part of a hierarchy overflows)
+            lib.check(H.HYPRE_ParCSRPCGSetup(pcg, S.par, self.b.par, self.x.par), "PCGSetup",
+                      S.comm)
             if lib.device:
                 bridge.synchronize()
         finally:

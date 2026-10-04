@@ -410,7 +410,8 @@ class KrylovSolver(_SolverBase):
                                                 p["abs_tolerance"], p["max_iter"])
         self.converged = (self.iterations < int(p["max_iter"])
                           or final <= max(float(p["rel_tolerance"]), SINGLE_TOL_FLOOR))
-        if self.converged and not math.isfinite(x.hypre.Norml2()):
+        # the norm over all ranks: one that judged its own part would raise alone
+        if self.converged and not math.isfinite(x.norm("l2")):
             self.converged = False
         if not self.converged and p["error_on_nonconvergence"]:
             raise RuntimeError(
@@ -479,11 +480,12 @@ class KrylovSolver(_SolverBase):
             self.iterations = solver.GetNumIterations()
             self.converged = bool(solver.GetConverged())
             final = None
-        if self.converged and not math.isfinite(x.hypre.Norml2()):
+        if self.converged and not math.isfinite(x.norm("l2")):
             # A preconditioner whose setup failed can leave the Krylov solver
             # reporting convergence on a vector full of NaN.  The norm is a device
             # reduction to one scalar (NaN or inf in any entry makes it NaN or inf),
-            # not a copy of the whole vector to the host.
+            # not a copy of the whole vector to the host, and it is the norm over all
+            # ranks: one that judged its own part would raise alone.
             self.converged = False
         if not self.converged and self.parameters["error_on_nonconvergence"]:
             raise RuntimeError(
