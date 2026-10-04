@@ -14,7 +14,10 @@
   incremental solves to 1e-6; one L40S 161.5 -> 110.5 -> 73.3 s; four MIG instances of
   two RTX PRO 6000 Blackwell 81.7 -> 39.0 s. The cost functional agrees to nine digits.
   `cg_reorthogonalize = False` gives hIPPYlib's iteration. **Iteration counts and times
-  of a Newton-CG run change with this default.**
+  of a Newton-CG run to its tolerance change with this default.** The benchmark of two
+  Newton-CG iterations (`bench_newton_device.py --steps 2`) keeps its eight CG
+  iterations at 64^3 and takes 13.6 -> 11.5 s on an L40S with hypre's PCG below and the
+  device geometry of the chunked assemblies.
 - **CG with a hypre preconditioner runs in hypre's own PCG** (`HIPPYMFEM_HYPRE_PCG`,
   `hm.config.hypre_pcg`, on by default). The iteration is the same as MFEM's `CGSolver`
   from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
@@ -37,8 +40,8 @@
   as they are. A CG iteration is 1.16 (H100), 1.31 (L40S) and 1.37 (Blackwell instance)
   times faster, a Hessian action 1.4 to 1.6 times, a BoomerAMG setup no faster, and the
   card holds 1.4 GiB less at 2.1 million state dofs (18.9 -> 17.5 GiB on the H100).
-  With both, the Newton-CG run above takes 24.5 s on the H100, 45.9 s on the L40S,
-  46.8 s on a Blackwell instance and 26.8 s on four: 2.6, 3.5, 3.5 and 3.0 times faster
+  With both, the Newton-CG run above takes 24.5 s on the H100, 46.3 s on the L40S,
+  45.4 s on a Blackwell instance and 26.1 s on four: 2.6, 3.5, 3.6 and 3.1 times faster
   than before these three changes; with the forward and adjoint solves refined to 1e-9
   only (`PDEVariationalProblem.SINGLE_REFINE_GOAL`, enough for Newton-CG to 1e-6 but
   not for BFGS to 1e-8) 23.5, 43.5, 42.4 and 25.6 s.

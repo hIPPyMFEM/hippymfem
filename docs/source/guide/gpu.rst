@@ -360,13 +360,13 @@ functional to nine digits; the first took 193 to 210 CG iterations:
    reorthogonalized CG, incremental solves to 1e-6     32.0 s    73.3 s    83.8 s       39.0 s
    and hypre's own PCG (:doc:`solvers`)                29.7 s    64.8 s    77.7 s       36.3 s
    and single-precision element matrices               29.1 s    61.0 s    61.7 s       32.5 s
-   single-precision solves, double-precision kernels   25.4 s    50.6 s    60.6 s       30.9 s
-   single-precision solves and element matrices        24.5 s    45.9 s    46.8 s       26.8 s
+   single-precision solves, double-precision kernels   25.4 s    50.6 s    59.9 s       29.9 s
+   single-precision solves and element matrices        24.5 s    46.3 s    45.4 s       26.1 s
    and forward and adjoint solves refined to 1e-9      23.5 s    43.5 s    42.4 s       25.6 s
    ==================================================  ========  ========  ===========  ================
 
 The last row is 2.7, 3.7, 3.9 and 3.2 times faster than the first, the one before it
-2.6, 3.5, 3.5 and 3.0 times.  What single precision itself gives, stage by stage: double
+2.6, 3.5, 3.6 and 3.1 times.  What single precision itself gives, stage by stage: double
 precision throughout against single-precision element matrices and solves, the solves
 in both by hypre's PCG, the incremental ones to 1e-6 and to the 1e-5 that single
 precision reaches:
@@ -381,8 +381,8 @@ precision reaches:
    BoomerAMG setup                            0.069 / 0.075 s   0.156 / 0.156 s   0.151 / 0.124 s
    Jacobian element kernel                    67 / 39 ms        339 / 124 ms      587 / 111 ms
    complete Jacobian assembly                 104 / 86 ms       380 / 165 ms      634 / 146 ms
-   forward solve at a new parameter           0.41 / 0.37 s     1.00 / 0.74 s     1.33 / 0.71 s
-   adjoint solve                              0.100 / 0.119 s   0.243 / 0.275 s   0.248 / 0.292 s
+   forward solve at a new parameter           0.41 / 0.37 s     1.00 / 0.75 s     1.33 / 0.67 s
+   adjoint solve                              0.100 / 0.119 s   0.243 / 0.255 s   0.248 / 0.257 s
    blocks of a linearization point            0.27 / 0.23 s     0.39 / 0.29 s     1.06 / 0.26 s
    Hessian action                             0.107 / 0.077 s   0.260 / 0.162 s   0.263 / 0.160 s
    =========================================  ================  ================  ====================
@@ -395,7 +395,7 @@ two solves need no refinement.  The forward and the adjoint solve gain least fro
 a refinement needs the double-precision residual from the element kernels, which on
 the H100 costs as much as seven CG iterations.  The forward solve owes its gain to the
 assembly, and the adjoint solve, three passes with two evaluations of the residual, is
-slower than in double precision.  Refined to 1e-9 the forward solve took 0.34, 0.65
+a little slower than in double precision.  Refined to 1e-9 the forward solve took 0.34, 0.65
 and 0.60 s and the adjoint solve 0.093, 0.192 and 0.191 s, 1.1 to 1.3 times faster than
 in double precision.
 
