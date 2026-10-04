@@ -593,6 +593,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: that the measured passes give.  ``REFINE_PREDICT = False`` measures every pass.
     REFINE_PREDICT = True
     REFINE_MARGIN = 3.0
+    #: With the Jacobian in a single-precision hypre, the relative residual the forward
+    #: and the adjoint solve are refined to when the solver's own tolerance asks for
+    #: less: two passes instead of three.  A gradient computed from them is then exact
+    #: to about nine digits, which a Newton-CG tolerance of 1e-6 does not notice; set
+    #: it to 0 to have the solver's tolerance honoured (for a tighter optimization).
+    SINGLE_REFINE_GOAL = 1e-9
 
     def _probe_symmetry(self, A):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -834,6 +840,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # how much more of its right-hand side a pass leaves than the tolerance it was
         # asked for: measured in every pass whose residual is evaluated
         low = float(getattr(solver, "tolerance_floor", 0.0) or 0.0)
+        if low > 0.0:
+            # a single-precision solver: two passes reach this, a third costs a quarter
+            # more for digits a gradient does not need
+            goal = max(goal, float(self.SINGLE_REFINE_GOAL) * r0)
         ratio = None
         self._refine_measured = True
         if r0 == 0.0:

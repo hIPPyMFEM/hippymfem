@@ -172,6 +172,11 @@ def main():
                     help="the CG of a Newton step keeps its residuals orthogonal explicitly "
                     "(cg_reorthogonalize, the library's default); --no-cg-reorth is the recurrence alone, "
                     "which needs incremental solves to round-off")
+    ap.add_argument("--solves-only", action="store_true",
+                    help="skip the two stages that time the Jacobian's kernel and assembly alone: for the "
+                    "device memory that the solves themselves need")
+    ap.add_argument("--pool-peaks", action="store_true",
+                    help="print the largest use of the element kernels' pool after every stage")
     ap.add_argument("--solve-tol", type=float, default=1e-12,
                     help="relative tolerance of the forward and adjoint solves")
     ap.add_argument("--inc-tol", type=float, default=None,
@@ -264,10 +269,24 @@ def main():
                                     pde.kernel.element_matrices(ADJOINT, STATE, loc), NE,
                                     test_ess=bc0.ess_tdof)
             del A
-        kernel_only()
-        out["t_kernel"], _ = clock(kernel_only, args.reps)
-        assembly()
-        out["t_assembly"], _ = clock(assembly, args.reps)
+        def pool_peak():
+            try:
+                return int((km.device().memory_stats() or {}).get("peak_bytes_in_use", 0)) / 2 ** 20
+            except Exception:                                         # noqa: BLE001
+                return float("nan")
+
+        peaks = [("setup", pool_peak())]
+        if args.solves_only:
+            # (these two hold every element matrix of the mesh at once, which no solve
+            # does: they would set the pool's size for the rest of the process)
+            out["t_kernel"] = out["t_assembly"] = float("nan")
+        else:
+            kernel_only()
+            out["t_kernel"], _ = clock(kernel_only, args.reps)
+            peaks.append(("kernel", pool_peak()))
+            assembly()
+            out["t_assembly"], _ = clock(assembly, args.reps)
+            peaks.append(("assembly", pool_peak()))
 
         # ---- the stages, warm: every one is run once before it is timed
         def forward():
@@ -291,16 +310,24 @@ def main():
         forward()
         forward()
         out["t_forward"], out["forward_passes"] = clock(forward, args.reps)
+        peaks.append(("forward", pool_peak()))
         adjoint()
         out["t_adjoint"], out["adjoint_passes"] = clock(adjoint, args.reps)
         gradient()
         out["t_gradient"], _ = clock(gradient, args.reps)
+        peaks.append(("adjoint, gradient", pool_peak()))
         blocks()
         out["t_blocks"], _ = clock(blocks, args.reps)
+        peaks.append(("blocks", pool_peak()))
         H = hm.ReducedHessian(model)
         Hd = model.generate_vector(PARAMETER)
         H.mult(direction, Hd)
         out["t_action"], _ = clock(lambda: H.mult(direction, Hd), args.reps)
+        peaks.append(("action", pool_peak()))
+        out["pool_peaks_mib"] = peaks
+        if args.pool_peaks:
+            say("  the element kernels' pool, largest use so far in this process, in MiB: "
+                + ", ".join("%s %.0f" % kv for kv in peaks))
         cur = {"u": x[STATE].copy(), "p": x[ADJOINT].copy(), "g": g.copy(), "Hd": Hd.copy()}
         if mode == "fp64":
             ref = cur
