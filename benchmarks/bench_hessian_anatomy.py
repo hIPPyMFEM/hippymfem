@@ -258,9 +258,14 @@ def main():
             COMM.Barrier()
             ts.append(time.perf_counter() - t0)
             prof = PROF.read()
-        its = int(s.GetNumIterations())
+        try:
+            its = int(s.GetNumIterations())
+        except TypeError:                       # hypre's own PCG hands it back through a pointer
+            count = mfem.intp()
+            s.GetNumIterations(count)
+            its = int(count.value())
         raw[name] = {"t": float(np.median(ts)), "iterations": its}
-        say("  MFEM's solver alone, %s: %.4f s, %d iterations, %.3f ms per iteration; %s"
+        say("  the Krylov solver alone, %s: %.4f s, %d iterations, %.3f ms per iteration; %s"
             % (name, raw[name]["t"], its, 1e3 * raw[name]["t"] / max(its, 1), copies(prof)))
     solves = raw["fwd"]["t"] + raw["adj"]["t"]
     products = sum(op[k] for k in ("applyC", "applyWuu", "applyWum", "applyWmm", "applyCt",

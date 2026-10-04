@@ -88,6 +88,13 @@ def main():
     ap.add_argument("--steps", type=int, default=2)
     ap.add_argument("--cg-max", type=int, default=25)
     ap.add_argument("--cg-tol", type=float, default=1e-6)
+    ap.add_argument("--cg-reorth", action=argparse.BooleanOptionalAction, default=None,
+                    help="the CG of a Newton step keeps its residuals orthogonal explicitly (the library's "
+                    "default since October 2026); --no-cg-reorth is the recurrence alone, with which the "
+                    "records of the paper were taken")
+    ap.add_argument("--inc-tol", type=float, default=None,
+                    help="relative tolerance of the incremental solves during the Newton-CG iteration "
+                    "(default: that of the forward solve, 1e-12; 1e-6 is enough with --cg-reorth)")
     ap.add_argument("--gn-iter", type=int, default=0)
     ap.add_argument("--ntargets", type=int, default=200)
     ap.add_argument("--route", default=None, help="assembly backend: csr or integrator")
@@ -243,6 +250,11 @@ def main():
     params["cg_max_iter"] = args.cg_max
     params["cg_coarse_tolerance"] = args.cg_tol
     params["print_level"] = -1
+    if args.cg_reorth is not None:
+        params["cg_reorthogonalize"] = bool(args.cg_reorth)
+    if args.inc_tol is not None:
+        for attr in ("solver_fwd_inc", "solver_adj_inc"):
+            getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol
     solver = hm.ReducedSpaceNewtonCG(model, params)
     t_step, xs = timed(lambda: solver.solve([None, prior.mean.copy(), None]))
     err = (mtrue.copy().axpy(-1.0, xs[PARAMETER]).norm("l2") / max(mtrue.norm("l2"), 1e-300))
@@ -258,6 +270,7 @@ def main():
            "t_hess_blocks_warm": t_hess_warm,
            "t_hess_apply": t_apply, "t_hess_apply_cold": t_apply_cold, "steps": args.steps, "t_steps": t_step,
            "newton_it": solver.it, "cg_it": solver.total_cg_iter, "J": solver.final_cost,
+           "cg_reorthogonalize": bool(params["cg_reorthogonalize"]), "inc_tol": args.inc_tol,
            "gradnorm": solver.final_grad_norm, "err_m": err,
            "cart_part": bool(args.cart_part), "newton_only": bool(args.newton_only),
            "hypre_spmv": hm.common.mfemconfig.HYPRE_SPMV,

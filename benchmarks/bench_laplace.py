@@ -130,6 +130,13 @@ def main():
     ap.add_argument("--r", type=int, default=64, help="probes for the randomized variance")
     ap.add_argument("--newton-max", type=int, default=25)
     ap.add_argument("--newton-tol", type=float, default=1e-6)
+    ap.add_argument("--cg-reorth", action=argparse.BooleanOptionalAction, default=None,
+                    help="the CG of a Newton step keeps its residuals orthogonal explicitly (the library's "
+                    "default since October 2026); --no-cg-reorth is the recurrence alone, with which the "
+                    "records of the paper were taken")
+    ap.add_argument("--map-inc-tol", type=float, default=None,
+                    help="relative tolerance of the incremental solves during the Newton-CG iteration "
+                    "(default: that of the forward solve, 1e-12; 1e-6 is enough with --cg-reorth)")
     ap.add_argument("--cg-max", type=int, default=50)
     ap.add_argument("--gauss-newton", action="store_true", help="Gauss-Newton Hessian at the MAP")
     ap.add_argument("--inc-tol", type=float, default=1e-8,
@@ -224,6 +231,11 @@ def main():
     params["GN_iter"] = 5
     params["cg_max_iter"] = args.cg_max
     params["print_level"] = -1
+    if args.cg_reorth is not None:
+        params["cg_reorthogonalize"] = bool(args.cg_reorth)
+    if args.map_inc_tol is not None:
+        for attr in ("solver_fwd_inc", "solver_adj_inc"):
+            getattr(pde, attr).parameters["rel_tolerance"] = args.map_inc_tol
     solver = hm.ReducedSpaceNewtonCG(model, params)
     if args.newton_skip:
         def at_prior_mean():
@@ -373,6 +385,7 @@ def main():
            "k": args.k, "p": args.p, "passes": args.passes, "single_pass": bool(args.single_pass), "samples": args.samples, "r": args.r,
            "gauss_newton": bool(args.gauss_newton), "symmetric_jacobian": bool(args.symmetric_jacobian),
            "release_linearization": bool(args.release_linearization), "prior_tol": args.prior_tol, "inc_tol": args.inc_tol,
+           "cg_reorthogonalize": bool(params["cg_reorthogonalize"]), "map_inc_tol": args.map_inc_tol,
            "t_map": t_map, "newton_it": 0 if args.newton_skip else solver.it,
            "cg_it": 0 if args.newton_skip else solver.total_cg_iter,
            "t_hess_blocks": t_hess, "t_eig": t_eig, "eig_parts": {k: list(v) for k, v in eig_parts.items()},
