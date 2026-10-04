@@ -48,6 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import hippymfem as hm                                               # noqa: E402
 from hippymfem.fem import assemble as asm                            # noqa: E402
+from hippymfem.common import mfemconfig                              # noqa: E402
 from hippymfem.fem import kernel as km                               # noqa: E402
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE   # noqa: E402
 
@@ -108,9 +109,10 @@ def main():
                     help="print the residual after every pass of a refined solve")
     ap.add_argument("--probe-tol-single", type=float, default=None,
                     help="tolerance of the symmetry probe for single-precision matrices (experiments)")
-    ap.add_argument("--cg-reorth", action="store_true",
+    ap.add_argument("--cg-reorth", action=argparse.BooleanOptionalAction, default=None,
                     help="the CG of a Newton step keeps its residuals orthogonal explicitly "
-                    "(cg_reorthogonalize); with it the incremental solves need a loose tolerance only")
+                    "(cg_reorthogonalize, the library's default); --no-cg-reorth is the recurrence alone, "
+                    "which needs incremental solves to round-off")
     ap.add_argument("--solve-tol", type=float, default=1e-12,
                     help="relative tolerance of the forward and adjoint solves")
     ap.add_argument("--inc-tol", type=float, default=None,
@@ -174,7 +176,8 @@ def main():
 
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "solve_tol": args.solve_tol, "inc_tol": args.inc_tol if args.inc_tol is not None else args.solve_tol,
-           "cg_reorthogonalize": bool(args.cg_reorth),
+           "cg_reorthogonalize": bool(hm.ReducedSpaceNewtonCG_ParameterList()["cg_reorthogonalize"]
+                                      if args.cg_reorth is None else args.cg_reorth),
            "NE_local": NE, "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
            "device": str(km.device()), "mfem_device": args.device, "modes": {}}
     ref = {}
@@ -262,11 +265,15 @@ def main():
             params["GN_iter"] = 5
             params["cg_max_iter"] = args.cg_max
             params["print_level"] = 0 if args.newton_print else -1
-            params["cg_reorthogonalize"] = bool(args.cg_reorth)
+            if args.cg_reorth is not None:
+                params["cg_reorthogonalize"] = bool(args.cg_reorth)
             try:
                 for _ in range(max(1, args.newton_repeats)):
                     pde.invalidate_jacobian()
                     pde.release_linearization_point()
+                    pool = mfemconfig.HYPRE_POOL
+                    if pool is not None:
+                        pool.peak_in_use = pool.in_use          # the peak of this solve alone
                     solver = hm.ReducedSpaceNewtonCG(model, params)
                     calls0 = dict(pde.n_calls)
                     first = out.get("newton_first_wall")
@@ -287,6 +294,20 @@ def main():
                 "err_map": 0.0 if mode == "fp64" else (rel(mmap, ref["m"]) if "m" in ref else None),
                 "err_truth": rel(mmap, mtrue),
                 "calls": {k: pde.n_calls[k] - calls0.get(k, 0) for k in pde.n_calls}}
+            # device memory of hypre (both libraries allocate through the library's pool)
+            # and of the element kernels, the largest over the ranks
+            pool = mfemconfig.HYPRE_POOL
+            if pool is not None and pool.installed:
+                out["newton"]["hypre_peak_mib"] = COMM.allreduce(pool.peak_in_use, op=MPI.MAX) / 2 ** 20
+            try:
+                st = km.device().memory_stats() or {}
+                out["newton"]["jax_peak_mib"] = COMM.allreduce(int(st.get("peak_bytes_in_use", 0)),
+                                                               op=MPI.MAX) / 2 ** 20
+            except Exception:                                         # noqa: BLE001
+                pass
+            if "hypre_peak_mib" in out["newton"]:
+                say("  device memory at its peak: hypre %.0f MiB, element kernels %.0f MiB (of the process so far)"
+                    % (out["newton"]["hypre_peak_mib"], out["newton"].get("jax_peak_mib", float("nan"))))
             r = out["newton"]
             say("  Newton-CG: %.2f s, %d Newton and %d CG iterations, J %.10e, |g| %.3e (%s); "
                 "MAP against fp64 %s; %s"

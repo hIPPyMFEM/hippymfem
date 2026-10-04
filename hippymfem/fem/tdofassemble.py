@@ -35,6 +35,7 @@ measurements behind the route and its slot layout are in
 """
 
 import copy
+import contextlib
 import os
 import time
 
@@ -57,6 +58,27 @@ from .pattern import host_writable
 #: faster, with identical results.  Every rank must agree, so set it through the
 #: launcher's environment (``HIPPYMFEM_PARMAT_DEVICE``).
 DEVICE_PARMAT = os.environ.get("HIPPYMFEM_PARMAT_DEVICE", "block").lower()
+
+
+#: Whether :meth:`TrueDofPattern.finish` is to make a matrix of the single-precision
+#: hypre (:func:`single_target`), which a PDE problem asks for around the assembly of
+#: its Jacobian.
+_SINGLE_TARGET = [False]
+
+
+@contextlib.contextmanager
+def single_target():
+    """Within this block a complete matrix (its elimination folded into the scatter) is
+    finished as a :class:`~hippymfem.algorithms.singlesolve.SingleParMatrix`."""
+    old, _SINGLE_TARGET[0] = _SINGLE_TARGET[0], True
+    try:
+        yield
+    finally:
+        _SINGLE_TARGET[0] = old
+
+
+def single_requested():
+    return _SINGLE_TARGET[0]
 
 
 def device_finish():
@@ -384,7 +406,20 @@ class TrueDofPattern:
             got = self._diag.put((ess,), slots)
         return got
 
-    def finish(self, acc, diagonal=None):
+    def device_columns(self, block):
+        """The device copy of a block's column indices that the pattern keeps
+        (:data:`hippymfem.fem.pattern.DEVICE_PATTERN`), or ``None``."""
+        if not _pattern.DEVICE_PATTERN:
+            return None
+        from .kernel import _put, device
+
+        key = (block, device())
+        got = self._dev_J.get(key)
+        if got is None:
+            got = self._dev_J[key] = _put(self.J_diag if block == "diag" else self.J_offd)
+        return got
+
+    def finish(self, acc, diagonal=None, single=False):
         """Exchange the send buffer of a scattered accumulator and build the matrix.
 
         ``diagonal`` is ``(slots, value)``, the slots from :meth:`diagonal_slots`; it
@@ -401,9 +436,15 @@ class TrueDofPattern:
         An accumulator that is still a device array is finished on the device
         (:meth:`_finish_device`): only the entries of rows owned by other ranks pass
         through the host, for the exchange.
+
+        With ``single`` the matrix is made in the single-precision hypre instead
+        (:class:`~hippymfem.algorithms.singlesolve.SingleParMatrix`), from the same
+        values: no double-precision matrix exists at any time.
         """
         if not isinstance(acc, np.ndarray):
             if device_finish():
+                if single:
+                    return self._finish_single(self._device_values(acc, diagonal))
                 return self._finish_device(acc, diagonal)
             dev, acc = acc, host_writable(acc)
             self.target.give_back(dev)
@@ -421,6 +462,8 @@ class TrueDofPattern:
         if diagonal is not None:
             slots, value = diagonal
             acc[slots] = value
+        if single:
+            return self._finish_single(acc)
         from ..common.parvector import device_active
 
         if device_active() and DEVICE_PARMAT == "block":
@@ -462,22 +505,9 @@ class TrueDofPattern:
         put the values if something asked for the matrix on the host.
         """
         from ..common import devicebridge as bridge
-        from .kernel import _put
-        from .pattern import _device_set, _fused_add
 
         tp = self.target
-        if self.exchange:                  # collective decision, see __init__
-            sbuf = (np.ascontiguousarray(np.asarray(acc[self.nnz_t:]), dtype=np.float64)
-                    if self.nsend else np.zeros(0, dtype=np.float64))
-            rbuf = np.empty(self.nrecv, dtype=np.float64)
-            self.comm.Alltoallv([sbuf, self.scnt, self.sdsp, MPI.DOUBLE],
-                                [rbuf, self.rcnt, self.rdsp, MPI.DOUBLE])
-            if self.nrecv:
-                acc = _fused_add(acc, _put(rbuf), tp._device_zero(self.slot_recv), None)
-        if diagonal is not None:
-            slots, value = diagonal
-            if len(slots):
-                acc = _device_set(acc, tp._device_zero(slots), float(value))
+        acc = self._device_values(acc, diagonal)
         nd, no = self.nnz_diag, self.nnz_t - self.nnz_diag
         # row pointers: private host copies, as in the block route (they are small)
         I_d, I_o = self.I_diag.copy(), self.I_offd.copy()
@@ -506,6 +536,37 @@ class TrueDofPattern:
         A.CopyColStarts()
         return own(A, d_diag, d_offd, diag, offd, I_d, J_d, I_o, J_o,
                    self.ia_rows, self.ia_cols, self.ia_cmap)
+
+    def _device_values(self, acc, diagonal=None):
+        """A device accumulator after the exchange with the other ranks and with the
+        eliminated rows' diagonal written: the values of the two blocks, in order."""
+        from .kernel import _put
+        from .pattern import _device_set, _fused_add
+
+        tp = self.target
+        if self.exchange:                  # collective decision, see __init__
+            sbuf = (np.ascontiguousarray(np.asarray(acc[self.nnz_t:]), dtype=np.float64)
+                    if self.nsend else np.zeros(0, dtype=np.float64))
+            rbuf = np.empty(self.nrecv, dtype=np.float64)
+            self.comm.Alltoallv([sbuf, self.scnt, self.sdsp, MPI.DOUBLE],
+                                [rbuf, self.rcnt, self.rdsp, MPI.DOUBLE])
+            if self.nrecv:
+                acc = _fused_add(acc, _put(rbuf), tp._device_zero(self.slot_recv), None)
+        if diagonal is not None:
+            slots, value = diagonal
+            if len(slots):
+                acc = _device_set(acc, tp._device_zero(slots), float(value))
+        return acc
+
+    def _finish_single(self, acc):
+        """The matrix in the single-precision hypre, from the values of the two blocks
+        (a device or a host accumulator, after the exchange)."""
+        from ..algorithms.singlesolve import SingleParMatrix
+
+        S = SingleParMatrix.from_pattern(self, acc)
+        if not isinstance(acc, np.ndarray):
+            self.target.give_back(acc)
+        return S
 
     def _copy_columns(self, bridge, pointer, block, J):
         """Fill the device copy of a block's column indices: from the pattern's host

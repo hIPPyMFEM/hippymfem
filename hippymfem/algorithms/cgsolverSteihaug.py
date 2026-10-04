@@ -41,7 +41,8 @@ inner product of the preconditioner, to all the earlier ones explicitly, which c
 ``k`` inner products and updates at iteration ``k`` and two stored vectors per
 iteration.  The iteration then takes the number of steps of exact arithmetic, the same
 in every run, and keeps taking it when the operator carries an error far above
-rounding (see ``ReducedSpaceNewtonCG``, ``cg_reorthogonalize``).
+rounding.  ``ReducedSpaceNewtonCG`` turns it on (``cg_reorthogonalize``); here it is
+off by default, since a solve of a thousand iterations would store two thousand vectors.
 """
 
 import math

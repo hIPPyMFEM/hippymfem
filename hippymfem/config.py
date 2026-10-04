@@ -219,6 +219,15 @@ _KNOBS = [
     _Knob("hypre_spmv", "HIPPYMFEM_HYPRE_SPMV",
           "hypre's matrix-vector kernel on a GPU: auto (its own on several ranks of a CUDA build), vendor, hypre",
           _module_attr("common.mfemconfig", "HYPRE_SPMV"), _module_setter("common.mfemconfig", "set_hypre_spmv")),
+    _Knob("hypre_pcg", "HIPPYMFEM_HYPRE_PCG",
+          "CG solves with a hypre preconditioner in hypre's own PCG (1, the default) or in MFEM's CG (0): "
+          "the same iteration; hypre's saves a matrix-vector product per V-cycle",
+          _module_attr("algorithms.linSolvers", "HYPRE_PCG"), _module_setter("algorithms.linSolvers", "set_hypre_pcg")),
+    _Knob("hypre_single", "HIPPYMFEM_HYPRE_SINGLE",
+          "path of a single-precision build of hypre (tools/build_hypre_single.sh): the Jacobian, its "
+          "BoomerAMG hierarchy and the CG solves with it then live in that library; empty: double precision",
+          _module_attr("algorithms.singlesolve", "HYPRE_SINGLE"),
+          _module_setter("algorithms.singlesolve", "set_hypre_single")),
     _Knob("hypre_pool", "HIPPYMFEM_HYPRE_POOL",
           "megabytes of freed device memory a recycling pool for hypre may hold per rank between "
           "BoomerAMG setups (the default pool, HIPPYMFEM_HYPRE_POOL=auto, may hold 1024 during a "

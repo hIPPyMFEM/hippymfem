@@ -21,17 +21,19 @@ enough for its indefiniteness not to matter.
 
 Globalization is either an Armijo line search or a trust region; both are ported
 from hIPPYlib, with the same parameters, the same termination codes and the same
-printed table, so runs can be compared iteration by iteration.
+printed table.
 
-``cg_reorthogonalize`` (off by default, for that comparison) departs from hIPPYlib.
-The CG iteration of a Newton step then keeps its residuals orthogonal explicitly
-instead of by its recurrence.  On the model problem of the benchmarks this took 143
-instead of about 200 CG iterations for the same eleven Newton steps, the same number in
-every run, and that number did not change when the incremental solves of the Hessian
-action were stopped at a relative residual of 1e-6, or 1e-2, instead of 1e-12: without
-it, incremental solves stopped at 1e-8 already cost a third more CG iterations.  The
-gradient stays exact (its forward and adjoint solves keep their tolerance), so the MAP
-point is the same; only the Newton directions come from a Hessian of lower accuracy.
+One default departs from hIPPYlib: ``cg_reorthogonalize``.  The CG iteration of a Newton
+step keeps its residuals orthogonal explicitly instead of by its recurrence
+(:mod:`~hippymfem.algorithms.cgsolverSteihaug`).  On the model problem of the benchmarks
+with 2.1 million state dofs this took 131 CG iterations for twelve Newton steps where
+the recurrence took 193 to 210, a number that changed from run to run and from one GPU
+to another, and the 131 did not change when the incremental solves of the Hessian
+action were stopped at a relative residual of 1e-6 instead of 1e-12; with the
+recurrence, incremental solves stopped at 1e-8 already cost a third more CG iterations.
+The gradient stays exact (its forward and adjoint solves keep their tolerance), so the
+MAP point is the same; only the Newton directions come from a Hessian of lower accuracy.
+``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by step.
 """
 
 import math
@@ -72,10 +74,11 @@ def ReducedSpaceNewtonCG_ParameterList():
         "GN_iter": [5, "Gauss-Newton iterations before switching to full Newton"],
         "cg_coarse_tolerance": [0.5, "coarsest CG tolerance (Eisenstat-Walker)"],
         "cg_max_iter": [100, "maximum CG iterations per Newton step"],
-        "cg_reorthogonalize": [False, "the CG of a Newton step keeps its residuals orthogonal "
-                                      "explicitly (CGSolverSteihaug, reorthogonalize): fewer "
-                                      "Hessian actions, the same count in every run, and "
-                                      "incremental solves that need a loose tolerance only"],
+        "cg_reorthogonalize": [True, "the CG of a Newton step keeps its residuals orthogonal "
+                                     "explicitly (CGSolverSteihaug, reorthogonalize): fewer "
+                                     "Hessian actions, the same count in every run, and "
+                                     "incremental solves that need a loose tolerance only; "
+                                     "False is hIPPYlib's iteration"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })

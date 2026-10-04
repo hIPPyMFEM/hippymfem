@@ -216,6 +216,11 @@ def copy_from_jax(dst, x, start=0, count=None):
     _copy(int(dst), base + int(start) * item, n * item, _D2D)
 
 
+def copy_device(dst, src, nbytes):
+    """Copy ``nbytes`` from the device address ``src`` to the device address ``dst``."""
+    _copy(int(dst), int(src), int(nbytes), _D2D)
+
+
 def copy_from_host(dst, array):
     """Copy a contiguous numpy array to the device address ``dst``."""
     array = np.ascontiguousarray(array)

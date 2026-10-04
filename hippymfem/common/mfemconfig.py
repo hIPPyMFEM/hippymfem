@@ -221,15 +221,30 @@ _DEVICE = []
 DEVICE_INDEX = None
 
 
+#: Path of a second, single-precision hypre library this process has loaded
+#: (:mod:`hippymfem.algorithms.singlesolve`), which :func:`_hypre_library` must not
+#: mistake for the one MFEM uses.
+SINGLE_LIBRARY_PATH = None
+
+_HYPRE_HANDLE = None
+
+
 def _hypre_library():
-    """A ``ctypes`` handle of the hypre library this process has loaded, or ``None``."""
+    """A ``ctypes`` handle of the hypre library MFEM uses in this process, or ``None``."""
+    global _HYPRE_HANDLE
+    if _HYPRE_HANDLE is not None:
+        return _HYPRE_HANDLE
     import ctypes
 
     try:
         with open("/proc/self/maps") as f:
             for line in f:
                 if "libHYPRE" in line:
-                    return ctypes.CDLL(line.split(None, 5)[-1].strip())
+                    path = line.split(None, 5)[-1].strip()
+                    if SINGLE_LIBRARY_PATH and os.path.realpath(path) == SINGLE_LIBRARY_PATH:
+                        continue
+                    _HYPRE_HANDLE = ctypes.CDLL(path)
+                    return _HYPRE_HANDLE
     except OSError:
         pass
     return None

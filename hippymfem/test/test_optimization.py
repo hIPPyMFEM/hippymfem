@@ -594,8 +594,8 @@ def test_newton_cg_reorthogonalized():
         x = solver.solve([None, model.prior.mean.copy(), None])
         return solver, x[PARAMETER].copy()
 
-    plain, m_plain = run(False)
-    reo, m_reo = run(True)
+    plain, m_plain = run(False)                  # hIPPYlib's iteration
+    reo, m_reo = run(True)                       # the default
     loose, m_loose = run(True, inc_tol=1e-5)
     scale = m_plain.norm("l2")
     e_reo = m_reo.copy().axpy(-1.0, m_plain).norm("l2") / scale

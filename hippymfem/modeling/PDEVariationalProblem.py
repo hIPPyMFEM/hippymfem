@@ -22,6 +22,7 @@ carrying it across) is the table in :mod:`hippymfem.fem.bcs`; with it baked into
 the matrices, ``apply_ij`` is a plain matrix product with no masking.
 """
 
+import inspect
 import gc
 import os
 
@@ -508,23 +509,35 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # constants (GroupKernel.consistent_block): from both sides, since the adjoint
         # solves with its transpose, or symmetrically once it is known to be symmetric.
         single = _kernel.matrix_precision() == "fp32"
+        # With a single-precision hypre the Jacobian is assembled into it and exists
+        # there alone, once it is known to be symmetric: CG is the solver there.
+        to_single = self._wants_single()
         known = (self.symmetric_jacobian if self.symmetric_jacobian != "auto"
-                 else (self._symmetric_verdict if single else None))
-        A = self._block(ADJOINT, STATE, xx, test_ess=self.bc0.ess_tdof,
-                        diag_policy="one",
-                        consistent=(("symmetric" if known else "two-sided") if single else None))
+                 else (self._symmetric_verdict if (single or to_single) else None))
+
+        def assemble(consistent, in_single):
+            kw = dict(test_ess=self.bc0.ess_tdof, diag_policy="one", consistent=consistent)
+            if in_single:
+                from ..fem.tdofassemble import single_target
+
+                with single_target():
+                    return self._block(ADJOINT, STATE, xx, **kw)
+            return self._block(ADJOINT, STATE, xx, **kw)
+
+        A = assemble(("symmetric" if known else "two-sided") if single else None,
+                     to_single and bool(known))
         if self.symmetric_jacobian == "auto":
             symmetric = self._probe_symmetry(A) if known is None else known
-            if single and known is None:
+            if (single or to_single) and known is None:
                 # Kept: a symmetrized matrix would pass the probe whatever the form
                 # is.  The matrix just probed was made consistent from both sides and
                 # is symmetric to 1e-7 only, which the adjoint and the Hessian must
-                # not inherit, so it is assembled once more, symmetrically.
+                # not inherit, so it is assembled once more, symmetrically (and into
+                # the single-precision hypre, if that is where it is to live).
                 self._symmetric_verdict = symmetric
                 if symmetric:
                     del A
-                    A = self._block(ADJOINT, STATE, xx, test_ess=self.bc0.ess_tdof,
-                                    diag_policy="one", consistent="symmetric")
+                    A = assemble("symmetric" if single else None, to_single)
         else:
             symmetric = self.symmetric_jacobian
         if symmetric:
@@ -536,6 +549,25 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._jac_cache = (None if self.is_fwd_linear else u.copy(), m.copy(),
                            A, At)
         return A, At
+
+    #: Whether this problem's solves may run in a single-precision hypre when one is
+    #: named (``HIPPYMFEM_HYPRE_SINGLE``, :mod:`hippymfem.algorithms.singlesolve`).
+    single_solves = True
+
+    def _wants_single(self):
+        """Whether the Jacobian is to be assembled into the single-precision hypre: such
+        a library is named and loads, and the three solvers that would hold the
+        Jacobian are CG with BoomerAMG."""
+        from ..algorithms import singlesolve
+
+        if not (self.single_solves and singlesolve.HYPRE_SINGLE):
+            return False
+        krylov = _krylov_class()
+        for attr in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            solver = self._get_solver(attr)
+            if not (isinstance(solver, krylov) and solver.can_solve_single()):
+                return False
+        return singlesolve.library() is not None
 
     #: relative tolerance of the symmetry probe, and how many vector pairs it uses
     SYMMETRY_PROBE_TOL = 1e-13
@@ -670,8 +702,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                   prm["abs_tolerance"])
         self.fwd_iterations = 0
 
-        if self.is_fwd_linear and _refines():
+        J = None
+        if self.is_fwd_linear:
             J, _Jt = self._jacobian([u, m, p], u=u)
+        if self.is_fwd_linear and (_refines() or _is_single(J)):
             _set_operator_once(solver, J)
             self.fwd_iterations, r = self._refined_solve(
                 solver, u, r, r0,
@@ -749,7 +783,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         rhs = adj_rhs.copy()
         self.bc0.zero(rhs)
         adj.zero()
-        if _refines():
+        if _refines() or _is_single(At):
             # A^T p in double precision is the derivative of the residual functional
             # with respect to the state, an element vector: rhs - A^T p is the
             # residual that the solve with the single-precision matrix is corrected
@@ -1292,6 +1326,14 @@ def _refines():
             and _kernel.vector_precision() == "fp64")
 
 
+def _is_single(A):
+    """Whether ``A`` is a matrix of the single-precision hypre, whose solves are
+    corrected against double-precision residuals like those of the mixed mode."""
+    from ..algorithms.singlesolve import SingleParMatrix
+
+    return isinstance(A, SingleParMatrix)
+
+
 def _set_operator_once(solver, A, share_from=None):
     """Point a solver at ``A``, skipping the work if it is already there.
 
@@ -1312,8 +1354,21 @@ def _set_operator_once(solver, A, share_from=None):
     if pc is None and base is not None and hasattr(solver, "_make_pc"):
         pc = solver._make_pc(base)                      # a hierarchy of A, not of the wrapper
     try:
-        solver.set_operator(A, pc=pc) if pc is not None else solver.set_operator(A)
+        if pc is None:
+            solver.set_operator(A)
+        elif _takes_donor(solver):
+            solver.set_operator(A, pc=pc, donor=share_from)
+        else:
+            solver.set_operator(A, pc=pc)
     except TypeError:                                    # a solver without the option
         solver.set_operator(A)
     solver.current_operator = A
     return solver
+
+
+def _takes_donor(solver):
+    """Whether ``solver.set_operator`` accepts the solver a preconditioner comes from."""
+    try:
+        return "donor" in inspect.signature(solver.set_operator).parameters
+    except (TypeError, ValueError):
+        return False

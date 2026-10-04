@@ -95,6 +95,30 @@ def KrylovSolver_ParameterList():
     })
 
 
+#: Whether a CG solve with a hypre preconditioner runs in hypre's own PCG (MFEM's
+#: ``HyprePCG``) instead of MFEM's ``CGSolver`` (``HIPPYMFEM_HYPRE_PCG``, on by default).
+#: The two make the same iteration: the same iterates, counts and stopping test from a
+#: zero initial guess.  hypre's PCG tells BoomerAMG that the initial guess of a V-cycle
+#: is zero, which saves the first relaxation its matrix-vector product on the finest
+#: level; MFEM zeroes the vector without saying so.  With l1-Jacobi relaxation on a GPU
+#: that is one product of four per iteration: a solve of 2.1 million dofs to 1e-12 took
+#: 0.103 s and 0.089 s on an H100, 0.274 s and 0.227 s on an L40S (24 iterations each).
+HYPRE_PCG = os.environ.get("HIPPYMFEM_HYPRE_PCG", "1").strip().lower() not in ("0", "off", "false", "no")
+
+#: preconditioners that are hypre solvers, which hypre's PCG can call itself
+_HYPRE_SOLVER_PCS = ("amg", "ilu", "parasails", "euclid")
+
+
+def set_hypre_pcg(on=True):
+    """Choose hypre's own PCG (``True``) or MFEM's CG (``False``) for the CG solves with a
+    hypre preconditioner that are set up from now on (see :data:`HYPRE_PCG`); returns the
+    old choice."""
+    global HYPRE_PCG
+    old = HYPRE_PCG
+    HYPRE_PCG = bool(on) if not isinstance(on, str) else on.strip().lower() not in ("0", "off", "false", "no")
+    return old
+
+
 _METHODS = {
     "cg": mfem.CGSolver,
     "gmres": mfem.GMRESSolver,
@@ -153,11 +177,12 @@ class _SolverBase(KeepAlive):
         rebuilds as usual.
         """
         for name in ("A", "_pc", "_solver", "_held", "_lu", "_template",
-                     "_pc_built_on"):
+                     "_pc_built_on", "_fallback"):
             if hasattr(self, name):
                 setattr(self, name, None)
         self.current_operator = None
         self._pc_age = 0
+        self._single = False
         return self
 
 
@@ -255,13 +280,25 @@ class KrylovSolver(_SolverBase):
             return self._set_error_mode(mfem.HypreEuclid(A))
         raise ValueError("unknown preconditioner %r" % (t,))
 
-    def set_operator(self, A, pc=None):
+    def set_operator(self, A, pc=None, donor=None):
         """Point the solver at ``A``; ``pc`` shares an existing preconditioner of ``A``.
 
         The forward solver and the forward-incremental solver hold the same Jacobian;
         the PDE passes the forward solver's preconditioner here when the operators are
-        the same object, so the hierarchy is built once and held once.
+        the same object, so the hierarchy is built once and held once.  ``donor`` is
+        the solver ``pc`` comes from: when that one runs hypre's PCG on this very
+        matrix (:data:`HYPRE_PCG`), its PCG object is shared too, since each such
+        object sets its preconditioner up at its first solve.
+
+        A :class:`~hippymfem.algorithms.singlesolve.SingleParMatrix` is solved in the
+        single-precision hypre it lives in (CG with BoomerAMG only); ``pc`` is then the
+        engine of another solver of the same matrix.
         """
+        from .singlesolve import SingleParMatrix
+
+        if isinstance(A, SingleParMatrix):
+            return self._set_single(A, pc)
+        self._single = False
         A = as_matrix(A)
         # Release the previous operator, preconditioner and MFEM solver *before*
         # building the new ones: an optimizer re-sets the forward solver at every
@@ -289,10 +326,26 @@ class KrylovSolver(_SolverBase):
             self._pc = pc if pc is not None else self._make_pc(A)
             self._pc_built_on = None if pc is not None else A
             self._pc_age = 0
-        s = _METHODS[self.method](self.comm)
-        s.SetOperator(A)
-        if self._pc is not None:
-            s.SetPreconditioner(self._pc)
+        s = None
+        self._fallback = None
+        if (HYPRE_PCG and self.method == "cg" and self.precond_type in _HYPRE_SOLVER_PCS
+                and keep is None and self._pc is not None and isinstance(A, mfem.HypreParMatrix)):
+            # (a hierarchy kept from an older matrix stays with MFEM's CG: the setup
+            # of hypre's PCG would rebuild it on the new one)
+            if pc is None:
+                s = mfem.HyprePCG(A)
+                s.SetPreconditioner(self._pc)
+            else:
+                shared = getattr(donor, "_solver", None) if donor is not None else None
+                if (isinstance(shared, mfem.HyprePCG) and getattr(donor, "A", None) is A
+                        and getattr(donor, "_pc", None) is pc):
+                    s = shared
+        self._native = s is not None
+        if s is None:
+            s = _METHODS[self.method](self.comm)
+            s.SetOperator(A)
+            if self._pc is not None:
+                s.SetPreconditioner(self._pc)
         self._solver = s
         # hypre sets a preconditioner up at its first application: until the first
         # solve is over, a scoped pool recycles the arrays the setup allocates and
@@ -307,9 +360,75 @@ class KrylovSolver(_SolverBase):
 
     SetOperator = set_operator
 
-    def _configure(self):
+    def can_solve_single(self):
+        """Whether this solver could run in the single-precision hypre: CG with a plain
+        BoomerAMG, the only combination set up there."""
+        return bool(self.method == "cg" and self.precond_type == "amg"
+                    and not self.systems_dim and int(self.parameters["pc_reuse"]) == 0)
+
+    def _set_single(self, S, engine=None):
+        from .singlesolve import SingleEngine
+
+        if not self.can_solve_single():
+            raise ValueError("a single-precision matrix is solved by cg with a plain amg "
+                             "preconditioner, not by %s with %s" % (self.method, self.precond_type))
+        self._solver = None
+        self._pc = None
+        self._held = None
+        self._fallback = None
+        self._native = False
+        self.A = S
+        self._template = ParVector(self.comm, S.Height())
+        self._pc = (engine if isinstance(engine, SingleEngine) and engine.matrix is S
+                    else SingleEngine(S, self.parameters))
+        self._pc_built_on = None
+        self._pc_age = 0
+        self._setup_pending = False
+        self._single = True
+        self._held = (S, self._pc)
+        return self
+
+    def _solve_single(self, x, b):
+        from .singlesolve import SINGLE_TOL_FLOOR
+
         p = self.parameters
-        s = self._solver
+        if p["nonzero_initial_guess"]:
+            raise ValueError("a single-precision solve starts from zero: its matrix cannot "
+                             "form the residual of a double-precision guess")
+        self.iterations, final = self._pc.solve(x.hypre, b.hypre, p["rel_tolerance"],
+                                                p["abs_tolerance"], p["max_iter"])
+        self.converged = (self.iterations < int(p["max_iter"])
+                          or final <= max(float(p["rel_tolerance"]), SINGLE_TOL_FLOOR))
+        if self.converged and not math.isfinite(x.hypre.Norml2()):
+            self.converged = False
+        if not self.converged and p["error_on_nonconvergence"]:
+            raise RuntimeError(
+                "cg(amg) in single precision failed to converge in %d iterations "
+                "(final rel. norm %.3e)" % (self.iterations, final))
+        return self.iterations
+
+    def _mfem_cg(self):
+        """MFEM's CG on the operator and preconditioner of a solver that runs hypre's
+        PCG, for a solve from a nonzero initial guess: MFEM's stopping test is relative
+        to the first residual, hypre's to the right-hand side."""
+        if getattr(self, "_fallback", None) is None:
+            s = mfem.CGSolver(self.comm)
+            s.SetOperator(self.A)
+            s.SetPreconditioner(self._pc)
+            self._fallback = s
+        return self._fallback
+
+    def _configure(self, s=None):
+        p = self.parameters
+        if s is None:
+            s = self._solver
+            if getattr(self, "_native", False):
+                s.SetTol(float(p["rel_tolerance"]))
+                s.SetAbsTol(float(p["abs_tolerance"]))
+                s.SetMaxIter(int(p["max_iter"]))
+                s.SetPrintLevel(max(0, int(p["print_level"])))
+                s.iterative_mode = False
+                return
         s.SetRelTol(float(p["rel_tolerance"]))
         s.SetAbsTol(float(p["abs_tolerance"]))
         s.SetMaxIter(int(p["max_iter"]))
@@ -320,19 +439,35 @@ class KrylovSolver(_SolverBase):
 
     def solve(self, x, b):
         """``x = A^{-1} b``; returns the iteration count."""
+        if getattr(self, "_single", False):
+            return self._solve_single(x, b)
         if self._solver is None:
             raise RuntimeError("set_operator must be called before solve")
-        self._configure()
+        native = getattr(self, "_native", False) and not self.parameters["nonzero_initial_guess"]
+        solver = self._solver if (native or not getattr(self, "_native", False)) else self._mfem_cg()
+        self._configure(None if solver is self._solver else solver)
         if not self.parameters["nonzero_initial_guess"]:
             x.zero()
-        self._solver.Mult(b.hypre, x.hypre)
+        solver.Mult(b.hypre, x.hypre)
         if getattr(self, "_setup_pending", False):
             from ..common.mfemconfig import hypre_pool_close
 
             self._setup_pending = False
             hypre_pool_close()
-        self.iterations = self._solver.GetNumIterations()
-        self.converged = bool(self._solver.GetConverged())
+        if native:
+            its, norm = mfem.intp(), mfem.doublep()
+            solver.GetNumIterations(its)
+            solver.GetFinalResidualNorm(norm)
+            self.iterations = int(its.value())
+            final = float(norm.value())
+            # (stopped by the absolute tolerance, or by the relative one at the last
+            # iteration allowed)
+            self.converged = (self.iterations < int(self.parameters["max_iter"])
+                              or final <= float(self.parameters["rel_tolerance"]))
+        else:
+            self.iterations = solver.GetNumIterations()
+            self.converged = bool(solver.GetConverged())
+            final = None
         if self.converged and not math.isfinite(x.hypre.Norml2()):
             # A preconditioner whose setup failed can leave the Krylov solver
             # reporting convergence on a vector full of NaN.  The norm is a device
@@ -343,7 +478,7 @@ class KrylovSolver(_SolverBase):
             raise RuntimeError(
                 "%s(%s) failed to converge in %d iterations (final rel. norm %.3e)"
                 % (self.method, self.precond_type, self.iterations,
-                   self._solver.GetFinalRelNorm())
+                   final if final is not None else solver.GetFinalRelNorm())
             )
         return self.iterations
 

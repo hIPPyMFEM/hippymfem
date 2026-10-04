@@ -229,7 +229,10 @@ def finish_block(p, acc):
         if p.fold and p.same and p.test_ess is not None:
             diagonal = (p.tpat.diagonal_slots(p.test_ess),
                         0.0 if p.diag_policy == "zero" else 1.0)
-        A = p.tpat.finish(acc, diagonal)
+        # (a complete matrix may be asked for in the single-precision hypre)
+        from .tdofassemble import single_requested
+
+        A = p.tpat.finish(acc, diagonal, single=bool(p.fold and single_requested()))
         if p.fold:
             return A
     else:
