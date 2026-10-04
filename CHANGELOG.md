@@ -45,6 +45,13 @@
   than before these three changes; with the forward and adjoint solves refined to 1e-9
   only (`PDEVariationalProblem.SINGLE_REFINE_GOAL`, enough for Newton-CG to 1e-6 but
   not for BFGS to 1e-8) 23.5, 43.5, 42.4 and 25.6 s.
+  At 17.0 million state dofs on four L40S the run takes 162 s against 240 s in double
+  precision, in the same 13 Newton and 191 CG iterations, and the busiest card holds
+  34.5 GiB against 39.2 GiB; a run that releases each linearization point before the
+  next holds more with the single-precision solves (21.9 to 23.4 GiB against 19.7 GiB
+  on the busiest of four Blackwell instances). A failure that one rank meets alone
+  (hypre's error flag is per process) stops every rank: before, a BFGS line search on
+  two ranks could wait forever.
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.

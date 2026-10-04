@@ -397,7 +397,9 @@ the H100 costs as much as seven CG iterations.  The forward solve owes its gain 
 assembly, and the adjoint solve, three passes with two evaluations of the residual, is
 a little slower than in double precision.  Refined to 1e-9 the forward solve took 0.34, 0.65
 and 0.60 s and the adjoint solve 0.093, 0.192 and 0.191 s, 1.1 to 1.3 times faster than
-in double precision.
+in double precision.  The first refined adjoint solve of a process also compiles the
+kernel of its residual, once (9 to 33 s in the runs at 128\ :sup:`3` below); an adjoint
+solve in double precision evaluates no residual and does not pay it.
 
 **Memory.**  A matrix entry is twelve bytes in double precision (value and column index)
 and eight in single, so the Jacobian and its hierarchy take two thirds of what they
@@ -423,6 +425,23 @@ CUDA context; a seventh of it goes.  The other blocks of a linearization point s
 double precision (for a forward problem that is linear in the state these are ``C`` and
 ``W_um``, 0.4 GB each at this size), and so do the accumulators of the assembly.
 
+**At a larger size.**  At 128\ :sup:`3` (17.0 million state dofs) on four L40S the same
+solve took 240 s in double precision and 162 s with single-precision element matrices
+and solves, 1.5 times faster, in the same 13 Newton and 191 CG iterations and to the
+same cost in ten digits.  A Hessian action took 0.72 and 0.43 s.  The busiest card held
+39.2 GiB at its peak in double precision and 34.5 GiB in single, 22.1 and 17.5 GiB of it
+outside the element kernels' pool.
+
+A run that releases each linearization point before the next
+(``release_linearization_on_move``) holds less at its peak, and there the
+single-precision solves needed more, not less: in the two Newton steps of
+``benchmarks/bench_newton_device.py --release-linearization`` at 128\ :sup:`3` the
+busiest of four Blackwell instances held 21.9 to 23.4 GiB against 19.7 GiB in double
+precision (the steps took 28.5 s in double precision, 19.5 s with the single-precision
+solves and 13.5 s with the single-precision element matrices as well).  What coexists
+at that peak was not taken apart.  The likely place is the assembly, which holds the
+double-precision accumulator, its rounded copy and the new matrix together.
+
 One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
 directions, but the eigenpairs of a Laplace approximation come out to about that
 accuracy relative to the largest eigenvalue (in ``test_uq`` the eigenvectors
@@ -436,6 +455,13 @@ stages after it:
    pde.invalidate_jacobian()
    model.setPointForHessianEvaluations(x)
 
+The 1e-5 also shows in the iterates on the way.  In the first Newton step of
+``bench_newton_device.py``, from the prior mean and with the full Hessian, CG stopped
+after three or four iterations in both precisions, and the directional derivative of
+the step differed by 0.2 %.  Two steps in, far from the minimum, the costs differed by
+6 % (128\ :sup:`3`) and 30 % (64\ :sup:`3`).  The runs to a tolerance agreed, as above,
+so compare such runs and not a fixed number of steps.
+
 What to set, for a symmetric problem solved by CG with BoomerAMG:
 
 .. code-block:: bash
@@ -446,8 +472,10 @@ What to set, for a symmetric problem solved by CG with BoomerAMG:
 
 and a loose tolerance on the two incremental solvers (:doc:`optimization`).  The
 single-precision library is used on a host build as well (``tools/build_hypre_single.sh``
-on that PyMFEM tree); it was not timed there.  ``test_solvers`` and ``test_device`` check
-the single-precision solves against the double-precision ones when the variable is set.
+on that PyMFEM tree).  There the suites take about as long with it as without
+(``test_optimization`` on two ranks 54 s against 48 s); no problem of a size that
+matters was timed.  ``test_solvers`` and ``test_device`` check the single-precision
+solves against the double-precision ones when the variable is set.
 
 .. _several-gpus:
 
