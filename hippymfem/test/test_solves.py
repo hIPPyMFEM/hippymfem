@@ -17,6 +17,7 @@ import hippymfem as hp
 from hippymfem.algorithms.linSolvers import KrylovSolver, LUSolver
 from hippymfem.fem.bcs import BCSet, DirichletBC
 from hippymfem.fem.jaxops import inner
+from hippymfem.algorithms.singlesolve import action_tolerance
 from hippymfem.fem.kernel import matrix_tolerance
 from hippymfem.fem.spaces import FunctionSpace
 from hippymfem.modeling.PDEVariationalProblem import PDEVariationalProblem
@@ -111,21 +112,23 @@ def test_adjoint_and_incremental():
     e = chk.copy().axpy(-1.0, rhs).norm("l2") / max(rhs.norm("l2"), 1e-300)
     # the adjoint solves the equation of the double-precision operator; the assembled
     # matrix applied here is the single-precision one in the mixed mode
-    check("A^T p == adj_rhs", e < matrix_tolerance(1e-9), "(%.2e)" % e)
+    check("A^T p == adj_rhs", e < max(matrix_tolerance(1e-9), action_tolerance(1e-9, single=1e-5)),
+          "(%.2e)" % e)
 
     # incremental forward: A du == rhs
     du = Vu.vector()
     pde.solveIncremental(du, rhs, False)
     pde.apply_ij(ADJOINT, STATE, du, chk)
     e = chk.copy().axpy(-1.0, rhs).norm("l2") / max(rhs.norm("l2"), 1e-300)
-    check("incremental forward consistent with A", e < 1e-9, "(%.2e)" % e)
+    # (in a single-precision hypre the incremental solves stop near 1e-5)
+    check("incremental forward consistent with A", e < action_tolerance(1e-9), "(%.2e)" % e)
 
     # incremental adjoint: A^T dp == rhs
     dp = Vu.vector()
     pde.solveIncremental(dp, rhs, True)
     pde.apply_ij(STATE, ADJOINT, dp, chk)
     e = chk.copy().axpy(-1.0, rhs).norm("l2") / max(rhs.norm("l2"), 1e-300)
-    check("incremental adjoint consistent with A^T", e < 1e-9, "(%.2e)" % e)
+    check("incremental adjoint consistent with A^T", e < action_tolerance(1e-9), "(%.2e)" % e)
 
     # adjoint identity across the C block
     dm = Vm.vector()
