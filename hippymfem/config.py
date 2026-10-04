@@ -143,7 +143,9 @@ _KNOBS = [
           _module_setter("modeling.PDEVariationalProblem", "set_share_hessian_pass")),
     # ------------------------------------------------------------------- kernels
     _Knob("precision", "HIPPYMFEM_PRECISION",
-          "fp64 (default) or fp32 for the element kernels (a tool, not the solve path)",
+          "precision of the element kernels: fp64 (default), mixed (matrices in single "
+          "precision, vectors in double, solves refined: for GPUs with slow double "
+          "precision) or fp32 (everything single, nothing corrected)",
           _module_attr("fem.kernel", "PRECISION"), _module_setter("fem.kernel", "set_precision")),
     _Knob("hessian", "HIPPYMFEM_HESSIAN",
           "how element Hessians are differentiated: element (default), quadrature "

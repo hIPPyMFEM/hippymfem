@@ -42,6 +42,7 @@ from ..fem.assemble import assembly_backend
 from ..fem.csrassemble import (_eliminate, add_boundary_entries, assemble_matrix_csr,
                                finish_block, plan_block, scatter_many)
 from ..common.random import Random
+from ..fem import kernel as _kernel
 
 
 #: Take the linearization point's blocks from one differentiation pass instead of
@@ -224,6 +225,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self.kernel = QuadratureKernel(
             varf_handler, self.Vh + self.aux_spaces, self.batches
         )
+        # Under the mixed precision the element matrices of the domain term, which are
+        # the cost of an assembly, are computed in single precision: the Jacobian is
+        # made consistent (_jacobian) and the solves with it are refined (solveFwd,
+        # solveAdj).  The boundary and facet terms keep double.
+        for gk in self.kernel.group_kernels:
+            gk.single_matrices = True
         self.nelem = self.mesh.GetNE()
 
         # ------------------------------------------------------ boundary term
@@ -295,6 +302,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._lin_point = None
         #: last assembled forward Jacobian and the point it was built at
         self._jac_cache = None
+        #: what the symmetry probe found, kept while the element matrices are in single
+        #: precision (see :meth:`_jacobian`)
+        self._symmetric_verdict = None
         #: private generator for the symmetry probe (see :meth:`_probe_symmetry`)
         self._symmetry_rng = None
         self._symmetry_probes = None
@@ -372,17 +382,21 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         return out
 
     def _block(self, i, j, x, test_ess=None, diag_policy="one", mats=None,
-               loc=None, floc=None):
-        """Assemble block ``(i, j)`` at ``x``, with its facet part if there is one."""
+               loc=None, floc=None, consistent=None):
+        """Assemble block ``(i, j)`` at ``x``, with its facet part if there is one.
+
+        ``consistent``: see :meth:`~hippymfem.fem.kernel.QuadratureKernel.element_matrices`.
+        """
         if self.facet_kernel is None:
-            return self._domain_block(i, j, x, test_ess, diag_policy, mats, loc)
+            return self._domain_block(i, j, x, test_ess, diag_policy, mats, loc,
+                                      consistent=consistent)
         from ..common.linalg import ParAdd
         from ..fem.facets import assemble_facet_matrix
 
         # Domain and facet parts are summed before the essential rows are eliminated:
         # eliminating each and adding afterwards would leave 2.0 on the essential
         # diagonal.
-        A = self._domain_block(i, j, x, None, diag_policy, mats, loc)
+        A = self._domain_block(i, j, x, None, diag_policy, mats, loc, consistent=consistent)
         fmats = self.facet_kernel.element_matrices(
             i, j, self._facet_locals(x) if floc is None else floc)
         require_finite_arrays(fmats, self.comm, "facet block (%d, %d)" % (i, j))
@@ -396,7 +410,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                           self.Vh[i].fes is self.Vh[j].fes)
 
     def _domain_block(self, i, j, x, test_ess=None, diag_policy="one", mats=None,
-                      loc=None):
+                      loc=None, consistent=None):
         """Assemble block ``(i, j)`` at ``x``.
 
         ``mats`` and ``loc`` let a caller that already differentiated at this
@@ -409,7 +423,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # Arrays when the element batch fits on the device whole, a chunk thunk
             # when it does not: the scatter then consumes each chunk as it is
             # produced and the full (ne, nd, nd) array is never formed.
-            mats = self.kernel.element_matrices_or_chunks(i, j, loc)
+            mats = self.kernel.element_matrices_or_chunks(i, j, loc, consistent=consistent)
         finite = None
         if callable(mats):
             # The arrays never exist all at once, so the overflow check rides along
@@ -490,10 +504,29 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._jac_cache = None
         self._release_operators("solver", "solver_adj")
         xx = [u, m, x[ADJOINT] if len(x) > ADJOINT else None]
+        # In single precision the Jacobian, which is inverted, is made exact on the
+        # constants (GroupKernel.consistent_block): from both sides, since the adjoint
+        # solves with its transpose, or symmetrically once it is known to be symmetric.
+        single = _kernel.matrix_precision() == "fp32"
+        known = (self.symmetric_jacobian if self.symmetric_jacobian != "auto"
+                 else (self._symmetric_verdict if single else None))
         A = self._block(ADJOINT, STATE, xx, test_ess=self.bc0.ess_tdof,
-                        diag_policy="one")
-        symmetric = (self._probe_symmetry(A) if self.symmetric_jacobian == "auto"
-                     else self.symmetric_jacobian)
+                        diag_policy="one",
+                        consistent=(("symmetric" if known else "two-sided") if single else None))
+        if self.symmetric_jacobian == "auto":
+            symmetric = self._probe_symmetry(A) if known is None else known
+            if single and known is None:
+                # Kept: a symmetrized matrix would pass the probe whatever the form
+                # is.  The matrix just probed was made consistent from both sides and
+                # is symmetric to 1e-7 only, which the adjoint and the Hessian must
+                # not inherit, so it is assembled once more, symmetrically.
+                self._symmetric_verdict = symmetric
+                if symmetric:
+                    del A
+                    A = self._block(ADJOINT, STATE, xx, test_ess=self.bc0.ess_tdof,
+                                    diag_policy="one", consistent="symmetric")
+        else:
+            symmetric = self.symmetric_jacobian
         if symmetric:
             At = A
         elif self.transpose_free_adjoint and isinstance(self._get_solver("solver"), _krylov_class()):
@@ -507,6 +540,21 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: relative tolerance of the symmetry probe, and how many vector pairs it uses
     SYMMETRY_PROBE_TOL = 1e-13
     SYMMETRY_PROBE_VECTORS = 2
+    #: the same when the element matrices are computed in single precision: the
+    #: matrix of a symmetric form then has a skew part of about 1e-7 of its entries,
+    #: which the probe sees at 1e-7 / sqrt(n); a form that is not symmetric shows up
+    #: at about 1 / sqrt(n), far above this for any size that fits a GPU
+    SYMMETRY_PROBE_TOL_SINGLE = 1e-8
+
+    #: Iterative refinement of the forward and the adjoint solve when the Jacobian is
+    #: assembled in single precision and the residuals in double (``"mixed"``): the
+    #: most corrections after the first solve, and the relative accuracy that one
+    #: solve with the single-precision matrix is asked for.  Each solve reduces the
+    #: double-precision residual by about that factor, so two solves at 1e-6 reach
+    #: what one solve at 1e-12 reaches with a double-precision matrix, in about as
+    #: many Krylov iterations.
+    REFINE_MAX_STEPS = 5
+    REFINE_INNER_TOL = 1e-6
 
     def _probe_symmetry(self, A):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -533,6 +581,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # (65 ms for 2.1 million dofs, against four products of a millisecond each on
         # a GPU), and kept vectors stay in device memory, where the products and the
         # inner products below then run without a copy.
+        tol = (self.SYMMETRY_PROBE_TOL_SINGLE if _kernel.matrix_precision() == "fp32"
+               else self.SYMMETRY_PROBE_TOL)
         probes = self._symmetry_probes
         if probes is None:
             if self._symmetry_rng is None:
@@ -555,7 +605,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             bound = max(nw * nAv, nv * nAw)
             if bound == 0.0:
                 continue
-            if abs(wAv - vAw) > self.SYMMETRY_PROBE_TOL * bound:
+            if abs(wAv - vAw) > tol * bound:
                 return False
         return True
 
@@ -615,10 +665,20 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         r = self._residual([u, m, p], ADJOINT, ess=self.bc0.ess)
         require_finite(r, "the forward residual")
         r0 = r.norm("l2")
-        tol = max(prm["rel_tolerance"] * r0, prm["abs_tolerance"])
+        # a residual assembled in single precision cannot be driven below its floor
+        tol = max(max(prm["rel_tolerance"], _kernel.residual_floor()) * r0,
+                  prm["abs_tolerance"])
         self.fwd_iterations = 0
 
-        maxit = 1 if self.is_fwd_linear else int(prm["max_iter"])
+        if self.is_fwd_linear and _refines():
+            J, _Jt = self._jacobian([u, m, p], u=u)
+            _set_operator_once(solver, J)
+            self.fwd_iterations, r = self._refined_solve(
+                solver, u, r, r0,
+                lambda: self._residual([u, m, p], ADJOINT, ess=self.bc0.ess), "forward")
+            maxit = 0
+        else:
+            maxit = 1 if self.is_fwd_linear else int(prm["max_iter"])
         for it in range(maxit):
             J, _Jt = self._jacobian([u, m, p], u=u)
             _set_operator_once(solver, J)
@@ -638,19 +698,20 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             if rnew < tol:
                 break
         else:
-            if not self.is_fwd_linear:
+            if maxit and not self.is_fwd_linear:
                 raise RuntimeError(
                     "forward Newton solve did not converge: ||r|| = %.3e, "
                     "tolerance %.3e after %d iterations" % (rnew, tol, maxit)
                 )
         if self.is_fwd_linear:
             rn = r.norm("l2")
-            # The floor is the element kernel's precision, not the solver's: in fp32
-            # one Newton step on a linear residual lands at about 1e-5 relative (the
-            # assembled operator's own error, not a nonlinearity), which the fp64
-            # threshold would reject.
-            from ..fem.kernel import PRECISION as _KPREC
-            rtol, atol = ((1e-4, 1e-6) if _KPREC == "fp32" else (1e-6, 1e-8))
+            # The floor is the element kernel's precision, not the solver's: with
+            # everything in single precision one Newton step on a linear residual
+            # lands at about 1e-5 relative (the assembled operator's own error, not a
+            # nonlinearity), which the double-precision threshold would reject.  In
+            # the mixed mode the refinement above has removed that error.
+            rtol, atol = ((1e-4, 1e-6) if _kernel.vector_precision() == "fp32"
+                          else (1e-6, 1e-8))
             if rn > max(rtol * max(r0, 1.0), atol):
                 raise RuntimeError(
                     "is_fwd_linear=True but one Newton step left ||r|| = %.3e "
@@ -688,8 +749,69 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         rhs = adj_rhs.copy()
         self.bc0.zero(rhs)
         adj.zero()
+        if _refines():
+            # A^T p in double precision is the derivative of the residual functional
+            # with respect to the state, an element vector: rhs - A^T p is the
+            # residual that the solve with the single-precision matrix is corrected
+            # against
+            u, m = x[STATE], x[PARAMETER]
+
+            def residual():
+                r = self._residual([u, m, adj], STATE, ess=self.bc0.ess)
+                r.scale(-1.0).axpy(1.0, rhs)
+                return r
+
+            r0 = rhs.norm("l2")
+            self.adj_iterations, _ = self._refined_solve(
+                solver, adj, rhs.copy(), r0, residual, "adjoint", negate=False)
+            return adj
         solver.solve(adj, rhs)
         return adj
+
+    def _refined_solve(self, solver, x, r, r0, residual, what, negate=True):
+        """Solve with a matrix assembled in single precision, to the accuracy of double.
+
+        ``solver`` holds the Jacobian (or its transpose) from the single-precision
+        kernels, ``r`` is the residual of the double-precision equation at ``x`` and
+        ``residual()`` evaluates it again (the forward residual has the sign of
+        ``A x - b`` and is negated before a solve, ``negate``; the adjoint one is
+        ``b - A^T x``).  Each pass solves for a correction and adds it.  The matrix is
+        exact to about 1e-7, so a pass cannot reduce the residual by more than a
+        factor of that order times a condition number of the problem; the solver is
+        therefore asked for :data:`REFINE_INNER_TOL` only, and for less where less
+        reaches the goal.  The goal is the residual that one solve to the solver's own
+        tolerance leaves with a double-precision matrix.  Returns the number of
+        passes and the last residual.
+        """
+        prm = getattr(solver, "parameters", None)
+        tight = float(prm["rel_tolerance"]) if prm is not None and "rel_tolerance" in prm else None
+        goal = max(10.0 * (tight if tight is not None else 1e-12) * r0,
+                   self.newton_parameters["abs_tolerance"])
+        dx = x.duplicate()
+        rk, floor, steps = r0, self.REFINE_INNER_TOL, 0
+        if r0 == 0.0:
+            return 0, r
+        try:
+            for steps in range(1, 2 + int(self.REFINE_MAX_STEPS)):
+                if tight is not None:
+                    prm["rel_tolerance"] = min(0.1, max(tight, 0.3 * goal / rk, floor))
+                if negate:
+                    r.scale(-1.0)
+                solver.solve(dx, r)
+                x.axpy(1.0, dx)
+                r = residual()
+                rn = r.norm("l2")
+                if self.newton_parameters["print_level"] >= 0 and self.comm.rank == 0:
+                    print("  %s refinement %d: ||r|| = %.6e (%.1e of the first)"
+                          % (what, steps, rn, rn / r0), flush=True)
+                if rn <= goal or rn > 0.5 * rk:
+                    break
+                # the reduction this pass achieved bounds what the next one can
+                floor, rk = 0.1 * rn / rk, rn
+        finally:
+            if tight is not None:
+                prm["rel_tolerance"] = tight
+        return steps, r
 
     def evalGradientParameter(self, x, out):
         """``out = dR/dm`` at ``x``; equals ``C^T p`` but needs no matrix."""
@@ -1161,6 +1283,13 @@ class TransposeOf(mfem.TransposeOperator):
 
 def _transpose_operator(A):
     return TransposeOf(A)
+
+
+def _refines():
+    """Whether the solves are corrected against double-precision residuals: the
+    element matrices are in single precision and the element vectors in double."""
+    return (_kernel.matrix_precision() == "fp32"
+            and _kernel.vector_precision() == "fp64")
 
 
 def _set_operator_once(solver, A, share_from=None):

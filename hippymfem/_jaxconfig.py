@@ -8,11 +8,10 @@ Import this module first from anything that touches JAX.  These settings have to
 be in place before the first ``import jax``, because JAX reads them once:
 
 ``JAX_ENABLE_X64``
-    Always on.  ``HIPPYMFEM_PRECISION=fp32`` (:data:`hippymfem.fem.kernel.PRECISION`)
-    is a tool for a preconditioner or a Gauss-Newton approximation, not for the
-    solve path: it speeds up the kernel but barely the assembly, and the forward
-    solve's own linearity check rejects the result (``benchmarks/DESIGN_NOTES.md``,
-    section 1).
+    Always on.  Single precision is a choice of the element kernels alone
+    (``HIPPYMFEM_PRECISION``, :data:`hippymfem.fem.kernel.PRECISION`): ``mixed``
+    computes the element matrices in single precision and keeps the vectors, the
+    solves and the results in double.
 
 ``JAX_PLATFORMS``
     Defaults to ``"cpu"``.  Set ``HIPPYMFEM_DEVICE=gpu``, or ``auto`` for a GPU

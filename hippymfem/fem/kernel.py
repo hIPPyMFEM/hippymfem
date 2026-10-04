@@ -55,27 +55,67 @@ import jax.numpy as jnp                           # noqa: E402
 jax.config.update("jax_enable_x64", True)
 
 
-#: Precision the differentiated element kernels compute in.  ``"fp64"`` is the
-#: default and the only one the convergence results are measured at.  ``"fp32"``
-#: casts the kernel's inputs to single precision, so every quadrature-point
-#: evaluation and AD pass runs in fp32, while the derivative arrays still come back
-#: as float64 (the cast's own derivative promotes them) and hypre still gets a
-#: double-precision matrix.  Workstation cards have up to a hundred times the fp32
-#: peak of their fp64; ``benchmarks/bench_precision.py`` measures the gain and the
-#: accuracy cost.  Meant for a preconditioner or a Gauss-Newton approximation, not
-#: for a converged solve.  Set ``HIPPYMFEM_PRECISION``.
+#: Precision the differentiated element kernels compute in.  Set ``HIPPYMFEM_PRECISION``.
+#:
+#: ``"fp64"``
+#:     Everything in double precision.  The default.
+#: ``"mixed"``
+#:     The element **matrices** (the Jacobian and the Hessian blocks) are computed in
+#:     single precision; the element **vectors** (residuals, gradients, the products
+#:     of the matrix-free mode) and the values stay in double.  hypre still gets
+#:     double-precision matrices, whose entries are then accurate to about 1e-7.  The
+#:     forward and the adjoint solve correct for that by iterative refinement against
+#:     the double-precision residual (:class:`~hippymfem.modeling.PDEVariationalProblem`),
+#:     so the state, the adjoint, the cost and the gradient are those of ``"fp64"`` to
+#:     the tolerance of the solves; what is perturbed, at 1e-7, is the Hessian, which
+#:     an inexact Newton-CG method does not notice.  This is the mode to use on GPUs
+#:     whose double-precision arithmetic is slow (L40S, RTX-class cards), where the
+#:     matrix kernels are several times faster in single precision.
+#: ``"fp32"``
+#:     Matrices and vectors in single precision: the kernel's inputs are cast inside
+#:     the functional every derivative is built on.  Nothing corrects the result, so
+#:     residuals stall at about 1e-6 of their size and the reduced gradient is off by
+#:     1e-4 to 1e-3 in relative terms; the tolerances that would be unreachable are
+#:     raised (:func:`residual_floor`).  A tool for a preconditioner or a rough
+#:     solve; ``"mixed"`` costs nearly the same and loses nothing.
+#:
+#: ``benchmarks/bench_precision.py`` measures the three.
 PRECISION = os.environ.get("HIPPYMFEM_PRECISION", "fp64").strip().lower()
+_PRECISIONS = ("fp64", "mixed", "fp32")
+if PRECISION not in _PRECISIONS:
+    raise ValueError("HIPPYMFEM_PRECISION must be one of %s, got %r" % (_PRECISIONS, PRECISION))
+
+
+def matrix_precision():
+    """``"fp32"`` when the element matrices are computed in single precision."""
+    return "fp32" if PRECISION in ("fp32", "mixed") else "fp64"
+
+
+def vector_precision():
+    """``"fp32"`` when the element vectors and values are computed in single precision."""
+    return "fp32" if PRECISION == "fp32" else "fp64"
+
+
+#: relative accuracy of a quantity computed by a single-precision kernel
+FP32_EPS = 1.2e-7
+
+
+def residual_floor():
+    """The relative size below which an assembled residual cannot be driven with the
+    present precision of the element vectors: a tolerance below it is unreachable."""
+    return 1e-5 if vector_precision() == "fp32" else 0.0
 
 
 def set_precision(mode):
-    """Choose the element-kernel precision; returns the old value.
+    """Choose the element-kernel precision (``"fp64"``, ``"mixed"`` or ``"fp32"``, see
+    :data:`PRECISION`); returns the old value.
 
     Clears the compiled-kernel cache of every kernel built so far, since the dtype is
     baked into the jitted code.
     """
     global PRECISION
-    if mode not in ("fp64", "fp32"):
-        raise ValueError("precision must be fp64 or fp32, got %r" % (mode,))
+    if mode not in _PRECISIONS:
+        raise ValueError("precision must be one of %s, got %r" % (_PRECISIONS, mode))
     old, PRECISION = PRECISION, mode
     for k in _KERNELS:
         k._cache.clear()
@@ -778,6 +818,13 @@ class GroupKernel:
         self.hessian_route = {}
         self._slot_axes = tuple(tuple(t.jax_axes()) for t in self.tables)
         self._slot_eval = tuple(t.evaluator() for t in self.tables)
+        #: Whether the ``"mixed"`` precision computes this kernel's matrices in single
+        #: precision.  Off unless the owner of the kernel turns it on: single-precision
+        #: matrices need the consistent Jacobian and the refined solves that go with
+        #: them, which :class:`~hippymfem.modeling.PDEVariationalProblem` has for the
+        #: element matrices of its domain term.  Every other kernel computes in double
+        #: under ``"mixed"``.
+        self.single_matrices = False
         # Tables and geometry are placed lazily and kept **per device**, so a
         # CPU-only run never touches a GPU and switching devices mid-process does
         # not leave arrays committed to the wrong one.
@@ -785,10 +832,13 @@ class GroupKernel:
         _KERNELS.append(self)
 
     # ----------------------------------------------------------- functional
-    def _functional(self):
+    def _functional(self, matrix=False):
+        """The element functional every derivative is built on.  ``matrix`` says that
+        the derivative taken of it is an element matrix, which decides its precision
+        (:func:`matrix_precision`, :func:`vector_precision`)."""
         density = self.density
         evals = self._slot_eval
-        lowp = PRECISION == "fp32"
+        lowp = self._matrix_single() if matrix else vector_precision() == "fp32"
 
         def _body(dofs, tabs, geo, params):
             Jinv, wdet = geo[0], geo[1]
@@ -815,6 +865,10 @@ class GroupKernel:
                 return _body(dofs, tabs, geo, params)
 
         return R
+
+    def _matrix_single(self):
+        """Whether this kernel's element matrices are computed in single precision."""
+        return PRECISION == "fp32" or (PRECISION == "mixed" and self.single_matrices)
 
     def _axes(self, nlead=1):
         """``in_axes`` for vmap: ``nlead`` mapped dof-like args, the tables, the
@@ -1124,17 +1178,23 @@ class GroupKernel:
 
     def _hess_slot_element(self, j):
         """:meth:`_hess_slot` by forward tangents over slot ``j``'s element dofs."""
-        R = self._functional()
+        return self._chunked(_mapped_kernel(self._hess_slot_element_fn(j), self._axes()),
+                             self._axes(), weight=self._slot_weight(j))
+
+    def _hess_slot_element_fn(self, j):
+        """The function of one element behind :meth:`_hess_slot_element`."""
+        R = self._functional(matrix=True)
         nslots = self.nslots
+        lowp = self._matrix_single()
 
         def f(dofs, tabs, geo, params):
             def g(zj):
                 z = tuple(zj if s == j else dofs[s] for s in range(nslots))
                 return jax.grad(lambda zz: R(zz, tabs, geo, params))(z)
-            return jax.jacfwd(g)(dofs[j])
+            out = jax.jacfwd(g)(dofs[j])
+            return _symmetric_diagonal(out, j) if lowp else out
 
-        return self._chunked(_mapped_kernel(f, self._axes()), self._axes(),
-                             weight=self._slot_weight(j))
+        return f
 
     def _quadrature_route(self):
         """Whether every slot evaluates its field from shared or per-element tables
@@ -1157,12 +1217,17 @@ class GroupKernel:
         in the state has no state-state block, and most densities couple few of the
         parts.  Equal to the element route to round-off.
         """
+        return self._chunked(_mapped_kernel(self._hess_slot_quadrature_fn(j), self._axes()),
+                             self._axes(), weight=self._slot_weight(j))
+
+    def _hess_slot_quadrature_fn(self, j):
+        """The function of one element behind :meth:`_hess_slot_quadrature`."""
         evals = self._slot_eval
         nslots = self.nslots
         vd = [int(t.vdim) for t in self.tables]
         nd = [int(t.nd) for t in self.tables]
         sdim = int(np.shape(self.group.Jinv)[-1])
-        lowp = PRECISION == "fp32"
+        lowp = self._matrix_single()
         zero = self._zero_point_blocks(j)
 
         def body(dofs, tabs, geo, params):
@@ -1204,10 +1269,92 @@ class GroupKernel:
                 return body(dofs, tabs, geo, params)
             args = _as32((dofs, tabs, geo, params))
             with jax.default_matmul_precision("highest"):
-                return tuple(o.astype(jnp.float64) for o in body(*args))
+                return _symmetric_diagonal(
+                    tuple(o.astype(jnp.float64) for o in body(*args)), j)
 
-        return self._chunked(_mapped_kernel(f, self._axes()), self._axes(),
-                             weight=self._slot_weight(j))
+        return f
+
+    # ------------------------------------------------- single precision, consistent
+    def _low_modes(self, j):
+        """The constants of slot ``j`` as element dof vectors, orthonormal rows of a
+        ``(k, nd_j)`` array: one per component of a nodal space, where a vector of ones
+        is the constant function.  Any other space gets the vector of ones, which is a
+        test vector like any other."""
+        t = self.tables[j]
+        n = int(t.nd_total)
+        if type(t).__name__ in ("SpaceTables", "BoundarySpaceTables"):
+            vd, nd = int(t.vdim), int(t.nd)
+            V = np.zeros((vd, n))
+            for c in range(vd):
+                V[c, c * nd:(c + 1) * nd] = 1.0 / np.sqrt(nd)
+            return V
+        return np.full((1, n), 1.0 / np.sqrt(n))
+
+    def consistent_block(self, i, j, symmetric=False):
+        """Block ``(i, j)`` in single precision, exact on the constants.
+
+        An element matrix computed in single precision is off by about 1e-7 of its
+        entries, and on a mesh of like elements every element makes the *same* error.
+        The assembled matrix then errs coherently: applied to a smooth function, whose
+        values on an element are nearly equal, the errors of a row add up to the defect
+        of its row sum, the same on every element, where the exact entries cancel.  A
+        solve amplifies that by the condition number.  Measured on the Jacobian of the
+        model problem at ``16^3`` second-order hexahedra, with a constant coefficient:
+        an incremental solve was off by 2.2e-4, and by 2.7e-7 with the row sums put
+        right.
+
+        So the block is computed in single precision and corrected by a matrix of rank
+        one per component: its product with the constants of slot ``j``, and that of
+        its transpose with the constants of slot ``i``, are replaced by the
+        double-precision ones, which are two derivative passes with one tangent each
+        (a matrix pass has one per element dof).  ``symmetric`` says that the block is
+        a symmetric matrix: it is then symmetrized first, one pass serves both sides,
+        and the result is symmetric to the last bit.
+        """
+        key = ("hc", int(i), int(j), bool(symmetric))
+        if key not in self._cache:
+            route = HESSIAN_MODE
+            if route == "auto":
+                route = self.hessian_route.get((device(), int(j)), "element")
+            slot = (self._hess_slot_quadrature_fn(j)
+                    if route == "quadrature" and self._quadrature_route()
+                    else self._hess_slot_element_fn(j))
+            R = self._functional()               # the vectors' precision: double
+            nslots = self.nslots
+            Vj = jnp.asarray(self._low_modes(j))
+            Vi = Vj if symmetric else jnp.asarray(self._low_modes(i))
+
+            def f(dofs, tabs, geo, params):
+                K = slot(dofs, tabs, geo, params)[i]
+
+                def action(row, col, v):
+                    # d2R / d(dofs_row) d(dofs_col) applied to v, one forward tangent
+                    def g(z):
+                        zz = tuple(z if s == col else dofs[s] for s in range(nslots))
+                        return jax.grad(lambda w: R(w, tabs, geo, params))(zz)[row]
+                    return jax.jvp(g, (dofs[col],), (v,))[1]
+
+                Rj = jax.vmap(lambda v: action(i, j, v), out_axes=1)(Vj)       # (nd_i, kj)
+                if symmetric:
+                    K = 0.5 * (K + K.T)
+                    Ri = Rj
+                else:
+                    Ri = jax.vmap(lambda v: action(j, i, v), out_axes=1)(Vi)   # (nd_j, ki)
+                Dj = Rj - K @ Vj.T
+                Di = Ri - K.T @ Vi.T
+                return K + Dj @ Vj + Vi.T @ Di.T - Vi.T @ (Vi @ Dj) @ Vj
+
+            self._cache[key] = self._chunked(
+                _mapped_kernel(f, self._axes()), self._axes(), weight=self._slot_weight(j))
+        return self._cache[key]
+
+    def _block_fn(self, i, j, consistent=None):
+        """:meth:`hess_block`, or :meth:`consistent_block` where ``consistent`` asks
+        for it (``"symmetric"`` or ``"two-sided"``) and the matrices of this kernel are
+        in single precision while its vectors are not."""
+        if consistent and self._matrix_single() and vector_precision() == "fp64":
+            return self.consistent_block(i, j, symmetric=(consistent == "symmetric"))
+        return self.hess_block(i, j)
 
     def _point_blocks(self, j, parts, extra, params, split=False):
         """The density's second derivatives at one point, ``D[s][r][c]``, forward over
@@ -1514,6 +1661,18 @@ class GroupKernel:
         return tuple(t.gather_device(a) for t, a in zip(self.tables, local_arrays))
 
 
+def _symmetric_diagonal(blocks, j):
+    """The row blocks of a slot pass over column slot ``j`` with the ``(j, j)`` block
+    symmetrized.  That block is a second derivative of a scalar and symmetric; in
+    double precision AD returns it so to the last bits, in single precision to about
+    1e-7, and a Hessian that is not symmetric to rounding costs CG its short
+    recurrence (measured: the full-Newton steps of the model problem took 30 to 40%
+    more CG iterations)."""
+    out = list(blocks)
+    out[j] = 0.5 * (out[j] + out[j].T)
+    return tuple(out)
+
+
 def _result(arr):
     """A kernel result, left on the device when that is where it was computed.
 
@@ -1578,31 +1737,37 @@ class QuadratureKernel:
         return self.group_kernels[gi].tables
 
     # -------------------------------------------------------------- evaluate
-    def element_matrices(self, i, j, local_arrays, params=()):
-        """Element matrices of block ``(i, j)``, one array per element group."""
+    def element_matrices(self, i, j, local_arrays, params=(), consistent=None):
+        """Element matrices of block ``(i, j)``, one array per element group.
+
+        ``consistent`` (``"symmetric"`` or ``"two-sided"``) asks, where the matrices
+        are computed in single precision, for the ones that are exact on the constants
+        (:meth:`GroupKernel.consistent_block`): for a matrix that will be inverted.
+        """
         out = []
         pr = _params(params)
         for gk in self.group_kernels:
             dofs = gk.gather(local_arrays)
             out.append(gk.tables[i].transform_dual_matrix(
-                _result(gk.hess_block(i, j)(dofs, *gk.mapped(), pr)),
+                _result(gk._block_fn(i, j, consistent)(dofs, *gk.mapped(), pr)),
                 gk.tables[j]))
         return out
 
     def will_chunk(self, weight=1):
         return any(gk.will_chunk(weight) for gk in self.group_kernels)
 
-    def element_matrices_or_chunks(self, i, j, local_arrays, params=()):
+    def element_matrices_or_chunks(self, i, j, local_arrays, params=(), consistent=None):
         """The arrays when the batch fits whole, a chunk thunk when it does not.
 
         Bit-identical to :meth:`element_matrices` in the first case, and in the
         second the splitting has already cost that, so the fused scatter is free.
         """
         if self.will_chunk():
-            return lambda: self.element_matrix_chunks(i, j, local_arrays, params)
-        return self.element_matrices(i, j, local_arrays, params)
+            return lambda: self.element_matrix_chunks(i, j, local_arrays, params,
+                                                      consistent=consistent)
+        return self.element_matrices(i, j, local_arrays, params, consistent=consistent)
 
-    def element_matrix_chunks(self, i, j, local_arrays, params=()):
+    def element_matrix_chunks(self, i, j, local_arrays, params=(), consistent=None):
         """Yield ``(group, start, stop, array)`` for block ``(i, j)``.
 
         The same work :meth:`element_matrices` does, handed over a chunk at a time
@@ -1613,7 +1778,7 @@ class QuadratureKernel:
         pr = _params(params)
         for g, gk in enumerate(self.group_kernels):
             dofs = gk.gather(local_arrays)
-            fn = gk.hess_block(i, j)
+            fn = gk._block_fn(i, j, consistent)
             # streaming geometry: this path only runs when the batch is split, and
             # that is exactly when keeping all of it resident is what hurts
             for a, bnd, out in gk.in_chunks(fn, dofs, gk.mapped(streaming=True), pr):
