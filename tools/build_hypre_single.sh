@@ -19,7 +19,9 @@
 #
 # Load the compiler and MPI modules of the PyMFEM build first (MODULES="gcc/12.3.0
 # openmpi/4.1.8" loads them here): a library linked against another MPI does not load
-# next to the installed one.  About three minutes with twelve jobs (JOBS).
+# next to the installed one.  About three minutes with twelve jobs (JOBS).  Built and
+# used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell cards and with a host
+# build; not tried with a HIP build.
 set -eo pipefail
 PYMFEM=${1:?PyMFEM source tree}
 NEW=${2:?output directory}
@@ -38,7 +40,7 @@ INIT=$NEW/initial_cache.cmake
 while IFS= read -r line; do
   name=${line%%:*}; value=${line#*=}
   printf 'set(%s "%s" CACHE STRING "" FORCE)\n' "$name" "$value" >> "$INIT"
-done < <(grep -E '^(CMAKE_BUILD_TYPE|CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_CUDA_COMPILER|CMAKE_CUDA_ARCHITECTURES|CMAKE_CUDA_FLAGS|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CUDA_TOOLKIT_ROOT_DIR|MPI_C_COMPILER|MPI_CXX_COMPILER|HYPRE_ENABLE_[A-Z_]+|HYPRE_WITH_[A-Z_]+|HYPRE_CUDA_SM):' "$OLD/CMakeCache.txt" \
+done < <(grep -E '^(CMAKE_BUILD_TYPE|CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_CUDA_COMPILER|CMAKE_CUDA_ARCHITECTURES|CMAKE_CUDA_FLAGS|CMAKE_HIP_COMPILER|CMAKE_HIP_ARCHITECTURES|CMAKE_HIP_FLAGS|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CUDA_TOOLKIT_ROOT_DIR|ROCM_PATH|HIP_PATH|MPI_C_COMPILER|MPI_CXX_COMPILER|HYPRE_ENABLE_[A-Z_]+|HYPRE_WITH_[A-Z_]+|HYPRE_CUDA_SM):' "$OLD/CMakeCache.txt" \
            | grep -vE '^HYPRE_ENABLE_SINGLE:')
 cat >> "$INIT" <<EOT
 set(HYPRE_ENABLE_SINGLE "ON" CACHE STRING "" FORCE)

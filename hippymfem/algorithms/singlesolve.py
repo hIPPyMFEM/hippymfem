@@ -104,6 +104,14 @@ def library():
     return _LIB
 
 
+def action_tolerance(tol, single=1e-4):
+    """A tolerance for a comparison that involves a reduced-Hessian action: ``tol`` when
+    the solves run in double precision.  In a single-precision hypre the incremental
+    solves stop near :data:`SINGLE_TOL_FLOOR`, so an action is exact, and symmetric, to
+    about that and no such comparison holds tighter than ``single``."""
+    return max(float(tol), float(single)) if (HYPRE_SINGLE and library() is not None) else float(tol)
+
+
 def _comm_type():
     return ctypes.c_int if MPI._sizeof(MPI.Comm) == ctypes.sizeof(ctypes.c_int) else ctypes.c_void_p
 
@@ -172,7 +180,8 @@ class _Library:
             # Hypre::SetDefaultOptions) and what the library chose for its products
             H.HYPRE_SetMemoryLocation(DEVICE)
             H.HYPRE_SetExecutionPolicy(DEVICE)
-            H.HYPRE_SetSpGemmUseVendor(0)
+            # (MFEM: hypre's own sparse product on CUDA, the vendor's on HIP)
+            H.HYPRE_SetSpGemmUseVendor(0 if mfemconfig.mfem_gpu_backend() == "cuda" else 1)
             H.HYPRE_SetUseGpuRand(1)
             H.HYPRE_SetSpMVUseVendor(0 if mfemconfig.HYPRE_SPMV == "hypre" else 1)
             pool = mfemconfig.HYPRE_POOL if os.environ.get("HIPPYMFEM_SINGLE_POOL", "1") != "0" else None
@@ -283,11 +292,22 @@ class SingleParMatrix:
                       "ParCSRMatrixInitialize")
             on_host = isinstance(acc, np.ndarray)
             if on_host:
-                vals = np.ascontiguousarray(acc[:nd + no], dtype=np.float32)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    vals = np.ascontiguousarray(acc[:nd + no], dtype=np.float32)
+                finite = bool(np.isfinite(vals).all())
             else:
                 import jax.numpy as jnp
 
                 vals = acc[:nd + no].astype(jnp.float32)
+                finite = bool(jnp.isfinite(vals).all())
+            # An entry beyond the range of single precision (a coefficient spanning
+            # dozens of decades, as a line search may propose) becomes infinite, and
+            # hypre does not return from a setup with such a matrix.  Collective, so
+            # that every rank raises, and a RuntimeError, which a line search takes for
+            # a failed solve and answers by backtracking.
+            if not self.comm.allreduce(finite, op=MPI.LAND):
+                raise RuntimeError("the matrix has entries beyond the range of single "
+                                   "precision (or not finite)")
             for name, block, I, J, start, count in (("par_diag", "diag", tp.I_diag, tp.J_diag, 0, nd),
                                                     ("par_offd", "offd", tp.I_offd, tp.J_offd, nd, no)):
                 csr = lib.pointer(par, name)

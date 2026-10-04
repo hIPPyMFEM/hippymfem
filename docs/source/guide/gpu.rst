@@ -327,12 +327,19 @@ problem is then assembled into that library and exists there alone, with its Boo
 hierarchy, and the CG solves with it run there
 (:mod:`hippymfem.algorithms.singlesolve`).  A single-precision solve reaches a relative
 residual near 1e-5.  The forward and the adjoint solve are therefore refined against
-double-precision residuals (three passes and the iterations of one double-precision
-solve to reach 1e-12; the state agreed with the double-precision one to 1e-12), and the
-incremental solves of a Hessian action are used as they are, which the reorthogonalized
-CG of a Newton step allows (:doc:`optimization`).  It applies when the three solvers
-that hold the Jacobian are CG with BoomerAMG and the Jacobian is symmetric; any other
-problem keeps its double-precision solves.
+double-precision residuals, which the element kernels compute, to the solver's own
+tolerance: three passes for 1e-12, with the iterations of one double-precision solve
+in all, the last pass not followed by another evaluation of the residual when the
+earlier ones predict that it reaches the goal.  The state then agreed with the
+double-precision one to 1e-12.  ``PDEVariationalProblem.SINGLE_REFINE_GOAL = 1e-9``
+stops after two passes and one evaluation of the residual, with the state exact to
+4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
+functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
+decrease, which is why it is not the default.  The incremental solves of a Hessian
+action are used as they are, which the
+reorthogonalized CG of a Newton step allows (:doc:`optimization`).  It applies when the
+three solvers that hold the Jacobian are CG with BoomerAMG and the Jacobian is
+symmetric; any other problem keeps its double-precision solves.
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
@@ -351,16 +358,18 @@ functional to nine digits; the first took 193 to 210 CG iterations:
    ==================================================  ========  ========  ===========  ================
    the library of 2 October 2026                       63.8 s    161.5 s   163.3 s      81.7 s
    reorthogonalized CG, incremental solves to 1e-6     32.0 s    73.3 s    83.8 s       39.0 s
-   and hypre's own PCG (:doc:`solvers`)                29.6 s    65.0 s    76.0 s       36.0 s
-   and single-precision element matrices               29.0 s    61.8 s    62.0 s       32.9 s
-   single-precision solves, double-precision kernels   25.7 s    50.6 s    60.6 s       30.9 s
-   single-precision solves and element matrices        24.8 s    45.9 s    46.8 s       26.8 s
+   and hypre's own PCG (:doc:`solvers`)                29.7 s    64.8 s    77.7 s       36.3 s
+   and single-precision element matrices               29.1 s    61.0 s    61.7 s       32.5 s
+   single-precision solves, double-precision kernels   25.4 s    50.6 s    60.6 s       30.9 s
+   single-precision solves and element matrices        24.5 s    45.9 s    46.8 s       26.8 s
+   and forward and adjoint solves refined to 1e-9      23.5 s    43.5 s    42.4 s       25.6 s
    ==================================================  ========  ========  ===========  ================
 
-The last row is 2.6, 3.5, 3.5 and 3.0 times faster than the first.  What single
-precision itself gives, stage by stage: double-precision kernels and solves against
-single-precision element matrices and solves, the solves in both by hypre's PCG, the
-incremental ones to 1e-6 and to the 1e-5 that single precision reaches:
+The last row is 2.7, 3.7, 3.9 and 3.2 times faster than the first, the one before it
+2.6, 3.5, 3.5 and 3.0 times.  What single precision itself gives, stage by stage: double
+precision throughout against single-precision element matrices and solves, the solves
+in both by hypre's PCG, the incremental ones to 1e-6 and to the 1e-5 that single
+precision reaches:
 
 .. table::
    :widths: auto
@@ -370,31 +379,49 @@ incremental ones to 1e-6 and to the 1e-5 that single precision reaches:
    =========================================  ================  ================  ====================
    one CG iteration with BoomerAMG            3.69 / 3.19 ms    9.46 / 7.24 ms    9.52 / 6.93 ms
    BoomerAMG setup                            0.069 / 0.075 s   0.156 / 0.156 s   0.151 / 0.124 s
-   Jacobian element kernel                    67 / 39 ms        339 / 124 ms      588 / 111 ms
-   complete Jacobian assembly                 104 / 87 ms       380 / 166 ms      623 / 147 ms
-   forward solve at a new parameter           0.41 / 0.38 s     1.00 / 0.74 s     1.26 / 0.71 s
-   adjoint solve                              0.10 / 0.12 s     0.24 / 0.28 s     0.25 / 0.29 s
-   blocks of a linearization point            0.27 / 0.23 s     0.39 / 0.28 s     0.99 / 0.30 s
-   Hessian action                             0.107 / 0.078 s   0.260 / 0.162 s   0.265 / 0.160 s
+   Jacobian element kernel                    67 / 39 ms        339 / 124 ms      587 / 111 ms
+   complete Jacobian assembly                 104 / 86 ms       380 / 165 ms      634 / 146 ms
+   forward solve at a new parameter           0.41 / 0.37 s     1.00 / 0.74 s     1.33 / 0.71 s
+   adjoint solve                              0.100 / 0.119 s   0.243 / 0.275 s   0.248 / 0.292 s
+   blocks of a linearization point            0.27 / 0.23 s     0.39 / 0.29 s     1.06 / 0.26 s
+   Hessian action                             0.107 / 0.077 s   0.260 / 0.162 s   0.263 / 0.160 s
    =========================================  ================  ================  ====================
 
 So single precision pays most where the card has least double-precision throughput
 (the kernels, five times on a Blackwell instance) and where an iteration is bound by
 memory traffic (a CG iteration, 1.16 to 1.37 times), and it does not help a BoomerAMG
-setup.  The adjoint solve does not gain: its three passes take the iterations of one
-double-precision solve, each a little cheaper, and two or three evaluations of the
-residual by the element kernels on top.  The Hessian action gains most, because its two
-solves need no refinement.
+setup.  The Hessian action gains most from the solves (1.4 to 1.6 times), because its
+two solves need no refinement.  The forward and the adjoint solve gain least from them:
+a refinement needs the double-precision residual from the element kernels, which on
+the H100 costs as much as seven CG iterations.  The forward solve owes its gain to the
+assembly, and the adjoint solve, three passes with two evaluations of the residual, is
+slower than in double precision.  Refined to 1e-9 the forward solve took 0.34, 0.65
+and 0.60 s and the adjoint solve 0.093, 0.192 and 0.191 s, 1.1 to 1.3 times faster than
+in double precision.
 
 **Memory.**  A matrix entry is twelve bytes in double precision (value and column index)
 and eight in single, so the Jacobian and its hierarchy take two thirds of what they
-took, and no double-precision copy of the Jacobian is made at any time.  On the H100 the
-card held 10.4 GiB outside the element kernels' pool at the peak of that Newton-CG solve
-with double-precision solves and 9.1 GiB with single-precision ones (card peak 26.9 and
-25.6 GiB); on four Blackwell instances the busiest one peaked at 7.5 and 6.9 GiB.  The
-other blocks of a linearization point stay in double precision, and so does everything
-in the element kernels' pool, whose size is set by the chunk planner and the pattern
-build, not by the precision of the matrices.
+took, and no double-precision copy of the Jacobian is made at any time.  The card's
+memory during that Newton-CG solve, at its peak, with double precision throughout and
+with single-precision element matrices and solves (``benchmarks/bench_precision.py
+--solves-only``):
+
+.. table::
+   :widths: auto
+
+   ==================================  =================  =================  =======================
+   ..                                  H100               L40S               busiest of four
+                                                                             Blackwell instances
+   ==================================  =================  =================  =======================
+   the card                            18.9 / 17.5 GiB    18.7 / 17.3 GiB    6.4 / 5.8 GiB
+   outside the element kernels' pool   10.4 / 9.0 GiB     10.2 / 8.8 GiB     4.2 / 3.7 GiB
+   the pool's largest use              5.4 / 4.4 GiB      4.4 / 4.4 GiB      1.8 / 1.4 GiB
+   ==================================  =================  =================  =======================
+
+What lies outside the pool is hypre's matrices, hierarchies and vectors, MFEM and the
+CUDA context; a seventh of it goes.  The other blocks of a linearization point stay in
+double precision (for a forward problem that is linear in the state these are ``C`` and
+``W_um``, 0.4 GB each at this size), and so do the accumulators of the assembly.
 
 What to set, for a symmetric problem solved by CG with BoomerAMG:
 

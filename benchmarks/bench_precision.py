@@ -172,6 +172,9 @@ def main():
                     help="the CG of a Newton step keeps its residuals orthogonal explicitly "
                     "(cg_reorthogonalize, the library's default); --no-cg-reorth is the recurrence alone, "
                     "which needs incremental solves to round-off")
+    ap.add_argument("--single-goal", type=float, default=None,
+                    help="with a single-precision hypre: the relative residual the forward and adjoint "
+                    "solves are refined to (PDEVariationalProblem.SINGLE_REFINE_GOAL; 1e-9 is two passes)")
     ap.add_argument("--solves-only", action="store_true",
                     help="skip the two stages that time the Jacobian's kernel and assembly alone: for the "
                     "device memory that the solves themselves need")
@@ -211,6 +214,8 @@ def main():
     if args.inc_tol is not None:
         for attr in ("solver_fwd_inc", "solver_adj_inc"):
             getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol
+    if args.single_goal is not None:
+        pde.SINGLE_REFINE_GOAL = args.single_goal
     if args.probe_tol_single is not None:
         pde.SYMMETRY_PROBE_TOL_SINGLE = args.probe_tol_single
     if args.print_refinement:
@@ -241,6 +246,7 @@ def main():
 
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "solve_tol": args.solve_tol, "inc_tol": args.inc_tol if args.inc_tol is not None else args.solve_tol,
+           "single_goal": args.single_goal,
            "cg_reorthogonalize": bool(hm.ReducedSpaceNewtonCG_ParameterList()["cg_reorthogonalize"]
                                       if args.cg_reorth is None else args.cg_reorth),
            "NE_local": NE, "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),

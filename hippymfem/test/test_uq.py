@@ -19,6 +19,7 @@ import mfem.par as mfem
 import jax.numpy as jnp
 
 import hippymfem as hm
+from hippymfem.algorithms.singlesolve import action_tolerance
 from hippymfem.common.linalg import operator_to_dense
 from hippymfem.modeling.variables import PARAMETER
 
@@ -339,7 +340,7 @@ def test_forward_uq():
     H.mult(a, Ha)
     H.mult(b, Hb)
     s = abs(Ha.inner(b) - Hb.inner(a)) / max(abs(Ha.inner(b)), 1e-300)
-    check("QoI Hessian symmetric", s < 1e-9, "(%.2e)" % s)
+    check("QoI Hessian symmetric", s < action_tolerance(1e-9), "(%.2e)" % s)
 
     # Taylor approximation and its analytic moments
     k = 25

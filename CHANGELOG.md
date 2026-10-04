@@ -20,8 +20,8 @@
   from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
   which saves the first relaxation of a V-cycle its matrix-vector product on the finest
   level: a solve of 2.1 million dofs to 1e-12 in 24 iterations took 0.103 -> 0.089 s on
-  an H100 and 0.274 -> 0.227 s on an L40S; the Newton-CG run above 32.0 -> 29.6 s and
-  73.3 -> 65.0 s. The solvers of one operator share one PCG object.
+  an H100 and 0.274 -> 0.227 s on an L40S; the Newton-CG run above 32.0 -> 29.7 s and
+  73.3 -> 64.8 s. The solvers of one operator share one PCG object.
 - **Single precision** in three places, none of which changes the state, the gradient or
   the MAP point (`docs/source/guide/gpu.rst`, "Single precision").
   `HIPPYMFEM_PRECISION=mixed` computes the element matrices in single precision, corrects
@@ -32,13 +32,16 @@
   (`tools/build_hypre_single.sh`, `hippymfem.algorithms.singlesolve`) loads a
   single-precision build of hypre next to the double-precision one: the Jacobian is
   assembled into it and exists there alone, with its BoomerAMG hierarchy, the forward
-  and adjoint solves are refined against double-precision residuals, and the
-  incremental solves of a Hessian action stop at 1e-5 and are used as they are. A CG
-  iteration is 1.16 (H100), 1.31 (L40S) and 1.37 (Blackwell instance) times faster, a
-  Hessian action 1.4 and 1.6 times, a BoomerAMG setup no faster, and the card holds
-  1.3 GiB less at 2.1 million state dofs. With both, the Newton-CG run above takes
-  24.8 s on the H100, 45.9 s on the L40S, 46.8 s on a Blackwell instance and 26.8 s on
-  four: 2.6, 3.5, 3.5 and 3.0 times faster than before these three changes.
+  and adjoint solves are refined against double-precision residuals to the solver's
+  tolerance, and the incremental solves of a Hessian action stop at 1e-5 and are used
+  as they are. A CG iteration is 1.16 (H100), 1.31 (L40S) and 1.37 (Blackwell instance)
+  times faster, a Hessian action 1.4 to 1.6 times, a BoomerAMG setup no faster, and the
+  card holds 1.4 GiB less at 2.1 million state dofs (18.9 -> 17.5 GiB on the H100).
+  With both, the Newton-CG run above takes 24.5 s on the H100, 45.9 s on the L40S,
+  46.8 s on a Blackwell instance and 26.8 s on four: 2.6, 3.5, 3.5 and 3.0 times faster
+  than before these three changes; with the forward and adjoint solves refined to 1e-9
+  only (`PDEVariationalProblem.SINGLE_REFINE_GOAL`, enough for Newton-CG to 1e-6 but
+  not for BFGS to 1e-8) 23.5, 43.5, 42.4 and 25.6 s.
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.

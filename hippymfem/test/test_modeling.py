@@ -17,6 +17,7 @@ import jax.numpy as jnp
 
 import hippymfem as hm
 from hippymfem.common.linalg import operator_to_dense
+from hippymfem.algorithms.singlesolve import action_tolerance
 from hippymfem.fem.kernel import matrix_tolerance
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
@@ -627,7 +628,7 @@ def test_hessian_properties():
         H.mult(b, Hb)
         s = abs(Ha.inner(b) - Hb.inner(a)) / max(abs(Ha.inner(b)), 1e-300)
         tag = "GN" if gn else "full"
-        check("%s Hessian symmetric" % tag, s < 1e-9, "(%.2e)" % s)
+        check("%s Hessian symmetric" % tag, s < action_tolerance(1e-9), "(%.2e)" % s)
         if gn:
             # The Gauss-Newton Hessian is C^T A^-T W_uu A^-1 C + R with W_uu
             # positive semi-definite and R positive definite, so it is positive

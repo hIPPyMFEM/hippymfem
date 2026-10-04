@@ -73,9 +73,10 @@ residuals orthogonalized                        47.4 s    110.5 s   122.2 s
 and incremental solves to 1e-6                  32.0 s    73.3 s    83.8 s
 ==============================================  ========  ========  =====================
 
-(one GPU each, or one MIG instance of an RTX PRO 6000 Blackwell; at ``1e-4`` the H100
-took 27.8 s, but one of the three GPUs then needed a thirteenth Newton step, so
-``1e-6`` is the tolerance to use.)  And single precision becomes usable for those
+(one GPU each, or one MIG instance of an RTX PRO 6000 Blackwell, with MFEM's CG for the
+solves in all three rows; hypre's own PCG, :doc:`solvers`, takes another 7 to 12 % off
+the last.  At ``1e-4`` the H100 took 27.8 s, but one of the three GPUs then needed a
+thirteenth Newton step, so ``1e-6`` is the tolerance to use.)  And single precision becomes usable for those
 solves (:ref:`single-precision` in the GPU guide), since their rounding no longer
 disturbs the iteration.
 

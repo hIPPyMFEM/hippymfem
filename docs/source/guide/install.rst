@@ -22,6 +22,10 @@ petsc4py            optional; adds distributed direct solvers, see
 numba               optional; builds large sparsity patterns without a global
                     sort, several times faster (:doc:`gpu`)
 CuPy                optional; a faster device sort where the sort route runs
+hypre, single       optional; a single-precision build of the hypre that PyMFEM
+precision           uses (``tools/build_hypre_single.sh``, three minutes), loaded next
+                    to it for the linear solves of a PDE problem (:doc:`gpu`,
+                    "Single precision")
 ==================  ========================================================
 
 Everything except PyMFEM is a ``pip install``.  The ``mfem`` wheel on PyPI is serial
@@ -83,7 +87,10 @@ Running the tests
 Each suite is checked against something external rather than against itself: MFEM's own
 integrators, exact Gaussian posteriors, dense eigendecompositions, finite differences.
 The GPU and PETSc suites skip with a printed reason when those are unavailable; they
-never pass silently.
+never pass silently.  ``HIPPYMFEM_PRECISION=mixed ./run_tests.sh`` runs every suite with
+single-precision element matrices, and with ``HIPPYMFEM_HYPRE_SINGLE`` set
+``test_solvers`` and ``test_device`` check the solves in the single-precision hypre
+against the double-precision ones.
 
 Cross-validation against hIPPYlibx
 ----------------------------------

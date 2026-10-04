@@ -593,12 +593,15 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: that the measured passes give.  ``REFINE_PREDICT = False`` measures every pass.
     REFINE_PREDICT = True
     REFINE_MARGIN = 3.0
-    #: With the Jacobian in a single-precision hypre, the relative residual the forward
-    #: and the adjoint solve are refined to when the solver's own tolerance asks for
-    #: less: two passes instead of three.  A gradient computed from them is then exact
-    #: to about nine digits, which a Newton-CG tolerance of 1e-6 does not notice; set
-    #: it to 0 to have the solver's tolerance honoured (for a tighter optimization).
-    SINGLE_REFINE_GOAL = 1e-9
+    #: With the Jacobian in a single-precision hypre, a relative residual at which the
+    #: refinement of the forward and the adjoint solve may stop although the solver's
+    #: own tolerance asks for less.  0, the default, honours the solver's tolerance
+    #: (three passes for 1e-12).  ``1e-9`` stops after two passes and one evaluation of
+    #: the residual: the gradient is then exact to about nine digits, which Newton-CG
+    #: with a tolerance of 1e-6 does not notice (the same steps, the same cost
+    #: functional to nine digits), while an optimizer run to a tighter tolerance, such
+    #: as BFGS to 1e-8, ends in a line search that finds no decrease.
+    SINGLE_REFINE_GOAL = 0.0
 
     def _probe_symmetry(self, A):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -840,9 +843,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # how much more of its right-hand side a pass leaves than the tolerance it was
         # asked for: measured in every pass whose residual is evaluated
         low = float(getattr(solver, "tolerance_floor", 0.0) or 0.0)
-        if low > 0.0:
+        if low > 0.0 and self.SINGLE_REFINE_GOAL:
             # a single-precision solver: two passes reach this, a third costs a quarter
-            # more for digits a gradient does not need
+            # more for digits that not every optimization needs
             goal = max(goal, float(self.SINGLE_REFINE_GOAL) * r0)
         ratio = None
         self._refine_measured = True
