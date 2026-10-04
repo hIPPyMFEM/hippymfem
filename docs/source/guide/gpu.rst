@@ -423,6 +423,19 @@ CUDA context; a seventh of it goes.  The other blocks of a linearization point s
 double precision (for a forward problem that is linear in the state these are ``C`` and
 ``W_um``, 0.4 GB each at this size), and so do the accumulators of the assembly.
 
+One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
+directions, but the eigenpairs of a Laplace approximation come out to about that
+accuracy relative to the largest eigenvalue (in ``test_uq`` the eigenvectors
+diagonalized the Hessian to 3e-7 instead of 1e-9).  Where the small eigenvalues matter,
+compute the MAP point with the single-precision solves and switch them off for the
+stages after it:
+
+.. code-block:: python
+
+   pde.single_solves = False          # the Jacobian is assembled in double precision again
+   pde.invalidate_jacobian()
+   model.setPointForHessianEvaluations(x)
+
 What to set, for a symmetric problem solved by CG with BoomerAMG:
 
 .. code-block:: bash

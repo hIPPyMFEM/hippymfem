@@ -90,6 +90,21 @@ def run(check, COMM=MPI.COMM_WORLD):
                            m=x[PARAMETER].copy(), newton=solver.it, cg=solver.total_cg_iter,
                            converged=solver.converged, passes=pde.fwd_iterations)
         del A
+    # back to double precision at a point reached with single-precision solves, as for
+    # the stages of a Laplace approximation after the MAP point
+    pde.single_solves = False
+    pde.invalidate_jacobian()
+    u, p = got[True]["u"].copy(), got[True]["p"].copy()
+    pde.setLinearizationPoint([u, m, p], gauss_newton_approx=False)
+    A, _ = pde._jacobian([u, m, None])
+    Cdm, uh = Vu.vector(), Vu.vector()
+    pde.apply_ij(ADJOINT, PARAMETER, dm, Cdm)
+    pde.solveIncremental(uh, Cdm, False)
+    back = uh.copy().axpy(-1.0, got[False]["uh"]).norm("l2") / got[False]["uh"].norm("l2")
+    check("with the single-precision solves switched off the Jacobian is in double precision again",
+          type(A).__name__ == "HypreParMatrix" and back < 1e-8,
+          "(%s; the incremental solve against the first %.1e)" % (type(A).__name__, back))
+    del A
     pde.single_solves = True
 
     def rel(key):

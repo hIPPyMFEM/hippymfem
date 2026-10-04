@@ -426,7 +426,8 @@ def test_taylor_under_posterior():
     resid, bortho, diag = check_g(tay.H, post.Hlr, Uq, dq)
     scale = max(float(np.abs(dq).max()), 1e-300)
     check("posterior-preconditioned eigenpairs solve H u = d Hlr u",
-          resid.max() / scale < 1e-6 and bortho < 1e-2 and diag < 1e-8,
+          resid.max() / scale < 1e-6 and bortho < 1e-2
+          and diag < action_tolerance(1e-8, single=1e-5),
           "(residual %.2e, Hlr-orthogonality %.2e, diagonalization %.2e)"
           % (resid.max() / scale, bortho, diag))
 
