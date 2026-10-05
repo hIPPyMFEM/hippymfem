@@ -68,8 +68,17 @@ hp.configure_device("gpu", COMM, quiet=(RANK != 0))
 
 
 def card_mib():
-    """Memory in use on this rank's card, from nvidia-smi or rocm-smi; None if unavailable."""
+    """Memory in use on this rank's card, from the GPU runtime (``cudaMemGetInfo`` or
+    ``hipMemGetInfo``), else from nvidia-smi or rocm-smi; None if unavailable.  The
+    runtime also answers for a MIG instance, of which nvidia-smi reports no memory."""
+    from hippymfem.common import devicebridge
     from hippymfem._jaxconfig import _visible_var
+    try:
+        got = devicebridge.device_memory()
+        if got is not None:
+            return got[0] / 2 ** 20
+    except Exception:
+        pass
     vis = (_visible_var() or "0").split(",")[0]
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
@@ -371,7 +380,7 @@ def test_device_memory_flat():
     gc.collect()
     m1 = card_mib()
     if m0 is None or m1 is None:
-        check("card memory readable", False, "(nvidia-smi unavailable)")
+        check("card memory readable", False, "(neither the runtime nor nvidia-smi or rocm-smi says)")
         return
     check("twelve operator resets do not grow card memory", m1 - m0 < 64.0,
           "(%+.0f MiB, from %.0f MiB)" % (m1 - m0, m0))
