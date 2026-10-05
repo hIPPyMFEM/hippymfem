@@ -64,6 +64,83 @@ process's share of its card is capped at 0.90 divided by the ranks sharing the c
 *per process*.  ``HIPPYMFEM_GPU_MEM_FRACTION`` overrides the share; :ref:`gpu-memory`
 says when to change it.
 
+.. _gpu-recommended:
+
+Recommended settings
+--------------------
+
+What to set, with the sections that have the measurements.  The numbers are for the
+model problem of this guide (``exp(m)`` diffusion on second-order hexahedra, a
+BiLaplacian prior, pointwise observations), its MAP point computed by Newton-CG to a
+relative gradient norm of 1e-6.  ``applications/precision/model_subsurf_single.py`` does
+all of it.
+
+**The MAP point.**
+
+* The defaults need no change: the CG of a Newton step keeps its residuals orthogonal,
+  CG with a hypre preconditioner runs in hypre's own PCG, and the prior's solves that
+  precondition that CG stop at 1e-6 (:doc:`optimization`, :doc:`solvers`).
+* Stop the two incremental solvers at 1e-6 and leave the forward and the adjoint solver
+  at their tolerance.  With the orthogonalized residuals the Newton and CG counts stay
+  those of incremental solves to 1e-12, and at 64\ :sup:`3` on an H100 the solve took
+  32.0 s instead of the 63.8 s of the recurrence with incremental solves to 1e-12.
+  1e-4 is too loose: one of three GPUs then took a thirteenth Newton step.
+* Set ``HIPPYMFEM_PRECISION=mixed`` together with ``HIPPYMFEM_HYPRE_SINGLE``, the path of
+  a single-precision build of hypre (:ref:`hypre-single-install`).  The Newton and CG
+  counts and the cost functional stay those of double precision; at 64\ :sup:`3` the
+  solve was 1.17 times faster on an H100 and 1.45 times on an L40S, and at
+  128\ :sup:`3` on four L40S 1.57 times, with 14 % less memory on the busiest card
+  (:ref:`single-precision`).  The single-precision solves need a Jacobian that is
+  symmetric and solved by CG with BoomerAMG; other problems keep their double-precision
+  solves.
+
+**The Laplace approximation.**  Its eigenpairs come out to about the accuracy of the
+incremental solves, and a single-precision solve stops near 1e-5, so switch the
+single-precision solves off after the MAP point and run the incremental solves to about
+1e-8 (below).  On several GPUs, if the problem fits on one, run these stages as an
+ensemble: at 64\ :sup:`3` the eigensolver took 17.6 s on four MIG instances as an
+ensemble and 30.4 s as a domain decomposition
+(`The Laplace approximation on the cards`_).
+
+**Several GPUs.**  Start the ranks through ``tools/mpirun_pinned.sh``, one card or MIG
+instance each.  Two things follow the rank count by themselves: the share of a card that
+JAX may use is divided among the ranks on it, and on more than one rank of a CUDA build
+hypre multiplies with its own kernel instead of cuSPARSE.  Keep a million state dofs or
+more on each GPU: below that, the halo exchanges through the host set the time of a
+Krylov iteration (:ref:`several-gpus`).  The settings above stay as they are.
+
+**Short of memory**, in this order: single precision as above, and
+``release_linearization_on_move=True`` for a line-search Newton-CG, which drops a
+linearization point before the next one is assembled (with both, the Newton-CG run at
+128\ :sup:`3`, 17.0 million state dofs, peaked at 75.8 GB on one 80 GB H100, where double
+precision with the release ran out of memory at each of the three shares of JAX tried,
+0.30 to 0.45); ``HIPPYMFEM_GPU_MEM_FRACTION=0.20``, which saved 1.9 GiB a card for 13 %
+more time in two Newton steps at 128\ :sup:`3` on four L40S; matrix-free linearization
+points last (:ref:`gpu-memory`).
+
+.. code-block:: python
+
+   # HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 HIPPYMFEM_PRECISION=mixed
+   # HIPPYMFEM_HYPRE_SINGLE=/path/to/libHYPRE_single.so
+   pde.set_solvers(hm.auto_solver, Vu, comm, max_direct=0, rel_tolerance=1e-12)
+   for name in ("solver_fwd_inc", "solver_adj_inc"):
+       getattr(pde, name).parameters["rel_tolerance"] = 1e-6
+   x = hm.ReducedSpaceNewtonCG(model, params).solve([None, prior.mean.copy(), None])
+
+   pde.single_solves = False          # the Laplace approximation: double-precision solves
+   pde.invalidate_jacobian()
+   for name in ("solver_fwd_inc", "solver_adj_inc"):
+       getattr(pde, name).parameters["rel_tolerance"] = 1e-8
+   model.setPointForHessianEvaluations(x)
+
+``max_direct=0`` keeps :func:`~hippymfem.algorithms.linSolvers.auto_solver` from a direct
+solve on a small mesh, which has no single-precision counterpart.  Measured and left
+opt-in: the index arrays of the assembly kept on the device
+(``HIPPYMFEM_DEVICE_PATTERN=1``, memory permitting), Hessian actions relaxed as the CG
+converges (``cg_hessian_relaxation``, which lost on a more informative problem), and the
+forward and adjoint solves refined to 1e-9 only (``SINGLE_REFINE_GOAL``, with which BFGS
+to 1e-8 failed).
+
 .. _mfem-device:
 
 What to expect
@@ -299,9 +376,10 @@ faster route except for vector-valued Jacobians.
 Single precision
 ----------------
 
-Three things can run in single precision, each on its own switch, and none of them
-changes what is computed: the state, the adjoint, the gradient and the MAP point come
-out as in double precision.
+Two things can run in single precision, each on its own switch, and a third switch, a
+loose tolerance on the incremental solves, is what makes the second usable.  None of
+the three changes what is computed: the state, the adjoint, the gradient and the MAP
+point come out as in double precision.  :ref:`gpu-recommended` says what to set.
 
 **The element matrices** (``HIPPYMFEM_PRECISION=mixed``, ``hm.config.precision``).
 The matrix kernels run in single precision and the vector kernels (residuals, gradients,
@@ -322,9 +400,9 @@ and the optimizers stop at that floor.
 ``hm.config.hypre_single``).  hypre is compiled for one precision, and MFEM and PyMFEM
 use a double-precision one.  ``tools/build_hypre_single.sh <PyMFEM tree> <directory>``
 builds the same hypre in single precision, in about three minutes, with the options of
-the installed build; the library loads it next to the other one.  The Jacobian of a PDE
-problem is then assembled into that library and exists there alone, with its BoomerAMG
-hierarchy, and the CG solves with it run there
+the installed build (:ref:`hypre-single-install`); the library loads it next to the
+other one.  The Jacobian of a PDE problem is then assembled into that library and exists
+there alone, with its BoomerAMG hierarchy, and the CG solves with it run there
 (:mod:`hippymfem.algorithms.singlesolve`).  A single-precision solve reaches a relative
 residual near 1e-5.  The forward and the adjoint solve are therefore refined against
 double-precision residuals, which the element kernels compute, to the solver's own
@@ -420,9 +498,10 @@ two solves need no refinement.  The forward and the adjoint solve gain least fro
 a refinement needs the double-precision residual from the element kernels, which on
 the H100 costs as much as seven CG iterations.  The forward solve owes its gain to the
 assembly, and the adjoint solve, three passes with two evaluations of the residual, is
-a little slower than in double precision.  Refined to 1e-9 the forward solve took 0.34, 0.65
-and 0.60 s and the adjoint solve 0.093, 0.192 and 0.191 s, 1.1 to 1.3 times faster than
-in double precision.  The first refined adjoint solve of a process also compiles the
+a little slower than in double precision.  Refined to 1e-9 only (``SINGLE_REFINE_GOAL``)
+the forward solve took 0.34, 0.65 and 0.60 s and the adjoint solve 0.093, 0.192 and
+0.191 s, which makes the adjoint solve too 1.1 to 1.3 times faster than in double
+precision.  The first refined adjoint solve of a process also compiles the
 kernel of its residual, once (9 to 33 s in the runs at 128\ :sup:`3` below); an adjoint
 solve in double precision evaluates no residual and does not pay it.
 
@@ -519,8 +598,20 @@ stages after it:
 .. code-block:: python
 
    pde.single_solves = False          # the Jacobian is assembled in double precision again
+   hm.config.precision = "fp64"       # optional: and its element matrices
    pde.invalidate_jacobian()
    model.setPointForHessianEvaluations(x)
+
+``applications/precision/model_subsurf_single.py`` does this.  At 8\ :sup:`3` on one host
+core (4 913 state dofs; Newton-CG to 1e-8, twenty eigenpairs, incremental solves to 1e-12
+after the MAP point), against a run in double precision throughout, the eigenvalues
+differed by up to 1.3e-5 relative with the single-precision solves left on, by 2e-7 with
+the solves switched off and the element matrices left in single precision, and by 4e-10
+with both switched, the level at which the two MAP points agreed (2e-9).  Switching the
+element matrices compiles their kernels again (at 24\ :sup:`3` on a Blackwell MIG instance
+twenty eigenpairs then took 109 s, against 3 s with the kernels already compiled), and
+incremental solves to 1e-8 move the eigenvalues by more than 2e-7 anyway
+(`The Laplace approximation on the cards`_).
 
 The 1e-5 also shows in the iterates on the way.  In the first Newton step of
 ``bench_newton_device.py``, from the prior mean and with the full Hessian, CG stopped
@@ -529,7 +620,8 @@ the step differed by 0.2 %.  Two steps in, far from the minimum, the costs diffe
 6 % (128\ :sup:`3`) and 30 % (64\ :sup:`3`).  The runs to a tolerance agreed, as above,
 so compare such runs and not a fixed number of steps.
 
-What to set, for a symmetric problem solved by CG with BoomerAMG:
+What to set, for a symmetric problem solved by CG with BoomerAMG (:ref:`gpu-recommended`
+has the rest, :ref:`hypre-single-install` the build):
 
 .. code-block:: bash
 
@@ -851,19 +943,20 @@ unsplit batch stays bit-identical.
 
 A streamed geometry is copied to the card once per element pass, and how it is copied
 decides what such a pass costs.  JAX moves a numpy array through a staging buffer of its
-own, at 5 to 11 GB/s on an H100, whose PCIe 5 link moves 55 GB/s from memory locked for
-the device.  Where the device bridge can be used (hypre and the kernels on one card), a
+own, measured at 3.4 to 5.6 GB/s on an H100 (8.8 GB/s from JAX's own pinned host arrays),
+whose PCIe 5 link moves 55 GB/s from memory locked for the device.  Where the device bridge can be used (hypre and the kernels on one card), a
 group that streams its geometry has it locked once (``cudaHostRegister``) and each
 chunk's slice is copied by the CUDA runtime, of the arrays the kernel reads only (the
 coordinates ``X`` of the quadrature points not at all where the density does not use
 them); ``HIPPYMFEM_PINNED_STREAM=0`` restores JAX's copy.  The element arrays are the
-same to the last bit.  At 64\ :sup:`3` on the H100 with the streaming forced
-(``HIPPYMFEM_ELEMENT_CHUNK=23000``), the gradient took 0.063 s instead of 0.169 s
-(0.027 s with the geometry kept on the card), a forward solve 0.48 s instead of 0.73 s.
-At 128\ :sup:`3` on one H100, where the geometry (13.9 GB) has to stream, the forward
-solve took 2.86 s instead of 5.51 s, the adjoint solve 1.25 s instead of 2.52 s, the
-gradient 0.40 s instead of 1.05 s, and the Newton-CG solve with single-precision solves
-197 s instead of 326 s, in the same 13 Newton and 191 CG iterations.
+same to the last bit.  At 64\ :sup:`3` on the H100 in double precision with the
+streaming forced (``HIPPYMFEM_ELEMENT_CHUNK=23000``, ``HIPPYMFEM_GEOMETRY_STREAM=0.001``),
+the gradient took 0.063 s instead of 0.15 to 0.17 s (0.027 s with the geometry kept on
+the card), a forward solve 0.48 s instead of 0.73 to 0.93 s (0.36 s).  At 128\ :sup:`3`
+on one H100 with single-precision element matrices and solves, where the geometry
+(13.9 GB) has to stream, the forward solve took 2.86 s instead of 5.51 s, the adjoint
+solve 1.25 s instead of 2.52 s, the gradient 0.40 s instead of 1.05 s, and the Newton-CG
+solve 197 s instead of 326 s, in the same 13 Newton and 191 CG iterations.
 
 The chunk count is a memory choice, not a speed one.  A launch costs about 5 ms: at
 1 906 624 P2 hexahedra on one L40S a warm Jacobian assembly takes 9.3 s in 128 chunks and

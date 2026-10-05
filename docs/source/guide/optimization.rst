@@ -132,6 +132,7 @@ then not a slower method: compare the gradient norms step by step.
 step.  The low-rank eigensolvers of the Laplace approximation are not Krylov
 recurrences and never had this sensitivity; their Hessian actions want incremental
 solves to about ``1e-8`` for the accuracy of the small eigenvalues.
+:ref:`gpu-recommended` in the GPU guide collects these settings.
 
 Gradient norms
 --------------

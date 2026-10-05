@@ -69,7 +69,7 @@ from an older matrix (``pc_reuse``) and a transposed operator keep MFEM's CG.
 With a single-precision build of hypre next to the double-precision one
 (``HIPPYMFEM_HYPRE_SINGLE``), the Jacobian of a PDE problem, its BoomerAMG hierarchy and
 the CG solves with it live in that library; :ref:`single-precision` in the GPU guide
-has the measurements and the build.
+has the measurements, and :ref:`hypre-single-install` the build.
 
 One behaviour differs deliberately from MFEM's default.  MFEM's hypre wrappers use
 ``ABORT_HYPRE_ERRORS``, so a failed AMG setup ends the whole MPI job.  Inside an
