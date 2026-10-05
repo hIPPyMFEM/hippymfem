@@ -21,11 +21,14 @@ Hessian actions at 1e-6.  A single-precision solve reaches a relative residual n
 1e-5, which is enough for the Newton directions but not for the small eigenvalues of
 the Laplace approximation, so the single-precision solves are switched off after the
 MAP point, and the eigenpairs, a posterior sample and the pointwise variance are
-computed in double precision.  ``HIPPYMFEM_PRECISION=mixed`` (single-precision element
-matrices) goes with the single-precision solves; the element matrices are switched
-back to double precision with them (``--keep-kernel-precision`` keeps them).  Without
-a single-precision library every solve is in double precision, and the script says
-so.
+computed with double-precision solves.  ``HIPPYMFEM_PRECISION=mixed`` (single-precision
+element matrices) goes with the single-precision solves and can stay: at 8^3 the
+eigenvalues then agreed with a run in double precision throughout to 2e-7, less than
+incremental solves to 1e-8 move them.  ``--fp64-kernels`` switches the element matrices
+back as well (4e-10), at the price of compiling their kernels again: at 24^3 on a
+Blackwell MIG instance the eigenpairs then took 109 s, against 3 s with the kernels
+already compiled.  Without a single-precision library every solve is in double
+precision, and the script says so.
 
 Run::
 
@@ -72,9 +75,9 @@ def main():
                     help="eigenpairs for the Laplace approximation")
     ap.add_argument("--nsamples", type=int, default=32,
                     help="Monte Carlo samples of the pointwise variance")
-    ap.add_argument("--keep-kernel-precision", action="store_true",
-                    help="keep HIPPYMFEM_PRECISION's element matrices after the MAP point "
-                    "instead of switching them to double precision")
+    ap.add_argument("--fp64-kernels", action="store_true",
+                    help="after the MAP point, switch HIPPYMFEM_PRECISION=mixed element matrices "
+                    "back to double precision as well (compiles their kernels again)")
     args = ap.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -177,14 +180,14 @@ def main():
     # precision, to 1e-8.  Without a single-precision library this changes nothing but
     # the tolerance.
     pde.single_solves = False          # the Jacobian is assembled in double precision again
-    if hm.config.precision != "fp64" and not args.keep_kernel_precision:
+    if args.fp64_kernels and hm.config.precision != "fp64":
         hm.config.precision = "fp64"   # and so are its element matrices
     pde.invalidate_jacobian()
     for name in ("solver_fwd_inc", "solver_adj_inc"):
         getattr(pde, name).parameters["rel_tolerance"] = args.laplace_inc_tol
 
     # ------------------------------------------------- Laplace approximation
-    log(SEP + "Laplace approximation of the posterior (double precision)" + SEP)
+    log(SEP + "Laplace approximation of the posterior (double-precision solves)" + SEP)
     comm.Barrier()
     t0 = time.perf_counter()
     model.setPointForHessianEvaluations(x, gauss_newton_approx=False)
