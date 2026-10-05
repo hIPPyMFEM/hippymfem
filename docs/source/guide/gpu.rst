@@ -336,7 +336,8 @@ stops after two passes and one evaluation of the residual, with the state exact 
 4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
 functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
 decrease, which is why it is not the problem's default.  Newton-CG sets it while it runs
-(``single_refine_goal``, 1e-9, never above a thousandth of its own tolerance): at
+(``single_refine_goal``, 1e-9, never above 1e3 times the square of its own tolerance,
+which leaves a run to 1e-8 as it was): at
 64\ :sup:`3` on a Blackwell instance 38.8 s instead of 40.8 s, the same twelve steps and
 131 CG iterations, the cost functional equal to 8e-10.  The incremental solves of a
 Hessian action are used as they are, which the
