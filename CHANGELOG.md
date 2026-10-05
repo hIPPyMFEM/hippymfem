@@ -34,8 +34,9 @@
 - **A streamed geometry is copied to the device at the rate of the bus**
   (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
   geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
-  each chunk's slice from a numpy array, through a staging buffer of its own, at 5 to
-  11 GB/s on an H100 against the 55 GB/s of its PCIe 5 link. The geometry is now locked
+  each chunk's slice from a numpy array, through a staging buffer of its own: 3.4 to
+  5.6 GB/s measured on an H100 (8.8 GB/s from JAX's pinned host arrays), against the
+  55 GB/s of its PCIe 5 link. The geometry is now locked
   in RAM once (`devicebridge.pin`) and each slice is copied by the CUDA runtime
   (`devicebridge.host_to_jax`), of the arrays the kernel reads only. The element arrays
   are bit for bit the same. 128^3 on one H100 with single-precision solves: forward solve
