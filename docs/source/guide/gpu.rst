@@ -313,7 +313,11 @@ element, and symmetric blocks are made symmetric to the last bit.  The forward a
 adjoint solve are then refined against double-precision residuals from the vector
 kernels: two passes, the iterations of one solve.  With 2.1 million state dofs the state
 differed from the double-precision one by 3e-13, the gradient by 3e-13 and a Hessian
-action by 4e-9 to 1e-7, with the same Newton and CG counts.  ``fp32`` puts the vector
+action by 4e-9 to 1e-7, with the same Newton and CG counts.  Since a symmetrized matrix
+passes any symmetry probe, ``symmetric_jacobian="auto"`` decides here on the first
+Jacobian and keeps the verdict: a residual that is symmetric at some parameters and not
+at others has to declare ``symmetric_jacobian=False`` (a refined solve whose matrix is
+not the operator of its residual stops and raises).  ``fp32`` puts the vector
 kernels in single precision too and is for experiments only: the state is then wrong by
 1e-6 and the gradient by 4e-5 on a mesh of 16\ :sup:`3` elements, more on a finer one,
 and the optimizers stop at that floor.

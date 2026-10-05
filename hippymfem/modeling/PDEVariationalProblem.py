@@ -180,7 +180,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         #: :meth:`_probe_symmetry` (four matrix-vector products, far cheaper than the
         #: AMG setup they can save), so a residual that is self-adjoint at one
         #: parameter and not at another is handled correctly.  ``True`` and ``False``
-        #: declare it outright and skip the probe.
+        #: declare it outright and skip the probe.  With single-precision element
+        #: matrices (``HIPPYMFEM_PRECISION=mixed``) the verdict on the first Jacobian is
+        #: kept, since a symmetrized matrix passes any probe: such a residual has to
+        #: say ``False`` there (a refined solve that stalls then raises).  With
+        #: single-precision solves alone the kept verdict is checked on every new
+        #: Jacobian.
         self.symmetric_jacobian = (
             "auto" if symmetric_jacobian == "auto" else bool(symmetric_jacobian))
         #: At a forward solve for a parameter other than the linearization point's,
@@ -538,6 +543,18 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 if symmetric:
                     del A
                     A = assemble("symmetric" if single else None, to_single)
+            elif (known and not single and _is_single(A) and not self._probe_symmetry(
+                    A, self.SYMMETRY_PROBE_TOL_SINGLE_PRODUCTS / np.sqrt(A.GetGlobalNumRows()))):
+                # The verdict kept from an earlier Jacobian, checked on this one: from
+                # double-precision element matrices the matrix of the single-precision
+                # hypre is not symmetrized, so a form that is symmetric at one parameter
+                # and not at this one shows here.  Its Jacobian goes back to double
+                # precision, where the adjoint solves with the transpose.  (With
+                # single-precision element matrices the Jacobian is symmetrized and no
+                # probe can tell: such a form has to say symmetric_jacobian=False.)
+                self._symmetric_verdict = symmetric = False
+                del A
+                A = assemble(None, False)
         else:
             symmetric = self.symmetric_jacobian
         if symmetric:
@@ -577,6 +594,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: which the probe sees at 1e-7 / sqrt(n); a form that is not symmetric shows up
     #: at about 1 / sqrt(n), far above this for any size that fits a GPU
     SYMMETRY_PROBE_TOL_SINGLE = 1e-8
+    #: the same, times sqrt(n), for a matrix of the single-precision hypre, whose
+    #: products are rounded to single precision: the probe sees a symmetric form there
+    #: at about 2e-7 / sqrt(n), and a skew part of a fraction s of the matrix at about
+    #: s / sqrt(n) (an advection term next to diffusion: 2e-3 on 21^3 dofs, falling
+    #: with the mesh size), so a skew part above about 1e-5 of the matrix is caught
+    SYMMETRY_PROBE_TOL_SINGLE_PRODUCTS = 1e-5
 
     #: Iterative refinement of the forward and the adjoint solve when the Jacobian is
     #: assembled in single precision and the residuals in double (``"mixed"``): the
@@ -602,8 +625,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: functional to nine digits), while an optimizer run to a tighter tolerance, such
     #: as BFGS to 1e-8, ends in a line search that finds no decrease.
     SINGLE_REFINE_GOAL = 0.0
+    #: A refinement that ends above this many times its goal and above this relative
+    #: residual (or a hundred times the floor of single-precision element vectors) has
+    #: not converged: the matrix it solves with is not the operator of its residual, as
+    #: for a Jacobian taken for symmetric where it is not (:attr:`symmetric_jacobian`).
+    #: It raises a ``RuntimeError`` instead of returning an inaccurate solution.
+    REFINE_STALL = (1e3, 1e-6)
 
-    def _probe_symmetry(self, A):
+    def _probe_symmetry(self, A, tol=None):
         """Whether the assembled Jacobian is symmetric, to round-off.
 
         Compares the bilinear form both ways, ``w^T (A v)`` against ``v^T (A w)``, for
@@ -628,8 +657,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # (65 ms for 2.1 million dofs, against four products of a millisecond each on
         # a GPU), and kept vectors stay in device memory, where the products and the
         # inner products below then run without a copy.
-        tol = (self.SYMMETRY_PROBE_TOL_SINGLE if _kernel.matrix_precision() == "fp32"
-               else self.SYMMETRY_PROBE_TOL)
+        if tol is None:
+            tol = (self.SYMMETRY_PROBE_TOL_SINGLE if _kernel.matrix_precision() == "fp32"
+                   else self.SYMMETRY_PROBE_TOL)
         probes = self._symmetry_probes
         if probes is None:
             if self._symmetry_rng is None:
@@ -851,6 +881,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._refine_measured = True
         if r0 == 0.0:
             return 0, r
+        rn = r0
         verbose = self.newton_parameters["print_level"] >= 0 and self.comm.rank == 0
         try:
             for steps in range(1, 2 + int(self.REFINE_MAX_STEPS)):
@@ -891,6 +922,16 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         finally:
             if tight is not None:
                 prm["rel_tolerance"] = tight
+        factor, worst = self.REFINE_STALL
+        if self._refine_measured and rn > max(factor * goal,
+                                              max(worst, 100.0 * _kernel.residual_floor()) * r0):
+            raise RuntimeError(
+                "the refined %s solve stopped at a relative residual of %.1e, its goal "
+                "%.1e: the matrix it solves with is not the operator of its residual.  A "
+                "Jacobian that is not symmetric at every parameter has to be declared "
+                "symmetric_jacobian=False (with single-precision element matrices or "
+                "solves, \"auto\" keeps the verdict of the first one)"
+                % (what, rn / r0, goal / r0))
         return steps, r
 
     def evalGradientParameter(self, x, out):

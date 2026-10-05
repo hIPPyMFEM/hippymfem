@@ -100,6 +100,17 @@
   The single-precision solves run with CUDA builds (H100, L40S, RTX PRO 6000 Blackwell)
   and host builds; with a HIP build (MI210) the library is refused before it is loaded,
   with a warning, and the solves stay in double precision (`singlesolve.unsupported`).
+  A non-symmetric Jacobian (GMRES, `transpose_free_adjoint`) keeps its double-precision
+  solves. With single-precision element matrices or solves `symmetric_jacobian="auto"`
+  keeps the verdict of its first probe; a residual symmetric at the first parameter and
+  not later got the Jacobian for its transpose, without an error: on an
+  advection-diffusion test the gradient was off by 3e-5 (mixed element matrices) and
+  1e-2 (single-precision solves). With the solves alone the verdict is now checked on
+  every new Jacobian (four products in single precision); the symmetrized matrices of
+  the mixed mode cannot be probed, and such a residual has to declare
+  `symmetric_jacobian=False` there. A refined forward or adjoint solve that ends far
+  above its goal (`PDEVariationalProblem.REFINE_STALL`) raises a `RuntimeError` instead
+  of returning an inaccurate solution.
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.
