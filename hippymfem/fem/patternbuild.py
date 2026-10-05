@@ -38,6 +38,8 @@ repay the compilation (:data:`MIN_ENTRIES`); otherwise the sort route runs, unch
 """
 
 import os
+import stat
+import tempfile
 
 import numpy as np
 
@@ -59,6 +61,7 @@ THREADS = int(os.environ.get("HIPPYMFEM_PATTERN_THREADS", "0") or 0)
 QBITS = 16
 
 _KERNELS = None
+_PASSES = None
 _USABLE = None
 
 
@@ -104,12 +107,53 @@ def threads():
     return max(min(allowed, share), 1)
 
 
+def cache_dir():
+    """The directory in which numba keeps the compiled passes where ``NUMBA_CACHE_DIR``
+    names none: one of this node and of this user, under the system's temporary directory.
+
+    numba's own choice is ``__pycache__`` next to the sources.  On a file system shared by
+    the nodes one rank rewrites that cache while the others read it: of 32 ranks started
+    from a fresh checkout one stopped with ``OSError: [Errno 116] Stale file handle`` in
+    ``numba/core/caching.py``, and the others waited for it.  ``None`` where the directory
+    cannot be had (it is not this user's, or others may write to it): numba's own choice
+    stays then.
+    """
+    try:
+        path = os.path.join(tempfile.gettempdir(), "hippymfem-numba-%d" % os.getuid())
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.lstat(path)
+    except (AttributeError, OSError):
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        return None
+    return path
+
+
+def _passes():
+    """:mod:`._patternkernels`, whose passes numba caches on disk in :func:`cache_dir`."""
+    global _PASSES
+    if _PASSES is None:
+        import numba
+
+        # a function's cache directory is fixed where it is decorated, that is by this
+        # import; set for its duration only, numba's setting stays what the process has
+        old = numba.config.CACHE_DIR
+        mine = None if old else cache_dir()
+        if mine:
+            numba.config.CACHE_DIR = mine
+        try:
+            from . import _patternkernels as pk
+        finally:
+            numba.config.CACHE_DIR = old
+        _PASSES = pk
+    return _PASSES
+
+
 def _kernels():
-    """The compiled passes, from :mod:`._patternkernels` (numba caches them on disk)."""
+    """The compiled passes of :func:`build`."""
     global _KERNELS
     if _KERNELS is None:
-        from . import _patternkernels as pk
-
+        pk = _passes()
         _KERNELS = (pk.runs, pk.group_runs, pk.order_rows, pk.place_rows)
     return _KERNELS
 
@@ -179,8 +223,7 @@ def block_slots(urow, rowstart, in_diag, lead, nrow):
     """The slot layout of :func:`~hippymfem.fem.tdofassemble._slot_order`, compiled."""
     import numba
 
-    from . import _patternkernels as pk
-
+    pk = _passes()
     newslot = np.empty(urow.size, np.int64)
     old = numba.get_num_threads()
     numba.set_num_threads(min(threads(), numba.config.NUMBA_NUM_THREADS))

@@ -208,6 +208,14 @@ def test_sortfree_pattern():
             os.environ["OMPI_COMM_WORLD_LOCAL_SIZE"] = old
     check("a full node of ranks gets one pattern thread each", t == 1 or pb.THREADS > 0,
           "(%d thread with %d ranks on %d cores)" % (t, os.cpu_count() or 1, os.cpu_count() or 1))
+    # numba's cache of the compiled passes: next to the sources by default, where the ranks
+    # of a run on a shared file system rewrite it under one another
+    where = os.path.realpath(pb._passes().runs.stats.cache_path)
+    want = os.environ.get("NUMBA_CACHE_DIR") or pb.cache_dir()
+    here = os.path.dirname(os.path.realpath(pb.__file__))
+    check("the compiled passes are cached on this node, or where NUMBA_CACHE_DIR says",
+          where.startswith(os.path.realpath(want)) if want else where.startswith(here),
+          "(%s%s)" % (where, "" if want else "; no directory of this user under the temporary one"))
 
 
 def test_blocks_identical():

@@ -770,7 +770,13 @@ patterns once, the largest one-time cost of a large run (1.5 billion entries a r
 256\ :sup:`3` on eight GPUs).  With numba installed (the ``perf`` extra) they are built
 on the host without a global sort, three times faster and with no device memory
 (:mod:`hippymfem.fem.patternbuild`; ``HIPPYMFEM_PATTERN_THREADS`` sets the thread
-count, by default this rank's share of the node's cores).  In an assembly on the card
+count, by default this rank's share of the node's cores).  numba keeps the compiled
+passes on disk, and the library points it to a directory of the node,
+``hippymfem-numba-<uid>`` under the system's temporary directory, unless
+``NUMBA_CACHE_DIR`` names another: numba's own place is next to the sources, and on a
+file system shared by the nodes one of 32 ranks started from a fresh checkout stopped
+with ``Stale file handle`` while the others rewrote the cache.  The first run on a node
+compiles them, in three seconds.  In an assembly on the card
 the scatter map arrives from the host slice by slice in a compact form (one byte an entry
 and two bases an element row, a third of the four-byte map, which
 ``HIPPYMFEM_COMPACT_PATTERN=0`` restores), and ``HIPPYMFEM_DEVICE_PATTERN=1`` keeps it
