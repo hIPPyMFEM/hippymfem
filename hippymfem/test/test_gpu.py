@@ -694,6 +694,10 @@ def test_speed():
        speedups move by up to 1.6x between runs on a shared machine, which is why
        the only absolute assertions are the ones with a fivefold margin.
 
+    The meshes grow with the rank count, so that a rank holds the elements of the
+    one-rank run: an assembly on the device has a fixed cost per rank, and it is the
+    elements of a rank that are weighed against it.
+
     ``_REPORT_ONLY`` says which cases are data rather than claims, and why.
     """
     if RANK == 0:
@@ -703,6 +707,9 @@ def test_speed():
     speedup = {}
     for kind, n, order in (("quad", 48, 1), ("quad", 48, 2), ("quad", 32, 3),
                            ("hex", 14, 1), ("hex", 10, 2)):
+        # on a fixed mesh four ranks hold a quarter each, and the host wins against the
+        # device's fixed cost (hex order 1 on four MI250X: 0.8x on 14^3, 4.8x on 22^3)
+        n = int(round(n * NP ** (1.0 / (2 if kind == "quad" else 3))))
         pm, Vu, Vm, b, kern, loc = build(kind, n, order)
         NE = pm.GetNE()
         bc = hp.DirichletBC(Vu, None, "all")

@@ -315,6 +315,16 @@
   for its run without a visible GPU and strips the launcher's variables from the
   environment; `PALS_*` were not among them, and with those the child took itself for a
   rank of the step and waited in `MPI_Init` for the others.
+- Two checks whose outcome depended on the rank count. `test_vectorfe` asserted that
+  Newton-CG reports convergence on its H(curl) problem, where the predicted decrease
+  after the first step is about 1e-18: under `gdm_tolerance` on most partitions, and
+  2.2e-18 on four ranks, where the line search was then exhausted at the same point. The
+  reduction of the gradient is asserted now, as for the reference MAP point of
+  `test_uq`. `test_gpu` compared an assembly on the device and on the host on a fixed
+  mesh, of which four ranks hold a quarter each: against the device's fixed cost per
+  assembly the host won there (0.8x for first-order hexahedra on four MI250X). The
+  meshes grow with the rank count now, so that a rank holds the elements of the one-rank
+  run (4.8x).
 
 ## Version 0.1.0, released on September 21, 2026
 
