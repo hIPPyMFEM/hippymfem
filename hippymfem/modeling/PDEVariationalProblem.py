@@ -552,7 +552,31 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
     #: Whether this problem's solves may run in a single-precision hypre when one is
     #: named (``HIPPYMFEM_HYPRE_SINGLE``, :mod:`hippymfem.algorithms.singlesolve`).
+    #: Change it with :meth:`set_single_solves`, which drops what was built for the
+    #: other precision.
     single_solves = True
+
+    def set_single_solves(self, on=True):
+        """Run the solves of this problem in the single-precision hypre (``True``, when
+        one is named) or in MFEM's double-precision one (``False``) from now on; returns
+        the old choice.
+
+        The Jacobian, the solvers built on it and the linearization point are dropped
+        when the choice changes: the next forward solve assembles the Jacobian into the
+        library chosen, and ``setPointForHessianEvaluations`` must be called again before
+        the next Hessian action.  The stages of a Laplace approximation keep the
+        single-precision solves well: at 64\\ :sup:`3` (``doublePassG``, k = 50) the
+        eigenvalues came out within 1e-5 of double precision, the pointwise posterior
+        variance within 6e-6, in half the time of the eigensolver; switch them off where
+        eigenvalues are wanted to more digits than that.
+        """
+        old = bool(self.single_solves)
+        if bool(on) != old:
+            self.single_solves = bool(on)
+            self.invalidate_jacobian()
+            self.release_linearization_point()
+            self._release_operators("solver", "solver_adj")
+        return old
 
     def _wants_single(self):
         """Whether the Jacobian is to be assembled into the single-precision hypre: such

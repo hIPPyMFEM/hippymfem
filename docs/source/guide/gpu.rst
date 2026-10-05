@@ -509,17 +509,26 @@ a forward solve at a new parameter from 0.39 to 0.29 s and the Newton-CG solve f
 0.41 to 0.36 s.  In the two Newton steps at 128\ :sup:`3` on four Blackwell instances the
 two took 13.2 s to 12.4 s without the device pattern, which gave 12.2 s.
 
-One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
-directions, but the eigenpairs of a Laplace approximation come out to about that
-accuracy relative to the largest eigenvalue (in ``test_uq`` the eigenvectors
-diagonalized the Hessian to 3e-7 instead of 1e-9).  Where the small eigenvalues matter,
-compute the MAP point with the single-precision solves and switch them off for the
-stages after it:
+The 1e-5 of the incremental solves is also the accuracy of a Laplace approximation
+computed with them, which is more than a posterior needs.  At the MAP point of the model
+problem at 64\ :sup:`3` on a Blackwell instance (``doublePassG`` with k = 50 and p = 20,
+eigenvalues from 3.2e4 down to 4.5), mixed kernels and single-precision solves against
+double precision with the incremental solves at 1e-10: the eigenvalues agreed to
+1.0e-5 (the smallest kept to 3.8e-6), the pointwise posterior variance to 5.7e-6
+(1.4e-6 rms over the dofs), the traces to 2e-7, and the eigenvectors diagonalized the
+double-precision Hessian to 1.1e-6 of the largest eigenvalue.  Double precision with
+the incremental solves stopped at 1e-5 gave the same errors: they are those of the
+tolerance, not of the arithmetic.  The eigensolver took 26.0 s instead of 52.3 s
+(double precision, incremental solves at 1e-8, the default of ``bench_laplace.py``;
+36.5 s at 1e-5); the samples, the variances and the traces do not solve with the
+Jacobian and took the same 23 s.  So the single-precision solves stay on for the
+stages after the MAP point.  Where eigenvalues are wanted to more digits than that,
+switch them off (in ``test_uq`` the eigenvectors diagonalized the Hessian to 3e-7 of the
+largest eigenvalue instead of 1e-9):
 
 .. code-block:: python
 
-   pde.single_solves = False          # the Jacobian is assembled in double precision again
-   pde.invalidate_jacobian()
+   pde.set_single_solves(False)       # the Jacobian is assembled in double precision again
    model.setPointForHessianEvaluations(x)
 
 The 1e-5 also shows in the iterates on the way.  In the first Newton step of
