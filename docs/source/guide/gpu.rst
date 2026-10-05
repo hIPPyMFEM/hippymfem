@@ -578,7 +578,10 @@ with single-precision element matrices and solves (``benchmarks/bench_precision.
    ==================================  =================  =================  =======================
 
 What lies outside the pool is hypre's matrices, hierarchies and vectors, MFEM and the
-CUDA context; a seventh of it goes.  The other blocks of a linearization point stay in
+CUDA context; a seventh of it goes.  Since a Gauss-Newton point assembles its single
+block a chunk at a time, the H100's card in single precision peaks at 13.0 GiB instead
+of the 17.5 GiB of the table (double precision unchanged; the other columns not yet
+measured again).  The other blocks of a linearization point stay in
 double precision (for a forward problem that is linear in the state these are ``C`` and
 ``W_um``, 0.4 GB each at this size).  The Jacobian's accumulator does not.  Where the
 elements are assembled a chunk at a time, the route of a mesh that does not fit the
@@ -920,7 +923,10 @@ How large a problem fits
 A Newton step holds about 2 kB of device memory per unknown (state, parameter and
 adjoint together): the assembled blocks and the AMG hierarchies.  That puts
 128\ :sup:`3` (36 M unknowns) on four 45 GB L40S at 17 to 19 GiB per card, on two of them
-at 29 to 35 GiB, or on one 80 GB H100 at 69 GiB.  What decides whether a given run fits:
+at 29 to 35 GiB, or on one 80 GB H100 at 69 GiB; measured there, a Newton-CG run to its
+tolerance peaked at 64.1 GiB in double precision (253.8 s) and at 58.4 GiB with
+single-precision element matrices and solves (197.7 s), both with
+``release_linearization_on_move``.  What decides whether a given run fits:
 
 **What the one-time setup leaves behind.**  JAX keeps what its arena has grown to, so
 the largest thing that ever ran in it sets its size for the rest of the run.  Without
@@ -1019,7 +1025,9 @@ the card), a forward solve 0.48 s instead of 0.73 to 0.93 s (0.36 s).  At 128\ :
 on one H100 with single-precision element matrices and solves, where the geometry
 (13.9 GB) has to stream, the forward solve took 2.86 s instead of 5.51 s, the adjoint
 solve 1.25 s instead of 2.52 s, the gradient 0.40 s instead of 1.05 s, and the Newton-CG
-solve 197 s instead of 326 s, in the same 13 Newton and 191 CG iterations.
+solve 197 s instead of 326 s, in the same 13 Newton and 191 CG iterations; in double
+precision, which did not fit the card before the Gauss-Newton points were assembled a
+chunk at a time, the Newton-CG solve took 253.8 s.
 
 The chunk count is a memory choice, not a speed one.  A launch costs about 5 ms: at
 1 906 624 P2 hexahedra on one L40S a warm Jacobian assembly takes 9.3 s in 128 chunks and
