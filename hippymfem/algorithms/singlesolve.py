@@ -601,7 +601,15 @@ class SingleEngine:
         amg = ctypes.c_void_p()
         H.HYPRE_BoomerAMGCreate(ctypes.byref(amg))
         self.amg = amg
-        # MFEM's defaults for the device and for the host, then the solver's own
+        # MFEM's defaults for the device and for the host, then the solver's own, except
+        # two on a device: Jacobi relaxation (7) instead of l1-Jacobi (18), and six
+        # interpolation entries a row instead of four.  l1-Jacobi divides by the sum of
+        # the magnitudes of a row, which for quadratic elements is a few times the
+        # diagonal, and smooths that much less.  On the Jacobian of the model problem at
+        # 64^3 (Blackwell instance, solves to 1e-5) the two took the iterations from 11
+        # to 6 and a solve from 76 to 48 ms, the same setup time, at the MAP point, the
+        # prior mean and the truth alike; Newton-CG to 1e-6 38.5 -> 29.0 s with the same
+        # Newton and CG counts.  HIPPYMFEM_SINGLE_AMG="relax=18,pmax=4" gives MFEM's.
         gpu = lib.device
         relax = int(p["amg_relax_type"])
         levels = int(p["amg_max_levels"])
@@ -609,11 +617,11 @@ class SingleEngine:
         theta = float(p["amg_strength_threshold"])
         H.HYPRE_BoomerAMGSetCoarsenType(amg, 8 if gpu else 10)
         H.HYPRE_BoomerAMGSetAggNumLevels(amg, agg if agg >= 0 else (0 if gpu else 1))
-        H.HYPRE_BoomerAMGSetRelaxType(amg, relax if relax >= 0 else (18 if gpu else 8))
+        H.HYPRE_BoomerAMGSetRelaxType(amg, relax if relax >= 0 else (7 if gpu else 8))
         H.HYPRE_BoomerAMGSetNumSweeps(amg, 1)
         H.HYPRE_BoomerAMGSetStrongThreshold(amg, theta if theta >= 0.0 else 0.25)
         H.HYPRE_BoomerAMGSetInterpType(amg, 6)
-        H.HYPRE_BoomerAMGSetPMaxElmts(amg, 4)
+        H.HYPRE_BoomerAMGSetPMaxElmts(amg, 6 if gpu else 4)
         H.HYPRE_BoomerAMGSetPrintLevel(amg, 0)
         H.HYPRE_BoomerAMGSetMaxLevels(amg, levels if levels > 0 else 25)
         H.HYPRE_BoomerAMGSetMaxIter(amg, 1)
