@@ -68,7 +68,10 @@ def KrylovSolver_ParameterList():
                            "hypre BoomerAMG relaxation type; -1 keeps MFEM's default "
                                "(l1-Jacobi on a device).  16 is Chebyshev, for SPD "
                                "operators only: faster per solve, slower per stage, so "
-                               "not the default (benchmarks/DESIGN_NOTES.md, section 4)"],
+                               "not the default (benchmarks/DESIGN_NOTES.md, section 4).  "
+                               "7 is Jacobi: on the quadratic hexahedra of the model "
+                               "problem a third fewer iterations at the same cost each "
+                               "(guide, gpu.rst, Single precision), not yet the default"],
         "amg_max_levels": [_env_default("HIPPYMFEM_AMG_MAX_LEVELS", int, -1),
                            "hypre BoomerAMG maximum number of levels; -1 keeps MFEM's "
                                "default of 25.  On a GPU the coarse levels are too small to "

@@ -363,6 +363,12 @@ Of the other settings tried, Chebyshev relaxation halved the iterations at more 
 twice their cost, a strength threshold of 0.5 and fewer interpolation entries cost
 iterations, HMIS coarsening set up on the host (2.2 s), aggressive coarsening cost
 iterations, and its extended+i interpolation does not run on a device (it crashes).
+In MFEM's BoomerAMG, which PyMFEM lets set the relaxation but not the interpolation
+entries, ``HIPPYMFEM_AMG_RELAX=7`` (read by every AMG solver, the prior's too) took
+Newton-CG in double precision throughout from 73.0 to 56.1 s on a Blackwell instance with
+the same counts, and from 199.8 to 148.5 s with noise ten times smaller; with ten times
+more observations from 158.6 to 129.6 s, but with 364 CG iterations instead of 329 in the
+same eighteen Newton steps.
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
