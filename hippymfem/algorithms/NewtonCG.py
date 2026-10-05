@@ -53,6 +53,9 @@ from .cgsolverSteihaug import CGSolverSteihaug
 from .linesearch import armijo_backtrack
 
 
+_UNSET = object()
+
+
 class ModelConvergenceError(RuntimeError):
     """Raised by a forward solve that fails, so the line search can back off."""
 
@@ -97,6 +100,13 @@ def ReducedSpaceNewtonCG_ParameterList():
                                         "|r_k| at CG iteration k, where that is looser "
                                         "than their own tolerance (line search); 0: "
                                         "their own tolerance throughout"],
+        "single_refine_goal": [1e-9, "with the solves in a single-precision hypre, the "
+                                     "relative residual at which the refinement of the "
+                                     "forward and the adjoint solve may stop while this "
+                                     "solver runs (PDEVariationalProblem."
+                                     "SINGLE_REFINE_GOAL, if the problem leaves it at 0), "
+                                     "never more than 1e3 * rel_tolerance**2: two passes "
+                                     "instead of three at 1e-6; 0: the problem's own"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })
@@ -171,11 +181,29 @@ class ReducedSpaceNewtonCG:
         if x[ADJOINT] is None:
             x[ADJOINT] = self.model.generate_vector(ADJOINT)
         g = self.parameters["globalization"]
-        if g == "LS":
-            return self._solve_ls(x)
-        if g == "TR":
-            return self._solve_tr(x)
-        raise ValueError("unknown globalization %r" % (g,))
+        if g not in ("LS", "TR"):
+            raise ValueError("unknown globalization %r" % (g,))
+        # The gradient of a Newton step to 1e-6 needs nine digits, not twelve: the
+        # refinement of a single-precision forward or adjoint solve may stop after two
+        # passes while this solver runs (a problem that sets its own goal keeps it).  The
+        # decrease the line search must see near the end shrinks with the square of the
+        # gradient, so the goal does too: 1e-9 at a tolerance of 1e-6, 1e-13 at 1e-8,
+        # where it is tighter than the solvers' own and changes nothing (at 1e-11 a
+        # Newton-CG run to 1e-8 ended in a line search that found no decrease).
+        pde = getattr(self.model, "problem", None)
+        goal = min(float(self.parameters["single_refine_goal"] or 0.0),
+                   1e3 * float(self.parameters["rel_tolerance"]) ** 2)
+        own = None
+        if goal > 0.0 and pde is not None and not getattr(pde, "SINGLE_REFINE_GOAL", 1.0):
+            own = pde.__dict__.get("SINGLE_REFINE_GOAL", _UNSET)
+            pde.SINGLE_REFINE_GOAL = goal
+        try:
+            return self._solve_ls(x) if g == "LS" else self._solve_tr(x)
+        finally:
+            if own is _UNSET:
+                del pde.SINGLE_REFINE_GOAL
+            elif own is not None:
+                pde.SINGLE_REFINE_GOAL = own
 
     # ------------------------------------------------------------ line search
     def _solve_ls(self, x):

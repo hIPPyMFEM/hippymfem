@@ -120,8 +120,7 @@ def run(check, COMM=MPI.COMM_WORLD):
         del A
     # back to double precision at a point reached with single-precision solves, as for
     # the stages of a Laplace approximation after the MAP point
-    pde.single_solves = False
-    pde.invalidate_jacobian()
+    was = pde.set_single_solves(False)
     u, p = got[True]["u"].copy(), got[True]["p"].copy()
     pde.setLinearizationPoint([u, m, p], gauss_newton_approx=False)
     A, _ = pde._jacobian([u, m, None])
@@ -133,7 +132,13 @@ def run(check, COMM=MPI.COMM_WORLD):
           type(A).__name__ == "HypreParMatrix" and back < 1e-8,
           "(%s; the incremental solve against the first %.1e)" % (type(A).__name__, back))
     del A
-    pde.single_solves = True
+    again = pde.set_single_solves(True)
+    A, _ = pde._jacobian([u, m, None])
+    check("set_single_solves reports the old choice, and switched on again the Jacobian is in the "
+          "single-precision library",
+          was is True and again is False and type(A).__name__ == "SingleParMatrix",
+          "(%s, %s; %s)" % (was, again, type(A).__name__))
+    del A
 
     def rel(key):
         d, s = got[False][key], got[True][key]

@@ -130,8 +130,10 @@ then not a slower method: compare the gradient norms step by step.
 
 ``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by
 step.  The low-rank eigensolvers of the Laplace approximation are not Krylov
-recurrences and never had this sensitivity; their Hessian actions want incremental
-solves to about ``1e-8`` for the accuracy of the small eigenvalues.
+recurrences and never had this sensitivity; the accuracy of their eigenpairs is that of
+the incremental solves: at 64\ :sup:`3` the 50 leading eigenvalues came out to 1e-8 with
+the solves at ``1e-8`` and to 1e-5 (the pointwise posterior variance to 6e-6) with the
+solves at ``1e-5``, in either precision (:ref:`single-precision`).
 :ref:`gpu-recommended` in the GPU guide collects these settings.
 
 Gradient norms

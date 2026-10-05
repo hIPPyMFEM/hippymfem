@@ -93,14 +93,25 @@ all of it.
   (:ref:`single-precision`).  The single-precision solves need a Jacobian that is
   symmetric and solved by CG with BoomerAMG; other problems keep their double-precision
   solves.
+* On a GPU, ``HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`` (Jacobi relaxation and six
+  interpolation entries a row in the BoomerAMG of the single-precision solves) took the
+  Newton-CG solve at 64\ :sup:`3` from 38.5 to 29.0 s on a Blackwell instance and from
+  19.8 to 15.7 s on an H100, with the same Newton and CG counts, also on the problems with
+  ten times more observations and with noise ten times smaller.  Measured on this model
+  problem only, so not the default (:ref:`single-precision`).
 
-**The Laplace approximation.**  Its eigenpairs come out to about the accuracy of the
-incremental solves, and a single-precision solve stops near 1e-5, so switch the
-single-precision solves off after the MAP point and run the incremental solves to about
-1e-8 (below).  On several GPUs, if the problem fits on one, run these stages as an
-ensemble: at 64\ :sup:`3` the eigensolver took 17.6 s on four MIG instances as an
-ensemble and 30.4 s as a domain decomposition
-(`The Laplace approximation on the cards`_).
+**The Laplace approximation.**  Keep the single-precision solves for the stages after the
+MAP point.  Their incremental solves stop near 1e-5, and the eigenpairs come out to about
+that: at 64\ :sup:`3` on a Blackwell instance (``doublePassG``, k = 50, p = 20, eigenvalues
+from 3.2e4 down to 4.5) the eigenvalues agreed with those of double-precision solves to
+1e-10 within 1.0e-5, the smallest kept within 3.8e-6, and the pointwise posterior variance
+within 5.7e-6, three orders of magnitude below what a posterior needs; the eigensolver took
+26.0 s instead of 52.3 s with double-precision solves to 1e-8 (:ref:`single-precision`).
+Where eigenvalues are wanted to more digits than that, switch the single-precision solves
+off after the MAP point and run the incremental solves to about 1e-8 (below).  On several
+GPUs, if the problem fits on one, run these stages as an ensemble: at 64\ :sup:`3` the
+eigensolver took 17.6 s on four MIG instances as an ensemble and 30.4 s as a domain
+decomposition (`The Laplace approximation on the cards`_).
 
 **Several GPUs.**  Start the ranks through ``tools/mpirun_pinned.sh``, one card or MIG
 instance each.  Two things follow the rank count by themselves: the share of a card that
@@ -112,9 +123,8 @@ Krylov iteration (:ref:`several-gpus`).  The settings above stay as they are.
 **Short of memory**, in this order: single precision as above, and
 ``release_linearization_on_move=True`` for a line-search Newton-CG, which drops a
 linearization point before the next one is assembled (with both, the Newton-CG run at
-128\ :sup:`3`, 17.0 million state dofs, peaked at 75.8 GB on one 80 GB H100, where double
-precision with the release ran out of memory at each of the three shares of JAX tried,
-0.30 to 0.45); ``HIPPYMFEM_GPU_MEM_FRACTION=0.20``, which saved 1.9 GiB a card for 13 %
+128\ :sup:`3`, 17.0 million state dofs, peaked at 59,785 MiB on one 80 GB H100, and at
+65,683 MiB in double precision with the release); ``HIPPYMFEM_GPU_MEM_FRACTION=0.20``, which saved 1.9 GiB a card for 13 %
 more time in two Newton steps at 128\ :sup:`3` on four L40S; matrix-free linearization
 points last (:ref:`gpu-memory`).
 
@@ -127,19 +137,23 @@ points last (:ref:`gpu-memory`).
        getattr(pde, name).parameters["rel_tolerance"] = 1e-6
    x = hm.ReducedSpaceNewtonCG(model, params).solve([None, prior.mean.copy(), None])
 
-   pde.single_solves = False          # the Laplace approximation: double-precision solves
-   pde.invalidate_jacobian()
-   for name in ("solver_fwd_inc", "solver_adj_inc"):
-       getattr(pde, name).parameters["rel_tolerance"] = 1e-8
-   model.setPointForHessianEvaluations(x)
+   model.setPointForHessianEvaluations(x)   # the Laplace approximation: single-precision solves
+
+   # only where eigenvalues are wanted to more than five digits:
+   # pde.set_single_solves(False)
+   # for name in ("solver_fwd_inc", "solver_adj_inc"):
+   #     getattr(pde, name).parameters["rel_tolerance"] = 1e-8
+   # model.setPointForHessianEvaluations(x)
 
 ``max_direct=0`` keeps :func:`~hippymfem.algorithms.linSolvers.auto_solver` from a direct
 solve on a small mesh, which has no single-precision counterpart.  Measured and left
 opt-in: the index arrays of the assembly kept on the device
 (``HIPPYMFEM_DEVICE_PATTERN=1``, memory permitting), Hessian actions relaxed as the CG
-converges (``cg_hessian_relaxation``, which lost on a more informative problem), and the
-forward and adjoint solves refined to 1e-9 only (``SINGLE_REFINE_GOAL``, with which BFGS
-to 1e-8 failed).
+converges (``cg_hessian_relaxation``, which lost on a more informative problem), and Jacobi
+relaxation in MFEM's BoomerAMG of the double-precision solves (``HIPPYMFEM_AMG_RELAX=7``,
+which took one problem from 329 to 364 CG iterations).  Newton-CG refines the forward and
+the adjoint solve to 1e-9 only by itself (``single_refine_goal``); the problem's own
+``SINGLE_REFINE_GOAL`` stays 0 for other optimizers (BFGS to 1e-8 failed with 1e-9).
 
 .. _mfem-device:
 
@@ -420,12 +434,43 @@ double-precision one to 1e-12.  ``PDEVariationalProblem.SINGLE_REFINE_GOAL = 1e-
 stops after two passes and one evaluation of the residual, with the state exact to
 4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
 functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
-decrease, which is why it is not the default.  The incremental solves of a Hessian
-action are used as they are, which the reorthogonalized CG of a Newton step allows
-(:doc:`optimization`).  All of this applies when the three solvers that hold the
-Jacobian are CG with BoomerAMG and the Jacobian is symmetric; any other problem keeps
-its double-precision solves.  On a GPU it is CUDA only: with a HIP build (AMD GPUs) the
-library is refused with a warning and the solves stay in double precision.
+decrease, which is why it is not the problem's default.  Newton-CG sets it while it runs
+(``single_refine_goal``, 1e-9, never above 1e3 times the square of its own tolerance,
+which leaves a run to 1e-8 as it was): at 64\ :sup:`3` on a Blackwell instance 38.8 s
+instead of 40.8 s, the same twelve steps and 131 CG iterations, the cost functional the
+same to 8e-10.  The incremental solves of a Hessian action are used as they are, which
+the reorthogonalized CG of a Newton step allows (:doc:`optimization`).  All of this
+applies when the three solvers that hold the Jacobian are CG with BoomerAMG and the
+Jacobian is symmetric; any other problem keeps its double-precision solves.  On a GPU it
+is CUDA only: with a HIP build (AMD GPUs) the library is refused with a warning and the
+solves stay in double precision.
+
+The BoomerAMG of that library takes MFEM's defaults for a device, and
+``HIPPYMFEM_SINGLE_AMG`` sets any of hypre's BoomerAMG options by name
+(:data:`hippymfem.algorithms.singlesolve.AMG_OPTIONS`).  ``"relax=7,pmax=6"``, Jacobi
+relaxation (hypre's type 7) instead of l1-Jacobi (18) and six interpolation entries a
+row instead of four, is the one worth setting on the model problem.  l1-Jacobi divides
+by the sum of the magnitudes of a row, a few times the diagonal for quadratic elements,
+and smooths that much less.  On the Jacobian at 64\ :sup:`3` (Blackwell instance, the
+right-hand sides of incremental solves, solved to 1e-5) it took the iterations from 11
+to 6 and a solve from 76 to 48 ms with the same setup time, at the MAP point, at the
+prior mean and at the true parameter alike, and Newton-CG to 1e-6 from 38.5 to 29.0 s on
+a Blackwell instance and from 19.8 to 15.7 s on an H100, with the same twelve Newton steps
+and 131 CG iterations.  It kept the steps and CG iterations of the problem with ten times
+more observations (68.3 to 52.0 s, 15 Newton steps and 273 CG iterations) and of the one
+with noise ten times smaller, whose CG runs into its cap of 50 iterations in most late
+steps (113.1 to 84.7 s, 18 and 488).  It is not the default: plain Jacobi is not guaranteed to smooth a matrix that
+is far from diagonally dominant, and it has been checked on this model problem only.
+Of the other settings tried, Chebyshev relaxation halved the iterations at more than
+twice their cost, a strength threshold of 0.5 and fewer interpolation entries cost
+iterations, HMIS coarsening set up on the host (2.2 s), aggressive coarsening cost
+iterations, and its extended+i interpolation does not run on a device (it crashes).
+In MFEM's BoomerAMG, which PyMFEM lets set the relaxation but not the interpolation
+entries, ``HIPPYMFEM_AMG_RELAX=7`` (read by every AMG solver, the prior's too) took
+Newton-CG in double precision throughout from 73.0 to 56.1 s on a Blackwell instance with
+the same counts, and from 199.8 to 148.5 s with noise ten times smaller; with ten times
+more observations from 158.6 to 129.6 s, but with 364 CG iterations instead of 329 in the
+same eighteen Newton steps.
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
@@ -596,18 +641,28 @@ a forward solve at a new parameter from 0.39 to 0.29 s and the Newton-CG solve f
 0.41 to 0.36 s.  In the two Newton steps at 128\ :sup:`3` on four Blackwell instances the
 two took 13.2 s to 12.4 s without the device pattern, which gave 12.2 s.
 
-One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
-directions, but the eigenpairs of a Laplace approximation come out to about that
-accuracy relative to the largest eigenvalue (in ``test_uq`` the eigenvectors
-diagonalized the Hessian to 3e-7 instead of 1e-9).  Where the small eigenvalues matter,
-compute the MAP point with the single-precision solves and switch them off for the
-stages after it:
+The 1e-5 of the incremental solves is also the accuracy of a Laplace approximation
+computed with them, which is more than a posterior needs.  At the MAP point of the model
+problem at 64\ :sup:`3` on a Blackwell instance (``doublePassG`` with k = 50 and p = 20,
+eigenvalues from 3.2e4 down to 4.5), mixed kernels and single-precision solves against
+double precision with the incremental solves at 1e-10: the eigenvalues agreed to
+1.0e-5 (the smallest kept to 3.8e-6), the pointwise posterior variance to 5.7e-6
+(1.4e-6 rms over the dofs), the traces to 2e-7, and the eigenvectors diagonalized the
+double-precision Hessian to 1.1e-6 of the largest eigenvalue.  Double precision with
+the incremental solves stopped at 1e-5 gave the same errors: they are those of the
+tolerance, not of the arithmetic.  The eigensolver took 26.0 s instead of 52.3 s
+(double precision, incremental solves at 1e-8, the default of ``bench_laplace.py``;
+36.5 s at 1e-5); the samples, the variances and the traces do not solve with the
+Jacobian and took the same 23 s.  With ``HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`` (above)
+the eigensolver took 17.4 s with the same errors.  So the single-precision solves stay on for the
+stages after the MAP point.  Where eigenvalues are wanted to more digits than that,
+switch them off (in ``test_uq`` the eigenvectors diagonalized the Hessian to 3e-7 of the
+largest eigenvalue instead of 1e-9):
 
 .. code-block:: python
 
-   pde.single_solves = False          # the Jacobian is assembled in double precision again
+   pde.set_single_solves(False)       # the Jacobian is assembled in double precision again
    hm.config.precision = "fp64"       # optional: and its element matrices
-   pde.invalidate_jacobian()
    model.setPointForHessianEvaluations(x)
 
 ``applications/precision/model_subsurf_single.py`` does this.  At 8\ :sup:`3` on one host
