@@ -386,8 +386,11 @@ def test_device_auto_without_gpu():
         print("HIPPYMFEM_DEVICE=auto without a visible GPU")
     ok, detail = True, ""
     if RANK == 0:
+        # PALS_ is how Slurm tells HPE Cray's PMI that srun launched it: left in, the
+        # child takes itself for a rank of this step and waits in MPI_Init for the others
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_"))}
+               if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_",
+                                    "PALS_"))}
         env.update(HIPPYMFEM_DEVICE="auto", CUDA_VISIBLE_DEVICES="",
                    ROCR_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
         code = ("import hippymfem\nfrom hippymfem.fem import kernel\n"

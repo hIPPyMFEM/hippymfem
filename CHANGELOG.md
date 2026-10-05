@@ -308,6 +308,13 @@
   was emptied, the runtime still remembered the refusal and MFEM stopped at its next
   kernel with an out-of-memory error; and when the card was full, hypre ended the run
   without a message. The refusal is read now, and a full card is reported.
+- Two test suites under `srun` with Cray MPICH. `test_nb` added one entry to its results
+  on rank 0 only, so rank 0 made one `check()` broadcast more than the other ranks:
+  OpenMPI let the mismatched collectives pass, Cray MPICH's collectives over shared
+  memory waited for ever on two ranks and more. `test_vectors` starts a fresh interpreter
+  for its run without a visible GPU and strips the launcher's variables from the
+  environment; `PALS_*` were not among them, and with those the child took itself for a
+  rank of the step and waited in `MPI_Init` for the others.
 
 ## Version 0.1.0, released on September 21, 2026
 

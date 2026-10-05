@@ -116,6 +116,10 @@ def test_drawing():
     V1 = hm.FunctionSpace.H1(mesh1, 1)
     results["plot 1D"] = nb.plot(V1, V1.project(lambda x: x[0]))
     results["plot 1D mesh"] = nb.plot(mesh1)
+    # the key is there on every rank: check() is a broadcast, and a rank that made one
+    # fewer of them is out of step with the others (OpenMPI lets that pass, Cray MPICH's
+    # collectives over shared memory wait for it for ever)
+    results["plot_pts"] = None
     if RANK == 0:
         results["plot_pts"] = nb.plot_pts(np.random.default_rng(0).uniform(size=(9, 2)),
                                           np.arange(9.0))
