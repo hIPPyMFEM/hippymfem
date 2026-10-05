@@ -979,7 +979,7 @@ class GroupKernel:
         geometry tuple (every array element-mapped), the unmapped parameters."""
         return (0,) * nlead + (self._slot_axes, 0, None)
 
-    def _chunked(self, fn, axes, weight=1):
+    def _chunked(self, fn, axes, weight=1, overlap=False):
         """``fn``, run over the element batch in pieces the device can hold.
 
         The batch runs whole unless a pinned size (:data:`ELEMENT_CHUNK`) or the
@@ -990,12 +990,14 @@ class GroupKernel:
         remembered size).
 
         JAX reports a launch that runs out of memory at the next synchronization, so a
-        split batch is waited for here, inside the retry, until its chunk size has got
-        through with no more room on the device than there is now (:func:`_room`).
-        From then on the joined arrays are returned while they are computed, as those
-        of an unsplit batch are, and what the caller does next overlaps with the
-        launches; an out-of-memory error of such a run is raised at the caller's
-        synchronization and is not retried.
+        split batch is waited for here, inside the retry.  ``overlap`` is for the
+        element matrices, whose caller prepares a scatter while the kernel runs: they
+        are waited for until their chunk size has got through with no more room on the
+        device than there is now (:func:`_room`), and from then on returned while they
+        are computed, as those of an unsplit batch are.  An out-of-memory error of such
+        a run is raised at the caller's synchronization and is not retried.  The
+        element vectors are always waited for: their callers check them at once, so
+        returning early would gain nothing and lose the retry.
 
         **Chunking changes the answer at round-off.**  XLA blocks each element's
         quadrature sum differently at different batch shapes, so a chunked result
@@ -1021,7 +1023,7 @@ class GroupKernel:
                 try:
                     if n >= ne:
                         return fn(*args)
-                    room = _room(d)
+                    room = _room(d) if overlap else None
                     parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne), fn))
                              for a in range(0, ne, n)]
                     out = jax.tree_util.tree_map(
@@ -1302,7 +1304,7 @@ class GroupKernel:
     def _hess_slot_element(self, j):
         """:meth:`_hess_slot` by forward tangents over slot ``j``'s element dofs."""
         return self._chunked(_mapped_kernel(self._hess_slot_element_fn(j), self._axes()),
-                             self._axes(), weight=self._slot_weight(j))
+                             self._axes(), weight=self._slot_weight(j), overlap=True)
 
     def _hess_slot_element_fn(self, j):
         """The function of one element behind :meth:`_hess_slot_element`."""
@@ -1341,7 +1343,7 @@ class GroupKernel:
         parts.  Equal to the element route to round-off.
         """
         return self._chunked(_mapped_kernel(self._hess_slot_quadrature_fn(j), self._axes()),
-                             self._axes(), weight=self._slot_weight(j))
+                             self._axes(), weight=self._slot_weight(j), overlap=True)
 
     def _hess_slot_quadrature_fn(self, j):
         """The function of one element behind :meth:`_hess_slot_quadrature`."""
@@ -1479,7 +1481,8 @@ class GroupKernel:
                 return K + Dj @ Vj + Vi.T @ Di.T - Vi.T @ (Vi @ Dj) @ Vj
 
             self._cache[key] = self._chunked(
-                _mapped_kernel(f, self._axes()), self._axes(), weight=self._slot_weight(j))
+                _mapped_kernel(f, self._axes()), self._axes(), weight=self._slot_weight(j),
+                overlap=True)
         return self._cache[key]
 
     def _block_fn(self, i, j, consistent=None):

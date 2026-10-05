@@ -188,13 +188,15 @@
   chunk loops that was the finiteness check of the element arrays (`kernel.all_finite`,
   where the failures above showed as `jit__reduce_all`), past the retry. The loops now wait
   for their results inside it, and the size of the failed request is read as JAX 0.11 words
-  it. A split batch whose chunks are joined (`element_matrices`, `element_vectors`) is
-  waited for until its chunk size has got through with no more free device memory than
-  there is now (`kernel._room`); after that its arrays are returned while they are
+  it. The element matrices of a split batch whose chunks are joined (`element_matrices`)
+  are waited for until their chunk size has got through with no more free device memory
+  than there is now (`kernel._room`); after that they are returned while they are
   computed, as those of an unsplit batch are, so that an assembly prepares its scatter
   while the kernel runs. Waiting every time cost that overlap: 9 ms of a complete assembly
   of 262,144 quadratic hexahedra on an L40S (919 against 910 ms) and of 518,400 quadratic
-  quadrilaterals (166 against 157 ms).
+  quadrilaterals (166 against 157 ms). The element vectors are always waited for: their
+  callers check them at once, so that returning early would gain nothing and lose the
+  retry.
 - **Assembled matrices and vectors stay on the GPU** (`HIPPYMFEM_DEVICE_BRIDGE`,
   `HIPPYMFEM_DEVICE_VECTORS`). With the element kernels and hypre on one card, assembled
   values and the vectors between two hypre calls no longer pass through the host. Two
