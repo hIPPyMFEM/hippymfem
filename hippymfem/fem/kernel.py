@@ -37,6 +37,7 @@ close.
 """
 
 import functools
+import math
 import os
 import time
 import warnings
@@ -547,6 +548,28 @@ def _free_budget(d):
     return max(budget - int(GPU_MEM_RESERVE * 2 ** 30), 0)
 
 
+def _room(d):
+    """Bytes a launch on GPU ``d`` can still take, or None where that cannot be told
+    (the host, an allocator without statistics).
+
+    What JAX's arena holds unused and what the card has free for the arena to grow
+    into, within JAX's own limit.  The planner's figure, :func:`_free_budget`, falls
+    when the arena grows, since the card's free memory then does; this one stays, so
+    two launches from the same state are given the same number.
+    """
+    if getattr(d, "platform", "") not in ("gpu", "cuda", "rocm"):
+        return None
+    try:
+        stats = d.memory_stats() or {}
+        limit, used, arena = stats["bytes_limit"], stats["bytes_in_use"], stats["pool_bytes"]
+    except Exception:                                   # noqa: BLE001
+        return None
+    card = _gpu_free_bytes()
+    if card is None:
+        return None
+    return min(limit, arena + card) - used
+
+
 def _is_oom(exc):
     """True for the device-out-of-memory error, whatever JAX is wrapping it in."""
     text = "%s: %s" % (type(exc).__name__, exc)
@@ -966,6 +989,14 @@ class GroupKernel:
         set (the full element Hessian carries every block at once and keeps its own
         remembered size).
 
+        JAX reports a launch that runs out of memory at the next synchronization, so a
+        split batch is waited for here, inside the retry, until its chunk size has got
+        through with no more room on the device than there is now (:func:`_room`).
+        From then on the joined arrays are returned while they are computed, as those
+        of an unsplit batch are, and what the caller does next overlaps with the
+        launches; an out-of-memory error of such a run is raised at the caller's
+        synchronization and is not retried.
+
         **Chunking changes the answer at round-off.**  XLA blocks each element's
         quadrature sum differently at different batch shapes, so a chunked result
         differs from an unchunked one by about 1e-15 relative; a given chunk size is
@@ -973,6 +1004,8 @@ class GroupKernel:
         and not a default, and why engaging it warns.  See
         ``benchmarks/DESIGN_NOTES.md``, section 1.
         """
+        proven = {}        # (device, chunk): the least room a waited run got through with
+
         def call(*args):
             ne = int(self.group.ne)
             if ne == 0:
@@ -988,15 +1021,25 @@ class GroupKernel:
                 try:
                     if n >= ne:
                         return fn(*args)
+                    room = _room(d)
                     parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne), fn))
                              for a in range(0, ne, n)]
                     out = jax.tree_util.tree_map(
                         lambda *p: jnp.concatenate(p, axis=0), *parts)
                     parts = None
+                    if room is not None and room >= proven.get((d, n), math.inf):
+                        return out
                     # Waited for here: JAX reports an allocation that fails while a
                     # launch runs at the next synchronization, which would otherwise
                     # be the caller's (the finiteness check), past this retry.
-                    return jax.block_until_ready(out)
+                    out = jax.block_until_ready(out)
+                    left = None if room is None else _room(d)
+                    if left is not None:
+                        # (what this run left on the device besides its result, the
+                        # geometry it cached for one, a later run need not find room for)
+                        held = sum(x.nbytes for x in jax.tree_util.tree_leaves(out))
+                        proven[(d, n)] = min(room, left + held)
+                    return out
                 except Exception as exc:
                     parts = out = None          # what the failed attempt holds goes first
                     if n <= 1 or not _is_oom(exc):
