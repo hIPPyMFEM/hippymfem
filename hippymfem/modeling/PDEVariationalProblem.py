@@ -954,8 +954,15 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         elif len(need) > 1 and SHARE_HESSIAN_PASS:
             mats = self.kernel.element_matrices_many(need, loc)
         else:
-            mats = {ij: self.kernel.element_matrices(ij[0], ij[1], loc)
-                    for ij in need}
+            # One block (a Gauss-Newton point needs C alone), or no shared pass: each
+            # block is left to _block below, which hands a split batch to the scatter
+            # a chunk at a time and computes an unsplit one whole, the arrays this
+            # branch computed.  Glued here, a split batch held every row block of the
+            # slot pass at once and all of it again while the chunks were joined, and
+            # its scatter kept the full map on the device: at 2.1 million quadratic
+            # hexahedra on a rank 8.3 GB, 8.3 GB more and 1.8 GB, which ran one H100
+            # out of memory in double precision.
+            mats = dict.fromkeys(need)
         self.A, self.At = self._jacobian(x)
         blocks = {}
         for ij, kw in (((ADJOINT, PARAMETER), dict(test_ess=ess)),
