@@ -316,8 +316,11 @@ differed from the double-precision one by 3e-13, the gradient by 3e-13 and a Hes
 action by 4e-9 to 1e-7, with the same Newton and CG counts.  Since a symmetrized matrix
 passes any symmetry probe, ``symmetric_jacobian="auto"`` decides here on the first
 Jacobian and keeps the verdict: a residual that is symmetric at some parameters and not
-at others has to declare ``symmetric_jacobian=False`` (a refined solve whose matrix is
-not the operator of its residual stops and raises).  ``fp32`` puts the vector
+at others has to declare ``symmetric_jacobian=False``.  A refined solve that ends far
+above its goal, because the matrix is not the operator of its residual or because the
+parameter makes the Jacobian too ill-conditioned for single precision (a line search
+may propose such a point), is solved again with the Jacobian in double precision, with
+a warning.  ``fp32`` puts the vector
 kernels in single precision too and is for experiments only: the state is then wrong by
 1e-6 and the gradient by 4e-5 on a mesh of 16\ :sup:`3` elements, more on a finer one,
 and the optimizers stop at that floor.

@@ -109,8 +109,14 @@
   every new Jacobian (four products in single precision); the symmetrized matrices of
   the mixed mode cannot be probed, and such a residual has to declare
   `symmetric_jacobian=False` there. A refined forward or adjoint solve that ends far
-  above its goal (`PDEVariationalProblem.REFINE_STALL`) raises a `RuntimeError` instead
-  of returning an inaccurate solution.
+  above its goal (`PDEVariationalProblem.REFINE_STALL`: above 1e3 times the goal and 1e-8
+  of its first residual) is solved once more with the Jacobian assembled in double
+  precision, with a `RuntimeWarning` once per process, where it used to return what it
+  had: single precision cannot carry a solve at a parameter that makes the Jacobian too
+  ill-conditioned (BFGS from the prior mean in `test_optimization` passes m in [-50, 52],
+  where a single-precision forward solve diverged and an adjoint solve stopped at 0.84
+  of its first residual), and the double-precision Jacobian drops a kept verdict of
+  symmetry that it contradicts.
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.

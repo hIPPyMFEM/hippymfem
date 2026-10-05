@@ -183,7 +183,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         #: declare it outright and skip the probe.  With single-precision element
         #: matrices (``HIPPYMFEM_PRECISION=mixed``) the verdict on the first Jacobian is
         #: kept, since a symmetrized matrix passes any probe: such a residual has to
-        #: say ``False`` there (a refined solve that stalls then raises).  With
+        #: say ``False`` there (a refined solve that stalls is then done again in
+        #: double precision, with a warning).  With
         #: single-precision solves alone the kept verdict is checked on every new
         #: Jacobian.
         self.symmetric_jacobian = (
@@ -627,10 +628,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     SINGLE_REFINE_GOAL = 0.0
     #: A refinement that ends above this many times its goal and above this relative
     #: residual (or a hundred times the floor of single-precision element vectors) has
-    #: not converged: the matrix it solves with is not the operator of its residual, as
-    #: for a Jacobian taken for symmetric where it is not (:attr:`symmetric_jacobian`).
-    #: It raises a ``RuntimeError`` instead of returning an inaccurate solution.
-    REFINE_STALL = (1e3, 1e-6)
+    #: not converged: single precision cannot carry the solve at this point (a parameter
+    #: that makes the Jacobian too ill-conditioned for it, as a line search may propose),
+    #: or the matrix is not the operator of its residual (a Jacobian taken for symmetric
+    #: where it is not, :attr:`symmetric_jacobian`).  The system is then solved once more
+    #: with the Jacobian assembled in double precision (:meth:`_solve_in_double`), with a
+    #: ``RuntimeWarning`` once per process.  A refinement that converges ends at its
+    #: goal (about 1e-11 for a tolerance of 1e-12) in two or three passes.
+    REFINE_STALL = (1e3, 1e-8)
 
     def _probe_symmetry(self, A, tol=None):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -755,7 +760,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             _set_operator_once(solver, J)
             self.fwd_iterations, r = self._refined_solve(
                 solver, u, r, r0,
-                lambda: self._residual([u, m, p], ADJOINT, ess=self.bc0.ess), "forward")
+                lambda: self._residual([u, m, p], ADJOINT, ess=self.bc0.ess), "forward",
+                point=[u, m, None])
             maxit = 0
         else:
             maxit = 1 if self.is_fwd_linear else int(prm["max_iter"])
@@ -843,12 +849,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
             r0 = rhs.norm("l2")
             self.adj_iterations, _ = self._refined_solve(
-                solver, adj, rhs.copy(), r0, residual, "adjoint", negate=False)
+                solver, adj, rhs.copy(), r0, residual, "adjoint", negate=False, point=x)
             return adj
         solver.solve(adj, rhs)
         return adj
 
-    def _refined_solve(self, solver, x, r, r0, residual, what, negate=True):
+    def _refined_solve(self, solver, x, r, r0, residual, what, negate=True, point=None):
         """Solve with a matrix assembled in single precision, to the accuracy of double.
 
         ``solver`` holds the Jacobian (or its transpose) from the single-precision
@@ -923,16 +929,51 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             if tight is not None:
                 prm["rel_tolerance"] = tight
         factor, worst = self.REFINE_STALL
-        if self._refine_measured and rn > max(factor * goal,
-                                              max(worst, 100.0 * _kernel.residual_floor()) * r0):
-            raise RuntimeError(
-                "the refined %s solve stopped at a relative residual of %.1e, its goal "
-                "%.1e: the matrix it solves with is not the operator of its residual.  A "
-                "Jacobian that is not symmetric at every parameter has to be declared "
-                "symmetric_jacobian=False (with single-precision element matrices or "
-                "solves, \"auto\" keeps the verdict of the first one)"
-                % (what, rn / r0, goal / r0))
+        if (point is not None and self._refine_measured
+                and rn > max(factor * goal, max(worst, 100.0 * _kernel.residual_floor()) * r0)):
+            _warn_stall(what, rn / r0, goal / r0,
+                        self.symmetric_jacobian == "auto" and bool(self._symmetric_verdict))
+            if negate:
+                r.scale(-1.0)
+            self._solve_in_double(point, dx, r, what == "adjoint", prm)
+            x.axpy(1.0, dx)
+            r = residual()
+            steps += 1
         return steps, r
+
+    def _solve_in_double(self, x, out, rhs, transpose, prm):
+        """``out = J^{-1} rhs`` (``J^{-T} rhs`` with ``transpose``), ``J`` the Jacobian at
+        ``x`` assembled in double precision from double-precision element matrices,
+        whatever the mode, in a matrix and a solver of its own that go when it returns:
+        the way out of a refinement that single precision cannot carry
+        (:data:`REFINE_STALL`).  The matrix is probed for symmetry (CG if it is, GMRES
+        with its transpose if not), and a kept verdict of "symmetric" that it
+        contradicts is dropped, with the cached Jacobian.  ``prm``: the parameters of
+        the refining solver (tolerance, iterations, error on nonconvergence)."""
+        from ..algorithms.linSolvers import KrylovSolver
+
+        xx = [x[STATE], x[PARAMETER], None]
+        # (a change of the precision clears the kernels' compiled programs: the next
+        # single-precision assembly compiles again, once)
+        old = _kernel.set_precision("fp64") if _kernel.matrix_precision() == "fp32" else None
+        try:
+            A = self._block(ADJOINT, STATE, xx, test_ess=self.bc0.ess_tdof, diag_policy="one")
+        finally:
+            if old is not None:
+                _kernel.set_precision(old)
+        symmetric = self._probe_symmetry(A, self.SYMMETRY_PROBE_TOL)
+        if not symmetric and self._symmetric_verdict:
+            self._symmetric_verdict = False
+            self._jac_cache = None
+        s = KrylovSolver(self.comm, method="cg" if symmetric else "gmres", precond="amg")
+        if prm is not None:
+            for k in ("rel_tolerance", "abs_tolerance", "max_iter", "error_on_nonconvergence"):
+                if k in prm:
+                    s.parameters[k] = prm[k]
+        s.set_operator(A if (symmetric or not transpose) else A.Transpose())
+        s.solve(out, rhs)
+        s.release()
+        return out
 
     def evalGradientParameter(self, x, out):
         """``out = dR/dm`` at ``x``; equals ``C^T p`` but needs no matrix."""
@@ -1376,6 +1417,26 @@ def require_finite(v, what):
             "large for this problem (a line search should reject it)" % what
         )
     return v
+
+
+_STALL_WARNED = []
+
+
+def _warn_stall(what, rel, goal, kept):
+    """The warning of a refinement that stalled (:data:`PDEVariationalProblem.REFINE_STALL`),
+    once per process."""
+    if _STALL_WARNED:
+        return
+    _STALL_WARNED.append(True)
+    import warnings
+
+    warnings.warn(
+        "a refined %s solve stopped at %.1e of its first residual, its goal %.1e: single "
+        "precision cannot carry this solve at this point%s; it is solved again with the "
+        "Jacobian in double precision (said once)"
+        % (what, rel, goal, (", or the Jacobian is not symmetric here although the first "
+                             "one was (symmetric_jacobian)" if kept else "")),
+        RuntimeWarning, stacklevel=4)
 
 
 def _same(a, b):
