@@ -31,7 +31,3 @@ __all__ = [
     "parameter2QoiMapVerify", "qoiVerify",
     "TaylorApproximationQoi", "varianceReductionMC",
 ]
-
-# snake_case spellings of the module-level functions (hippymfem.common.naming)
-from .varianceReductionMC import variance_reduction_mc  # noqa: E402
-__all__ += ["variance_reduction_mc"]

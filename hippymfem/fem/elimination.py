@@ -72,9 +72,6 @@ def _set_eliminated_diagonal(A, ess, value):
     return A
 
 
-_keep_with = own          # an alias, re-exported by csrassemble
-
-
 def _eliminate(A, test_space, trial_space, test_ess, trial_ess, diag_policy,
                same):
     """Apply essential-dof elimination exactly as MFEM's Form*SystemMatrix does.
@@ -102,7 +99,7 @@ def _eliminate(A, test_space, trial_space, test_ess, trial_ess, diag_policy,
         # leaves 1.0 on the diagonal, whatever MFEM's DiagonalPolicy says; the
         # serial DiagonalPolicy never reaches the parallel path.
         Ae = take_ownership(A.EliminateRowsCols(ess))
-        _keep_with(A, Ae)
+        own(A, Ae)
         if diag_policy == "zero":
             set_diagonal_entries(A, idx, 0.0)
         elif diag_policy == "keep":
@@ -112,7 +109,7 @@ def _eliminate(A, test_space, trial_space, test_ess, trial_ess, diag_policy,
     # EliminateCols communicates, so it is called on the same condition everywhere;
     # EliminateRows only touches local rows and is safe either way.
     if trial_ess is not None:
-        _keep_with(A, take_ownership(A.EliminateCols(trial_ess)))
+        own(A, take_ownership(A.EliminateCols(trial_ess)))
     if test_ess is not None and test_ess.Size():
         A.EliminateRows(test_ess)
     return A

@@ -72,8 +72,3 @@ __all__ = [
     "GaussianLRPosterior", "LowRankHessian", "LowRankPosteriorSampler",
     "modelVerify", "fd_slopes", "best_slope",
 ]
-
-# snake_case spellings of the module-level functions (hippymfem.common.naming)
-from .modelVerify import model_verify  # noqa: E402
-from .pointwiseObservation import assemble_pointwise_observation, assemble_pointwise_los_observation, export_pointwise_observation  # noqa: E402
-__all__ += ["model_verify", "assemble_pointwise_observation", "assemble_pointwise_los_observation", "export_pointwise_observation"]

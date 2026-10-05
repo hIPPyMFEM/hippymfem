@@ -22,7 +22,6 @@ reduced Hessian from the blocks the PDE problem and misfit provide.  Signatures
 follow hIPPYlib exactly.
 """
 
-from ..common.naming import SnakeCamel, sync_spellings
 from .variables import ADJOINT, PARAMETER, STATE
 
 
@@ -34,7 +33,7 @@ def _is_zero(term, i, j):
     return bool(fn(i, j)) if fn is not None else False
 
 
-class ReducedMap(SnakeCamel):
+class ReducedMap(object):
     r"""A PDE problem and a functional of ``(u, m)`` reduced over the state.
 
     Both the inverse problem (:class:`Model`, whose functional is the data misfit)
@@ -243,7 +242,3 @@ class Model(ReducedMap):
                 except TypeError:          # a prior written before the argument existed
                     pass
         return self.prior.Rsolver
-
-
-sync_spellings(ReducedMap)
-sync_spellings(Model)

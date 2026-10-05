@@ -4,11 +4,11 @@
 # COPYRIGHT.
 """Direct CSR assembly: scatter element arrays without MFEM's per-element callback.
 
-The callback route (:mod:`.integrators`) hands each element array to MFEM through a
-``PyBilinearFormIntegrator``.  It is the reference, since MFEM owns the dof
-combination, the essential-bc elimination and the parallel reduction, but its
-Python call per element is a large share of an assembly on a fine mesh
-(``benchmarks/DESIGN_NOTES.md``, section 2).  This module, the default route of
+Handing each element array to MFEM through a ``PyBilinearFormIntegrator`` lets MFEM
+own the dof combination, the essential-bc elimination and the parallel reduction,
+but its Python call per element is a large share of an assembly on a fine mesh
+(``benchmarks/DESIGN_NOTES.md``, section 2).  The test suite keeps that route as
+its reference (:mod:`hippymfem.test.reference_assembly`).  This module, the route of
 :func:`hippymfem.fem.assemble.assemble_matrix`, removes that call and does what
 ``ParBilinearForm::ParallelAssemble`` does, one level up:
 
@@ -22,7 +22,7 @@ Python call per element is a large share of an assembly on a fine mesh
    the rows of shared dofs it does not own go to their owner in one ``Alltoallv``,
    so ``P^T A P`` is never formed, which is a few times cheaper.  Otherwise the CSR is
    wrapped as a block-diagonal ``HypreParMatrix`` over the **ldof** partition and
-   hypre forms ``P^T A_local P`` with :func:`mfem.RAP`, which is right for
+   hypre forms ``P^T A_local P`` (:func:`_triple`), which is right for
    non-conforming interfaces and for faces that carry a dof transformation alike.
    ``HIPPYMFEM_PARMAT`` forces either (:func:`set_parmat_mode`).  With hypre on a
    device every live matrix gets its own copy of the pattern's index arrays, for
@@ -48,9 +48,7 @@ on 1, 2 and 4 ranks.
 The sparsity pattern and the scatter map depend only on the mesh and the spaces,
 so they are built once per pair of spaces and reused by every later assembly.  That
 is what pays off in an inverse problem, where a Newton-CG run reassembles ``A``,
-``C``, ``W_uu`` and the other blocks hundreds of times on a fixed mesh.  Set
-``HIPPYMFEM_ASSEMBLY=integrator`` or call
-:func:`hippymfem.fem.assemble.set_assembly_backend` to use the callback route.
+``C``, ``W_uu`` and the other blocks hundreds of times on a fixed mesh.
 """
 
 import os
@@ -72,23 +70,16 @@ from .prolongation import (  # noqa: F401  (re-exported, see below)
 )
 from .parmat import (  # noqa: F401  (re-exported, see below)
     _TRANSPOSE,
-    _TRIPLE_CHOICE,
     _as_sparse,
-    _check_host_hypre,
     _tdof_route,
     _transposed,
     _triple,
-    _triple_fused,
-    _triple_split,
-    _via_mfem,
     local_par_matrix,
     set_parmat_mode,
-    set_triple_mode,
 )
 from .elimination import (  # noqa: F401  (re-exported, see below)
     _eliminate,
     _foldable,
-    _keep_with,
     _set_eliminated_diagonal,
     set_fold_elimination,
 )
@@ -112,7 +103,7 @@ from .pattern import (  # noqa: F401  (re-exported, see below)
 # :mod:`.pattern` (the CSR graphs and the scatter), :mod:`.prolongation` (what ``P``
 # is), :mod:`.parmat` (the parallel matrix and the triple product) and
 # :mod:`.elimination` (essential dofs).  The route switches (``PARMAT_MODE``,
-# ``TRIPLE_MODE``, ``FOLD_ELIMINATION``, ``DETERMINISTIC``) are read through their
+# ``FOLD_ELIMINATION``, ``DETERMINISTIC``) are read through their
 # modules, since a name copied here would not follow ``set_*_mode``.
 
 
@@ -240,19 +231,15 @@ def finish_block(p, acc):
         if p.fold:
             return A
     else:
-        # A triple product consumes the ldof matrix and hands back a new one, so
-        # that matrix never reaches the caller and can be built once and refilled.
-        # When the prolongation is the identity it *is* the result, and must be
-        # fresh.
-        Aloc = local_par_matrix(p.pattern, acc, p.test_space, p.trial_space,
-                                reuse=not p.escapes)
+        # When the prolongation is the identity the ldof matrix *is* the result;
+        # otherwise the triple product consumes it.
+        Aloc = local_par_matrix(p.pattern, acc, p.test_space, p.trial_space)
         if p.escapes:
             A = Aloc
         elif p.same:
-            A = _triple(Aloc, None, p.Pt, p.test_space.comm, (p.test_space.fes,))
+            A = _triple(Aloc, None, p.Pt, (p.test_space.fes,))
         else:
-            A = _triple(Aloc, p.Pt, p.Pr, p.test_space.comm,
-                        (p.test_space.fes, p.trial_space.fes))
+            A = _triple(Aloc, p.Pt, p.Pr, (p.test_space.fes, p.trial_space.fes))
         del Aloc
     if p.fold:
         if p.same and p.test_ess is not None:

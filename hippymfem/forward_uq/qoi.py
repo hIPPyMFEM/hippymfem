@@ -15,13 +15,12 @@ import mfem.par as mfem
 from ..common.keepalive import KeepAlive
 from ..common.linalg import as_matrix
 from ..fem.assemble import assemble_native_matrix, mass_functional  # noqa: F401
-from ..common.naming import SnakeCamel, sync_spellings
 from ..fem.coefficients import attribute_indicator
 from ..fem.spaces import as_space
 from ..modeling.variables import STATE
 
 
-class Qoi(SnakeCamel):
+class Qoi(object):
     """Abstract scalar functional of ``x = [u, m, p]``."""
 
     def eval(self, x):
@@ -161,6 +160,3 @@ def weighted_mean_qoi(Vh, w=None):
 def mean_state_qoi(Vh):
     r"""``q`` = the spatial average of the state, ``(1^T M u) / (1^T M 1)``."""
     return weighted_mean_qoi(Vh)
-
-
-sync_spellings(Qoi)

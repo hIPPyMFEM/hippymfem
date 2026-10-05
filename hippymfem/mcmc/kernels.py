@@ -32,7 +32,6 @@ References
 
 import math
 
-from ..common.naming import sync_spellings
 from ..common.operators import make_vector
 from ..common.parameterList import ParameterList
 from ..common.random import parRandom
@@ -268,6 +267,3 @@ class ISKernel(_KernelBase):
     def consume_random(self):
         self.prior.sample_noise(1.0, self.noise, self.rng)
 
-
-sync_spellings(_KernelBase)
-sync_spellings(MALAKernel)

@@ -77,7 +77,3 @@ def check_SVD(A, U, sigma, V):
     eV = np.linalg.norm(V.dot_mv(V) - np.eye(k), "fro")
     return res, eU, eV
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-accuracy_enhanced_svd = accuracyEnhancedSVD
-single_pass_svd = singlePassSVD

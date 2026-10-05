@@ -19,7 +19,3 @@ __all__ = [
     "NullTracer", "QoiTracer", "FullTracer",
     "integratedAutocorrelationTime", "effective_sample_size", "chain_summary",
 ]
-
-# snake_case spellings of the module-level functions (hippymfem.common.naming)
-from .diagnostics import integrated_autocorrelation_time  # noqa: E402
-__all__ += ["integrated_autocorrelation_time"]

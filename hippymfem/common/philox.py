@@ -18,12 +18,6 @@ four words and incremented before a block is generated, and doubles taken as
 
 import numpy as np
 
-_M0 = np.uint64(0xD2E7470EE14C6C93)
-_M1 = np.uint64(0xCA5A826395121157)
-_W0 = np.uint64(0x9E3779B97F4A7C15)
-_W1 = np.uint64(0xBB67AE8584CAA73B)
-_MASK32 = np.uint64(0xFFFFFFFF)
-_S32 = np.uint64(32)
 _TWO53 = 9007199254740992.0
 _MASK64 = (1 << 64) - 1
 

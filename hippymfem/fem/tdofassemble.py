@@ -47,6 +47,7 @@ import mfem.par as mfem
 from ..common.identitycache import IdentityCache
 from ..common.linalg import own
 from ..common.parvector import _HYPRE_INT
+from ..config import env_choice
 from . import pattern as _pattern, patternbuild
 from .devsort import unique_inverse
 from .pattern import host_writable
@@ -57,7 +58,7 @@ from .pattern import host_writable
 #: block constructor makes a forward solve and a warm Hessian assembly about a third
 #: faster, with identical results.  Every rank must agree, so set it through the
 #: launcher's environment (``HIPPYMFEM_PARMAT_DEVICE``).
-DEVICE_PARMAT = os.environ.get("HIPPYMFEM_PARMAT_DEVICE", "block").lower()
+DEVICE_PARMAT = env_choice("HIPPYMFEM_PARMAT_DEVICE", "block", ("block", "copy"))
 
 
 #: Whether :meth:`TrueDofPattern.finish` is to make a matrix of the single-precision
@@ -359,7 +360,7 @@ class TrueDofPattern:
         tp.nnz = width
         tp.nrow, tp.ncol = self.ntd, self.gnc
         tp.indptr, tp.indices = self.I_diag, self.J_diag   # the diagonal block's
-        for name in ("_hypre", "_fused", "_reuse", "_dev", "_dev_pad"):
+        for name in ("_hypre", "_fused", "_dev", "_dev_pad"):
             setattr(tp, name, {})
         tp._masked, tp._dev_zero = IdentityCache(), IdentityCache()
         tp._pad = None

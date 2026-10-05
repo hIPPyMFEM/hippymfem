@@ -2,110 +2,8 @@
 
 ## Unreleased
 
-- **Newton-CG sets the refinement goal of the single-precision solves** (`single_refine_goal`
-  of `ReducedSpaceNewtonCG`, 1e-9, at most 1e3 times the square of its tolerance, so a run to
-  1e-8 is unchanged): the forward and adjoint solves stop after two passes instead of three.
-  64^3 on a Blackwell instance 40.8 -> 38.8 s, the same counts, the cost functional the same
-  to 8e-10. The problem's own `SINGLE_REFINE_GOAL` stays 0 for other optimizers. **The
-  stages after the MAP point may keep the single-precision solves**
-  (`PDEVariationalProblem.set_single_solves`): at 64^3 the eigenvalues came out within 1e-5
-  of double precision and the pointwise posterior variance within 6e-6, and the eigensolver
-  took 26.0 s instead of 52.3 s. **BoomerAMG options of the single-precision solves**
-  (`HIPPYMFEM_SINGLE_AMG`, opt-in) and the relaxation of MFEM's BoomerAMG
-  (`HIPPYMFEM_AMG_RELAX`, opt-in): `relax=7,pmax=6` took Newton-CG at 64^3 from 19.8 to
-  15.7 s on an H100 with the same counts; checked on the model problem only.
-- **Newton-CG in double precision at 128^3 fits one H100.** With 2.1 million quadratic
-  hexahedra on one rank (17.0 million state dofs) it ran out of the card's memory in its
-  first Gauss-Newton step, at every share of JAX tried. A linearization point that needs one
-  block (`C`, at a Gauss-Newton step) took the glued route of the element kernels: a split
-  batch held every row block of the slot pass at once and all of it again while the chunks
-  were joined, and the scatter of the joined arrays kept the pattern's full map on the
-  device, 7.8, 7.8 and 1.7 GiB at that size. In single precision, which took the same route,
-  that took the kernels' pool from 11.2 to 21.2 GiB in use and its arena to the cap; in
-  double precision the 44 GiB needed outside the pool did not fit beside it. Such a block
-  is now assembled a chunk at a time through the fused scatter, as the Jacobian and a full
-  point are; an unsplit batch is computed whole, into the same arrays as before. 128^3 on
-  one H100 at the default share, Newton-CG to 1e-6 with `release_linearization_on_move`:
-  253.8 s in double precision, 13 Newton and 191 CG iterations, the card at 64.1 GiB at its
-  peak (the kernels' pool 12.6 GiB in use); with single-precision solves 197.7 s as before,
-  the card at 58.4 GiB instead of 74.0. 64^3 is unchanged within the noise of the H100
-  (double 27.2 to 27.9 s, single 21.4 to 22.2 s, before and after). **An out-of-memory error
-  inside a chunk loop is retried again.** JAX 0.11 reports an allocation that fails while a
-  launch runs at the next synchronization, under the name of the program waited on; in the
-  chunk loops that was the finiteness check of the element arrays (`kernel.all_finite`,
-  where the failures above showed as `jit__reduce_all`), past the retry. The loops now wait
-  for their results inside it, and the size of the failed request is read as JAX 0.11 words
-  it.
-- **A script that holds MFEM objects at module level no longer ends with a segmentation
-  fault on a GPU.** MFEM's memory manager goes with the `mfem.Device` that
-  `mfemconfig.configure_device` creates, and at the interpreter's exit the module holding
-  it could be cleared before the script's own objects, whose hypre matrices then faulted
-  in their destructor (`HypreParMatrix::Destroy`), after all the work was done (exit code
-  139). The device is now never destroyed from Python. Seen on RTX PRO 6000 Blackwell
-  instances with the library of 2 October as well.
-- **A streamed geometry is copied to the device at the rate of the bus**
-  (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
-  geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
-  each chunk's slice from a numpy array, through a staging buffer of its own: 3.4 to
-  5.6 GB/s measured on an H100 (8.8 GB/s from JAX's pinned host arrays), against the
-  55 GB/s of its PCIe 5 link. The geometry is now locked
-  in RAM once (`devicebridge.pin`) and each slice is copied by the CUDA runtime
-  (`devicebridge.host_to_jax`), of the arrays the kernel reads only. The element arrays
-  are bit for bit the same. 128^3 on one H100 with single-precision solves: forward solve
-  5.51 -> 2.86 s, adjoint 2.52 -> 1.25 s, gradient 1.05 -> 0.40 s, Newton-CG 326 -> 197 s
-  in the same 13 Newton and 191 CG iterations.
-- **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
-  of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
-  recurrence of CG loses that orthogonality to rounding on a prior-preconditioned
-  Hessian, and to the error of the incremental solves when these are inexact: the model
-  problem with 2.1 million state dofs took 193 to 210 CG iterations for its twelve Newton
-  steps, depending on the GPU and the rank count, and a third more with incremental
-  solves stopped at 1e-8. With every residual made orthogonal to the earlier ones it
-  takes 131 on every GPU and rank count, and still 131 with incremental solves stopped
-  at 1e-6, which halves their iterations. One H100: 63.8 s -> 47.4 s -> 32.0 s with
-  incremental solves to 1e-6; one L40S 161.5 -> 110.5 -> 73.3 s; four MIG instances of
-  two RTX PRO 6000 Blackwell 81.7 -> 39.0 s. The cost functional agrees to nine digits.
-  `cg_reorthogonalize = False` gives hIPPYlib's iteration. **Iteration counts and times
-  of a Newton-CG run to its tolerance change with this default.** The benchmark of two
-  Newton-CG iterations (`bench_newton_device.py --steps 2`) keeps its eight CG
-  iterations at 64^3 and takes 13.6 -> 11.5 s on an L40S with hypre's PCG below and the
-  device geometry of the chunked assemblies.
-- **The scatter map of a fused assembly in a compact form** (`HIPPYMFEM_COMPACT_PATTERN`,
-  on): for every element row two base slots and for every entry one byte (two where an
-  offset does not fit in seven bits) that picks one and adds an offset, 1.3 bytes an
-  entry for quadratic hexahedra instead of 4. The slots are rebuilt in the scatter on the
-  device and are the same, so the matrices are bit for bit the same on a CPU. It is a
-  third of the map that an assembly uploads from the host slice by slice, and a third of
-  what `HIPPYMFEM_DEVICE_PATTERN=1` keeps on the device. **The matrices of the
-  single-precision library share the column indices of their pattern**
-  (`HIPPYMFEM_SINGLE_SHARE_COLUMNS`, on): no upload of four bytes a nonzero per matrix
-  (52 ms of a 187 ms assembly at 64^3 on an H100), and one copy for two matrices alive at
-  once. With both the device pattern no longer grows the element kernels' arena by a
-  region: at 128^3 on four Blackwell instances in the two-iteration benchmark the busiest
-  instance held 26.2 GiB with it before and 18.0 GiB now, as much as without it (double
-  precision: 19.9 GiB).
-- **Cheaper solves inside the CG of a Newton step** (`docs/source/guide/optimization.rst`,
-  "The CG of a Newton step"). The prior's solves, where they precondition that CG, stop
-  at 1e-6 (`cg_preconditioner_tolerance` of `ReducedSpaceNewtonCG`, the default; never
-  more than a thousandth of the CG's own tolerance; `0` leaves them as they are; the
-  line search with `cg_reorthogonalize` only): eleven iterations per solve instead of
-  twenty-one on the model problem, the same Newton and CG counts and gradient norms. With
-  `cg_hessian_relaxation = c` (off by default) the incremental solves of a Hessian action
-  at CG iteration k stop at c times the CG's tolerance times |r_0| / |r_k| where that is
-  looser than their own tolerance (`relax_operator` of `CGSolverSteihaug`,
-  `ReducedHessian.set_accuracy`, `rel_tolerance` of `solveIncremental`); with c = 1e-2
-  6.5 iterations instead of eleven, the same counts. Newton-CG to 1e-6 at 64^3 with
-  single-precision solves: H100 25.3 -> 23.6 s with the first, 18.0 s with the second and
-  the index arrays on the device (`HIPPYMFEM_DEVICE_PATTERN=1`); L40S 46.1 -> 43.2 ->
-  32.4 s; in double precision on the H100 29.9 -> 27.6 s. **This default changes the times
-  of every Newton-CG run, not its counts.**
-- **CG with a hypre preconditioner runs in hypre's own PCG** (`HIPPYMFEM_HYPRE_PCG`,
-  `hm.config.hypre_pcg`, on by default). The iteration is the same as MFEM's `CGSolver`
-  from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
-  which saves the first relaxation of a V-cycle its matrix-vector product on the finest
-  level: a solve of 2.1 million dofs to 1e-12 in 24 iterations took 0.103 -> 0.089 s on
-  an H100 and 0.274 -> 0.227 s on an L40S; the Newton-CG run above 32.0 -> 29.7 s and
-  73.3 -> 64.8 s. The solvers of one operator share one PCG object.
+### Added
+
 - **Single precision** in three places, none of which changes the state, the gradient or
   the MAP point (`docs/source/guide/gpu.rst`, "Single precision").
   `HIPPYMFEM_PRECISION=mixed` computes the element matrices in single precision, corrects
@@ -162,250 +60,216 @@
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.
-- **Independent solves as an ensemble over the GPUs** (`ensemble=` of `MatMvMult`,
-  `singlePass`, `doublePass`, `singlePassG`, `doublePassG`, and of the prior's and the
-  posterior's `trace` and `pointwise_variance`; `benchmarks/bench_laplace.py --ensemble`).
-  When the problem fits on one GPU, every rank builds it on `MPI.COMM_SELF` and the
-  columns of a MultiVector, or the Monte Carlo samples, are divided among the ranks of
-  the communicator passed as `ensemble`; the results are exchanged and every rank returns
-  what one rank alone computes (`Random.tell` / `Random.seek` keep the samples the same).
-  The stages of the Laplace approximation are sets of independent solves, and a domain
-  decomposition of a small mesh speeds each of them up very little: at 64^3 the
-  eigensolver takes 62.0 s on one MIG instance of an RTX PRO 6000 Blackwell, 30.4 s on
-  four and 21.2 s on eight with the mesh divided, and 17.6 s and 9.9 s as an ensemble;
-  all stages after the MAP point 83.5 s, 48.2 / 37.2 s and 27.8 / 17.9 s. The MAP point
-  itself cannot be computed this way.
-- **Assembled matrices and vectors stay on the GPU** (`hippymfem.common.devicebridge`;
-  `HIPPYMFEM_DEVICE_BRIDGE`, `HIPPYMFEM_DEVICE_VECTORS`, `hm.config.device_bridge`,
-  `hm.config.device_vectors`). With the element kernels and hypre on one card, the
-  assembled values used to be copied to the host, handed to MFEM there and uploaded again,
-  and every vector the library touched between two hypre calls was copied down and up.
-  JAX and MFEM cannot write into each other's memory, so the library now takes the address
-  of a JAX array's buffer and of MFEM's device copy of a vector or matrix block and copies
-  between them on the device with the runtime's `cudaMemcpy` or `hipMemcpy`. The two
-  blocks of a hypre matrix are filled that way and MFEM's constructor uploads the row
-  pointers only; a `ParVector` that hypre has used does its arithmetic through MFEM on
-  the device; essential entries, the kernels' dof values, assembled residual and gradient
-  vectors and the pointwise observation operator stay there too. A complete Jacobian
-  assembly of 32 768 Q2 hexahedra on an H100 went from 71 to 12.7 ms (kernel 9.8 ms); on
-  meshes of 0.3 to 2.1 million state dofs a complete assembly is 18x to 84x faster than a
-  host core on an L40S and 46x to 313x on an H100 (11x to 36x and 15x to 73x before). A
-  forward solve at a new parameter with 2.1 million state dofs: 3.22 -> 1.48 s on one MIG
-  instance, 4.75 -> 2.38 s on sixteen with 2.1 million each, 1.34 -> 0.53 s on an H100. A reduced-Hessian application is its two solves
-  for 96 % at 2.1 million dofs per instance (91 % before). Two Newton-CG steps, against the times of
-  September: 128^3 on four L40S 49.5 -> 29.1 s, on one H100 109 -> 42.9 s, on four MI210
-  31.9 -> 23.6 s; 256^3 on 16 Blackwell cards 77.4 -> 46.3 s; 400^3 on 24 Blackwell cards
-  191 -> 134 s, with the same cost functional to nine digits and the same CG counts.  The
-  copy on the device also works on the HIP build (MI210). Matrices agree with the host route to round-off.
-  Both switches fall back to the host route, which is also taken when the kernels and
-  hypre are on different cards or the runtime's copy function is not found.
-- **hypre's recycling pool is on by default and keeps blocks between setups**
-  (`HIPPYMFEM_HYPRE_POOL=auto`, `HIPPYMFEM_HYPRE_POOL_KEEP`, `set_hypre_pool(...,
-  scoped=True, keep_megabytes=...)`, `hypre_pool_trim`). Without a pool a forward solve on
-  sixteen MIG instances made 4 963 device allocations and frees, 1.28 s of its 3.21 s; the
-  ones that cost are the few hundred blocks above 1 MB, at 1.7 to 2.3 ms each when sixteen
-  processes share a node. The pool may hold 1 GiB while a BoomerAMG setup runs and 512 MB
-  between setups (never more than a quarter of the most hypre has had in use), and a
-  freed block displaces larger ones when it is full. The forward solve took 2.37 s and its
-  setup 0.55 instead of 1.45 s. `HIPPYMFEM_HYPRE_POOL=<megabytes>` keeps one limit at all
-  times as before, `0` removes the pool, and the element kernels empty it before they
-  retry after running out of device memory. NVIDIA builds only.
-- **Less device memory after the pattern build.** Without numba or CuPy the sorts of a
-  pattern build run in JAX's arena, which never shrinks; they now take chunks of 2^26
-  keys at most (`hippymfem.fem.devsort.MAX_CHUNK_ARENA`). 2.1 million Q2 state dofs on one
-  H100: 21.0 -> 12.8 GB on the card for 8 s more of one-time setup; a MIG instance with
-  the same dofs 12.7 -> 8.7 GB.
-- `HIPPYMFEM_DEVICE_PATTERN=1` (`hm.config.device_pattern`) keeps the scatter map and the
-  column indices of the patterns on the device, so that an assembly uploads nothing but
-  row pointers: 1.3 GB at 2.1 million state dofs for 3 % of a forward solve on one H100
-  and 5 % on sixteen MIG instances. Off by default.
-- **hypre with a faster exchange between GPUs** (`tools/rebuild_hypre.sh`,
-  `tools/hypre-2.32.0-pinned-staging.patch`; `mfemconfig.hypre_gpu_aware_mpi`,
-  `mpi_gpu_support`). The script rebuilds the hypre of an existing PyMFEM build in one of
-  two variants. `--gpu-aware-mpi` hands MPI the device buffers: with a CUDA-aware Open MPI
-  a CG iteration on two H100 took 5.4 instead of 6.2 ms at 2.2 million dofs per card and
-  20.9 instead of 22.4 ms at 8.5 million; on MIG instances, which cannot use CUDA IPC, it
-  is slower than the default from four instances up. `--pinned-staging` keeps the route
-  through the host with page-locked buffers that are reused: 3 to 6 % per iteration on
-  two to sixteen MIG instances (`HYPRE_PINNED_STAGING=1 tools/build_pymfem_cuda.sh`
-  installs it at the end of a build; off by default). `configure_device` raises, with the reason, when the
-  loaded hypre hands over device buffers and the MPI library reports no CUDA support.
-- `benchmarks/bench_forward_steps.py` (the steps of a forward solve with the driver calls
-  of each), `hypre_pool_trace.py` and `hypre_pool_replay.py` (hypre's device allocations
-  recorded and replayed under pool rules). `krylov_anatomy.py` had two defects: with
-  `--assembly mfem` it read the parameter from a host copy that the device had not
-  filled, so its matrices had the coefficient 1, and on several ranks its variant without
-  a kernel was no longer cuSPARSE once the library chose hypre's. The iteration times of
-  the GPU guide were measured again and changed by 3 % or less, except at 64^3 on two and
-  four instances (up to 13 %).
-  `benchmarks/DESIGN_NOTES.md`, section 11, has the measurements.
-- **hypre's matrix-vector kernel on several GPUs** (`HIPPYMFEM_HYPRE_SPMV`,
-  `hippymfem.common.mfemconfig.set_hypre_spmv`, `hm.config.hypre_spmv`). hypre multiplies
-  with the off-diagonal blocks of its parallel matrices through cuSPARSE, whose product
-  does not get cheaper with fewer nonzeros: up to 5.4 ms for a block with 2.2 million rows
-  and 701 nonzeros, against 2.2 ms for the diagonal block with 136 million. `auto`, the default,
-  switches hypre to its own kernel when the communicator has more than one rank (CUDA
-  builds) and keeps the vendor's on one rank, where it is the faster. A CG iteration on two
-  to sixteen MIG instances became 11 to 36 % faster and a reduced-Hessian application 1.2
-  to 1.5 times; on two H100 an iteration went from 16.5 to 6.2 ms. Results are unchanged.
-- **A recycling pool for hypre's device memory** (`HIPPYMFEM_HYPRE_POOL=<megabytes>`,
-  `set_hypre_pool`, `hm.config.hypre_pool`; see above for the default). A BoomerAMG setup makes about
-  2 200 `cudaMalloc` and 2 000 `cudaFree`, 60 to 75 % of its time, and a call takes longer
-  the more processes of a node make them: 0.16 s on one MIG instance, 1.47 s on sixteen.
-  With a pool that may hold 1 GiB per rank, sixteen instances took 0.63 s. The pool goes
-  through hypre's hook for user allocators, hands out exact new blocks and recycled ones
-  of at most 1.19 times the request, and empties itself when the driver refuses an
-  allocation. NVIDIA builds only.
-- **One rank with hypre on a device assembles through the true-dof route**
-  (`HIPPYMFEM_TDOF_IDENTITY`, default `auto`). A block with identity prolongations used the
-  constructor that copies and splits a row-major CSR on the host; it now hands MFEM
-  hypre's two blocks, as several ranks do. A complete Jacobian assembly on one H100 or
-  L40S became 1.4 to 3.2 times faster (hex P2: 5.2 -> 1.7 us per element on an H100), with
-  matrices identical to round-off. The host is unchanged.
-- The GPU guide's assembly factors are now those of meshes with 0.3 to 2.1 million state
-  dofs (kernels 17x to 89x on an L40S and 43x to 537x on an H100 against one host core;
-  the complete assembly is in the first entry). The smaller meshes used before understated
-  the cheap elements (a kernel call costs about 1.5 ms on a card) and overstated the P3
-  hexahedra (the host core is 1.7 times slower per element at 2 744 elements than at
-  32 768).
-- `benchmarks/bench_hessian_anatomy.py`: a reduced-Hessian application as the library
-  runs it against MFEM's solver alone, with the copies between host and device counted.
-  The two solves were 89 to 91 % of an application on one and on sixteen MIG instances
-  while the vector arithmetic and the observation operator ran on the host (first entry).
-  `benchmarks/bench_assembly_profile.py` now also counts the transfers of the matrix (the
-  upload of the finished matrix is about 20 of the 71 ms of an assembly of 32 768 Q2
-  hexahedra on an H100).
-- `benchmarks/krylov_anatomy.py` and `tools/gpuprof.c`: one preconditioned Krylov
-  iteration taken apart per rank count and BoomerAMG variant, with a preloaded library
-  that counts driver allocations, copies, kernel launches, cuSPARSE products and MPI calls
-  and times every kernel on the device. `benchmarks/bench_assembly_sweep.py` and
-  `bench_assembly_profile.py`: time per element against the number of elements, and where
-  a complete assembly on a GPU spends it. `bench_scaling.py --cart-part --both-kernels`.
-  The GPU guide's new section "Several GPUs" and `benchmarks/DESIGN_NOTES.md`, section 10,
-  have the measurements.
-
-- `PDEVariationalProblem.apply_ij_at(i, j, x, dir, out)`: a second-derivative block at `x`
-  applied to a direction, from the element kernels and without assembling the block
-  (`QuadratureKernel.element_hvp`, one forward tangent through the element gradient where
-  the assembled block takes one per element dof). Equal to `apply_ij` after
-  `setLinearizationPoint(x)` to round-off, the essential rows and columns and the
-  Jacobian's identity rows included; the cheaper route for a block applied once or twice at
-  a point (SOUPyMFEM's sample-average Hessians). As for the residual, an interior-facet
-  density must be unchanged when the sides of a face trade places (every DG form is).
-- The kernels of one mesh share a single device copy of its geometry and of each space's
-  tables; each kernel held its own, so a problem with a quadrature-kernel objective or
-  penalty (SOUPyMFEM's QoIs) held two or three copies of the largest arrays on the device
-  (873 against 454 MB of JAX arrays at 68 921 P1 unknowns).
-- `setLinearizationPoint(x, matrix_free=True)` (and `matrix_free=` on
-  `Model.setPointForHessianEvaluations` and `ReducedMap.setLinearizationPoint`) assembles
-  the Jacobian alone, which the incremental solves need, and `apply_ij` then takes the
-  products with the other blocks from the element kernels at `x` (`apply_ij_at`);
-  `matrix_free=(PARAMETER,)` does that for the blocks that involve the parameter and
-  assembles the rest. A point then costs almost nothing and holds less, and every product
-  costs a kernel pass. On the two Newton-CG steps of the GPU guide (four L40S, hypre on the
-  cards, `benchmarks/bench_newton_device.py --matrix-free`) the card peak fell from 4.9 to
-  4.6 GiB at 64^3 and from 19.1 to 17.2 GiB at 128^3 (hypre's `C`, `W_um` and `W_mm`; JAX's
-  pool and the host are unchanged), and the steps took 9.9 s instead of 9.6 and 51.3 s
-  instead of 49.1, with the same cost functional: a reduced-Hessian apply is about 40 %
-  slower and a point 0.4 s and 2.7 s cheaper, so it breaks even at about three applies per
-  point. On a CPU a reduced-Hessian apply costs about nine times the assembled one (a P1
-  Poisson inverse problem at 68 921 unknowns: 1.63 s against 0.19, the point 1.0 s against
-  2.1), so there it is for memory alone. It suits a point applied once or twice (a
-  sample-average Hessian) or a problem short of memory; the default stays assembled. A
-  residual declared linear in the state (`is_fwd_linear`) has no `W_uu` work at a
-  matrix-free point either.
+- **Newton-CG sets the refinement goal of the single-precision solves** (`single_refine_goal`
+  of `ReducedSpaceNewtonCG`, 1e-9, at most 1e3 times the square of its tolerance, so a run to
+  1e-8 is unchanged): the forward and adjoint solves stop after two passes instead of three.
+  64^3 on a Blackwell instance 40.8 -> 38.8 s, the same counts, the cost functional the same
+  to 8e-10. The problem's own `SINGLE_REFINE_GOAL` stays 0 for other optimizers. **The
+  stages after the MAP point may keep the single-precision solves**
+  (`PDEVariationalProblem.set_single_solves`): at 64^3 the eigenvalues came out within 1e-5
+  of double precision and the pointwise posterior variance within 6e-6, and the eigensolver
+  took 26.0 s instead of 52.3 s. **BoomerAMG options of the single-precision solves**
+  (`HIPPYMFEM_SINGLE_AMG`, opt-in) and the relaxation of MFEM's BoomerAMG
+  (`HIPPYMFEM_AMG_RELAX`, opt-in): `relax=7,pmax=6` took Newton-CG at 64^3 from 19.8 to
+  15.7 s on an H100 with the same counts; checked on the model problem only.
+- **Independent solves as an ensemble over the GPUs**: `ensemble=` on `MatMvMult`, the
+  randomized eigensolvers and the `trace` and `pointwise_variance` of the prior and the
+  posterior. When the problem fits on one GPU, every rank builds it on `MPI.COMM_SELF`
+  and the columns or the Monte Carlo samples are divided among the ranks; every rank
+  returns what one rank alone computes (`benchmarks/bench_laplace.py --ensemble`).
+- **Matrix-free linearization points**: `setLinearizationPoint(x, matrix_free=True)`
+  assembles the Jacobian alone and takes the products with the other blocks from the
+  element kernels, which saves their memory. `PDEVariationalProblem.apply_ij_at(i, j, x,
+  dir, out)` applies a second-derivative block at any point without assembling it.
+- `HIPPYMFEM_HESSIAN=quadrature` (`hm.config.hessian`): element Hessian blocks from the
+  density's second derivatives at the quadrature points, the faster route on a GPU from
+  P2 up. The default stays `element`, whose results are reproducible bit for bit.
+- `PDEProblem.apply_third_dir`: the weighted second directional derivatives of a gradient
+  along several directions in one kernel pass.
+- `TimeDependentPDEVariationalProblem` takes a boundary density (`bdr_varf`).
+- `HIPPYMFEM_DEVICE=auto`: the element kernels take a GPU when the process can see one
+  and the host otherwise.
 - A problem with an interior-facet density checks once that the density is unchanged when
-  the two sides of a face trade places (traces swapped, normal reversed, element measures
-  exchanged) and warns if it is not (`hippymfem.fem.facets.check_facet_symmetry`). A face
-  shared by two ranks is assembled by each from its own side, so such a density gives
-  results that depend on the partition; every form written in jumps, averages and the
-  normal passes. `test_modeling`'s third-derivative check used one that did not (an odd
-  power of the jumps; it compared like with like, so it passed) and now uses one that does.
-- `HIPPYMFEM_HESSIAN=quadrature` (or `hm.config.hessian`): the element Hessian blocks from
-  the density's second derivatives at the quadrature points, with respect to the fields'
-  values and gradients, contracted with the basis values and physical gradients; the
-  element route, the default, pushes one forward tangent per element dof through the whole
-  element. The parts of the pointwise Hessian that are identically zero are found once
-  from the density's trace and skipped (a residual linear in the state has no state-state
-  part, and most couple few of the others). Equal to the element route to round-off. On
-  an L40S it is the faster route from P2 up: a Jacobian 1.6x (Poisson, P2 tetrahedra),
-  1.9x (a nonlinear density), 2.6x (elasticity, P2 tetrahedra) and 4.4x (elasticity, Q2
-  hexahedra) faster, and a whole linearization point 1.2x to 1.7x. On P1 the element route
-  stays the faster (the quadrature route's Jacobian runs at 0.7x), and so it does on the
-  host, except for vector-valued Jacobians (1.4x there). `auto` times both routes once per
-  kernel program, column slot and device and keeps the faster, so kernels built alike take
-  the same route within a run. The default stays `element`, whose results are reproducible
-  bit for bit. Spaces with a Piola map and interior facets always take the element route.
-- Fixed: the matrix-free second-derivative products (`hvp_block`, behind `element_hvp` and
-  `apply_ij_at`) and the third-derivative kernels (`third_block`, `third_dir_block`) gave
-  the slots without a direction zero tangents, which JAX carries through the whole element,
-  where differentiating in the direction's slots alone lets it drop the rest: a product
-  into the state or adjoint row paid for every field's evaluation even where it is
-  identically zero. On SOUPyMFEM's control problem at 82 944 P1 tetrahedra such products
-  take 4.2 and 2.4 ms instead of 34 and 32, and a sample-average Hessian action with 8
-  samples at 15 625 unknowns takes 1.02 s instead of 1.22 (2.16 s with assembled blocks).
-  The inverse problem of `bench_newton_device.py`, whose density couples every slot, is
-  unchanged (two Newton steps at 64^3 on one L40S: 27.1 s matrix-free, 27.5 s assembled).
-- The GPU guide's table of JAX's share of the card is re-measured on the current code, with
-  matrix-free linearization points beside it (128^3 on four L40S): a share of 0.20 takes the
-  card peak from 19.1 to 15.1 GiB for 7 % more time, and matrix-free points on top take it
-  to 13.2 GiB for 30 % more.
-- On a CPU the element kernels step through the batch 2 048 elements at a time inside the
-  compiled program (`HIPPYMFEM_HOST_BATCH`, `0` for the whole batch), which keeps each
-  step's intermediates in cache: 2.2x on a P1-tetrahedron Jacobian and 3x on a third
-  derivative at 196 608 elements, with the same element arrays. The GPU path is unchanged.
-  The CPU timings quoted elsewhere in the documentation predate it.
-- The element dof gather in front of every kernel is compiled; eager indexing spent more
-  time checking the index array than gathering (a residual-vector assembly at 64^3
-  tetrahedra: 1.11 s, now 0.35 s). The values are unchanged.
-- `PDEProblem.apply_third_dir(i, x, dirs, weights, out)`: the weighted second directional
-  derivatives of the slot-`i` gradient along directions spanning every variable, the sum of
-  the `apply_ijk` pairs of each direction in one kernel pass (`QuadratureKernel.
-  element_third_dir`); the base class sums the pairs. SOUPyMFEM's second-order adjoint uses
-  it: its quadratic Taylor gradient at 32^3 takes half the time.
-- Fixed: `MultiVector(other)` copied the backing array without syncing it, so columns hypre
-  had written on a device were copied as zeros.
-- Fixed: `ParVector.norm("linf")`, `max()`, `min()` and `MultiVector.norm("linf")` lost a
-  NaN held by a rank other than the first (MPI's MAX and MIN compare, and NaN compares
-  false); they now return NaN wherever a rank holds one.
-- Fixed: `BFGS_operator.update` computed `H y` with the two-loop recursion working in the
-  output vector, so `H0inv.solve` got its input as its output; with the default rescaled
-  identity `y^T H y` came out 0 and a pair that needed Powell damping raised. hIPPYlib has
-  the same code.
-- `CGSolverSteihaug` with a trust region follows a direction of nonpositive curvature to the
-  boundary, as Steihaug's method prescribes; it took the whole first direction wherever that
-  landed (outside a small region) and stopped inside the region at a later iteration, as
-  hIPPYlib does. Without a trust region nothing changes.
-- `test_kernels`' chunk-planner checks size their mesh by the number of ranks, and
-  `test_device`'s accumulator check its pinned chunk: on four ranks the batches did not
-  split (250 elements a rank against the planner's floor of 256, 54 against a chunk of
-  64) and the checks failed.
-- `TimeDependentPDEVariationalProblem` takes a boundary density (`bdr_varf`), so a Robin
-  condition or a prescribed flux enters the one-step residual as it does the stationary
-  one; checked against MFEM's boundary mass matrix and through an inversion.
-- `LUSolver` and `ReplicatedLUSolver` factorize on rank 0 and scatter the solution, so a
-  node's memory is charged once rather than once per rank; `replicate=True` restores the
-  factorization on every rank. A factorization that fails raises on every rank.
-- `HIPPYMFEM_DEVICE=auto`: the element kernels take a GPU when the process can see one and
-  the host otherwise, so one environment serves a laptop and a GPU node.
+  the two sides of a face trade places, and warns if it is not
+  (`hippymfem.fem.facets.check_facet_symmetry`).
+- `tools/install_petsc_mumps.sh` builds PETSc with MUMPS and petsc4py against it, so
+  `PETScLUSolver` factorizes in parallel. `tools/rebuild_hypre.sh` rebuilds hypre with
+  page-locked staging buffers or for a CUDA-aware MPI.
+- Tests for the exported classes that no suite exercised: the multiplicative-noise and
+  multi-state misfits, the vector and mollified priors, importance sampling, the full
+  tracer, steepest descent, and the lumped-mass and transpose solvers.
+
+### Changed
+
+- **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
+  of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
+  recurrence of CG loses that orthogonality to rounding on a prior-preconditioned
+  Hessian, and to the error of the incremental solves when these are inexact: the model
+  problem with 2.1 million state dofs took 193 to 210 CG iterations for its twelve Newton
+  steps, depending on the GPU and the rank count, and a third more with incremental
+  solves stopped at 1e-8. With every residual made orthogonal to the earlier ones it
+  takes 131 on every GPU and rank count, and still 131 with incremental solves stopped
+  at 1e-6, which halves their iterations. One H100: 63.8 s -> 47.4 s -> 32.0 s with
+  incremental solves to 1e-6; one L40S 161.5 -> 110.5 -> 73.3 s; four MIG instances of
+  two RTX PRO 6000 Blackwell 81.7 -> 39.0 s. The cost functional agrees to nine digits.
+  `cg_reorthogonalize = False` gives hIPPYlib's iteration. **Iteration counts and times
+  of a Newton-CG run to its tolerance change with this default.** The benchmark of two
+  Newton-CG iterations (`bench_newton_device.py --steps 2`) keeps its eight CG
+  iterations at 64^3 and takes 13.6 -> 11.5 s on an L40S with hypre's PCG below and the
+  device geometry of the chunked assemblies.
+- **CG with a hypre preconditioner runs in hypre's own PCG** (`HIPPYMFEM_HYPRE_PCG`,
+  `hm.config.hypre_pcg`, on by default). The iteration is the same as MFEM's `CGSolver`
+  from a zero initial guess. hypre's PCG marks the vector it hands to BoomerAMG as zero,
+  which saves the first relaxation of a V-cycle its matrix-vector product on the finest
+  level: a solve of 2.1 million dofs to 1e-12 in 24 iterations took 0.103 -> 0.089 s on
+  an H100 and 0.274 -> 0.227 s on an L40S; the Newton-CG run above 32.0 -> 29.7 s and
+  73.3 -> 64.8 s. The solvers of one operator share one PCG object.
+- **Cheaper solves inside the CG of a Newton step** (`docs/source/guide/optimization.rst`,
+  "The CG of a Newton step"). The prior's solves, where they precondition that CG, stop
+  at 1e-6 (`cg_preconditioner_tolerance` of `ReducedSpaceNewtonCG`, the default; never
+  more than a thousandth of the CG's own tolerance; `0` leaves them as they are; the
+  line search with `cg_reorthogonalize` only): eleven iterations per solve instead of
+  twenty-one on the model problem, the same Newton and CG counts and gradient norms. With
+  `cg_hessian_relaxation = c` (off by default) the incremental solves of a Hessian action
+  at CG iteration k stop at c times the CG's tolerance times |r_0| / |r_k| where that is
+  looser than their own tolerance (`relax_operator` of `CGSolverSteihaug`,
+  `ReducedHessian.set_accuracy`, `rel_tolerance` of `solveIncremental`); with c = 1e-2
+  6.5 iterations instead of eleven, the same counts. Newton-CG to 1e-6 at 64^3 with
+  single-precision solves: H100 25.3 -> 23.6 s with the first, 18.0 s with the second and
+  the index arrays on the device (`HIPPYMFEM_DEVICE_PATTERN=1`); L40S 46.1 -> 43.2 ->
+  32.4 s; in double precision on the H100 29.9 -> 27.6 s. **This default changes the times
+  of every Newton-CG run, not its counts.**
+- **A streamed geometry is copied to the device at the rate of the bus**
+  (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
+  geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
+  each chunk's slice from a numpy array, through a staging buffer of its own: 3.4 to
+  5.6 GB/s measured on an H100 (8.8 GB/s from JAX's pinned host arrays), against the
+  55 GB/s of its PCIe 5 link. The geometry is now locked
+  in RAM once (`devicebridge.pin`) and each slice is copied by the CUDA runtime
+  (`devicebridge.host_to_jax`), of the arrays the kernel reads only. The element arrays
+  are bit for bit the same. 128^3 on one H100 with single-precision solves: forward solve
+  5.51 -> 2.86 s, adjoint 2.52 -> 1.25 s, gradient 1.05 -> 0.40 s, Newton-CG 326 -> 197 s
+  in the same 13 Newton and 191 CG iterations.
+- **The scatter map of a fused assembly in a compact form** (`HIPPYMFEM_COMPACT_PATTERN`,
+  on): for every element row two base slots and for every entry one byte (two where an
+  offset does not fit in seven bits) that picks one and adds an offset, 1.3 bytes an
+  entry for quadratic hexahedra instead of 4. The slots are rebuilt in the scatter on the
+  device and are the same, so the matrices are bit for bit the same on a CPU. It is a
+  third of the map that an assembly uploads from the host slice by slice, and a third of
+  what `HIPPYMFEM_DEVICE_PATTERN=1` keeps on the device. **The matrices of the
+  single-precision library share the column indices of their pattern**
+  (`HIPPYMFEM_SINGLE_SHARE_COLUMNS`, on): no upload of four bytes a nonzero per matrix
+  (52 ms of a 187 ms assembly at 64^3 on an H100), and one copy for two matrices alive at
+  once. With both the device pattern no longer grows the element kernels' arena by a
+  region: at 128^3 on four Blackwell instances in the two-iteration benchmark the busiest
+  instance held 26.2 GiB with it before and 18.0 GiB now, as much as without it (double
+  precision: 19.9 GiB).
+- **Newton-CG in double precision at 128^3 fits one H100.** With 2.1 million quadratic
+  hexahedra on one rank (17.0 million state dofs) it ran out of the card's memory in its
+  first Gauss-Newton step, at every share of JAX tried. A linearization point that needs one
+  block (`C`, at a Gauss-Newton step) took the glued route of the element kernels: a split
+  batch held every row block of the slot pass at once and all of it again while the chunks
+  were joined, and the scatter of the joined arrays kept the pattern's full map on the
+  device, 7.8, 7.8 and 1.7 GiB at that size. In single precision, which took the same route,
+  that took the kernels' pool from 11.2 to 21.2 GiB in use and its arena to the cap; in
+  double precision the 44 GiB needed outside the pool did not fit beside it. Such a block
+  is now assembled a chunk at a time through the fused scatter, as the Jacobian and a full
+  point are; an unsplit batch is computed whole, into the same arrays as before. 128^3 on
+  one H100 at the default share, Newton-CG to 1e-6 with `release_linearization_on_move`:
+  253.8 s in double precision, 13 Newton and 191 CG iterations, the card at 64.1 GiB at its
+  peak (the kernels' pool 12.6 GiB in use); with single-precision solves 197.7 s as before,
+  the card at 58.4 GiB instead of 74.0. 64^3 is unchanged within the noise of the H100
+  (double 27.2 to 27.9 s, single 21.4 to 22.2 s, before and after). **An out-of-memory error
+  inside a chunk loop is retried again.** JAX 0.11 reports an allocation that fails while a
+  launch runs at the next synchronization, under the name of the program waited on; in the
+  chunk loops that was the finiteness check of the element arrays (`kernel.all_finite`,
+  where the failures above showed as `jit__reduce_all`), past the retry. The loops now wait
+  for their results inside it, and the size of the failed request is read as JAX 0.11 words
+  it.
+- **Assembled matrices and vectors stay on the GPU** (`HIPPYMFEM_DEVICE_BRIDGE`,
+  `HIPPYMFEM_DEVICE_VECTORS`). With the element kernels and hypre on one card, assembled
+  values and the vectors between two hypre calls no longer pass through the host. Two
+  Newton-CG steps of the benchmark take 29.1 s instead of 49.5 at 128^3 on four L40S and
+  134 s instead of 191 at 400^3 on 24 Blackwell cards, with the same cost functional and
+  CG counts.
+- **hypre on several GPUs.** hypre multiplies with its own kernel on more than one rank
+  of a CUDA build (`HIPPYMFEM_HYPRE_SPMV`), and recycles its device memory through a pool
+  that is on by default (`HIPPYMFEM_HYPRE_POOL`, `HIPPYMFEM_HYPRE_POOL_KEEP`).
+- One rank with hypre on a device assembles through the true-dof route
+  (`HIPPYMFEM_TDOF_IDENTITY`).
+- A boundary term adds its entries to a block only where it has any: a term that does not
+  depend on the block's variables, as a prescribed flux in the Jacobian, no longer takes
+  that block's assembly through the host on a GPU.
+- The kernels of one mesh share one device copy of its geometry and of each space's
+  tables.
+- The sorts of a pattern build take bounded chunks of JAX's arena, which lowers the
+  device memory a run holds afterwards.
+- On a CPU the element kernels step through the batch 2 048 elements at a time
+  (`HIPPYMFEM_HOST_BATCH`) and the element dof gather is compiled: large host assemblies
+  are two to three times faster.
+- `LUSolver` and `ReplicatedLUSolver` factorize on rank 0 and scatter the solution;
+  `replicate=True` restores the factorization on every rank.
 - The randomized eigensolvers orthonormalize after every power iteration, so more
-  iterations sharpen the tail of the spectrum instead of losing it past 1/eps: at a
-  spectral ratio of 3e6, the 40th of 40 eigenvalues goes from 84 % off to 6e-5 with three
-  iterations and 25 extra vectors; one iteration is unchanged.
-- `tools/install_petsc_mumps.sh` builds PETSc with MUMPS, ScaLAPACK, METIS and ParMETIS
-  against the system MPI and petsc4py against it, so `PETScLUSolver` factorizes in parallel
-  (`package_used == "mumps"`); the solvers guide gives the measured cost.
-- The 400^3 row (1.09 billion unknowns, 24 Blackwell GPUs) now reports two warm Newton-CG
-  steps like every other row: 190.9 s with 3 + 9 CG iterations (it quoted one step with the
-  first Hessian-block build and its JAX compilation inside, 197 s, before).
-- `benchmarks/bench_laplace.py` gains `--fields` (truth, MAP, prior and posterior pointwise
-  std and the exact variance reduction on the parameter grid, for plotting),
-  `--release-linearization` (128^3 then fits on two 45 GiB cards), and records the setup and
-  end-to-end times, the KL divergence and the fraction of dofs where the truth lies within
-  two posterior standard deviations of the MAP.
-- The README figure and the GPU and performance guides carry the 256^3 comparison on 32
-  ranks: 77 s on 32 Blackwell slices against 6187 s for hIPPYlibx and 2859 s for hIPPyMFEM
-  on 32 CPU cores.
+  iterations sharpen the tail of the spectrum.
+- `CGSolverSteihaug` with a trust region follows a direction of nonpositive curvature to
+  the boundary, as Steihaug's method prescribes.
+- A route switch refuses a value it does not know, in the environment (at import) and
+  through `hm.config`, instead of falling back to another route; `hm.config` names every
+  setting (`pattern_builder_min`, `pattern_sort_kernel`, `pattern_timing` and
+  `hypre_pool_keep` are new there).
+- The documentation and the benchmarks folder are shorter: the user guide keeps what a
+  run needs, `benchmarks/README.md` maps each published table to its script,
+  `docs/source/guide/configuration.rst` lists every setting, and the profiling scripts of
+  finished investigations are gone from `benchmarks/` and `tools/`.
+
+### Removed
+
+- The snake_case aliases of hIPPYlib's method names (`solve_fwd` for `solveFwd`, and so
+  on) and of the module-level functions (`double_pass_g` for `doublePassG`), with
+  `hippymfem.common.naming`. Nothing used them; the names of hIPPYlib are the interface.
+- Four switches whose other setting was a slower way to the same result:
+  `HIPPYMFEM_ASSEMBLY=integrator` (assembly through MFEM's per-element callback, with
+  `hippymfem.fem.integrators`; the tests keep it as their reference in
+  `hippymfem/test/reference_assembly.py`), `HIPPYMFEM_TRIPLE` (the triple product is two
+  sparse products, which the tests hold against hypre's `RAP`),
+  `HIPPYMFEM_CHUNK_PLAN`, `_SHARE` and `_PROBE` (chunks are sized from the estimate), and
+  `HIPPYMFEM_PARMAT=direct`.
+
+### Fixed
+
+- **A script that holds MFEM objects at module level no longer ends with a segmentation
+  fault on a GPU.** MFEM's memory manager goes with the `mfem.Device` that
+  `mfemconfig.configure_device` creates, and at the interpreter's exit the module holding
+  it could be cleared before the script's own objects, whose hypre matrices then faulted
+  in their destructor (`HypreParMatrix::Destroy`), after all the work was done (exit code
+  139). The device is now never destroyed from Python. Seen on RTX PRO 6000 Blackwell
+  instances with the library of 2 October as well.
+- The matrix-free second-derivative products and the third-derivative kernels carried
+  zero tangents through the whole element for the slots without a direction.
+- `MultiVector(other)` copied the backing array without syncing it from the device.
+- `ParVector.norm("linf")`, `max()`, `min()` and `MultiVector.norm("linf")` lost a NaN held
+  by a rank other than the first.
+- `BFGS_operator.update` computed `H y` in the output vector of the two-loop recursion, so
+  a pair that needed Powell damping raised.
+- `test_kernels`' chunk-planner checks and `test_device`'s accumulator check failed on
+  four ranks, where their batches did not split.
+- `release()` left `LUSolver` on several ranks and the PETSc solvers holding the
+  factorization it is called to free.
+- `tools/mpirun_pinned.sh` hid the GPUs from a run with `HIPPYMFEM_DEVICE=auto`.
+- `hm.config` took `"0"` as true for `fold_elimination`, `gpu_deterministic`,
+  `device_pattern` and `share_hessian`, and reported `hypre_device` by another rule than
+  the one the import applies.
+- `hm.NullQoi` was the MCMC module's class, without the derivative methods of a QoI; the
+  two are one class now.
+- The MCMC guide's example used arguments the classes do not take.
+- `VectorBiLaplacianPrior` assembled the mass matrix of its vector space with the scalar
+  mass integrator, which left the matrix wrong and the prior unusable.
+- `MultDiscreteStateObservation` (the multiplicative noise model) and `LumpedMassSolver`
+  raised their errors on the ranks that saw the bad value only, which hangs a parallel run.
+- hypre's device memory pool: when the driver refused a block and gave it after the pool
+  was emptied, the runtime still remembered the refusal and MFEM stopped at its next
+  kernel with an out-of-memory error; and when the card was full, hypre ended the run
+  without a message. The refusal is read now, and a full card is reported.
 
 ## Version 0.1.0, released on September 21, 2026
 

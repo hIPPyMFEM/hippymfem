@@ -2,34 +2,28 @@
 # One GPU per rank, and nothing else.
 #
 # JAX opens a CUDA context on every device it can see when its backend comes up, not
-# only on the one it computes on: on a four-card node a one-rank job held 439 MB on each
-# of the three idle cards, and at four ranks every card carried three stray contexts.
+# only on the one it computes on (439 MB on each idle card of a node).
 # CUDA_VISIBLE_DEVICES removes that, but it has to be set before the interpreter's first
-# CUDA call -- which is MPI_Init here, since the MPI is CUDA-aware -- so the reliable
-# place is the launcher, before python starts.  Rank k of the node gets device k % ndev.
-#
-# Measured with hypre on the device at two ranks: only the two assigned cards carried
-# memory (7977 and 7947 MB at peak), the other two stayed at 4 MB, same answer.
+# CUDA call -- which is MPI_Init when the MPI is CUDA-aware -- so the reliable place is
+# the launcher, before python starts.  Rank k of the node gets device k % ndev.
 #
 # Cores need nothing extra: OpenMPI's default --bind-to core already confines each rank
-# to one core (measured 1.00 cores busy per rank), which is what stops XLA's CPU worker
-# pool taking two.  A run started without mpirun should get taskset for the same reason.
+# to one core, which is what stops XLA's CPU worker pool taking two.  A run started
+# without mpirun should get taskset for the same reason.
 #
 # Usage:
 #   mpirun -n 4 tools/mpirun_pinned.sh python script.py args...
-#   HIPPYMFEM_DEVICE=gpu mpirun -n 2 tools/mpirun_pinned.sh python benchmarks/bench_newton_step.py --device cuda
+#   HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 mpirun -n 2 tools/mpirun_pinned.sh \
+#       python benchmarks/bench_newton_device.py --n 32
 #
 # Honors a CUDA_VISIBLE_DEVICES already set by a scheduler: it subsets that list rather
 # than the node's, so a SLURM allocation of two cards is split between two ranks, not
 # overwritten with device ids the job was never given.
-# A run that asked for no device gets none.  What put an all-host benchmark on all
-# four cards (426 MB each) was JAX bringing up its CUDA backend because the script
-# imported jax before hippymfem could confine it to the CPU; hippymfem now sets the
-# platform list either way, and this empties the device list before python starts so
-# that nothing else in the process can open a context either.  An explicit
+# A run that asked for no device gets none: the device list is emptied before python
+# starts, so that nothing in the process can open a context.  An explicit
 # CUDA_VISIBLE_DEVICES is the caller's choice and is honored; HIPPYMFEM_PIN_GPU=0 too.
-case "${HIPPYMFEM_DEVICE:-}" in gpu|cuda|rocm|gpu:0) WANT_GPU=1 ;; *) WANT_GPU=0 ;; esac
-case "${HIPPYMFEM_HYPRE_DEVICE:-}" in 1|yes|true|on) WANT_GPU=1 ;; esac
+case "${HIPPYMFEM_DEVICE:-}" in gpu|cuda|rocm|gpu:0|auto) WANT_GPU=1 ;; *) WANT_GPU=0 ;; esac
+case "${HIPPYMFEM_HYPRE_DEVICE:-}" in ""|0|no|false|off) ;; *) WANT_GPU=1 ;; esac
 case "${HIPPYMFEM_PIN_GPU:-1}" in 0|no|false|off) PIN=0 ;; *) PIN=1 ;; esac
 # The variable of the vendor this node carries: NVIDIA's, or AMD's ROCm runtime's.  A
 # scheduler that already set one decides it; otherwise whichever vendor tool answers.

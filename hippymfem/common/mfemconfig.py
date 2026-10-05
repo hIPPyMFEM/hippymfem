@@ -113,9 +113,7 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     scatter builds the parallel matrix from hypre's two blocks
     (:mod:`hippymfem.fem.tdofassemble`), and the triple-product fallback builds its
     local matrix with the constructor that copies into hypre's own memory
-    (:func:`hippymfem.fem.parmat.local_par_matrix`), which is what it does on a device
-    whatever ``HIPPYMFEM_PARMAT`` says.  An explicit ``HIPPYMFEM_PARMAT=direct`` is
-    still refused here.
+    (:func:`hippymfem.fem.parmat.local_par_matrix`).
 
     **This is the configuration that matters.**  The element kernels are a small share
     of a Newton step, so moving only them to the GPU gains little; moving the solves
@@ -153,18 +151,6 @@ def configure_device(kind="gpu", comm=None, quiet=False):
             "  Set HIPPYMFEM_HYPRE_DEVICE=1 *before* importing hippymfem, which "
             "halves JAX's share so the two fit together. The cap is read once, "
             "when JAX is imported, so setting it afterwards has no effect.")
-    from ..fem import parmat as _parmat
-
-    if _parmat.PARMAT_MODE == "direct":
-        raise RuntimeError(
-            "hypre cannot run on a device while HIPPYMFEM_PARMAT=direct: that route "
-            "builds the matrix from numpy arrays, which a device-configured hypre "
-            "reads as device pointers, and it segfaults rather than failing "
-            "cleanly.\n"
-            "  Unset HIPPYMFEM_PARMAT (or set it to \"auto\") to let MFEM's own "
-            "ParallelAssemble build the parallel matrix from the same local CSR. "
-            "It is bit-identical and it keeps the vectorized scatter, so nothing is "
-            "given up by doing so.")
     # The element kernels also pick their device by node-local rank, and the two must
     # agree: with MFEM on device 0 and JAX on device 1, hypre gets a pointer from the
     # wrong context and thrust aborts with "invalid device ordinal".
@@ -356,16 +342,12 @@ def set_hypre_spmv(kernel="auto", comm=None):
     dofs of its neighbours.  The off-diagonal block has as many rows as the diagonal one
     and nonzeros in the few rows next to an interface only, and so have the blocks of
     the interpolation matrices of BoomerAMG.  By default hypre hands every block to the
-    vendor's library, and with cuSPARSE the time of the product with such a block is
-    unrelated to its nonzeros and grows with its rows: measured with hypre 2.32 and CUDA 12.9 on two
-    ranks with 2.2 million dofs each, 0.6 to 0.9 ms for the off-diagonal block of the
-    Jacobian (840 thousand nonzeros) and 5.4 ms for a block of an interpolation matrix
-    with 701 nonzeros, against 2.2 ms for the diagonal block with 136 million.  hypre's
-    own kernel takes 0.16 ms or less for the same blocks and 2.6 ms for the diagonal
-    one.  On one rank there are no off-diagonal blocks and the vendor's kernel is the
-    faster one (12 % per Krylov iteration); on two to sixteen ranks hypre's kernel made
-    an iteration 11 to 36 % faster, and on two H100 it took 6.2 ms where cuSPARSE took
-    16.5 (the GPU guide, "Several GPUs"; ``benchmarks/krylov_anatomy.py`` measures it).
+    vendor's library, and with cuSPARSE the time of the product with such a block grows
+    with its rows, not its nonzeros: 5.4 ms for a block of an interpolation matrix with
+    701 nonzeros in 2.2 million rows, where hypre's own kernel takes 0.16 ms or less.
+    On one rank there are no off-diagonal blocks and the vendor's kernel is the faster
+    one; on two to sixteen ranks hypre's kernel made a Krylov iteration 11 to 36 %
+    faster (the GPU guide, "Several GPUs").
 
     ``kernel`` is ``"vendor"``, ``"hypre"``, or ``"auto"``: hypre's kernel when ``comm``
     has more than one rank and the build is a CUDA one, the vendor's otherwise.  The
@@ -429,6 +411,10 @@ class HyprePool:
         self._dev_free = runtime.cudaFree
         self._dev_free.argtypes = [ctypes.c_void_p]
         self._dev_free.restype = ctypes.c_int
+        # reads the runtime's last error, which resets it
+        self._last_error = getattr(runtime, "cudaGetLastError", None)
+        #: how many requests the driver refused even after the pool was emptied
+        self.refused = 0
         self.max_cached = self.keep
         self.max_block = int(max_block if max_block is not None else max_cached)
         self._bins = {}                    # size class -> [(pointer, size), ...]
@@ -453,9 +439,27 @@ class HyprePool:
             # out of device memory: give back what the pool holds and try once more
             self.trim()
             p = self._ct.c_void_p()
-            self._dev_malloc(self._ct.byref(p), size)
+            if self._dev_malloc(self._ct.byref(p), size) != 0 or not p.value:
+                p = self._ct.c_void_p()
+                self._refuse(size)
+            # The runtime keeps a refusal as its last error, and MFEM reads the last
+            # error after its next kernel and takes it for that kernel's.  Read it here.
+            if self._last_error is not None:
+                self._last_error()
         self.driver_allocs += 1
         return p.value
+
+    def _refuse(self, size):
+        """The card has no room for a block hypre asks for.  hypre stops the run at a
+        null pointer without a word, so say what happened, once."""
+        self.refused += 1
+        if self.refused == 1:
+            import sys
+
+            print("hippymfem: the GPU is out of memory: hypre asked for %.2f GiB with %.2f GiB of its "
+                  "own in use.  Use more ranks, or leave hypre more of the card "
+                  "(HIPPYMFEM_GPU_MEM_FRACTION)." % (size / 2 ** 30, self.in_use / 2 ** 30),
+                  file=sys.stderr, flush=True)
 
     def _malloc(self, out, size):
         # called by hypre: nothing may escape, or hypre is left without a pointer
@@ -629,10 +633,8 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
     PyMFEM build scripts produce, takes every device array from ``cudaMalloc`` and
     returns it with ``cudaFree``.  One BoomerAMG setup makes about two thousand such
     pairs of calls.  Each is a trip into the driver that costs tens of microseconds
-    when one process uses the node and several hundred when sixteen do: measured on
-    sixteen MIG instances of one node with 2.1 million dofs each, 2,206 allocations
-    took 467 ms and 1,993 frees 617 ms of a setup of 1.47 s, against 21 ms and 91 ms
-    of 0.18 s for one process alone (the GPU guide, "Several GPUs").
+    when one process uses the node and several hundred when sixteen do, more than a
+    second of a setup of 1.5 s (the GPU guide, "Several GPUs").
 
     hypre lets the application supply the two functions, and this supplies a pair that
     keeps freed blocks and hands them out again.  A new block has exactly the size
@@ -645,28 +647,18 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
     If the driver refuses an allocation the pool is emptied and the allocation retried,
     and the element kernels empty it when they run out of device memory.
 
-    With 1024 MB the setup above took 0.62 s instead of 1.47 s, and with 4096 MB
-    0.44 s.  Nothing but the time of an allocation changes.
+    Nothing but the time of an allocation changes.
 
     With ``scoped=True`` the pool has two limits: ``megabytes`` while a BoomerAMG setup
     runs (between :func:`hypre_pool_open`, which a solver calls when it is given an
     operator, and :func:`hypre_pool_close`, after its first solve) and
     ``keep_megabytes`` otherwise, or a quarter of the most hypre has had in use at
     once when that is less, so that a small problem keeps little.  The first serves
-    the setup's own temporaries: a
-    setup that starts with an empty pool of 1024 MB took 0.65 s.  The second carries
-    blocks from one setup to the next, and from the hierarchy a solver gives up to the
-    one it builds.  When the pool is full a freed block displaces larger ones, so what
-    it keeps are the smallest: of the 2,300 allocations that a forward solve and its
-    Hessian blocks made on one of sixteen instances with 2.1 million dofs, 89 % were
-    under 1 MB and took 6 to 70 us each, and the 256 larger ones took 1.7 to 2.3 ms
-    each (0.2 to 0.3 ms with two processes on an H100).  Replaying those recorded
-    allocations and frees under each policy (``benchmarks/hypre_pool_trace.py`` and
-    ``hypre_pool_replay.py``; ``benchmarks/DESIGN_NOTES.md``, section 11), the driver
-    calls cost 1.34 s without a pool, 1.03 s with 1024 MB during a setup only, 0.47 s
-    when 512 MB are kept between setups as well and 0.34 s with 1024 MB kept.
-    Measured, a forward solve on the sixteen instances took 2.67, 2.31 and 2.26 s
-    with 0, 512 and 1024 MB kept.
+    the setup's own temporaries.  The second carries blocks from one setup to the
+    next, and from the hierarchy a solver gives up to the one it builds.  When the
+    pool is full a freed block displaces larger ones, so what it keeps are the
+    smallest, which are the many: nine in ten of a forward solve's allocations are
+    under 1 MB.
 
     :func:`configure_device` installs the scoped pool by default
     (``HIPPYMFEM_HYPRE_POOL=auto``: :data:`HYPRE_POOL_SETUP_MB` during a setup and

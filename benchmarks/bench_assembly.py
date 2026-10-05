@@ -7,8 +7,8 @@
 
 Every assembly number in the documentation comes from here.  The measurement is deliberately narrow and repeatable:
 
-* one MPI rank per measurement unless ``--ranks`` says otherwise, so per-element
-  costs are per-rank costs and not confounded by partitioning;
+* per-element costs are per-rank costs: run on one rank, they are not confounded by
+  partitioning;
 * the timed region is **one full assembly** of the forward Jacobian -- dof gather,
   element kernel, scatter, ``P^T A P`` and essential-dof elimination -- because
   that is what an optimizer actually pays, not just the kernel;
@@ -24,7 +24,7 @@ measurement rather than retyped.
 Usage::
 
     HIPPYMFEM_DEVICE=gpu python benchmarks/bench_assembly.py --out results/asm.json
-    HIPPYMFEM_DEVICE=gpu mpirun -n 4 python benchmarks/bench_assembly.py --ranks 4
+    HIPPYMFEM_DEVICE=gpu mpirun -n 4 python benchmarks/bench_assembly.py --only 2
 """
 
 import argparse
@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import hippymfem as hp                                              # noqa: E402
 from hippymfem.fem import assemble as asm                           # noqa: E402
+from hippymfem.test import reference_assembly as ref                # noqa: E402
 from hippymfem.fem import kernel as K                               # noqa: E402
 from hippymfem.fem.csrassemble import get_pattern                   # noqa: E402
 from hippymfem.fem.elementbatch import MeshBatches                  # noqa: E402
@@ -156,7 +157,7 @@ def measure(kind, n, order, backend, device, reps, density="diffusion"):
     """One configuration: kernel time, assembly time, and the total."""
     pm, Vu, Vm, b, kern, loc, bc = make(kind, n, order, density)
     NE = pm.GetNE()
-    old_backend = asm.set_assembly_backend(backend)
+    route = ref if backend == "integrator" else asm
     old_dev = K.device()
     K.set_device(device)
     try:
@@ -170,20 +171,19 @@ def measure(kind, n, order, backend, device, reps, density="diffusion"):
         mats = kern.element_matrices(ADJOINT, STATE, loc)
 
         def scatter_only():
-            A = asm.assemble_matrix(Vu, Vu, b.groups, mats, NE,
-                                    test_ess=bc.ess_tdof)
+            A = route.assemble_matrix(Vu, Vu, b.groups, mats, NE,
+                                      test_ess=bc.ess_tdof)
             del A
         t_scatter = timed(scatter_only, reps)
 
         def full():
-            A = asm.assemble_matrix(Vu, Vu, b.groups,
-                                    kern.element_matrices(ADJOINT, STATE, loc),
-                                    NE, test_ess=bc.ess_tdof)
+            A = route.assemble_matrix(Vu, Vu, b.groups,
+                                      kern.element_matrices(ADJOINT, STATE, loc),
+                                      NE, test_ess=bc.ess_tdof)
             del A
         t_full = timed(full, reps)
         nnz = (get_pattern(Vu, Vu, b.groups).nnz if backend == "csr" else None)
     finally:
-        asm.set_assembly_backend(old_backend)
         K._DEVICE = old_dev
     ne_glob = COMM.allreduce(NE)
     return {

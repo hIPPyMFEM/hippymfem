@@ -349,6 +349,59 @@ def test_blocks_with_boundary():
           "(rel %.3e)" % (num / den))
 
 
+def test_prescribed_flux():
+    """A boundary term that does not depend on the state is in the residual and not in
+    the Jacobian: the block is the volume term's own, and it is not taken through the
+    boundary route."""
+    if RANK == 0:
+        print("a prescribed flux: in the residual, not in the Jacobian")
+    pm = mesh_of("tri", 8)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * jnp.dot(u.grad, p.grad) - (1.0 + x[0]) * p.val
+
+    bc = hp.DirichletBC(Vu, lambda x: x[1], bdr_attributes=[1])
+    kw = dict(is_fwd_linear=True)
+    flux = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                    bdr_varf=lambda u, m, p, x, n: -0.5 * x[1] * p.val,
+                                    bdr_attributes=[2, 3, 4], **kw)
+    robin = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                     bdr_varf=lambda u, m, p, x, n: (2.0 * u.val - 0.5 * x[1]) * p.val,
+                                     bdr_attributes=[2, 3, 4], **kw)
+    plain = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(), **kw)
+    hp.parRandom.set_seed(9)
+    m = Vm.vector()
+    hp.parRandom.normal(0.3, m)
+    u = Vu.project(lambda x: x[1] + 0.2 * np.sin(3.0 * x[0]))
+    x = [u, m, Vu.vector()]
+
+    loc = flux._locals(x) + flux._aux_locals()
+    skipped = flux._boundary_vanishes(flux.bdr_kernel.element_matrices(ADJOINT, STATE, loc))
+    kept = not robin._boundary_vanishes(robin.bdr_kernel.element_matrices(ADJOINT, STATE, loc))
+    check("the flux's Jacobian block is found zero, the Robin term's is not", skipped and kept)
+    ess = bc.ess_tdof
+    Af = to_dense(flux._block(ADJOINT, STATE, x, test_ess=ess), COMM)
+    Ap = to_dense(plain._block(ADJOINT, STATE, x, test_ess=ess), COMM)
+    Ar = to_dense(robin._block(ADJOINT, STATE, x, test_ess=ess), COMM)
+    check("the Jacobian with the flux is the volume term's, exactly", float(np.abs(Af - Ap).max()) == 0.0)
+    check("and the Robin term still changes it", float(np.abs(Ar - Ap).max()) > 1e-3)
+
+    # the flux is in the residual: the difference is MFEM's boundary linear form
+    rf = flux._residual(x, ADJOINT)
+    rp = plain._residual(x, ADJOINT)
+    lf = mfem.ParLinearForm(Vu.fes)
+    gc = _ScalPy(lambda x: -0.5 * x[1])
+    marker = mfem.intArray([0, 1, 1, 1])
+    lf.AddBoundaryIntegrator(mfem.BoundaryLFIntegrator(gc), marker)
+    lf.Assemble()
+    ref = Vu.vector()
+    ref.array[:] = hp.to_numpy(lf.ParallelAssemble(), copy=True)
+    d = rf.copy().axpy(-1.0, rp)
+    e = d.copy().axpy(-1.0, ref).norm("l2") / ref.norm("l2")
+    check("the residual carries the flux (MFEM's boundary linear form)", e < 1e-12, "(%.2e)" % e)
+
+
 def test_dirichlet_plus_robin():
     """A Robin term on part of the boundary next to an essential condition.
 
@@ -476,6 +529,7 @@ def main():
     test_attribute_restriction()
     test_robin_solve()
     test_blocks_with_boundary()
+    test_prescribed_flux()
     test_dirichlet_plus_robin()
     test_rank_without_boundary_elements()
     test_streamed_pass_with_boundary()

@@ -30,7 +30,6 @@ inner products, with no further PDE solves.
 import numpy as np
 
 from ..common.operators import as_operator
-from ..common.naming import sync_spellings
 from ..algorithms.lowRankOperator import LowRankOperator
 from ..common.keepalive import KeepAlive
 from ..common.operators import Operator, make_vector
@@ -195,5 +194,3 @@ class GaussianLRPosterior(KeepAlive):
             return kld, c_logdet, c_trace, c_shift
         return kld
 
-
-sync_spellings(GaussianLRPosterior)

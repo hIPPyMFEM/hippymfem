@@ -6,15 +6,6 @@ The inverse-problem classes keep the names and signatures of
 script written for it usually ports by changing the imports and the space construction.
 This page is the map.
 
-**Two spellings.**  hIPPYlib's methods are camelCase (``solveFwd``,
-``setLinearizationPoint``, ``applyWuu``); the library's own names are snake_case.
-Every class of the programming model answers to both (``solve_fwd`` and
-``solveFwd`` are the same method, and a subclass may override either), and the
-module-level functions have both too (``model_verify`` / ``modelVerify``,
-``double_pass_g`` / ``doublePassG``).  The snake_case spelling is the preferred
-one in this documentation; the camelCase one is what a ported driver already
-contains.  See :mod:`hippymfem.common.naming` for the list.
-
 =====================================  =========================================
 hIPPYlib / hIPPYlibx                   hIPPyMFEM
 =====================================  =========================================

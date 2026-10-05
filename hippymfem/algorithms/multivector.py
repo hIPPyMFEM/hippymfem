@@ -23,11 +23,10 @@ against the hIPPYlib interface works unchanged.
 import numpy as np
 from mpi4py import MPI
 
-from ..common.naming import SnakeCamel, sync_spellings
 from ..common.parvector import ParVector, allreduce_extreme
 
 
-class MultiVector(SnakeCamel):
+class MultiVector(object):
     """``nvec`` distributed vectors sharing one layout.
 
     Parameters
@@ -336,6 +335,3 @@ def MvDSmatMult(X, A, Y):
         )
     Y.data[:] = A.T @ X.data          # both properties sync their columns
     return Y
-
-
-sync_spellings(MultiVector)

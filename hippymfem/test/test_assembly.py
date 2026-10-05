@@ -33,7 +33,9 @@ import jax.numpy as jnp
 
 import hippymfem as hp
 from hippymfem.fem import assemble as asm
+from hippymfem.test import reference_assembly as ref
 from hippymfem.fem import csrassemble as csr
+from hippymfem.fem import parmat
 from hippymfem.fem.csrassemble import clear_pattern_cache, get_pattern
 from hippymfem.fem.elementbatch import MeshBatches
 from hippymfem.fem import kernel as kernel_mod
@@ -113,16 +115,9 @@ def locals_at(spaces, seed=7):
 
 
 def both_backends(fn):
-    """Run ``fn()`` under each backend and return ``(integrator, csr)``."""
-    old = asm.assembly_backend()
-    try:
-        asm.set_assembly_backend("integrator")
-        a = fn()
-        asm.set_assembly_backend("csr")
-        b = fn()
-    finally:
-        asm.set_assembly_backend(old)
-    return a, b
+    """``fn(module)`` with MFEM's callback assembly (the reference) and with the
+    library's direct scatter: ``(reference, direct)``."""
+    return fn(ref), fn(asm)
 
 
 # ------------------------------------------------------------------ equality
@@ -243,7 +238,7 @@ def test_blocks_identical():
         bad = []
         for name, i, j, te, tr, pol in blocks:
             mats = K.element_matrices(i, j, loc)
-            A1, A2 = both_backends(lambda: asm.assemble_matrix(
+            A1, A2 = both_backends(lambda a: a.assemble_matrix(
                 spaces[i], spaces[j], batches.groups, mats, NE,
                 test_ess=te, trial_ess=tr, diag_policy=pol))
             D1, D2 = to_dense(A1, COMM), to_dense(A2, COMM)
@@ -254,7 +249,7 @@ def test_blocks_identical():
                 bad.append("%s %.2e" % (name, err))
         for var in (STATE, PARAMETER, ADJOINT):
             vecs = K.element_vectors(var, loc)
-            v1, v2 = both_backends(lambda: asm.assemble_vector(
+            v1, v2 = both_backends(lambda a: a.assemble_vector(
                 spaces[var], batches.groups, vecs, NE))
             d = np.concatenate(COMM.allgather(v1.array - v2.array))
             if np.abs(d).max() != 0.0:
@@ -297,7 +292,6 @@ def test_structural_zeros():
             Vu.local_values(Vu.vector())]
 
     clear_pattern_cache()
-    asm.set_assembly_backend("csr")
     A0 = asm.assemble_matrix(Vu, Vu, batches.groups,
                              K.element_matrices(ADJOINT, STATE, loc0), NE)
     n0 = float(np.abs(to_dense(A0, COMM)).max())
@@ -306,11 +300,9 @@ def test_structural_zeros():
                              K.element_matrices(ADJOINT, STATE, loc1), NE)
     D1 = to_dense(A1, COMM)
 
-    asm.set_assembly_backend("integrator")
-    R1 = to_dense(asm.assemble_matrix(Vu, Vu, batches.groups,
+    R1 = to_dense(ref.assemble_matrix(Vu, Vu, batches.groups,
                                       K.element_matrices(ADJOINT, STATE, loc1),
                                       NE), COMM)
-    asm.set_assembly_backend("csr")
     err = float(np.abs(D1 - R1).max()) / max(float(np.abs(R1).max()), 1e-300)
     check("zero first assembly does not prune the pattern",
           n0 == 0.0 and err == 0.0,
@@ -341,11 +333,9 @@ def test_structural_zeros():
     Da = to_dense(asm.assemble_matrix(
         Vt, Vt, bt.groups, Kt.element_matrices(ADJOINT, STATE, loct),
         pmt.GetNE()), COMM)
-    asm.set_assembly_backend("integrator")
-    Ra = to_dense(asm.assemble_matrix(
+    Ra = to_dense(ref.assemble_matrix(
         Vt, Vt, bt.groups, Kt.element_matrices(ADJOINT, STATE, loct),
         pmt.GetNE()), COMM)
-    asm.set_assembly_backend("csr")
     e2 = float(np.abs(Da - Ra).max()) / max(float(np.abs(Ra).max()), 1e-300)
     check("isotropic pattern carries an anisotropic refill", e2 == 0.0,
           "(%.3e)" % e2)
@@ -372,7 +362,6 @@ def test_keep_policy():
     bc = hp.DirichletBC(V, None, "all")
     ess = np.asarray(bc.ess_tdof.ToList(), dtype=np.int64)
 
-    asm.set_assembly_backend("csr")
     free = to_dense(asm.assemble_matrix(V, V, b.groups, mats, pm.GetNE()), COMM)
     got = {}
     for pol in ("one", "zero", "keep"):
@@ -444,7 +433,7 @@ def test_partial_boundary_elimination():
           "(local counts %s)" % (counts if NP <= 8 else
                                  "%d of %d ranks empty" % (empty, NP)))
 
-    A1, A2 = both_backends(lambda: asm.assemble_matrix(
+    A1, A2 = both_backends(lambda a: a.assemble_matrix(
         Vu, Vu, b.groups, mats, NE, test_ess=bc.ess_tdof, diag_policy="one"))
     D1, D2 = to_dense(A1, COMM), to_dense(A2, COMM)
     e = float(np.abs(D1 - D2).max()) / max(float(np.abs(D1).max()), 1e-300)
@@ -452,7 +441,6 @@ def test_partial_boundary_elimination():
           "(%.3e)" % e)
 
     # a transpose walks the parallel structure the damage would corrupt
-    asm.set_assembly_backend("csr")
     A = asm.assemble_matrix(Vu, Vu, b.groups, mats, NE, test_ess=bc.ess_tdof,
                             diag_policy="one")
     At = A.Transpose()
@@ -479,7 +467,6 @@ def test_folded_elimination():
     """
     if RANK == 0:
         print("elimination folded into the scatter")
-    asm.set_assembly_backend("csr")
     for kind, order in (("quad", 1), ("quad", 2), ("tri", 2), ("hex", 2)):
         pm, Vh, b, K = build(kind, 4 if kind != "hex" else 3, order)
         loc = locals_at(Vh)
@@ -748,7 +735,6 @@ def test_fused_scatter():
     """
     if RANK == 0:
         print("fused chunk scatter")
-    asm.set_assembly_backend("csr")
     for kind, order in (("quad", 2), ("tri", 1), ("hex", 2)):
         pm, Vh, b, K = build(kind, 5 if kind != "hex" else 3, order)
         loc = locals_at(Vh)
@@ -786,7 +772,6 @@ def test_compact_scatter_map():
 
     if RANK == 0:
         print("compact scatter map")
-    asm.set_assembly_backend("csr")
     old, orig = pat.COMPACT_PATTERN, pat._fused_add_coded
     used = []
 
@@ -910,105 +895,76 @@ def test_release_linearization_on_move():
     check("the next point's blocks are identical", worst == 0.0, "(%.3e)" % worst)
 
 
-def test_triple_product_forms():
-    """The fused and split forms of ``P^T A P`` must agree bit for bit.
+def test_triple_product():
+    """``P^T A P`` as the library forms it against MFEM's fused ``RAP``, bit for bit.
 
-    Which is faster depends on the rank count and the problem size, so the
-    library times both once per space pair and keeps the winner.  That is only
-    legitimate if they are the same matrix, values *and* structure: the folded
-    elimination writes into entries that are structurally present but
-    numerically zero, so a form that pruned them would break it.
+    The library takes two sparse products with the transpose kept.  That is only
+    legitimate if it is the matrix ``RAP`` gives, values *and* structure: the folded
+    elimination writes into entries that are structurally present but numerically
+    zero, so a product that pruned them would break it.
     """
     if RANK == 0:
-        print("triple product forms")
-    asm.set_assembly_backend("csr")
+        print("triple product against MFEM's RAP")
+    from hippymfem.common.linalg import take_ownership
+    from hippymfem.fem.prolongation import _prolongation
+
     pm, Vh, b, K = build("quad", 5, 2)
     loc = locals_at(Vh)
     bc = hp.DirichletBC(Vh[0], None, "all")
-    mats = K.element_matrices(ADJOINT, STATE, loc)
-    got, nnz = {}, {}
-    for mode in ("rap", "split"):
-        old = csr.set_triple_mode(mode)
-        csr._TRIPLE_CHOICE.clear()
-        try:
-            A = asm.assemble_matrix(Vh[0], Vh[0], b.groups, mats, pm.GetNE(),
-                                    test_ess=bc.ess_tdof)
-            got[mode] = to_dense(A, COMM)
-            loc_csr = hypre_to_scipy(A)
-            nnz[mode] = COMM.allreduce(int(loc_csr.nnz))
-            del A
-        finally:
-            csr.set_triple_mode(old)
-            csr._TRIPLE_CHOICE.clear()
-    d = float(np.abs(got["rap"] - got["split"]).max())
-    check("fused and split triple products agree", d == 0.0, "(%.3e)" % d)
-    check("and keep the same structure", nnz["rap"] == nnz["split"],
-          "(%d against %d nonzeros)" % (nnz["rap"], nnz["split"]))
-
-
-def test_matrix_reuse():
-    """A reused local matrix must never carry values from the previous assembly.
-
-    The block-diagonal ldof matrix is consumed by the triple product and never
-    reaches the caller, so it is built once and refilled rather than rebuilt at
-    every assembly.  Refilling has to overwrite every entry: hypre stores a square
-    row with its diagonal first, so the stored order is a permutation of the one
-    the pattern produces, and a wrong permutation would show up here as a matrix
-    that is right the first time and stale afterwards.
-    """
-    if RANK == 0:
-        print("local matrix reuse")
-    asm.set_assembly_backend("csr")
-    pm, Vh, b, K = build("quad", 5, 2)
-    bc = hp.DirichletBC(Vh[0], None, "all")
-    points = [locals_at(Vh, seed=s) for s in (7, 13, 21, 7)]
-    for name, ti, ri, i, j, tr in (("A", 0, 0, ADJOINT, STATE, True),
-                                   ("C", 0, 1, ADJOINT, PARAMETER, False)):
-        def one(loc):
-            A = asm.assemble_matrix(
-                Vh[ti], Vh[ri], b.groups, K.element_matrices(i, j, loc),
-                pm.GetNE(), test_ess=bc.ess_tdof,
-                trial_ess=bc.ess_tdof if tr else None)
-            out = to_dense(A, COMM)
-            del A
-            return out
-        seq = [one(loc) for loc in points]
-        fresh = []
-        for loc in points:                     # each from a cold cache
-            csr.clear_pattern_cache()
-            fresh.append(one(loc))
-        worst = max(float(np.abs(a - f).max()) for a, f in zip(seq, fresh))
-        check("reused matrix == freshly built (%s, %d assemblies)"
-              % (name, len(points)), worst == 0.0, "(%.3e)" % worst)
-        # the first and last point are the same: a stale entry would make them differ
-        check("same parameter gives the same matrix (%s)" % name,
-              float(np.abs(seq[0] - seq[-1]).max()) == 0.0)
-    csr.clear_pattern_cache()
+    worst, same_nnz = 0.0, True
+    for i, j in ((ADJOINT, STATE), (ADJOINT, PARAMETER)):
+        test, trial = Vh[i], Vh[j]
+        same = test.fes is trial.fes
+        pat = csr.get_pattern(test, trial, b.groups)
+        # the eliminated rows (and columns of the square block) as explicit zeros
+        rows = csr._ess_ldof_mask(test, bc.ess_tdof)
+        kill = pat.masked_slots(rows, rows if same else None)
+        Aloc = csr.local_par_matrix(
+            pat, pat.data(K.element_matrices(i, j, loc), zero_slots=kill), test, trial)
+        P, ident = _prolongation(test)
+        if ident:                       # one rank: the ldof matrix is the result
+            continue
+        Pr = _prolongation(trial)[0]
+        if same:
+            ours = csr._triple(Aloc, None, P, (test.fes,))
+            ref = take_ownership(mfem.RAP(Aloc, P))
+        else:
+            ours = csr._triple(Aloc, P, Pr, (test.fes, trial.fes))
+            ref = take_ownership(mfem.RAP(P, Aloc, Pr))
+        worst = max(worst, float(np.abs(to_dense(ours, COMM) - to_dense(ref, COMM)).max()))
+        same_nnz = same_nnz and (COMM.allreduce(int(hypre_to_scipy(ours).nnz))
+                                 == COMM.allreduce(int(hypre_to_scipy(ref).nnz)))
+        del ours, ref, Aloc
+    check("two products and MFEM's fused RAP agree", worst == 0.0, "(%.3e)" % worst)
+    check("and keep the same structure", same_nnz)
 
 
 def both_parmat(fn):
-    """Run ``fn()`` with each parallel-matrix construction, from a cold cache."""
-    old = csr.set_parmat_mode("direct")
+    """Run ``fn()`` on the triple-product route with each constructor of the local
+    matrix, the copying one (which a device run takes) first, from a cold cache."""
+    old = csr.set_parmat_mode("mfem")
     try:
+        parmat.COPYING_CONSTRUCTOR = True
         csr.clear_pattern_cache()
         a = fn()
-        csr.set_parmat_mode("mfem")
+        parmat.COPYING_CONSTRUCTOR = False
         csr.clear_pattern_cache()
         b = fn()
     finally:
+        parmat.COPYING_CONSTRUCTOR = False
         csr.set_parmat_mode(old)
         csr.clear_pattern_cache()
     return a, b
 
 
 def test_parmat_routes():
-    """Both ways of turning the local CSR into a parallel matrix must agree.
+    """Both constructors of the local matrix must give the same parallel matrix.
 
-    ``direct`` hands hypre the numpy arrays; ``mfem`` goes through an
-    ``mfem.SparseMatrix`` so that MFEM stages them into hypre's own memory space,
-    which is the only way to reach a device-configured hypre.  They must be the
-    same matrix, so this compares them densely over the block shapes and diagonal
-    policies the library assembles.
+    One hands hypre the numpy arrays, which it copies (what a run with hypre on a
+    device does); the other wraps them as an ``mfem.SparseMatrix`` that MFEM's
+    constructor aliases (the host's).  They must be the same matrix, so this
+    compares them densely over the block shapes and diagonal policies the library
+    assembles.
 
     The repeated-assembly check guards a trap: the square constructor reorders
     each row to put the diagonal first and syncs that permutation back into the
@@ -1018,8 +974,7 @@ def test_parmat_routes():
     repeatedly and comparing against a cold cache catches that.
     """
     if RANK == 0:
-        print("parallel-matrix construction: direct vs through MFEM")
-    asm.set_assembly_backend("csr")
+        print("parallel-matrix construction: the copying against the aliasing constructor")
     for kind, n, order in (("quad", 5, 2), ("hex", 3, 2)):
         pm, Vh, b, K = build(kind, n, order)
         bc = hp.DirichletBC(Vh[0], None, "all")
@@ -1061,10 +1016,10 @@ def test_parmat_routes():
                       and np.array_equal(i0, np.asarray(pat.indptr)))
             return out, intact
         (da, ia), (dc, ic) = both_parmat(repeat)
-        check("%s %s: pattern indices survive the direct route" % (kind, order), ia)
-        check("%s %s: pattern indices survive the MFEM route" % (kind, order), ic)
+        check("%s %s: pattern indices survive the copying constructor" % (kind, order), ia)
+        check("%s %s: pattern indices survive the aliasing constructor" % (kind, order), ic)
         worst = max(float(np.abs(x - da[0]).max()) for x in da + dc)
-        check("%s %s: three assemblies agree across both routes" % (kind, order),
+        check("%s %s: three assemblies agree across both constructors" % (kind, order),
               worst == 0.0, "(%.3e)" % worst)
 
 
@@ -1085,7 +1040,6 @@ def test_tdof_route():
     """
     if RANK == 0:
         print("true-dof route vs triple product")
-    asm.set_assembly_backend("csr")
     tol = 0.0 if COMM.size == 1 else 1e-13
 
     def under(mode, fn):
@@ -1153,14 +1107,14 @@ def test_eliminated_diagonal():
     """
     if RANK == 0:
         print("eliminated diagonal")
-    asm.set_assembly_backend("csr")
     pm, Vh, b, K = build("quad", 5, 2)
     bc = hp.DirichletBC(Vh[0], None, "all")
     loc = locals_at(Vh)
     idx = np.asarray(bc.ess_tdof.ToList(), dtype=np.int64)
     for pol, want in (("one", 1.0), ("zero", 0.0)):
-        for mode in ("direct", "mfem"):
-            old = csr.set_parmat_mode(mode)
+        for copying in (True, False):
+            old = csr.set_parmat_mode("mfem")
+            parmat.COPYING_CONSTRUCTOR = copying
             try:
                 csr.clear_pattern_cache()
                 A = asm.assemble_matrix(
@@ -1172,11 +1126,13 @@ def test_eliminated_diagonal():
                          else float(np.abs(d[idx] - want).max()))
                 del A
             finally:
+                parmat.COPYING_CONSTRUCTOR = False
                 csr.set_parmat_mode(old)
                 csr.clear_pattern_cache()
             worst = COMM.allreduce(worst, op=MPI.MAX)
-            check("diag=%s leaves %.1f on every eliminated row (%s)"
-                  % (pol, want, mode), worst == 0.0, "(%.3e)" % worst)
+            check("diag=%s leaves %.1f on every eliminated row (%s constructor)"
+                  % (pol, want, "copying" if copying else "aliasing"),
+                  worst == 0.0, "(%.3e)" % worst)
 
 
 def test_boolean_prolongation():
@@ -1238,16 +1194,15 @@ def test_no_leak():
     bc = hp.DirichletBC(V, None, "all")
     NE = pm.GetNE()
 
-    for backend in ("csr", "integrator"):
-        asm.set_assembly_backend(backend)
+    for backend, mod in (("csr", asm), ("integrator", ref)):
         for _ in range(5):                     # warm up caches and allocators
-            A = asm.assemble_matrix(V, V, b.groups, mats, NE,
+            A = mod.assemble_matrix(V, V, b.groups, mats, NE,
                                     test_ess=bc.ess_tdof)
             del A
         gc.collect()
         r0 = rss_kb()
         for _ in range(60):
-            A = asm.assemble_matrix(V, V, b.groups, mats, NE,
+            A = mod.assemble_matrix(V, V, b.groups, mats, NE,
                                     test_ess=bc.ess_tdof)
             del A
         gc.collect()
@@ -1255,7 +1210,6 @@ def test_no_leak():
         worst = COMM.allreduce(grew, op=MPI.MAX)
         check("%s: 60 assemblies do not grow RSS" % backend, worst < 20000,
               "(+%d kB)" % worst)
-    asm.set_assembly_backend("csr")
 
     from hippymfem.common.linalg import ParAdd, MatPtAP
 
@@ -1282,7 +1236,6 @@ def test_operator_reset_frees():
     """
     if RANK == 0:
         print("operator resets free the previous operator")
-    asm.set_assembly_backend("csr")
 
     def live(name):
         return sum(1 for o in gc.get_objects() if type(o).__name__ == name)
@@ -1385,20 +1338,18 @@ def test_speed():
         bc = hp.DirichletBC(spaces[STATE], None, "all")
         mats = K.element_matrices(ADJOINT, STATE, loc)
         t = {}
-        for backend in ("integrator", "csr"):
-            asm.set_assembly_backend(backend)
-            A = asm.assemble_matrix(spaces[0], spaces[0], batches.groups, mats,
+        for backend, mod in (("integrator", ref), ("csr", asm)):
+            A = mod.assemble_matrix(spaces[0], spaces[0], batches.groups, mats,
                                     NE, test_ess=bc.ess_tdof)
             del A
             COMM.Barrier()
             t0 = time.perf_counter()
             for _ in range(5):
-                A = asm.assemble_matrix(spaces[0], spaces[0], batches.groups,
+                A = mod.assemble_matrix(spaces[0], spaces[0], batches.groups,
                                         mats, NE, test_ess=bc.ess_tdof)
                 del A
             COMM.Barrier()
             t[backend] = (time.perf_counter() - t0) / 5
-        asm.set_assembly_backend("csr")
         pat = get_pattern(spaces[0], spaces[0], batches.groups)
         if RANK == 0:
             print("      %s order %d, NE/rank=%d: callback %.2f us/elem, "
@@ -1460,9 +1411,8 @@ def main():
     test_slot_order_is_the_lexsort()
     test_transpose_free_adjoint()
     test_element_chunking()
-    test_triple_product_forms()
+    test_triple_product()
     test_coordinates_and_project()
-    test_matrix_reuse()
     test_fused_scatter()
     test_compact_scatter_map()
     test_geometric_factors_freed()

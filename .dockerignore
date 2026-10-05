@@ -5,8 +5,7 @@
 *.egg-info
 .pytest_cache
 docs/build
-applications/*/results
-tutorial/*_files
-results
+**/results
+validation/out
 wheelhouse
 docs/source/tutorials

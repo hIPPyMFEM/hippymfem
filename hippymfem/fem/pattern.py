@@ -17,11 +17,10 @@ import warnings
 import numpy as np
 from ..common.identitycache import IdentityCache
 from ..common.keepalive import KeepAlive
-from ..common.linalg import _diag_block, alias
 from ..common.parvector import _HYPRE_INT
 from .elementbatch import group_tables
 from .spaces import as_space
-from .parmat import _TRANSPOSE, _TRIPLE_CHOICE
+from .parmat import _TRANSPOSE
 from .prolongation import _BOOLEAN_P, _ESS_LDOF, _IDENTITY_P
 
 
@@ -38,7 +37,7 @@ DETERMINISTIC = os.environ.get("HIPPYMFEM_GPU_DETERMINISTIC", "").lower() not in
 #: one costs a *contiguous* ``nnz`` block: at two million P2 hexahedra on a rank that
 #: is 7.7 GiB, more than half the arena at a quarter-card cap, and once the arena has
 #: grown to its cap and small allocations have landed in the freed block, the next
-#: assembly fails (RESOURCE_EXHAUSTED inside the scatter; 400^3 on 32 MIG slices).
+#: assembly fails with RESOURCE_EXHAUSTED inside the scatter.
 #: Buffers are kept per (device, ``nnz``) and borrowed, so what is held is the peak an
 #: assembly needs at once, never more.  Set ``HIPPYMFEM_FUSED_KEEP=0`` to allocate per
 #: assembly.
@@ -48,8 +47,7 @@ FUSED_KEEP = os.environ.get("HIPPYMFEM_FUSED_KEEP", "1").lower() not in (
 #: Share of JAX's arena above which an accumulator is kept.  Only the large ones are
 #: worth it: a small buffer is one the allocator can fit in the holes it already has,
 #: while a buffer of a third of the arena or more cannot be found again once the arena
-#: is full and its old block has been split (the assemblies that failed that way sat at
-#: 0.34 and 0.58 of their arenas).  Keeping the small ones as well raises the
+#: is full and its old block has been split.  Keeping the small ones as well raises the
 #: high-water mark for nothing, since A, C and the W blocks are each assembled in a
 #: pass of their own: at 128^3 on two L40S, where the accumulator is a fifth of the
 #: arena, keeping it takes JAX's peak from 7.6 to 11.7 GiB.  Set
@@ -433,7 +431,6 @@ class ScatterPattern(KeepAlive):
         self._masked = IdentityCache()
         self._dev_zero = IdentityCache()
         self._fused = {}
-        self._reuse = {}
         self._dev = {}
         self._dev_pad = {}
         self._pad = None
@@ -620,45 +617,6 @@ class ScatterPattern(KeepAlive):
                 hit = hit | col_mask[cols]
             kill = np.flatnonzero(hit).astype(np.intp)
         return self._masked.put((row_mask, col_mask), kill)
-
-    # ------------------------------------------------------------------ reuse
-    def reusable(self, roff, coff, same):
-        """The cached ldof matrix for this partition, or ``None`` on first use."""
-        return self._reuse.get((int(roff), int(coff), bool(same)))
-
-    def make_reusable(self, roff, coff, same, A):
-        """Record ``A`` so later assemblies can overwrite its values in place.
-
-        hypre keeps its own copy of the arrays, and the order it stores a row in
-        may differ from this pattern's.  The permutation is derived once by
-        reading the structure back, one ``searchsorted`` over the row-major keys
-        mapping stored positions to ours; ``A`` is not recorded if its structure
-        cannot be addressed that way.
-        """
-        # ``blk`` is _diag_block's shared scratch wrapper (a private one crashes a
-        # CUDA build, see _diag_block), so the kept view must not refer to it; the
-        # buffer belongs to ``A``, which the reuse entry keeps.
-        blk = _diag_block(A)
-        n = blk.Height()
-        I = np.asarray(blk.GetIArray())[:n + 1].copy()
-        nnz = int(I[-1])
-        stored_j = np.asarray(blk.GetJArray())[:nnz].copy()
-        view = alias(np.asarray(blk.GetDataArray()))[:nnz]
-        ours_j = np.asarray(self.indices, dtype=np.int64)
-        if nnz != self.nnz or not np.array_equal(I, self.indptr):
-            return                              # structure we cannot address
-        if np.array_equal(stored_j, ours_j):
-            order = None
-        else:
-            rowof = np.repeat(np.arange(n, dtype=np.int64),
-                              np.diff(I.astype(np.int64)))
-            ncol = np.int64(max(self.ncol, 1))
-            order = np.searchsorted(rowof * ncol + ours_j,
-                                    rowof * ncol + stored_j.astype(np.int64))
-            if not np.array_equal(ours_j[order], stored_j):
-                return                          # not a within-row permutation
-        self._reuse[(int(roff), int(coff), bool(same))] = (A, view, order)
-        self.keep(A)
 
     # ------------------------------------------------------------------ hypre
     def hypre_indices(self, roff, coff, same):
@@ -1031,7 +989,6 @@ def clear_pattern_cache():
     _IDENTITY_P.clear()
     _BOOLEAN_P.clear()
     _ESS_LDOF.clear()
-    _TRIPLE_CHOICE.clear()
     _TRANSPOSE.clear()
     clear_accumulators()
     from .tdofassemble import clear_tdof_cache

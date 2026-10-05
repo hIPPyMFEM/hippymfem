@@ -9,8 +9,7 @@
 #   3. the SWIG wrappers of an existing CPU PyMFEM tree of the same MFEM version,
 #      recompiled against the new headers and libraries (no swig rerun).
 #
-# One source patch is needed, and it is the HIP twin of the CUDA trap recorded in
-# NOTES.md: sparsemat.hpp guards SparseMatrix's hipSPARSE members on
+# One source patch is needed: sparsemat.hpp guards SparseMatrix's hipSPARSE members on
 # MFEM_USE_CUDA_OR_HIP, which hip.hpp defines only when the HIP compiler is running
 # (__HIP__).  libmfem.so is compiled by it, the wrappers by mpicxx, and the two would
 # disagree on sizeof(SparseMatrix).  The guard is widened to MFEM_USE_HIP here, in the

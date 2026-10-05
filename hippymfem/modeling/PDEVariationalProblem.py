@@ -38,8 +38,7 @@ from ..fem.spaces import as_space
 from .PDEProblem import PDEProblem
 from .variables import ADJOINT, NVAR, PARAMETER, STATE
 import mfem.par as mfem
-from ..fem.boundary import assemble_boundary_matrix, assemble_boundary_vector, get_boundary_batches
-from ..fem.assemble import assembly_backend
+from ..fem.boundary import assemble_boundary_vector, get_boundary_batches
 from ..fem.csrassemble import (_eliminate, add_boundary_entries, assemble_matrix_csr,
                                finish_block, plan_block, scatter_many)
 from ..common.random import Random
@@ -441,39 +440,36 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             mats = finite.wrap(mats)
         else:
             require_finite_arrays(mats, self.comm, "block (%d, %d)" % (i, j))
-        if self.bdr_kernel is None:
+        boundary = None
+        if self.bdr_kernel is not None:
+            bmats = self.bdr_kernel.element_matrices(i, j, loc)
+            require_finite_arrays(bmats, self.comm,
+                                  "boundary block (%d, %d)" % (i, j))
+            if not self._boundary_vanishes(bmats):
+                boundary = self._boundary_arrays(i, j, bmats)
+        if boundary is None:
             A = assemble_matrix(self.Vh[i], self.Vh[j], self.batches.groups,
                                 mats, self.nelem, test_ess=test_ess,
                                 diag_policy=diag_policy)
-            if finite is not None:
-                finite.check(self.comm, "block (%d, %d)" % (i, j))
-            return A
-        bmats = self.bdr_kernel.element_matrices(i, j, loc)
-        require_finite_arrays(bmats, self.comm,
-                              "boundary block (%d, %d)" % (i, j))
-        if assembly_backend() == "csr":
+        else:
             # The boundary entries go into the domain block's own slots, so one
             # matrix comes out with the elimination folded in (see
             # csrassemble.add_boundary_entries).
             A = assemble_matrix_csr(self.Vh[i], self.Vh[j], self.batches.groups,
                                     mats, self.nelem, test_ess=test_ess,
-                                    diag_policy=diag_policy,
-                                    boundary=self._boundary_arrays(i, j, bmats))
-            if finite is not None:
-                finite.check(self.comm, "block (%d, %d)" % (i, j))
-            return A
-        # The callback route: the two parts are summed *before* elimination, since
-        # eliminating each and then adding would leave 2.0 on the essential diagonal.
-        from ..common.linalg import ParAdd
+                                    diag_policy=diag_policy, boundary=boundary)
+        if finite is not None:
+            finite.check(self.comm, "block (%d, %d)" % (i, j))
+        return A
 
-        dom = assemble_matrix(self.Vh[i], self.Vh[j], self.batches.groups, mats,
-                              self.nelem)
-        bdr = assemble_boundary_matrix(self.Vh[i], self.Vh[j],
-                                       self.bdr_batches.groups, bmats)
-        A = ParAdd(dom, bdr)
-        del dom, bdr
-        return _eliminate(A, self.Vh[i], self.Vh[j], test_ess, None,
-                          diag_policy, self.Vh[i].fes is self.Vh[j].fes)
+    def _boundary_vanishes(self, bmats):
+        """Whether a boundary block is zero on every rank, as that of a boundary term
+        which does not depend on the block's variables (a prescribed flux, in the
+        Jacobian).  Adding its entries would change nothing and bring the assembled
+        values to the host on the way (:func:`~hippymfem.fem.csrassemble.add_boundary_entries`)."""
+        from ..fem.kernel import any_nonzero
+
+        return bool(self.comm.allreduce(int(not any_nonzero(bmats)), op=MPI.MIN))
 
     def _boundary_arrays(self, i, j, bmats):
         """``(test_tables, trial_tables, element_matrices)`` of block ``(i, j)``'s
@@ -1097,7 +1093,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     def _stream_shared_pass(self):
         """Whether the linearization point can be assembled a chunk at a time.
 
-        It needs the direct-CSR route, no interior-facet term, and a batch the
+        It needs no interior-facet term and a batch the
         device would split anyway: the condition under which a single block takes
         the fused scatter, since splitting has already given up bit-identity with
         an unsplit run.  Whether a batch splits is a per-rank fact (its element
@@ -1105,7 +1101,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         per-rank answer is reduced first and every rank takes the same branch.
         """
 
-        if assembly_backend() != "csr" or self.facet_kernel is not None:
+        if self.facet_kernel is not None:
             # A facet block is a second matrix that has to be added before the
             # essential rows go, and the streamed pass finishes each block with the
             # elimination already folded in.
@@ -1132,8 +1128,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             bmats = self.bdr_kernel.element_matrices_many(need, loc)
             for ij in need:
                 require_finite_arrays(bmats[ij], self.comm, "boundary block %s" % (ij,))
-                accs[ij] = add_boundary_entries(
-                    plans[ij], accs[ij], self._boundary_arrays(ij[0], ij[1], bmats[ij]))
+                if not self._boundary_vanishes(bmats[ij]):
+                    accs[ij] = add_boundary_entries(
+                        plans[ij], accs[ij], self._boundary_arrays(ij[0], ij[1], bmats[ij]))
         return {ij: finish_block(plans[ij], accs[ij]) for ij in need}
 
     def solveIncremental(self, out, rhs, is_adj, rel_tolerance=None):

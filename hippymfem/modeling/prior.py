@@ -50,7 +50,6 @@ from mpi4py import MPI
 import mfem.par as mfem
 
 from ..common.keepalive import KeepAlive
-from ..common.naming import SnakeCamel, sync_spellings
 from ..common.operators import Operator, Solver2Operator, init_vector_like
 from ..common.parvector import ParVector
 from ..common.random import parRandom
@@ -388,7 +387,7 @@ class _RinvM(Operator):
 
 
 # ------------------------------------------------------------------ base class
-class _Prior(SnakeCamel, KeepAlive):
+class _Prior(KeepAlive):
     """Shared prior behaviour: cost, gradient, trace, pointwise variance."""
 
     #: set by subclasses
@@ -603,7 +602,8 @@ class SqrtPrecisionPDE_Prior(_Prior):
                  quadrature_degree=None, systems_dim=None):
         self.Vh = as_space(Vh)
         self.comm = self.Vh.comm
-        self.M = assemble_native_matrix(self.Vh, [mfem.MassIntegrator()])
+        mass = mfem.VectorMassIntegrator() if self.Vh.vdim > 1 else mfem.MassIntegrator()
+        self.M = assemble_native_matrix(self.Vh, [mass])
         self.A = assemble_native_matrix(self.Vh, list(domain_integrators),
                                         list(bdr_integrators))
         self.keep(self.M, self.A)
@@ -1004,6 +1004,3 @@ class _DenseSolver(KeepAlive):
         if b.comm.rank == 0:
             x.array[:] = self.Adense @ b.array
         return 1
-
-
-sync_spellings(_Prior)

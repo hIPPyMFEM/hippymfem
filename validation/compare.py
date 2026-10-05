@@ -35,7 +35,7 @@ TOL = {
     "traces.prior": 1e-9,
     "traces.correction": 1e-3,
     "eigenvalues_leading": 1e-6,
-    "eigenvalues_tail": 1.0,       # informational: the two solvers differ there, see NOTES
+    "eigenvalues_tail": 1.0,       # informational: the two solvers differ there, see README.md
     "dense_eigenvalues_at_m0": 1e-9,
     "dense_eigenvalues": 1e-6,
     "clean_data": 1e-10,

@@ -47,6 +47,7 @@ import numpy as np
 
 from .. import _jaxconfig                         # noqa: F401
 from ..common.mpiutil import local_rank
+from ..config import env_choice
 
 # Device and precision defaults live in hippymfem._jaxconfig, which must be
 # imported before jax; see that module for why the default platform is the CPU.
@@ -81,10 +82,8 @@ jax.config.update("jax_enable_x64", True)
 #:     solve; ``"mixed"`` costs nearly the same and loses nothing.
 #:
 #: ``benchmarks/bench_precision.py`` measures the three.
-PRECISION = os.environ.get("HIPPYMFEM_PRECISION", "fp64").strip().lower()
 _PRECISIONS = ("fp64", "mixed", "fp32")
-if PRECISION not in _PRECISIONS:
-    raise ValueError("HIPPYMFEM_PRECISION must be one of %s, got %r" % (_PRECISIONS, PRECISION))
+PRECISION = env_choice("HIPPYMFEM_PRECISION", "fp64", _PRECISIONS)
 
 
 def matrix_precision():
@@ -151,11 +150,9 @@ _KERNELS = []
 #: to the fields' values and gradients (one tangent per such feature), skips the parts
 #: of that pointwise Hessian that are identically zero, and contracts the rest with the
 #: basis values and physical gradients; it is exact too, since the fields are linear in
-#: the dofs.  On a GPU it is the faster route from P2 up: a Jacobian 1.6x (Poisson, P2
-#: tetrahedra) to 4.4x (elasticity, Q2 hexahedra) faster on an L40S, a whole
-#: linearization point 1.2x to 1.7x.  On P1 the element route stays the faster (the
-#: quadrature route's Jacobian runs at 0.7x), and so it does on the host, except for
-#: vector-valued Jacobians (1.4x there).  ``auto`` times both once per kernel program,
+#: the dofs.  On a GPU it is the faster route from P2 up (a Jacobian 1.6 to 4.4 times
+#: faster on an L40S); on P1 the element route stays the faster, and so it does on the
+#: host, except for vector-valued Jacobians.  ``auto`` times both once per kernel program,
 #: column slot and device and keeps the faster (:data:`_ROUTES`), so every kernel built
 #: alike takes the same route in a run, while which one a run takes, and its round-off,
 #: can differ from run to run.  Spaces with a Piola map and interior facets always take
@@ -334,6 +331,16 @@ def to_host(x):
     return np.asarray(x)
 
 
+def any_nonzero(arrays):
+    """Whether any entry of any array is nonzero, checked where the data lives."""
+    for a in arrays:
+        if not a.size:
+            continue
+        if bool(np.any(a)) if isinstance(a, np.ndarray) else bool(jnp.any(a != 0)):
+            return True
+    return False
+
+
 def all_finite(arrays):
     """Whether every entry of every array is finite, checked where the data lives.
 
@@ -427,28 +434,6 @@ GPU_MEM_RESERVE = float(os.environ.get("HIPPYMFEM_GPU_MEM_RESERVE", "0") or 0.0)
 #: device path makes.  ``0`` restores the unplanned host behaviour.  Set
 #: ``HIPPYMFEM_HOST_MEM_FRACTION``.
 HOST_MEM_FRACTION = float(os.environ.get("HIPPYMFEM_HOST_MEM_FRACTION", "0.5") or 0.0)
-
-#: How a split batch's chunk is sized.  ``estimate``, the default, is the per-tangent
-#: estimate of :meth:`GroupKernel._plan`.  ``xla`` asks the compiled program instead:
-#: XLA's memory analysis of the pass at a probe chunk gives the argument, output and
-#: scratch bytes it needs, which are linear in the chunk, and the chunk is sized to
-#: :data:`CHUNK_SHARE` of the free budget from that, never below the estimate.  The
-#: estimate is generous (664 kB an element for a P2 hexahedral Hessian pass, where XLA
-#: reports 143), so ``xla`` runs far fewer chunks, and fewer chunks buy little: at a
-#: million P2 hexahedra on one L40S, hypre on the card, it took the Jacobian pass from 125
-#: chunks to 15 and a Hessian pass from 86 to 5, a warm linearization point from 6.9 s to
-#: 6.5, the cold one from 13.2 s to 13.6, and JAX's peak from 6.1 GiB to 14.4 (the card's
-#: from 24.0 GB to 32.2).  A launch costs about 5 ms there; the element work is the cost.
-#: So ``xla`` is for a card with memory to spare.  Set ``HIPPYMFEM_CHUNK_PLAN``.
-CHUNK_PLAN = os.environ.get("HIPPYMFEM_CHUNK_PLAN", "estimate").strip().lower()
-#: Share of the free budget an analysed chunk may take.  The rest covers what the
-#: analysis does not see: the allocator's fragmentation and the scatter's own buffers.
-#: Set ``HIPPYMFEM_CHUNK_SHARE``.
-CHUNK_SHARE = float(os.environ.get("HIPPYMFEM_CHUNK_SHARE", "0.6") or 0.6)
-#: Elements in the probe chunk the analysis is compiled at.  The per-element cost is
-#: constant from about 2048 elements up; the probe executable is compiled for that
-#: shape only and is not run.
-CHUNK_PROBE = int(os.environ.get("HIPPYMFEM_CHUNK_PROBE", "2048") or 2048)
 
 _GPURT = None
 
@@ -610,34 +595,6 @@ def _fits(exc, n):
         return max(1, n // 2)
 
 
-def _analysed_per_element(raws, args, axes, probe):
-    """``(need, output)``: device bytes per element of a pass, from XLA's analysis.
-
-    ``raws`` are the jitted functions one chunk runs in turn (a Hessian pass over
-    several columns runs one slot pass per column and holds every output together),
-    so ``need`` is the largest scratch-plus-arguments of any of them plus the sum of
-    their outputs, and ``output`` is that sum alone.  ``None`` wherever the backend or
-    the program does not say, and the caller then keeps its estimate.
-    """
-    temps, outs = [], 0
-    try:
-        sub = _chunk_args(args, axes, 0, probe)
-        for raw in raws:
-            lower = getattr(raw, "lower", None)
-            if lower is None:
-                return None
-            ma = lower(*sub).compile().memory_analysis()
-            if ma is None:
-                return None
-            temps.append(int(ma.temp_size_in_bytes) + int(ma.argument_size_in_bytes))
-            outs += int(ma.output_size_in_bytes)
-    except Exception:                                            # noqa: BLE001
-        return None
-    if not temps:
-        return None
-    return (max(temps) + outs) / float(probe), outs / float(probe)
-
-
 #: Elements per step of an element kernel on the host.  XLA runs a ``vmap`` over the
 #: whole batch as one program whose intermediates have the batch's size, and on a CPU
 #: core those leave the cache from about 1e4 elements on: a P1 tetrahedron's Jacobian
@@ -727,8 +684,6 @@ def _mapped_kernel(f, in_axes):
             fn = stepped[batch] = jax.jit(functools.partial(stepped_fn, batch))
         return fn(*args)
 
-    # the chunk planner's XLA analysis (a GPU's) compiles the whole-batch program
-    call.lower = whole.lower
     return call
 
 
@@ -1026,7 +981,7 @@ class GroupKernel:
             key = (d, weight)
             n = self._chunk.get(key) or ELEMENT_CHUNK
             if not n:
-                n = self._planned(fn, args, axes, d, weight, ne, glued=True)
+                n = self._planned(fn, d, weight, ne, glued=True)
             n = min(n, ne)
             while True:
                 parts = None
@@ -1111,7 +1066,7 @@ class GroupKernel:
         key = (d, weight)
         n = self._chunk.get(key) or ELEMENT_CHUNK
         if not n:
-            n = self._planned(fn, args, axes, d, weight, ne)
+            n = self._planned(fn, d, weight, ne)
         n = max(1, min(n, ne))
         a = 0
         while a < ne:
@@ -1121,9 +1076,8 @@ class GroupKernel:
                 # finiteness, which waits for it anyway)
                 out = jax.block_until_ready(raw(*_chunk_slices(args, axes, a, bnd, raw)))
             except Exception as exc:
-                # the streaming path had no retry: a chunk that does not fit is
-                # shrunk from what the allocator asked for, as _chunked does, and the
-                # same stretch is tried again
+                # a chunk that does not fit is shrunk from what the allocator asked
+                # for, as _chunked does, and the same stretch is tried again
                 if n <= 1 or not _is_oom(exc):
                     raise
                 _release_for_retry()
@@ -1136,35 +1090,19 @@ class GroupKernel:
             yield a, bnd, out
             a = bnd
 
-    def _planned(self, fn, args, axes, d, weight, ne, glued=False):
-        """The chunk for a pass that has no size an out-of-memory error has proven:
-        the estimate, grown by XLA's analysis of the compiled pass where that says more
-        fits (:data:`CHUNK_PLAN`).
+    def _planned(self, fn, d, weight, ne, glued=False):
+        """The chunk for a pass that has no size an out-of-memory error has proven: the
+        estimate of :meth:`_plan`.
 
-        The size is remembered for this pass alone.  Keyed by the weight, as the
-        estimate is, a gradient pass that fits whole would hand its answer to a Hessian
-        pass of the same weight, and to :meth:`will_chunk`, which would then send an
-        assembly down the glued route with a batch that must be split.  That route,
-        ``glued``, keeps every chunk's output until they are joined and copies them
-        once more to join them, so a split there sets twice the batch's output aside
-        before sizing the chunk; the streamed route scatters each output as it comes.
+        The size is remembered for this pass and its route alone (``glued`` keeps every
+        chunk's output until they are joined; the streamed route scatters each as it
+        comes), and announced once.
         """
         pkey = (d, "plan", getattr(fn, "_raw", fn), bool(glued))
         n = self._chunk.get(pkey)
         if n is not None:
             return n
         n = self._plan(ne, d, weight, announce=False, remember=False)
-        if n < ne and CHUNK_PLAN == "xla":
-            raws = getattr(fn, "_slot_raws", None) or [getattr(fn, "_raw", fn)]
-            probe = max(1, min(CHUNK_PROBE, n))
-            need = _analysed_per_element(raws, args, axes, probe)
-            free = _free_budget(d)
-            if need and free:
-                per_elem, out_per_elem = need
-                room = CHUNK_SHARE * free
-                if glued and per_elem * ne > room:
-                    room -= 2 * out_per_elem * ne
-                n = max(n, min(ne, int(room / per_elem)))
         self._chunk[pkey] = n
         self._announce(ne, d, n, weight)
         return n
@@ -1615,8 +1553,6 @@ class GroupKernel:
         def raw(*args):
             return pick(a._raw, b._raw, args)[1]
 
-        # the chunk planner's XLA analysis sizes the chunk by the element route's program
-        raw.lower = getattr(a._raw, "lower", None)
         call._raw = raw
         call._weight = a._weight
         return call
@@ -1635,7 +1571,6 @@ class GroupKernel:
             def call(*args):
                 return slot(*args)[i]
             call._raw = lambda *args: slot._raw(*args)[i]
-            call._slot_raws = [slot._raw]
             call._weight = slot._weight
             self._cache[key] = call
         return self._cache[key]
@@ -1664,7 +1599,6 @@ class GroupKernel:
             def call(*args):
                 return stack([sl(*args) for sl in slots])
             call._raw = lambda *args: stack([sl._raw(*args) for sl in slots])
-            call._slot_raws = [sl._raw for sl in slots]
             call._weight = max(1.0, self.nslots * sum(self.nd[c] for c in cols)
                                / max(sum(self.nd), 1))
             self._cache[key] = call

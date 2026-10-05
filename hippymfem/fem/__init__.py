@@ -45,11 +45,6 @@ from .facets import (
     jump,
     jump_grad,
 )
-from .integrators import (
-    CachedMatrixIntegrator,
-    CachedVectorIntegrator,
-    ElementLookup,
-)
 from .io import (
     ParaViewWriter,
     load_vector,
@@ -64,8 +59,6 @@ from .assemble import (
     assemble_native_matrix,
     assemble_scalar,
     assemble_vector,
-    assembly_backend,
-    set_assembly_backend,
 )
 from .csrassemble import (
     ScatterPattern,
@@ -80,10 +73,9 @@ from .csrassemble import (
 __all__ = [
     "FunctionSpace", "as_space", "ElementGroup", "MeshBatches", "SpaceTables",
     "default_quadrature_degree", "get_batches", "DirichletBC", "BCSet",
-    "as_bcset", "CachedMatrixIntegrator", "CachedVectorIntegrator",
-    "ElementLookup", "assemble_matrix", "assemble_vector", "assemble_scalar",
+    "as_bcset", "assemble_matrix", "assemble_vector", "assemble_scalar",
     "assemble_native_matrix", "own", "group_tables",
-    "assembly_backend", "set_assembly_backend", "ScatterPattern", "get_pattern",
+    "ScatterPattern", "get_pattern",
     "assemble_matrix_csr", "assemble_vector_csr", "clear_pattern_cache",
     "VectorPattern", "get_vector_pattern",
     "BoundaryBatches", "BoundaryGroup", "BoundarySpaceTables",
@@ -97,13 +89,6 @@ __all__ = [
     "write_paraview", "ParaViewWriter", "write_glvis", "save_vector",
     "load_vector", "write_point_csv",
 ]
-
-
-def _lazy_kernel():
-    """Import the JAX-dependent kernel layer only when it is first needed."""
-    from . import kernel
-
-    return kernel
 
 
 def __getattr__(name):

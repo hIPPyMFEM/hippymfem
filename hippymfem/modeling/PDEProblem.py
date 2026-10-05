@@ -16,13 +16,12 @@ The signatures match hIPPYlib's ``PDEProblem`` so that the algorithms, the
 model, and user driver scripts port across with no changes.
 """
 
-from ..common.naming import SnakeCamel, sync_spellings
 from ..algorithms.linSolvers import KrylovSolver, KrylovSolver_ParameterList, LUSolver
 from .variables import ADJOINT, PARAMETER, STATE, Variables
 
 
 
-class PDEProblem(SnakeCamel):
+class PDEProblem(object):
     """Forward PDE, its adjoint, and the derivative blocks the Hessian needs.
 
     Besides the interface, this carries what every concrete problem needs the same
@@ -238,6 +237,3 @@ class PDEProblem(SnakeCamel):
                     self.apply_ijk(i, j, k, x, d[j], d[k], work)
                     out.axpy(float(w), work)
         return out
-
-
-sync_spellings(PDEProblem)

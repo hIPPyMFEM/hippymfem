@@ -67,7 +67,7 @@ landing about 1e-8 apart in the parameter. That is why the harness also evaluate
 the Hessian spectrum at a **fixed analytic point**, where neither optimizer
 enters, and gets 3.7e-13.
 
-The full report is in `out/report_nx12_np1.txt`.
+`run_validation.sh` writes the full report to `validation/out/`.
 
 ### The one loose comparison, and why
 

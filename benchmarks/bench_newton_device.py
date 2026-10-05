@@ -40,7 +40,6 @@ import mfem.par as mfem
 import jax.numpy as jnp
 
 from hippymfem import _jaxconfig                                     # noqa: E402
-from hippymfem.fem import assemble as asm                            # noqa: E402
 from hippymfem.fem import kernel as kernel_mod                       # noqa: E402
 from hippymfem.modeling.variables import PARAMETER, STATE, ADJOINT   # noqa: E402
 
@@ -105,7 +104,6 @@ def main():
                     "(default: that of the forward solve, 1e-12; 1e-6 is enough with --cg-reorth)")
     ap.add_argument("--gn-iter", type=int, default=0)
     ap.add_argument("--ntargets", type=int, default=200)
-    ap.add_argument("--route", default=None, help="assembly backend: csr or integrator")
     ap.add_argument("--device", default=("cuda" if hm.config.hypre_device else "cpu"), help="mfem.Device kind; 'cpu' keeps hypre on the host")
     ap.add_argument("--out", default=None)
     ap.add_argument("--symmetric-jacobian", action="store_true",
@@ -129,8 +127,6 @@ def main():
     # what MFEM actually runs on: "cuda" or "gpu" means the backend the build has (hip on AMD)
     from hippymfem.common.mfemconfig import mfem_gpu_backend
     mfem_dev = args.device if args.device in ("cpu", None) else (mfem_gpu_backend() or args.device)
-    if args.route:
-        asm.set_assembly_backend(args.route)
     N, ORDER = args.n, args.order
     t_start = time.perf_counter()
     serial = mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON)
@@ -152,8 +148,8 @@ def main():
     Vh = [Vu, Vm, Vu]
     say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks, %d elem/rank"
         % (N, ORDER, Vu.GlobalTrueVSize(), Vm.GlobalTrueVSize(), COMM.size, pmesh.GetNE()))
-    say("  kernels on %s (%s), MFEM on %s, assembly %s, parmat %s, pin %s%s"
-        % (kernel_mod.device(), gpu_name(), mfem_dev, asm.assembly_backend(),
+    say("  kernels on %s (%s), MFEM on %s, parmat %s, pin %s%s"
+        % (kernel_mod.device(), gpu_name(), mfem_dev,
            os.environ.get("HIPPYMFEM_PARMAT", "auto"),
            "rank->%s" % _jaxconfig.PINNED_DEVICE if _jaxconfig.PINNED_DEVICE is not None
            else (_jaxconfig.PIN_SKIPPED or "launcher/single device"),
@@ -275,7 +271,7 @@ def main():
            solver.final_grad_norm, err, solver.termination_reasons[solver.reason]))
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(), "mfem_device": mfem_dev,
-           "backend": asm.assembly_backend(), "symmetric_jacobian": bool(args.symmetric_jacobian),
+           "symmetric_jacobian": bool(args.symmetric_jacobian),
            "release_linearization": bool(args.release_linearization), "parmat": os.environ.get("HIPPYMFEM_PARMAT", "auto"),
            "matrix_free": bool(args.matrix_free),
            "t_fwd": t_fwd, "t_adj": t_adj, "t_grad": t_grad, "t_hess_blocks": t_hess,

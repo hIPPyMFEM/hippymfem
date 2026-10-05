@@ -224,9 +224,3 @@ def check_g(A, B, U, d):
     err_AV = np.linalg.norm(V - np.diag(d), "fro") / max(np.linalg.norm(d), 1e-300)
     return err, err_Bortho, err_AV
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-single_pass = singlePass
-double_pass = doublePass
-single_pass_g = singlePassG
-double_pass_g = doublePassG

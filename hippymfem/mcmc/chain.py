@@ -13,15 +13,9 @@
 """Running an MCMC chain."""
 
 from ..common.parameterList import ParameterList
+from ..forward_uq.qoi import NullQoi
 from ..modeling.timeDependentVector import TimeDependentVector
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
-
-
-class NullQoi(object):
-    """A quantity of interest that is always zero."""
-
-    def eval(self, x):
-        return 0.0
 
 
 class SampleStruct:

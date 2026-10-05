@@ -99,14 +99,6 @@ hippymfem.fem.assemble
    :undoc-members:
    :show-inheritance:
 
-hippymfem.fem.integrators
--------------------------
-
-.. automodule:: hippymfem.fem.integrators
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 hippymfem.fem.coefficients
 --------------------------
 

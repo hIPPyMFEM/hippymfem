@@ -20,7 +20,7 @@ Run the same problem at 1, 2 and 4 devices and compare::
     for r in 1 2 4; do
       HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 mpirun -n $r tools/mpirun_pinned.sh \
         python benchmarks/bench_scaling.py --n 64 --device cuda \
-        --out results/local/scaling_l40s_n64_r$r.json
+        --out results/scaling_n64_r$r.json
     done
 
 The problem is that of ``bench_newton_device.py``: same mesh, PDE, prior, observations

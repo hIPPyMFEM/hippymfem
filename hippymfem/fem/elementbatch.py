@@ -46,7 +46,7 @@ KEEP_GEOMETRIC_FACTORS = os.environ.get(
 #: MFEM sizes the vectors of ``GetGeometricFactors`` with an ``int``: the Jacobians
 #: are ``nq * sdim * dim * NE``, which passes 2^31 at four million hexahedra and 64
 #: quadrature points, and the kernel then reads out of bounds (an illegal memory
-#: access, not an error: job 5856681, 400^3 on 16 H100).  Above the limit the
+#: access, not an error).  Above the limit the
 #: geometry is built here instead, in element slices, from the mesh nodes.  That
 #: path also keeps the geometry off the card, where MFEM's costs ``nq*sdim*dim*NE``
 #: doubles for something read once.

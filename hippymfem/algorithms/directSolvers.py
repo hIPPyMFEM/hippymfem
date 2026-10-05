@@ -182,7 +182,7 @@ class ReplicatedLUSolver(_Base):
             full = b.gather_to_zero()
             sol = ok = None
             if self.comm.rank == 0:
-                sol = self._lu.solve(full, trans=trans)
+                sol = self._lu.solve(full, trans=trans)      # serial: SuperLU on rank 0
                 ok = bool(np.isfinite(sol).all())
             # one verdict for every rank, so that an error is raised on all of them
             ok = self.comm.bcast(ok, root=0)

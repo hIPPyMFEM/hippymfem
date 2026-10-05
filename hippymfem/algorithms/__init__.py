@@ -69,8 +69,3 @@ __all__ = [
     "ReplicatedLUSolver", "PETScLUSolver", "PETScKrylovSolver",
     "gather_matrix", "petsc_available", "preload_petsc",
 ]
-
-# snake_case spellings of the module-level functions (hippymfem.common.naming)
-from .randomizedEigensolver import single_pass, double_pass, single_pass_g, double_pass_g  # noqa: E402
-from .randomizedSVD import accuracy_enhanced_svd, single_pass_svd  # noqa: E402
-__all__ += ["single_pass", "double_pass", "single_pass_g", "double_pass_g", "accuracy_enhanced_svd", "single_pass_svd"]

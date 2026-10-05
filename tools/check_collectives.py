@@ -15,6 +15,9 @@ counts), and the collectives include the non-obvious ones: ``Model.cost`` reduce
 the misfit and solves with the prior, ``PointwiseObservation.mult`` applies the
 prolongation, and every ``KrylovSolver.solve`` is collective.
 
+A call that only looks collective (a serial solve on rank 0) is marked with a
+``# serial`` comment on its line.
+
 Usage::
 
     python tools/check_collectives.py [paths...]      # default: the whole tree
@@ -41,7 +44,10 @@ SAFE = re.compile(
     r"|\.items\(|\.keys\(|\.values\(|\[[\"']"
 )
 
-DEFAULT_PATHS = ("hippymfem", "applications", "validation", "tools")
+#: a line that carries this comment is a serial call on purpose
+MARK = "# serial"
+
+DEFAULT_PATHS = ("hippymfem", "applications", "benchmarks", "validation", "tools")
 
 
 def scan_file(path):
@@ -61,7 +67,7 @@ def scan_file(path):
             if line.strip() and (len(line) - len(line.lstrip())) <= indent:
                 break
             code = line.split("#")[0]
-            if COLLECTIVE.search(code) and not SAFE.search(code):
+            if COLLECTIVE.search(code) and not SAFE.search(code) and MARK not in line:
                 findings.append((j + 1, line.strip()))
             j += 1
         i = j

@@ -361,11 +361,10 @@ def clear_boundary_cache():
 # ----------------------------------------------------------------- assembly
 def assemble_boundary_matrix(test_space, trial_space, groups, element_matrices,
                              test_ess=None, trial_ess=None, diag_policy="one"):
-    """Assemble a boundary block, always through the direct-CSR path.
+    """Assemble a boundary block.
 
-    The callback route cannot serve these arrays: its integrators are domain
-    integrators, and the element arrays here are indexed by boundary element but
-    carry the adjacent *volume* element's dofs.
+    The element arrays are indexed by boundary element but carry the adjacent
+    *volume* element's dofs.
     """
 
     return assemble_matrix_csr(test_space, trial_space, groups, element_matrices,

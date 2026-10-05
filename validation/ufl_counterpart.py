@@ -3,8 +3,8 @@
 # This file is part of hIPPyMFEM, free software under the GNU General Public
 # License version 2.0 dated June 1991 (GPL-2.0-only); see the files LICENSE and
 # COPYRIGHT.
-"""The UFL side of E1: which of the expressiveness cases a form language can write, at
-what cost, and with what derivatives.
+"""Which of the expressiveness cases a form language can write, at what cost, and with
+what derivatives.
 
 The cases are those of ``benchmarks/bench_vs_hippylibx.py`` (the same weights, tables
 and constants), written in UFL where UFL can write them: the MLP as sixteen ``tanh``

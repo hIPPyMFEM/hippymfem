@@ -73,15 +73,6 @@ def main():
     mfem.Hypre.Init()
     if RANK == 0:
         dev.Print()
-    if args.gpu:
-        # The direct-CSR route builds the matrix from numpy arrays, which a
-        # device-configured hypre reads as device pointers.  MFEM's own assembly is
-        # the route that survives that; it is slower, which is the price of having
-        # the solves on the device at all.
-        from hippymfem.fem import assemble as _asm
-
-        _asm.set_assembly_backend("integrator")
-
     cfg = hp.mfem_config()
     if args.gpu and not cfg.get("MFEM_USE_CUDA"):
         say("  this PyMFEM has no CUDA (MFEM %s); nothing to measure."

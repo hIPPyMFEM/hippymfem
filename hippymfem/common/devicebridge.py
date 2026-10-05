@@ -5,11 +5,11 @@
 """Copies between JAX arrays and MFEM or hypre memory that stay on the GPU.
 
 The element kernels are JAX programs and the matrices and vectors belong to MFEM and
-hypre.  When both live on the same GPU, what one produces for the other used to travel
-through CPU memory: an assembled matrix was copied to the host as a numpy array, handed
-to MFEM there, and uploaded again when hypre first used it.  For the Jacobian of 32,768
-quadratic hexahedra on an H100 that passage was 61 of the 71 ms of an assembly
-(``benchmarks/DESIGN_NOTES.md``, section 11).
+hypre.  When both live on the same GPU, what one produces for the other should not
+travel through CPU memory: copied to the host as a numpy array, handed to MFEM there
+and uploaded again when hypre first uses it, an assembled matrix spends most of its
+assembly time in that passage (61 of 71 ms for the Jacobian of 32,768 quadratic
+hexahedra on an H100).
 
 Nothing in JAX writes into memory it does not own, and nothing in PyMFEM builds a matrix
 from a device array, so the two are joined one level down: a JAX array gives the address
@@ -22,7 +22,7 @@ allocator (:mod:`.mfemconfig`).
 The bridge is used only when :func:`available` says so: MFEM configured on a GPU, hypre
 on it, the element kernels on the same card, the copy function found, and a first copy
 of eight numbers read back correctly.  ``HIPPYMFEM_DEVICE_BRIDGE=0`` turns it off, and
-everything then takes the route through the host as before.
+everything then takes the route through the host.
 """
 
 import ctypes

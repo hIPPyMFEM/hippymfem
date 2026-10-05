@@ -786,6 +786,61 @@ def test_bfgs():
               % (results["identity"], results["prior"]))
 
 
+def test_steepest_descent():
+    """Steepest descent in the prior's metric on a quadratic cost, against the minimizer
+    that one dense solve gives."""
+    from hippymfem.common.linalg import operator_to_dense
+
+    if RANK == 0:
+        print("SteepestDescent")
+    # -lap u = m with u = 0 on the boundary and a few noisy point values: linear in m
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(6, 6, mfem.Element.TRIANGLE))
+    Vu = hm.FunctionSpace.H1(pmesh, 1)
+    Vm = hm.FunctionSpace.H1(pmesh, 1)
+    bc = hm.DirichletBC(Vu, 0.0, bdr_attributes="all")
+    pde = hm.PDEVariationalProblem([Vu, Vm, Vu], lambda u, m, p, x: hm.inner(u.grad, p.grad) - m.val * p.val,
+                                   bc, bc.homogeneous(), is_fwd_linear=True)
+    for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+        if NP == 1:
+            setattr(pde, a, hm.LUSolver(COMM))
+        else:
+            ks = hm.KrylovSolver(COMM, "cg", "amg")
+            ks.parameters["rel_tolerance"] = 1e-14
+            setattr(pde, a, ks)
+    prior = hm.BiLaplacianPrior(Vm, 1.0, 4.0, solver_type="lu" if NP == 1 else "krylov")
+    rng = np.random.default_rng(9)
+    B = hm.assemblePointwiseObservation(Vu, rng.uniform(0.15, 0.85, size=(8, 2)))
+    noise_std = 0.02
+    misfit = hm.DiscreteStateObservation(B, B.scatter(0.02 * rng.normal(size=8)), noise_std ** 2)
+    model = hm.Model(pde, prior, misfit)
+
+    # the minimizer: one Newton step from the prior mean with the dense Hessian
+    n = Vm.GlobalTrueVSize()
+    x0 = [model.generate_vector(STATE), prior.mean.copy(), model.generate_vector(ADJOINT)]
+    model.solveFwd(x0[STATE], x0)
+    model.solveAdj(x0[ADJOINT], x0)
+    g = Vm.vector()
+    model.evalGradientParameter(x0, g)
+    model.setPointForHessianEvaluations(x0, gauss_newton_approx=True)
+    H = operator_to_dense(hm.ReducedHessian(model, misfit_only=False), n, COMM)
+    full = lambda v: np.concatenate(COMM.allgather(v.array))
+    mstar = full(prior.mean) - np.linalg.solve(0.5 * (H + H.T), full(g))
+
+    # the default tolerance, 1e-6: the cost is flat at its minimum, and below about
+    # 1e-8 a step no longer registers as a decrease
+    params = hm.SteepestDescent_ParameterList()
+    params["max_iter"] = 4000
+    params["print_level"] = -1
+    seen = []
+    solver = hm.SteepestDescent(model, params, callback=lambda it, x: seen.append(it))
+    x = solver.solve([None, prior.mean.copy(), None])
+    check("steepest descent converged", solver.converged and solver.reason == 1,
+          "(%s, %d iterations)" % (solver.termination_reasons[solver.reason], solver.it))
+    e = float(np.abs(full(x[PARAMETER]) - mstar).max() / np.abs(mstar).max())
+    check("to the minimizer of the quadratic", e < 1e-4, "(rel %.2e)" % e)
+    check("the callback saw every iteration", seen == list(range(1, solver.it + 1)))
+
+
 def test_laplace_approximation():
     if RANK == 0:
         print("Laplace approximation")
@@ -939,6 +994,7 @@ if __name__ == "__main__":
     test_newton_cg_reorthogonalized()
     test_bfgs_operator()
     test_bfgs()
+    test_steepest_descent()
     test_map_recovers_smooth_truth()
     test_laplace_approximation()
     test_cg_sampler()

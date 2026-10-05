@@ -31,7 +31,6 @@ for a small sample (see :mod:`.varianceReductionMC`).
 
 import numpy as np
 
-from ..common.naming import sync_spellings
 from ..algorithms.randomizedEigensolver import doublePassG
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
 
@@ -128,5 +127,3 @@ class TaylorApproximationQoi:
             return q + 0.5 * self.H.inner(dm, dm)
         raise ValueError("order must be 1 or 2")
 
-
-sync_spellings(TaylorApproximationQoi)

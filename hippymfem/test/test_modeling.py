@@ -283,6 +283,238 @@ def test_pointwise_observation():
     check("off-mesh target is rejected", raised)
 
 
+def test_vector_prior():
+    """A Matern prior on a vector space: the mass matrix against an integral, the precision
+    against the scalar prior's on each component."""
+    if RANK == 0:
+        print("prior: VectorBiLaplacianPrior")
+    pmesh = mesh2d(8)
+    V1 = hm.FunctionSpace.H1(pmesh, 1)
+    V2 = hm.FunctionSpace.H1(pmesh, 1, vdim=2)
+    gamma, delta = 0.4, 1.7
+    kind = "lu" if NP == 1 else "krylov"
+    scalar = hm.BiLaplacianPrior(V1, gamma, delta, robin_bc=True, solver_type=kind)
+    prior = hm.VectorBiLaplacianPrior(V2, [gamma, gamma], [delta, delta], robin_bc=True,
+                                      solver_type=kind)
+
+    f0 = lambda x: x[0]
+    f1 = lambda x: 1.0 + x[1]
+    zero = lambda x: 0.0 * x[0]
+    v = V2.project(lambda x: np.array([f0(x), f1(x)]))
+    v0 = V2.project(lambda x: np.array([f0(x), zero(x)]))
+    v1 = V2.project(lambda x: np.array([zero(x), f1(x)]))
+    a, b = V1.project(f0), V1.project(f1)
+
+    # both components are in the space, so v^T M v is the integral of x^2 + (1 + y)^2
+    Mv = V2.vector()
+    prior.M.Mult(v.hypre, Mv.hypre)
+    got = Mv.inner(v)
+    check("v^T M v is the integral of |v|^2", abs(got - 8.0 / 3.0) < 1e-12, "(%.12f)" % got)
+
+    Rv, Ra, Rb = V2.vector(), V1.vector(), V1.vector()
+    prior.R.mult(v, Rv)
+    scalar.R.mult(a, Ra)
+    scalar.R.mult(b, Rb)
+    got, want = Rv.inner(v), Ra.inner(a) + Rb.inner(b)
+    check("v^T R v is the scalar prior's on each component", abs(got - want) <= 1e-8 * abs(want),
+          "(%.10e vs %.10e)" % (got, want))
+    prior.R.mult(v0, Rv)
+    cross = Rv.inner(v1)
+    check("the components are independent", abs(cross) <= 1e-8 * abs(want), "(%.2e)" % cross)
+
+    prior.R.mult(v, Rv)
+    back = V2.vector()
+    prior.Rsolver.solve(back, Rv)
+    e = back.axpy(-1.0, v).norm("l2") / v.norm("l2")
+    check("Rsolver inverts R", e < 1e-8, "(%.2e)" % e)
+
+    # the factor the samples are drawn with
+    hm.parRandom.set_seed(11)
+    x = V2.vector()
+    hm.parRandom.normal(1.0, x)
+    noise = prior.sqrtM.noise_vector()
+    prior.sqrtM.multTranspose(x, noise)
+    y = V2.vector()
+    prior.sqrtM.mult(noise, y)
+    prior.M.Mult(x.hypre, Mv.hypre)
+    e = y.axpy(-1.0, Mv).norm("l2") / Mv.norm("l2")
+    check("sqrtM sqrtM^T == M on the vector space", e < 1e-12, "(%.2e)" % e)
+    noise = prior.noise_vector()
+    prior.sample_noise(1.0, noise)
+    prior.sample(noise, x)
+    check("a sample is finite and not zero", math.isfinite(x.norm("l2")) and x.norm("l2") > 0.0)
+
+    refused = False
+    try:
+        hm.VectorBiLaplacianPrior(V2, [gamma, 2.0 * gamma], [delta, delta])
+    except NotImplementedError:
+        refused = True
+    check("component-dependent coefficients are refused", refused)
+
+
+def test_mollified_prior():
+    """The mollified prior's operator and mean against the same forms assembled by MFEM."""
+    if RANK == 0:
+        print("prior: MollifiedBiLaplacianPrior")
+    pmesh = mesh2d(20)
+    V = hm.FunctionSpace.H1(pmesh, 1)
+    gamma, delta, pen = 0.01, 2.0, 10.0          # a correlation length of 0.07
+    locs = np.array([[0.3, 0.4], [0.7, 0.6]])
+    truth = lambda x: 1.0 + 0.5 * x[0]
+    mtrue = V.project(truth)
+    prior = hm.MollifiedBiLaplacianPrior(V, gamma, delta, locs, mtrue, pen=pen,
+                                         solver_type="lu" if NP == 1 else "krylov")
+
+    h2 = gamma / delta
+    moll = V.project(lambda x: sum(math.exp(-0.5 * ((x[0] - c[0]) ** 2 + (x[1] - c[1]) ** 2) / h2)
+                                   for c in locs))
+    gf = V.to_gridfunction(moll)
+    cg, cd = mfem.ConstantCoefficient(gamma), mfem.ConstantCoefficient(delta)
+    cp, cm = mfem.ConstantCoefficient(pen * delta), mfem.GridFunctionCoefficient(gf)
+    cw = mfem.ProductCoefficient(cp, cm)
+    a = mfem.ParBilinearForm(V.fes)
+    a.AddDomainIntegrator(mfem.DiffusionIntegrator(cg))
+    a.AddDomainIntegrator(mfem.MassIntegrator(cd))
+    a.AddDomainIntegrator(mfem.MassIntegrator(cw))
+    a.Assemble()
+    a.Finalize()
+    Aref = a.ParallelAssemble()
+    w = mfem.ParBilinearForm(V.fes)
+    w.AddDomainIntegrator(mfem.MassIntegrator(cw))
+    w.Assemble()
+    w.Finalize()
+    Wref = w.ParallelAssemble()
+
+    hm.parRandom.set_seed(12)
+    x = V.vector()
+    hm.parRandom.normal(1.0, x)
+    y, yref = V.vector(), V.vector()
+    prior.A.Mult(x.hypre, y.hypre)
+    Aref.Mult(x.hypre, yref.hypre)
+    e = y.axpy(-1.0, yref).norm("l2") / yref.norm("l2")
+    check("the operator is gamma K + delta M + pen delta M_mollifier", e < 1e-12, "(%.2e)" % e)
+
+    rhs = V.vector()
+    Wref.Mult(mtrue.hypre, rhs.hypre)
+    Aref.Mult(prior.mean.hypre, y.hypre)
+    e = y.axpy(-1.0, rhs).norm("l2") / rhs.norm("l2")
+    check("the mean solves A mean = pen delta M_mollifier m_true", e < 1e-8, "(%.2e)" % e)
+
+    # pulled to m_true at the locations, left at zero several lengths from them
+    pts = np.vstack([locs, [[0.02, 0.98]]])
+    B = hm.assemblePointwiseObservation(V, pts)
+    obs = B.createVecLeft()
+    B.mult(prior.mean, obs)
+    at = B.gather(obs)
+    ratio = at[:2] / np.array([truth(c) for c in locs])
+    check("the mean is near m_true at the locations", bool(np.all((ratio > 0.6) & (ratio < 1.0))),
+          "(%.3f and %.3f of it)" % tuple(ratio))
+    check("and near zero away from them", abs(at[2]) < 0.02, "(%.4f)" % at[2])
+
+
+def test_multiplicative_noise():
+    """The multiplicative-noise misfit against its formula, its derivatives against differences."""
+    if RANK == 0:
+        print("misfit: multiplicative noise")
+    pmesh = mesh2d(8)
+    V = hm.FunctionSpace.H1(pmesh, 1)
+    rng = np.random.default_rng(3)
+    pts = rng.uniform(0.1, 0.9, size=(9, 2))
+    f = lambda x: 1.5 + x[0] + 0.5 * x[1]               # in the space, and positive
+    u = V.project(f)
+    Mpar = 3.0
+    misfit = hm.MultPointwiseStateObservation(V, pts, Mpar)
+    fac = 1.0 + 0.3 * np.cos(np.arange(len(pts)))        # d_t = fac_t u(x_t)
+    exact = np.array([f(t) for t in pts])
+    misfit.d.assign(misfit.B.scatter(fac * exact))
+
+    x = [u, None, None]
+    got, want = misfit.cost(x), Mpar * float(np.sum(np.log(exact) + fac))
+    check("the cost is M sum(log Bu + d / Bu)", abs(got - want) <= 1e-12 * abs(want),
+          "(%.12e vs %.12e)" % (got, want))
+
+    v = V.project(lambda x: math.sin(3.0 * x[0]) + x[1] ** 2)
+    g = V.vector()
+    misfit.grad(STATE, x, g)
+    eps = 1e-5
+    up, um = u.copy().axpy(eps, v), u.copy().axpy(-eps, v)
+    fd = (misfit.cost([up, None, None]) - misfit.cost([um, None, None])) / (2.0 * eps)
+    e = abs(fd - g.inner(v)) / abs(fd)
+    check("the gradient matches a central difference of the cost", e < 1e-7, "(%.2e)" % e)
+
+    misfit.setLinearizationPoint(x)
+    Hv = V.vector()
+    misfit.apply_ij(STATE, STATE, v, Hv)
+    gp, gm = V.vector(), V.vector()
+    misfit.grad(STATE, [up, None, None], gp)
+    misfit.grad(STATE, [um, None, None], gm)
+    gp.axpy(-1.0, gm).scale(1.0 / (2.0 * eps))
+    e = gp.copy().axpy(-1.0, Hv).norm("l2") / Hv.norm("l2")
+    check("the Hessian matches a central difference of the gradient", e < 1e-7, "(%.2e)" % e)
+    check("the parameter gradient is zero", misfit.grad(PARAMETER, x, V.vector()).norm("l2") == 0.0)
+
+    # a state that is not positive at some of the points: every rank has to raise
+    low = V.project(lambda x: x[0] - 0.5)
+    raised = False
+    try:
+        misfit.cost([low, None, None])
+    except FloatingPointError:
+        raised = True
+    check("a nonpositive observed state is reported", raised)
+
+
+def test_multi_state_misfit():
+    """A misfit over two experiments: the sum of the two, each written out."""
+    if RANK == 0:
+        print("misfit: several states")
+    pmesh = mesh2d(8)
+    V = hm.FunctionSpace.H1(pmesh, 1)
+    rng = np.random.default_rng(4)
+    pts = [rng.uniform(0.1, 0.9, size=(7, 2)), rng.uniform(0.1, 0.9, size=(5, 2))]
+    fs = [lambda x: 1.0 + x[0] - x[1], lambda x: 2.0 * x[0] + 0.5 * x[1]]
+    nv = [0.04, 0.25]
+    data = [rng.normal(size=7), rng.normal(size=5)]
+    us = [V.project(f) for f in fs]
+    parts = []
+    for k in range(2):
+        B = hm.assemblePointwiseObservation(V, pts[k])
+        parts.append(hm.DiscreteStateObservation(B, B.scatter(data[k]), nv[k]))
+    multi = hm.MultiStateMisfit([parts[0]])
+    multi.append(parts[1])
+
+    x = [us, None, None]
+    exact = [np.array([fs[k](t) for t in pts[k]]) for k in range(2)]
+    want = sum(0.5 / nv[k] * float(np.sum((exact[k] - data[k]) ** 2)) for k in range(2))
+    got = multi.cost(x)
+    check("the cost is the sum over the experiments", abs(got - want) <= 1e-12 * abs(want),
+          "(%.12e vs %.12e)" % (got, want))
+
+    dirs = [lambda x: 0.5 - x[0] + 2.0 * x[1], lambda x: x[0] - 3.0 * x[1]]    # in the space
+    vs = [V.project(d) for d in dirs]
+    vex = [np.array([dirs[k](t) for t in pts[k]]) for k in range(2)]
+    g = [V.vector(), V.vector()]
+    multi.grad(STATE, x, g)
+    H = [V.vector(), V.vector()]
+    multi.setLinearizationPoint(x)
+    multi.apply_ij(STATE, STATE, vs, H)
+    for k in range(2):
+        want = float(np.sum((exact[k] - data[k]) * vex[k])) / nv[k]
+        got = g[k].inner(vs[k])
+        check("experiment %d: the state gradient" % k, abs(got - want) <= 1e-11 * abs(want),
+              "(%.10e vs %.10e)" % (got, want))
+        want = float(np.sum(vex[k] ** 2)) / nv[k]
+        got = H[k].inner(vs[k])
+        check("experiment %d: the state Hessian" % k, abs(got - want) <= 1e-11 * abs(want),
+              "(%.10e vs %.10e)" % (got, want))
+    out = V.vector()
+    out.set(1.0)
+    multi.grad(PARAMETER, [us, V.vector(), None], out)
+    zero = out.norm("l2") == 0.0
+    out.set(1.0)
+    multi.apply_ij(PARAMETER, STATE, vs, out)
+    check("no dependence on the parameter", zero and out.norm("l2") == 0.0)
+
+
 # ------------------------------------------------------------ model + Hessian
 def build_inverse_problem(n=12, order=2, ntargets=40, seed=1):
     """The hIPPYlib subsurface-flow benchmark: -div(exp(m) grad u) = 0."""
@@ -771,6 +1003,10 @@ if __name__ == "__main__":
     test_gaussian_real_prior()
     test_prior_rank_invariance()
     test_pointwise_observation()
+    test_vector_prior()
+    test_mollified_prior()
+    test_multiplicative_noise()
+    test_multi_state_misfit()
     test_model_verify()
     test_model_verify_nonlinear_inhomogeneous_bc()
     test_third_dir()

@@ -65,7 +65,8 @@ _KERNEL_NAMES = ("QuadratureKernel", "BoundaryKernel", "GroupKernel", "Field",
 
 __all__ = (["__version__", "version_info", "config"]
            + list(_common_all) + list(_alg_all) + list(_fem_all)
-           + list(_mod_all) + list(_uq_all) + list(_mcmc_all)
+           + list(_mod_all) + list(_uq_all)
+           + [n for n in _mcmc_all if n not in _uq_all]
            + list(_JAX_NAMES))
 
 

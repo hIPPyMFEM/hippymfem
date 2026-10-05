@@ -703,11 +703,11 @@ def assemble_facet_matrix(test_space, groups, element_matrices, trial_space=None
     same = trial.fes is test.fes
     P, identity = _prolongation(test)
     if same:
-        return A if identity else _triple(A, None, P, test.comm, (test.fes,))
+        return A if identity else _triple(A, None, P, (test.fes,))
     Pr, ridentity = _prolongation(trial)
     if identity and ridentity:
         return A                       # two discontinuous spaces: ldofs are true dofs
-    return _triple(A, P, Pr, test.comm, (test.fes, trial.fes))
+    return _triple(A, P, Pr, (test.fes, trial.fes))
 
 
 def assemble_facet_vector(space, groups, element_vectors, tables=None, out=None):

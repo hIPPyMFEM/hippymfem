@@ -6,7 +6,7 @@
 """The geothermal inversion, end to end, with timings and records.
 
     HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 PYTHONPATH=<cuda pymfem> \\
-      mpirun -n 4 tools/mpirun_pinned.sh python -m applications.geothermal.run --n 64 --out results/local/geothermal_n64_r4.json
+      mpirun -n 4 tools/mpirun_pinned.sh python -m applications.geothermal.run --n 64 --out results/geothermal_n64.json
 
 Stages: synthetic truth and data, MAP by Newton-CG, Laplace approximation (doublePassG),
 posterior samples, Monte Carlo and randomized pointwise variance, traces, KL divergence,

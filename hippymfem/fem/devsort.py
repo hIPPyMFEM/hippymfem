@@ -30,9 +30,10 @@ import time
 
 import numpy as np
 
+from ..config import env_choice
 from . import kernel as kernel_mod
 
-MODE = os.environ.get("HIPPYMFEM_PATTERN_SORT", "auto").strip().lower()
+MODE = env_choice("HIPPYMFEM_PATTERN_SORT", "auto", ("auto", "host", "device"))
 MIN_DEVICE = int(os.environ.get("HIPPYMFEM_PATTERN_SORT_MIN", str(2 ** 22)) or 0)
 #: Keys per device sort; ``0``, the default, sizes it from the free device memory.
 #: Set ``HIPPYMFEM_PATTERN_SORT_CHUNK``.
@@ -40,13 +41,12 @@ CHUNK = int(os.environ.get("HIPPYMFEM_PATTERN_SORT_CHUNK", "0") or 0)
 MAX_CHUNK = 2 ** 28
 #: The largest chunk when the sort runs in JAX's arena (XLA's sort, which is the one
 #: used without CuPy).  JAX keeps what its arena has grown to, so a sort that takes
-#: more than the element kernels need later costs that memory for the rest of the run.
-#: Measured on an H100 with 2.1 million Q2 state dofs on one rank (191 million keys):
-#: one sort of the whole array, padded to 2^28 keys, left the arena at 16.9 GB and the
-#: card at 21.0 GB; chunks of 2^26 keys left them at 8.7 and 12.8 GB, which is what the
-#: kernels take, for 8 s more in the pattern build (the bucketing is host work) and the
-#: same forward solve.  CuPy's sort returns its memory and keeps :data:`MAX_CHUNK`, and
-#: the sort-free builder (numba) uses no device memory at all.
+#: more than the element kernels need later costs that memory for the rest of the run:
+#: with 2.1 million Q2 state dofs on one rank (191 million keys), one sort of the whole
+#: array left the arena at 16.9 GB, and chunks of 2^26 keys leave it at 8.7 GB, which is
+#: what the kernels take, for 8 s more in the pattern build.  CuPy's sort returns its
+#: memory and keeps :data:`MAX_CHUNK`, and the sort-free builder (numba) uses no device
+#: memory at all.
 MAX_CHUNK_ARENA = 2 ** 26
 PAD = 2 ** 22
 #: Device bytes per key at the peak of a sort (measured about 35, with margin).
@@ -115,7 +115,7 @@ def _padded_size(n, fixed=0):
 #: bitonic network, and on 100 M int64 keys on an L40S it measures 24 ns a key
 #: against CuPy's 9.2 (transfers included), which matters because a 256\ :sup:`3`
 #: linearization point sorts 1.5 billion of them.  Set ``HIPPYMFEM_PATTERN_SORT_KERNEL``.
-SORT_KERNEL = os.environ.get("HIPPYMFEM_PATTERN_SORT_KERNEL", "auto").strip().lower()
+SORT_KERNEL = env_choice("HIPPYMFEM_PATTERN_SORT_KERNEL", "auto", ("auto", "cupy", "xla"))
 _CUPY_OK = None
 
 

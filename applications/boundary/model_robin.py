@@ -5,8 +5,8 @@
 # COPYRIGHT.
 r"""Infer a log-conductivity field from boundary flux data, with a Robin condition.
 
-A demonstration of the two capabilities the AD route gained in the second pass:
-a **boundary density** and an **exact parallel solve**.  Infer :math:`m` in
+A demonstration of two capabilities of the AD route: a **boundary density** and an
+**exact parallel solve**.  Infer :math:`m` in
 
 .. math::
 
@@ -76,7 +76,7 @@ def main():
                     help="relative noise on the data")
     ap.add_argument("--nmodes", type=int, default=40,
                     help="eigenpairs for the Laplace approximation")
-    ap.add_argument("--outdir", default=None)
+    ap.add_argument("--out", "--outdir", dest="outdir", default=None)
     ap.add_argument("--iterative", action="store_true",
                     help="use Krylov+AMG instead of exact solves")
     args = ap.parse_args()

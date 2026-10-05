@@ -27,11 +27,10 @@ import numpy as np
 import mfem.par as mfem
 
 from .keepalive import KeepAlive
-from .naming import SnakeCamel, sync_spellings
 from .parvector import ParVector, host_readwrite, host_sync
 
 
-class Operator(SnakeCamel, KeepAlive):
+class Operator(KeepAlive):
     """Base class supplying ``inner`` and vector generation from ``mult``."""
 
     def mult(self, x, y):
@@ -68,9 +67,6 @@ class _Slot:
     """Sink used by ``generate_vector`` to capture what ``init_vector`` builds."""
 
     value = None
-
-    def __setattr__(self, name, v):
-        object.__setattr__(self, name, v)
 
 
 def make_vector(obj, dim=0):
@@ -405,6 +401,3 @@ def _matrix_comm(A):
     from mpi4py import MPI
 
     return MPI.COMM_WORLD
-
-
-sync_spellings(Operator)

@@ -140,6 +140,26 @@ def test_exact_solve():
     check("the factorization lives on rank 0 only by default, on every rank replicated",
           held == 1 and held_all == NP, "(%d and %d of %d ranks)" % (held, held_all, NP))
 
+    # release gives the factorization back on every rank; the next set_operator rebuilds it
+    for name, solver in (("LUSolver", hp.LUSolver(COMM)),
+                         ("ReplicatedLUSolver", ReplicatedLUSolver(COMM))):
+        solver.set_operator(A)
+        solver.release()
+        mine = (getattr(solver, "_lu", None) is None
+                and getattr(solver, "_replicated", None) is None)
+        gone = COMM.allreduce(int(mine), op=MPI.SUM) == NP
+        refused = False
+        try:
+            solver.solve(V.vector(), b)
+        except RuntimeError:
+            refused = True
+        solver.set_operator(A)
+        x = V.vector()
+        solver.solve(x, b)
+        rel = residual(A, x, b)
+        check("%s gives its factorization back on release and rebuilds it" % name,
+              gone and refused and rel < 1e-12, "(%.3e)" % rel)
+
     # rank-count independence: store on the first run, compare on later ones
     key = "exact_solve_bTx_n10_p2"
     val = out["ReplicatedLUSolver"]
@@ -406,6 +426,107 @@ def test_hypre_pool_logic():
     small.trim()
     check("pool: what is kept between setups is at most a quarter of the peak in use",
           ok and not live, "(%s)" % (small.stats(),))
+    # a driver that is out of memory: the pool is emptied and the request tried again,
+    # and the refusal the runtime remembers is read, or MFEM takes it for an error of its
+    # next kernel
+    full, read = [0], [0]                       # refusals to come, refusals read
+
+    def stingy(pp, n):
+        if full[0]:
+            full[0] -= 1
+            return 2                            # cudaErrorMemoryAllocation
+        return dev_malloc(pp, n)
+
+    def last_error():
+        read[0] += 1
+        return 2
+
+    tight = types.SimpleNamespace(cudaMalloc=Fn(stingy), cudaFree=Fn(dev_free),
+                                  cudaGetLastError=Fn(last_error))
+    short = HyprePool(hypre, tight, max_cached=3000, max_block=2000)
+
+    def ask(n):
+        short._malloc(out, n)
+        return out[0]
+
+    kept = ask(600)
+    short._free(kept)                           # held by the pool
+    full[0] = 1
+    got = ask(1500)                             # refused once: the pool gives its block back
+    ok = bool(got) and kept not in live and live[got] == 1500 and read[0] == 1 and short.refused == 0
+    full[0] = 2
+    import contextlib
+    import io
+
+    said = io.StringIO()
+    with contextlib.redirect_stderr(said):
+        none = ask(1500)                        # refused twice: hypre is told, and so is the user
+    check("pool: a refused request empties the pool and is tried again; the refusal is read",
+          ok and not none and short.refused == 1 and read[0] == 2 and "out of memory" in said.getvalue(),
+          "(%s)" % (short.stats(),))
+    short._free(got)
+    short.trim()
+
+
+def test_lumped_mass():
+    """The lumped mass solver: its diagonal against MFEM's linear form of the constant one."""
+    if RANK == 0:
+        print("lumped mass solver")
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(9, 7, mfem.Element.TRIANGLE))
+    V = hp.FunctionSpace.H1(pm, 1)
+    M = hp.assemble_native_matrix(V, [mfem.MassIntegrator()])
+    S = hp.LumpedMassSolver(M, COMM)
+
+    one = mfem.ConstantCoefficient(1.0)
+    lf = mfem.ParLinearForm(V.fes)
+    lf.AddDomainIntegrator(mfem.DomainLFIntegrator(one))
+    lf.Assemble()
+    ref = V.vector()
+    lf.ParallelAssemble(ref.hypre)
+
+    ones, d = V.vector(), V.vector()
+    ones.set(1.0)
+    S.mult(ones, d)
+    e = d.copy().axpy(-1.0, ref).norm("linf") / ref.norm("linf")
+    check("the lumped diagonal is the integral of each basis function", e < 1e-13, "(%.2e)" % e)
+    check("and sums to the area of the mesh", abs(d.sum() - 1.0) < 1e-13, "(%.15f)" % d.sum())
+    x = V.vector()
+    S.solve(x, ref)
+    e = x.axpy(-1.0, ones).norm("linf")
+    check("solve inverts it", e < 1e-13, "(%.2e)" % e)
+
+
+def test_transpose_solver():
+    """``A^T x = b`` for a nonsymmetric matrix, held against MFEM's ``MultTranspose``."""
+    if RANK == 0:
+        print("transpose solver")
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(10, 10, mfem.Element.TRIANGLE))
+    V = hp.FunctionSpace.H1(pm, 1)
+    wind = mfem.Vector(2)
+    wind[0], wind[1] = 1.0, 0.5
+    vel = mfem.VectorConstantCoefficient(wind)
+    A = hp.assemble_native_matrix(V, [mfem.DiffusionIntegrator(), mfem.MassIntegrator(),
+                                      mfem.ConvectionIntegrator(vel, 3.0)])
+    b = V.project(lambda x: np.sin(3.0 * x[0]) * np.cos(2.0 * x[1]) + x[0])
+
+    def factory():
+        if NP == 1:
+            return hp.LUSolver(COMM)
+        ks = hp.KrylovSolver(COMM, "gmres", "amg")
+        ks.parameters["rel_tolerance"] = 1e-13
+        return ks
+
+    S = hp.TransposeSolver(factory)
+    S.set_operator(A)
+    x = V.vector()
+    S.solve(x, b)
+    r = V.vector()
+    A.MultTranspose(x.hypre, r.hypre)
+    e = r.axpy(-1.0, b).norm("l2") / b.norm("l2")
+    check("A^T x = b", e < 1e-10, "(%.2e)" % e)
+    check("which is not A x = b", residual(A, x, b) > 1e-3, "(%.2e)" % residual(A, x, b))
+    S.release()
+    check("release drops the transpose and the inner solver", S.inner is None and S._At is None)
 
 
 def test_petsc():
@@ -456,6 +577,8 @@ def main():
     test_inverse_problem()
     test_hypre_pool_logic()
     test_single_precision_solves()
+    test_lumped_mass()
+    test_transpose_solver()
     test_petsc()
     COMM.Barrier()
     if RANK == 0:

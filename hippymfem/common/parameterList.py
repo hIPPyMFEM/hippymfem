@@ -16,7 +16,6 @@ Ported from hIPPYlib so that parameter dictionaries in driver scripts are
 interchangeable between the two libraries.
 """
 
-from .naming import sync_spellings
 
 
 
@@ -60,5 +59,3 @@ class ParameterList(object):
                 print(indent, k, "({0}):".format(self.data[k][0]), self.data[k][1])
         print(indent, "---")
 
-
-sync_spellings(ParameterList)

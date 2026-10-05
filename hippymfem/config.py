@@ -4,8 +4,8 @@
 # COPYRIGHT.
 """Every knob of the library in one object, ``hippymfem.config``.
 
-The library reads twenty-odd ``HIPPYMFEM_*`` environment variables in a dozen
-modules.  This object names each one as a typed attribute with a one-line
+The library reads its ``HIPPYMFEM_*`` environment variables in a dozen modules.
+This object names each one as an attribute with a one-line
 description: ``hm.config.parmat_device`` reads the current setting,
 ``hm.config.parmat_device = "copy"`` changes it (through the module's own setter,
 so it takes effect exactly as the environment variable would), and
@@ -38,9 +38,10 @@ def _module_call(module, fn):
     return get
 
 
-def _module_setter(module, fn):
+def _module_setter(module, fn, cast=None):
     def put(value):
-        getattr(importlib.import_module("hippymfem." + module), fn)(value)
+        getattr(importlib.import_module("hippymfem." + module), fn)(
+            value if cast is None else cast(value))
     return put
 
 
@@ -74,6 +75,26 @@ def _bool(v):
     return str(v).lower() in ("1", "yes", "true", "on") if not isinstance(v, bool) else v
 
 
+def _choice(*allowed):
+    """A cast that lowercases a setting and refuses a value that is not ``allowed``."""
+    def cast(value):
+        v = str(value).strip().lower()
+        if v not in allowed:
+            raise ValueError("must be one of %s, not %r" % (", ".join(allowed), value))
+        return v
+    return cast
+
+
+def env_choice(name, default, allowed):
+    """The environment variable ``name``, lowercased, or ``default``.  A value that is
+    not ``allowed`` raises, so that a mistyped route name does not select another one."""
+    raw = os.environ.get(name, "")
+    v = raw.strip().lower() or default
+    if v not in allowed:
+        raise ValueError("%s must be one of %s, not %r" % (name, ", ".join(allowed), raw))
+    return v
+
+
 _KNOBS = [
     # ---------------------------------------------------------- import-time only
     _Knob("device", "HIPPYMFEM_DEVICE",
@@ -81,7 +102,7 @@ _KNOBS = [
           _env_only("HIPPYMFEM_DEVICE", "cpu"), when="import"),
     _Knob("hypre_device", "HIPPYMFEM_HYPRE_DEVICE",
           "MFEM and hypre on the device too (CUDA build of PyMFEM; configured at import)",
-          lambda: _bool(os.environ.get("HIPPYMFEM_HYPRE_DEVICE", "")), when="import"),
+          _module_call("_jaxconfig", "hypre_on_device"), when="import"),
     _Knob("auto_device", "HIPPYMFEM_AUTO_DEVICE",
           "configure MFEM's device at import when hypre_device is set (0 to call configure_device yourself)",
           lambda: _bool(os.environ.get("HIPPYMFEM_AUTO_DEVICE", "1")), when="import"),
@@ -98,18 +119,17 @@ _KNOBS = [
           "import petsc4py before PyMFEM so the PETSc solvers are available",
           lambda: _bool(os.environ.get("HIPPYMFEM_PETSC", "")), when="import"),
     # ------------------------------------------------------------------ assembly
-    _Knob("assembly_backend", "HIPPYMFEM_ASSEMBLY",
-          "csr (direct scatter, default) or integrator (MFEM's per-element callback, the reference)",
-          _module_attr("fem.assemble", "_BACKEND"), _module_setter("fem.assemble", "set_assembly_backend")),
     _Knob("parmat", "HIPPYMFEM_PARMAT",
-          "how the parallel matrix is built: auto (true-dof route where P is boolean), tdof, mfem, direct",
+          "how the parallel matrix is built: auto (true-dof route where P is boolean), tdof, mfem",
           _module_attr("fem.parmat", "PARMAT_MODE"), _module_setter("fem.parmat", "set_parmat_mode")),
     _Knob("parmat_device", "HIPPYMFEM_PARMAT_DEVICE",
           "with hypre on a device: block (hypre's two blocks directly, default) or copy",
           _module_attr("fem.tdofassemble", "DEVICE_PARMAT"), _module_setter("fem.tdofassemble", "set_device_parmat")),
     _Knob("tdof_identity", "HIPPYMFEM_TDOF_IDENTITY",
           "true-dof route also where the prolongations are the identity (one rank): auto (with hypre on a device), 1, 0",
-          _module_attr("fem.csrassemble", "TDOF_IDENTITY"), _module_assign("fem.csrassemble", "TDOF_IDENTITY", str)),
+          _module_attr("fem.csrassemble", "TDOF_IDENTITY"),
+          _module_assign("fem.csrassemble", "TDOF_IDENTITY",
+                         _choice("auto", "1", "true", "yes", "on", "0", "false", "no", "off"))),
     _Knob("device_bridge", "HIPPYMFEM_DEVICE_BRIDGE",
           "with the kernels and hypre on one GPU, matrix values and assembled vectors cross between "
           "JAX's memory and MFEM's on the device instead of through the host: auto, 1, 0",
@@ -123,16 +143,14 @@ _KNOBS = [
     _Knob("device_pattern", "HIPPYMFEM_DEVICE_PATTERN",
           "keep a pattern's index arrays on the device (4 bytes per element-matrix entry and per "
           "nonzero) so that an assembly uploads nothing but the row pointers",
-          _module_attr("fem.pattern", "DEVICE_PATTERN"), _module_setter("fem.pattern", "set_device_pattern")),
-    _Knob("triple", "HIPPYMFEM_TRIPLE",
-          "the triple product's form where one is formed: auto (timed once), rap, split",
-          _module_attr("fem.parmat", "TRIPLE_MODE"), _module_setter("fem.parmat", "set_triple_mode")),
+          _module_attr("fem.pattern", "DEVICE_PATTERN"), _module_setter("fem.pattern", "set_device_pattern", _bool)),
     _Knob("fold_elimination", "HIPPYMFEM_FOLD_ELIMINATION",
           "fold the essential-dof elimination into the scatter (default) or use MFEM's calls after",
-          _module_attr("fem.elimination", "FOLD_ELIMINATION"), _module_setter("fem.elimination", "set_fold_elimination")),
+          _module_attr("fem.elimination", "FOLD_ELIMINATION"),
+          _module_setter("fem.elimination", "set_fold_elimination", _bool)),
     _Knob("gpu_deterministic", "HIPPYMFEM_GPU_DETERMINISTIC",
           "device scatter in a fixed order instead of atomics (bit-identical repeats, more memory)",
-          _module_attr("fem.pattern", "DETERMINISTIC"), _module_setter("fem.pattern", "set_deterministic")),
+          _module_attr("fem.pattern", "DETERMINISTIC"), _module_setter("fem.pattern", "set_deterministic", _bool)),
     _Knob("keep_geometric_factors", "HIPPYMFEM_KEEP_GEOMETRIC_FACTORS",
           "keep MFEM's GeometricFactors alive after the batches are built",
           _module_attr("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS"),
@@ -140,7 +158,7 @@ _KNOBS = [
     _Knob("share_hessian", "HIPPYMFEM_SHARE_HESSIAN",
           "one differentiation pass for all blocks of a linearization point (default)",
           _module_attr("modeling.PDEVariationalProblem", "SHARE_HESSIAN_PASS"),
-          _module_setter("modeling.PDEVariationalProblem", "set_share_hessian_pass")),
+          _module_setter("modeling.PDEVariationalProblem", "set_share_hessian_pass", _bool)),
     # ------------------------------------------------------------------- kernels
     _Knob("precision", "HIPPYMFEM_PRECISION",
           "precision of the element kernels: fp64 (default), mixed (matrices in single "
@@ -162,16 +180,6 @@ _KNOBS = [
           "doubles per tangent and quadrature point the chunk planner assumes (16, with a margin)",
           _module_attr("fem.kernel", "AD_DOUBLES_PER_TANGENT_QP"),
           _module_assign("fem.kernel", "AD_DOUBLES_PER_TANGENT_QP", float)),
-    _Knob("chunk_plan", "HIPPYMFEM_CHUNK_PLAN",
-          "how a split batch's chunk is sized: estimate (default; the per-tangent estimate) "
-          "or xla (XLA's memory analysis of the compiled pass: fewer chunks, more device memory)",
-          _module_attr("fem.kernel", "CHUNK_PLAN"), _module_assign("fem.kernel", "CHUNK_PLAN", str)),
-    _Knob("chunk_share", "HIPPYMFEM_CHUNK_SHARE",
-          "share of the free device memory a chunk sized by XLA's analysis may take (0.6)",
-          _module_attr("fem.kernel", "CHUNK_SHARE"), _module_assign("fem.kernel", "CHUNK_SHARE", float)),
-    _Knob("chunk_probe", "HIPPYMFEM_CHUNK_PROBE",
-          "elements in the probe chunk XLA's memory analysis is compiled at (2048)",
-          _module_attr("fem.kernel", "CHUNK_PROBE"), _module_assign("fem.kernel", "CHUNK_PROBE", int)),
     _Knob("geometry_stream", "HIPPYMFEM_GEOMETRY_STREAM",
           "share of the device budget above which a group's geometry stays on the host and is streamed",
           _module_attr("fem.kernel", "GEOMETRY_STREAM_FRACTION"),
@@ -196,7 +204,12 @@ _KNOBS = [
     _Knob("pattern_builder", "HIPPYMFEM_PATTERN_BUILDER",
           "how a sparsity pattern is built: auto (sort-free when numba is importable and "
           "the pattern is large), numba (always sort-free), sort (the global sort)",
-          _module_attr("fem.patternbuild", "MODE"), _module_assign("fem.patternbuild", "MODE", str)),
+          _module_attr("fem.patternbuild", "MODE"),
+          _module_assign("fem.patternbuild", "MODE", _choice("auto", "numba", "sort"))),
+    _Knob("pattern_builder_min", "HIPPYMFEM_PATTERN_BUILDER_MIN",
+          "smallest pattern, in element-matrix entries, the sort-free builder is used for",
+          _module_attr("fem.patternbuild", "MIN_ENTRIES"),
+          _module_assign("fem.patternbuild", "MIN_ENTRIES", int)),
     _Knob("pattern_threads", "HIPPYMFEM_PATTERN_THREADS",
           "threads for a sort-free pattern build; 0 takes this rank's share of the node",
           _module_attr("fem.patternbuild", "THREADS"),
@@ -208,13 +221,22 @@ _KNOBS = [
           _module_assign("fem.kernel", "HOST_MEM_FRACTION", float)),
     _Knob("pattern_sort", "HIPPYMFEM_PATTERN_SORT",
           "where the pattern build sorts its keys: auto, host, device",
-          _module_attr("fem.devsort", "MODE"), _module_assign("fem.devsort", "MODE", str)),
+          _module_attr("fem.devsort", "MODE"),
+          _module_assign("fem.devsort", "MODE", _choice("auto", "host", "device"))),
     _Knob("pattern_sort_min", "HIPPYMFEM_PATTERN_SORT_MIN",
           "smallest key array the device sort is used for",
           _module_attr("fem.devsort", "MIN_DEVICE"), _module_assign("fem.devsort", "MIN_DEVICE", int)),
     _Knob("pattern_sort_chunk", "HIPPYMFEM_PATTERN_SORT_CHUNK",
           "keys per device sort chunk; 0 sizes it from the free memory, up to 2^26 in JAX's arena",
           _module_attr("fem.devsort", "CHUNK"), _module_assign("fem.devsort", "CHUNK", int)),
+    _Knob("pattern_sort_kernel", "HIPPYMFEM_PATTERN_SORT_KERNEL",
+          "the kernel of the device sort: auto (CuPy's where importable), cupy, xla",
+          _module_attr("fem.devsort", "SORT_KERNEL"),
+          _module_assign("fem.devsort", "SORT_KERNEL", _choice("auto", "cupy", "xla"))),
+    _Knob("pattern_timing", "HIPPYMFEM_PATTERN_TIMING",
+          "print what each phase of a sparsity-pattern build took, on rank 0",
+          _module_attr("fem.pattern", "PATTERN_TIMING"),
+          _module_assign("fem.pattern", "PATTERN_TIMING", _bool)),
     # ------------------------------------------------------------------- solvers
     _Knob("hypre_spmv", "HIPPYMFEM_HYPRE_SPMV",
           "hypre's matrix-vector kernel on a GPU: auto (its own on several ranks of a CUDA build), vendor, hypre",
@@ -234,6 +256,9 @@ _KNOBS = [
           "setup and HIPPYMFEM_HYPRE_POOL_KEEP, 512, between setups; 0 removes the pool)",
           _module_call("common.mfemconfig", "hypre_pool_megabytes"),
           _module_setter("common.mfemconfig", "set_hypre_pool_megabytes")),
+    _Knob("hypre_pool_keep", "HIPPYMFEM_HYPRE_POOL_KEEP",
+          "megabytes the default hypre pool keeps between BoomerAMG setups (512)",
+          _env_only("HIPPYMFEM_HYPRE_POOL_KEEP", "512"), when="import"),
     _Knob("amg_relax", "HIPPYMFEM_AMG_RELAX",
           "default BoomerAMG relaxation type for new solvers; -1 keeps MFEM's (16 is Chebyshev, SPD only)",
           _env_only("HIPPYMFEM_AMG_RELAX", "-1"), _env_setter("HIPPYMFEM_AMG_RELAX")),

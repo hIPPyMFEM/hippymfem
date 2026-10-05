@@ -6,11 +6,12 @@ degrade as the mesh is refined, because the proposals respect the prior.
 
 .. code-block:: python
 
-   kernel = hm.pCNKernel(model, s=0.1)
+   kernel = hm.pCNKernel(model)
+   kernel.parameters["s"] = 0.1
    chain  = hm.MCMC(kernel)
    chain.parameters["number_of_samples"] = 5000
    chain.parameters["burn_in"] = 500
-   tracer = hm.FullTracer(Vm, chain.parameters["number_of_samples"])
+   tracer = hm.QoiTracer(chain.parameters["number_of_samples"])
    n_accept = chain.run(m0, qoi=qoi, tracer=tracer)
 
 ================================================  ============================
@@ -33,7 +34,7 @@ autocorrelation time and the effective sample size:
 
 .. code-block:: python
 
-   iact, lags, acorr = hm.integratedAutocorrelationTime(tracer.data[:, 0])
+   iact, lags, acorr = hm.integratedAutocorrelationTime(tracer.data)
    ess = len(tracer.data) / iact
 
 A chain with 1500 samples and an IACT of 70 has an effective sample size of about

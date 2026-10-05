@@ -35,7 +35,7 @@ from .keepalive import KeepAlive
 #: :attr:`ParVector.hypre`) is updated, copied and reduced on the device by MFEM, so
 #: that a result hypre left there is not copied to the host for an update and back for
 #: the next product; a vector last touched as a numpy array stays with numpy.  ``"0"``:
-#: always numpy on the host, as before.  The results agree to round-off (the device
+#: always numpy on the host.  The results agree to round-off (the device
 #: reductions sum in a different order).  ``HIPPYMFEM_DEVICE_VECTORS``.
 DEVICE_VECTORS = os.environ.get("HIPPYMFEM_DEVICE_VECTORS", "auto").lower()
 

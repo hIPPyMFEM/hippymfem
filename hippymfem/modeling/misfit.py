@@ -24,14 +24,13 @@ import mfem.par as mfem
 from ..common.keepalive import KeepAlive
 from ..fem.assemble import assemble_native_matrix
 from ..fem.bcs import as_bcset
-from ..common.naming import SnakeCamel, sync_spellings
 from ..fem.coefficients import attribute_indicator
 from ..fem.spaces import as_space
 from .pointwiseObservation import assemblePointwiseObservation
 from .variables import PARAMETER, STATE
 
 
-class Misfit(SnakeCamel):
+class Misfit(object):
     """Abstract misfit term of the cost functional."""
 
     def cost(self, x):
@@ -135,17 +134,17 @@ class MultDiscreteStateObservation(Misfit, KeepAlive):
         self.Mpar = float(Mpar)
         self.keep(B)
 
-    def _positive(self, a, where):
-        if a.size and np.min(a) <= 0.0:
+    def _positive(self, Bu, where):
+        # the smallest value over every rank, so that all of them raise together
+        lo = Bu.min()
+        if not lo > 0.0:
             raise FloatingPointError(
-                "multiplicative noise model needs Bu > 0; got min %g in %s"
-                % (float(np.min(a)), where)
-            )
+                "multiplicative noise model needs Bu > 0; got min %g in %s" % (lo, where))
 
     def cost(self, x):
         self.B.mult(x[STATE], self.Bu)
+        self._positive(self.Bu, "cost")
         bu = self.Bu.array
-        self._positive(bu, "cost")
         self.help.array[:] = np.log(bu) + self.d.array / bu
         ones = self.B.createVecLeft()
         ones.set(1.0)
@@ -155,8 +154,8 @@ class MultDiscreteStateObservation(Misfit, KeepAlive):
         out.zero()
         if i == STATE:
             self.B.mult(x[STATE], self.Bu)
+            self._positive(self.Bu, "grad")
             bu = self.Bu.array
-            self._positive(bu, "grad")
             self.help.array[:] = 1.0 / bu - self.d.array / (bu * bu)
             self.B.multTranspose(self.help, out)
             out.scale(self.Mpar)
@@ -176,8 +175,8 @@ class MultDiscreteStateObservation(Misfit, KeepAlive):
         if i == STATE and j == STATE:
             self.B.mult(dir, self.Bu)
             bd = self.Bu.array
+            self._positive(self.Bu_lin, "apply_ij")
             bl = self.Bu_lin.array
-            self._positive(bl, "apply_ij")
             self.help.array[:] = (-bd * bl ** -2
                                   + 2.0 * self.d.array * bd * bl ** -3)
             self.B.multTranspose(self.help, out)
@@ -396,6 +395,3 @@ class MisfitTD(Misfit):
                 m.apply_ij(i, j, dir.view(t), tmp)
                 out.axpy(1.0, tmp)
         return out
-
-
-sync_spellings(Misfit)

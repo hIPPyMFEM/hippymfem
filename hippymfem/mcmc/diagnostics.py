@@ -61,6 +61,3 @@ def chain_summary(samples, max_lag=None):
         if s.size > 1 else 0.0,
     }
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-integrated_autocorrelation_time = integratedAutocorrelationTime

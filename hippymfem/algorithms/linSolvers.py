@@ -179,8 +179,8 @@ class _SolverBase(KeepAlive):
         (``benchmarks/DESIGN_NOTES.md``, section 4).  The next ``set_operator``
         rebuilds as usual.
         """
-        for name in ("A", "_pc", "_solver", "_held", "_lu", "_template",
-                     "_pc_built_on", "_fallback"):
+        for name in ("A", "_pc", "_solver", "_held", "_lu", "_replicated", "_n",
+                     "_ksp", "_mat", "_template", "_pc_built_on", "_fallback"):
             if hasattr(self, name):
                 setattr(self, name, None)
         self.current_operator = None
@@ -636,7 +636,9 @@ class LumpedMassSolver(KeepAlive):
         ones.set(1.0)
         self.d = ParVector(self.comm, M.Height())
         M.Mult(ones.hypre, self.d.hypre)
-        if np.any(np.abs(self.d.array) < 1e-300):
+        d = self.d.array
+        smallest = float(np.abs(d).min()) if d.size else np.inf
+        if self.comm.allreduce(smallest, op=MPI.MIN) < 1e-300:     # every rank raises
             raise ValueError("lumped mass has a zero entry")
         self.parameters = KrylovSolver_ParameterList()
         self.keep(M)

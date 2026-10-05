@@ -5,8 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../../tutorial"
 OUT="$(mktemp -d)"
 # The names are zero padded (01_ ... 12_), so they sort in order; sort -V keeps that true
-# if an unpadded name ever appears, and the glob is *.ipynb so nothing is silently skipped
-# (the old [0-9]_*.ipynb glob skipped 10_FacetsAndDG without a word).
+# if an unpadded name ever appears, and the glob is *.ipynb so nothing is silently skipped.
 for nb in $(ls *.ipynb | sort -V); do
   echo "=== $nb ==="
   start=$(date +%s)

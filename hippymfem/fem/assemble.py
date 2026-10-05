@@ -4,50 +4,22 @@
 # COPYRIGHT.
 """Assembly of AD-generated element arrays into parallel matrices and vectors.
 
-By default the element arrays are scattered directly (:mod:`.csrassemble`).  The
-``"integrator"`` route instead builds a short-lived MFEM form, attaches a
-:class:`~.integrators.CachedMatrixIntegrator` holding the already-computed
-element arrays, and lets MFEM assemble.  Either way essential boundary conditions
-are applied block by block as the table in :mod:`.bcs` states, so that the
+The element arrays are scattered directly (:mod:`.csrassemble`).  Essential boundary
+conditions are applied block by block as the table in :mod:`.bcs` states, so that the
 matrices behave exactly as hIPPYlib's do.
 """
 
-import os
 
 import numpy as np
 
 import mfem.par as mfem
 
-from ..common.linalg import own, set_diagonal_entries  # noqa: F401  (own: re-exported)
+from ..common.linalg import own  # noqa: F401  (re-exported)
 from ..common.parvector import host_sync, to_numpy
-from .integrators import CachedMatrixIntegrator, CachedVectorIntegrator, ElementLookup
 from .spaces import as_space
 from .csrassemble import assemble_matrix_csr, assemble_vector_csr
 
 _EMPTY = None
-
-#: Which assembly route :func:`assemble_matrix` and :func:`assemble_vector` take.
-#: ``"csr"`` scatters the element arrays directly (see :mod:`.csrassemble`);
-#: ``"integrator"`` hands them to MFEM one element at a time.  The two agree to
-#: round-off, which the test suite checks on every block; the integrator route is
-#: the reference, and a fallback for element families the direct scatter does not
-#: cover.
-_BACKEND = os.environ.get("HIPPYMFEM_ASSEMBLY", "csr")
-
-
-def set_assembly_backend(name):
-    """Select ``"csr"`` (default) or ``"integrator"`` assembly; returns the old one."""
-    global _BACKEND
-    if name not in ("csr", "integrator"):
-        raise ValueError("assembly backend must be 'csr' or 'integrator', got %r"
-                         % (name,))
-    old, _BACKEND = _BACKEND, name
-    return old
-
-
-def assembly_backend():
-    """The assembly route currently in use."""
-    return _BACKEND
 
 
 def empty_ess():
@@ -58,17 +30,6 @@ def empty_ess():
     return _EMPTY
 
 
-def _materialize(chunks):
-    """Glue ``(group, start, stop, array)`` chunks back into one array per group."""
-    import numpy as _np
-
-    parts = {}
-    for g, _a, _b, arr in chunks:
-        parts.setdefault(g, []).append(_np.asarray(arr))
-    for g in sorted(parts):
-        yield _np.concatenate(parts[g], axis=0) if len(parts[g]) > 1 else parts[g][0]
-
-
 def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
                     test_ess=None, trial_ess=None, diag_policy="one"):
     """Assemble a block from per-group element matrices.
@@ -76,16 +37,14 @@ def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
     Parameters
     ----------
     test_space, trial_space : FunctionSpace
-        Row and column spaces.  When they are the same object a
-        ``ParBilinearForm`` is used, otherwise a ``ParMixedBilinearForm``.
+        Row and column spaces.
     groups : sequence of ElementGroup
     element_matrices : sequence of ndarray, or callable
         One ``(ne, nd_test, nd_trial)`` array per group.  A callable returning an
-        iterator of ``(group, start, stop, array)`` chunks lets the direct-CSR
-        route scatter each chunk as it is produced, so the full array is never
-        formed; the callback route materializes them.
+        iterator of ``(group, start, stop, array)`` chunks lets each chunk be
+        scattered as it is produced, so the full array is never formed.
     nelem : int
-        Total number of mesh elements (for the element lookup).
+        Total number of mesh elements.
     test_ess, trial_ess : mfem.intArray, optional
         Essential true dofs to eliminate on each side.
     diag_policy : {"one", "zero", "keep"}
@@ -98,77 +57,20 @@ def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
     Returns
     -------
     mfem.HypreParMatrix
-        With whatever it references (the MFEM form, on the integrator route)
-        retained through :func:`own`.
     """
-    if _BACKEND == "csr":
-
-        return assemble_matrix_csr(
-            test_space, trial_space, groups, element_matrices, nelem,
-            test_ess=test_ess, trial_ess=trial_ess, diag_policy=diag_policy)
-
-    test_space = as_space(test_space)
-    trial_space = as_space(trial_space)
-    if callable(element_matrices):
-        # Only the direct-CSR route can consume chunks lazily; MFEM's callback
-        # wants the arrays, so realize them here.
-        element_matrices = list(_materialize(element_matrices()))
-    lookup = ElementLookup(groups, element_matrices, nelem)
-    integ = CachedMatrixIntegrator(lookup)
-
-    same = test_space.fes is trial_space.fes
-    A = mfem.HypreParMatrix()
-    if same:
-        form = mfem.ParBilinearForm(test_space.fes)
-        form.SetDiagonalPolicy(_policy("one" if diag_policy == "zero" else diag_policy))
-        form.AddDomainIntegrator(integ)
-        form.Assemble()
-        form.Finalize()
-        ess = test_ess if test_ess is not None else empty_ess()
-        form.FormSystemMatrix(ess, A)
-        if diag_policy == "zero" and ess.Size():
-            # MFEM's DiagonalPolicy reaches only the serial SparseMatrix path;
-            # hypre's EliminateRowsCols always writes 1.0, so fix it up here.
-            set_diagonal_entries(A, np.asarray(ess.ToList(), dtype=np.int64), 0.0)
-        return own(A, form, integ, lookup)
-    else:
-        form = mfem.ParMixedBilinearForm(trial_space.fes, test_space.fes)
-        form.AddDomainIntegrator(integ)
-        form.Assemble()
-        form.Finalize()
-        form.FormRectangularSystemMatrix(
-            trial_ess if trial_ess is not None else empty_ess(),
-            test_ess if test_ess is not None else empty_ess(),
-            A,
-        )
-    return own(A, form, integ, lookup)
+    return assemble_matrix_csr(
+        test_space, trial_space, groups, element_matrices, nelem,
+        test_ess=test_ess, trial_ess=trial_ess, diag_policy=diag_policy)
 
 
 def assemble_vector(space, groups, element_vectors, nelem, ess=None, out=None):
     """Assemble a dual (residual) vector from per-group element vectors.
 
-    The result lives on true dofs: MFEM's ``ParallelAssemble`` applies ``P^T``,
+    The result lives on true dofs: the local-dof sums are reduced with ``P^T``,
     which is the correct reduction for a linear functional.
     """
-    if _BACKEND == "csr":
-
-        return assemble_vector_csr(space, groups, element_vectors, nelem,
-                                   ess=ess, out=out)
-
-    space = as_space(space)
-    lookup = ElementLookup(groups, element_vectors, nelem)
-    integ = CachedVectorIntegrator(lookup)
-    form = mfem.ParLinearForm(space.fes)
-    form.AddDomainIntegrator(integ)
-    form.Assemble()
-    hv = form.ParallelAssemble()
-    if out is None:
-        out = space.vector()
-    out.array[:] = to_numpy(hv, copy=False)
-    del hv
-    if ess is not None and len(ess):
-        out.array[np.asarray(ess, dtype=np.int64)] = 0.0
-    return out
+    return assemble_vector_csr(space, groups, element_vectors, nelem,
+                               ess=ess, out=out)
 
 
 def assemble_scalar(comm, element_values):

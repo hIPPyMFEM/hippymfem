@@ -3,73 +3,43 @@
 # License version 2.0 dated June 1991 (GPL-2.0-only); see the files LICENSE and
 # COPYRIGHT.
 """From a local CSR to the parallel ``HypreParMatrix``: the constructors, the
-triple product ``P^T A P`` in its two forms, and the route selection
-(``HIPPYMFEM_PARMAT``, ``HIPPYMFEM_TRIPLE``).
+triple product ``P^T A P``, and the route selection (``HIPPYMFEM_PARMAT``).
 """
 
-import os
 import numpy as np
 import mfem.par as mfem
-from mpi4py import MPI
 from ..common.identitycache import IdentityCache
 from ..common.linalg import own, take_ownership
 from ..common.parvector import _HYPRE_INT
+from ..config import env_choice
 from .prolongation import _boolean_prolongation, _ldof_offset, _ldof_starts
-import time
 from ..common.parvector import device_active
 
 
-def _check_host_hypre():
-    """Raise ``RuntimeError`` if MFEM has put hypre's memory on a device.
-
-    Called by :func:`local_par_matrix` only on its host path in ``"direct"`` mode
-    (:data:`PARMAT_MODE`); with hypre on a device that function takes the copying
-    constructor without calling this.
-    """
-
-    if device_active():
-        raise RuntimeError(
-            "MFEM is configured on a GPU device (mfem.Device(\"cuda\")), which puts "
-            "hypre's memory on the device, and HIPPYMFEM_PARMAT=direct builds the "
-            "matrix from host CSR arrays, which hypre then reads as device "
-            "pointers.\n"
-            "  Unset HIPPYMFEM_PARMAT (or set it to \"auto\") to let MFEM's own "
-            "ParallelAssemble build the parallel matrix from the same local CSR, "
-            "which is bit-identical and works on the device.\n"
-            "  Whichever route builds the matrix, give each rank its own GPU or "
-            "they all land on device 0:\n"
-            "      mfem.Device(\"cuda\", rank % n_devices)\n"
-            "  See docs/source/guide/gpu.rst for what each configuration measured.")
-
-
 # --------------------------------------------------- the route through MFEM
-#: How the local CSR becomes a ``HypreParMatrix``.  ``"direct"`` hands hypre the
-#: numpy arrays through PyMFEM's CSR constructor, which copies them; ``"mfem"`` wraps
-#: them as an ``mfem.SparseMatrix`` and lets MFEM's constructor alias them, about a
-#: hundred times cheaper.  Both then form the parallel triple product.  ``"tdof"``
-#: does not: for boolean prolongations it scatters straight into true-dof rows and
-#: exchanges the few entries in ghost rows (:mod:`hippymfem.fem.tdofassemble`), two
-#: to three times faster than the triple product on a few ranks.  ``"auto"``, the
-#: default, is ``"tdof"`` wherever the prolongations are boolean and ``"mfem"``
-#: otherwise; ``"direct"`` is the reference the test suite compares against.  With
-#: hypre on a device the triple-product route always uses the copying constructor
-#: (see :func:`local_par_matrix`).  Set ``HIPPYMFEM_PARMAT``.
-PARMAT_MODE = os.environ.get("HIPPYMFEM_PARMAT", "auto").lower()
+#: How the local CSR becomes a ``HypreParMatrix``.  ``"tdof"`` scatters straight into
+#: true-dof rows and exchanges the few entries in ghost rows
+#: (:mod:`hippymfem.fem.tdofassemble`), which needs boolean prolongations and is two
+#: to three times faster than a triple product on a few ranks.  ``"mfem"`` builds the
+#: block-diagonal matrix over the local dofs and forms the parallel triple product
+#: (:func:`_triple`), which is right for every space.  ``"auto"``, the default, is
+#: ``"tdof"`` wherever the prolongations are boolean and ``"mfem"`` otherwise.  Set
+#: ``HIPPYMFEM_PARMAT``.
+PARMAT_MODE = env_choice("HIPPYMFEM_PARMAT", "auto", ("auto", "mfem", "tdof"))
+
+#: Build the local matrix on the host with the constructor that copies the arrays into
+#: hypre's memory, as a run with hypre on a device always does, instead of the one that
+#: aliases them.  For the test suite, which holds the two to exact equality.
+COPYING_CONSTRUCTOR = False
 
 
 def set_parmat_mode(mode):
     """Choose how the parallel matrix is built; returns the old mode."""
     global PARMAT_MODE
-    if mode not in ("auto", "direct", "mfem", "tdof"):
-        raise ValueError("PARMAT_MODE must be auto, direct, mfem or tdof, got %r"
-                         % (mode,))
+    if mode not in ("auto", "mfem", "tdof"):
+        raise ValueError("PARMAT_MODE must be auto, mfem or tdof, got %r" % (mode,))
     old, PARMAT_MODE = PARMAT_MODE, mode
     return old
-
-
-def _via_mfem():
-    """Whether to let MFEM build the parallel matrix from our local CSR."""
-    return PARMAT_MODE != "direct"
 
 
 def _tdof_route(test_space, trial_space, same):
@@ -80,7 +50,7 @@ def _tdof_route(test_space, trial_space, same):
     other condition is the mode, a global.  Nothing rank-local may be consulted
     ahead of that collective.
     """
-    if PARMAT_MODE in ("mfem", "direct"):
+    if PARMAT_MODE == "mfem":
         return False
     if not _boolean_prolongation(test_space):
         return False
@@ -133,7 +103,7 @@ def _as_sparse(pattern, data):
                              False, False, True), keep
 
 
-def local_par_matrix(pattern, data, test_space, trial_space, reuse=False):
+def local_par_matrix(pattern, data, test_space, trial_space):
     """Block-diagonal ``HypreParMatrix`` over the ldof partition.
 
     The local CSR carries local column indices; they are shifted into the global
@@ -141,30 +111,14 @@ def local_par_matrix(pattern, data, test_space, trial_space, reuse=False):
     element matrices is one of that rank's own local dofs.
 
     Two constructors can do this, with bit-identical results.  On the host the
-    default wraps the arrays as an ``mfem.SparseMatrix`` (:func:`_as_sparse`) that
-    MFEM's constructor aliases, copying nothing; ``HIPPYMFEM_PARMAT=direct`` hands
-    the raw arrays to the constructor that copies them into hypre's memory.  With
-    hypre on a device the copying constructor is always used: the aliasing one
+    arrays are wrapped as an ``mfem.SparseMatrix`` (:func:`_as_sparse`) that MFEM's
+    constructor aliases, copying nothing.  With hypre on a device the raw arrays go
+    to the constructor that copies them into hypre's memory: the aliasing one
     registers the arrays with MFEM's memory manager, and a Python proxy drops the
     arrays it keeps before its C++ destructor runs, so hypre's destroy would find
     the device mirrors already freed (see ``TrueDofPattern.finish``).
-
-    With ``reuse``, one matrix per (pattern, partition) is built on the first call
-    and later calls overwrite its values in place.  That is only correct when the
-    matrix does not outlive the call, which is the case exactly when a triple
-    product follows and consumes it; a caller that receives this matrix as the
-    assembled result must not ask for it.  Only the copying constructor on the
-    host reuses; the aliasing route, and any build with hypre on a device, makes a
-    new matrix each time.
     """
-
-    # On a device: the copying constructor, and no reuse, whose in-place writes go
-    # through a host alias of hypre's values.
     on_device = device_active()
-    via_mfem = _via_mfem() and not on_device
-    reuse = reuse and not on_device
-    if not via_mfem and not on_device:
-        _check_host_hypre()
     comm = test_space.comm
     roff, rglob = _ldof_offset(test_space)
     same = test_space.fes is trial_space.fes
@@ -173,18 +127,7 @@ def local_par_matrix(pattern, data, test_space, trial_space, reuse=False):
     else:
         coff, cglob = _ldof_offset(trial_space)
 
-    # cached per partition (see ScatterPattern.hypre_indices)
-    I, J, rows, cols = pattern.hypre_indices(roff, coff, same)
-    if reuse and not via_mfem:
-        got = pattern.reusable(roff, coff, same)
-        if got is not None:
-            A, view, order = got
-            if order is None:
-                np.copyto(view, data, casting="unsafe")
-            else:
-                np.take(data, order, out=view)
-            return A
-    if via_mfem:
+    if not (on_device or COPYING_CONSTRUCTOR):
         # The SparseMatrix takes the *local* column indices, not the shifted ones:
         # it is the rank's diagonal block, and the partition arrays say where it
         # sits.  Square blocks take the 4-argument constructor so MFEM sees one
@@ -198,6 +141,8 @@ def local_par_matrix(pattern, data, test_space, trial_space, reuse=False):
         # A aliases our arrays, so they have to outlive it.
         own(A, sp, *keep)
     else:
+        # cached per partition (see ScatterPattern.hypre_indices)
+        I, J, rows, cols = pattern.hypre_indices(roff, coff, same)
         D = np.ascontiguousarray(data, dtype=np.float64)
         if on_device:
             # This constructor's typemaps want HYPRE_Int row pointers and
@@ -219,20 +164,7 @@ def local_par_matrix(pattern, data, test_space, trial_space, reuse=False):
         A = mfem.HypreParMatrix(comm, pattern.nrow, rglob, cglob, args)
     A.CopyRowStarts()
     A.CopyColStarts()
-    if reuse and not via_mfem:
-        pattern.make_reusable(roff, coff, same, A)
     return A
-
-
-#: How to form the parallel triple product ``R^T A P``.  ``"rap"`` is MFEM's fused
-#: :func:`mfem.RAP`; ``"split"`` is the same thing as two sparse products with the
-#: transpose taken once; ``"auto"`` times both on the first assembly for a given
-#: pair of spaces and keeps the faster.  They are bit-identical, so this is a
-#: speed choice only.  Set ``HIPPYMFEM_TRIPLE``.
-TRIPLE_MODE = os.environ.get("HIPPYMFEM_TRIPLE", "auto").lower()
-
-
-_TRIPLE_CHOICE = IdentityCache()
 
 
 _TRANSPOSE = IdentityCache()
@@ -252,57 +184,18 @@ def _transposed(P, owner):
     return got
 
 
-def _triple_fused(A, Rt, P, owner=None):
-    return take_ownership(mfem.RAP(A, P) if Rt is None else mfem.RAP(Rt, A, P))
+def _triple(A, Rt, P, spaces):
+    """``R^T A P`` as two sparse products, with the transpose taken once.
 
-
-def _triple_split(A, Rt, P, owner=None):
-    """``R^T A P`` as two sparse products instead of one fused triple product.
-
-    The output is identical to the fused form's, nonzero counts and the explicitly
-    stored zeros of the folded elimination included.  Which is faster depends on
-    the rank count and the problem size, so :func:`_triple` measures.
+    ``spaces`` are the ``ParFiniteElementSpace`` objects the prolongations belong
+    to (the test space first); the first one keys the cached transpose.  The result
+    is the matrix MFEM's fused ``RAP`` gives, nonzero counts and the explicitly
+    stored zeros of the folded elimination included (``test_assembly`` holds the two
+    to exact equality).  On the host the two products take a half to a sixth of the
+    fused form's time; on a device the two forms are within a quarter of each other.
     """
-    tmp = take_ownership(mfem.ParMult(_transposed(P if Rt is None else Rt, owner), A))
+    tmp = take_ownership(mfem.ParMult(_transposed(P if Rt is None else Rt, spaces[0]), A))
     try:
         return take_ownership(mfem.ParMult(tmp, P))
     finally:
         del tmp
-
-
-def _triple(A, Rt, P, comm, spaces):
-    """``R^T A P`` by whichever form is faster here, decided once per space pair.
-
-    ``spaces`` are the ``ParFiniteElementSpace`` objects the prolongations belong
-    to (the test space first), which key the decision and the cached transpose.
-
-    The decision has to be the same on every rank, since both forms communicate:
-    the two timings are reduced with MAX (the slowest rank is what a collective
-    costs) before they are compared, so every rank compares the same numbers.
-    """
-    mode = TRIPLE_MODE
-    if mode == "auto":
-        mode = _TRIPLE_CHOICE.get(spaces)
-        if mode is None:
-
-            t = {}
-            for name, fn in (("rap", _triple_fused), ("split", _triple_split)):
-                fn(A, Rt, P, spaces[0])                    # warm-up, dropped at once
-                comm.Barrier()
-                t0 = time.perf_counter()
-                fn(A, Rt, P, spaces[0])
-                t[name] = comm.allreduce(time.perf_counter() - t0, op=MPI.MAX)
-            mode = "rap" if t["rap"] <= t["split"] else "split"
-            _TRIPLE_CHOICE.put(spaces, mode)
-    return (_triple_fused if mode == "rap" else _triple_split)(A, Rt, P, spaces[0])
-
-
-def set_triple_mode(mode):
-    """Choose the triple-product form (``"auto"``, ``"rap"``, ``"split"``); returns the
-    old one.  The tests use it to compare the two."""
-    global TRIPLE_MODE
-    if mode not in ("auto", "rap", "split"):
-        raise ValueError("TRIPLE_MODE must be auto, rap or split, got %r" % (mode,))
-    old, TRIPLE_MODE = TRIPLE_MODE, mode
-    return old
-

@@ -318,8 +318,3 @@ def exportPointwiseObservation(B, data, filename, comm=None):
     header = ",".join(["x", "y", "z"][: B.targets.shape[1]]) + ",value"
     np.savetxt(filename, arr, delimiter=",", header=header, comments="")
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-assemble_pointwise_observation = assemblePointwiseObservation
-assemble_pointwise_los_observation = assemblePointwiseLOSObservation
-export_pointwise_observation = exportPointwiseObservation

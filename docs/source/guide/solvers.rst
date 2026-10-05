@@ -95,8 +95,7 @@ a serial factorization: one factorization of the whole matrix in time,
 memory.
 
 Why bother: an exact solve makes the reduced Hessian exact, so a spectrum or a
-tolerance study measures the discretization instead of a Krylov tolerance.  Before
-this, that was only possible on one rank.
+tolerance study measures the discretization instead of a Krylov tolerance.
 
 Genuinely distributed direct solvers
 ------------------------------------

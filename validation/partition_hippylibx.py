@@ -3,7 +3,7 @@
 # This file is part of hIPPyMFEM, free software under the GNU General Public
 # License version 2.0 dated June 1991 (GPL-2.0-only); see the files LICENSE and
 # COPYRIGHT.
-"""What hIPPYlibx's random stream does across MPI partitions (E5, the counterpart).
+"""What hIPPYlibx's random stream does across MPI partitions.
 
 hIPPYlibx seeds a numpy generator per rank from ``SeedSequence(seed).spawn(nproc)``, so
 the prior sample, the synthetic data and therefore the MAP depend on the number of

@@ -5,7 +5,7 @@
 # COPYRIGHT.
 """Solve the shared benchmark with hIPPyMFEM and write the results as JSON.
 
-Run with the conda ``base`` interpreter (PyMFEM lives there)::
+Run with the interpreter that has PyMFEM::
 
     python validation/run_hippymfem.py --out validation/out/mfem.json
 

@@ -74,10 +74,8 @@ from .timeDependentVector import TimeDependentVector
 from .variables import ADJOINT, NVAR, PARAMETER, STATE
 from ..common.random import Random
 from ..fem.io import ParaViewWriter
-from ..fem.assemble import assembly_backend
-from ..fem.boundary import (assemble_boundary_matrix, assemble_boundary_vector,
-                            get_boundary_batches)
-from ..fem.csrassemble import _eliminate, assemble_matrix_csr
+from ..fem.boundary import assemble_boundary_vector, get_boundary_batches
+from ..fem.csrassemble import assemble_matrix_csr
 
 #: kernel field slots of the one-step residual
 NEW = 0          #: u_n
@@ -280,24 +278,14 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         return self._with_boundary(i, j, mats, bmats, test_ess, diag_policy)
 
     def _with_boundary(self, i, j, mats, bmats, test_ess, diag_policy):
-        """Block ``(i, j)`` with its boundary part, the two summed before the
-        essential rows are eliminated (eliminating each and adding would leave 2.0
-        on the essential diagonal), as
+        """Block ``(i, j)`` with its boundary part in the same slots, so that the
+        essential rows are eliminated once, as
         :meth:`.PDEVariationalProblem.PDEVariationalProblem._domain_block` does."""
         ti, tj = self.slots[i], self.slots[j]
-        if assembly_backend() == "csr":
-            return assemble_matrix_csr(
-                ti, tj, self.batches.groups, mats, self.nelem, test_ess=test_ess,
-                diag_policy=diag_policy,
-                boundary=(self.bdr_batches.tables(ti), self.bdr_batches.tables(tj),
-                          bmats))
-        from ..common.linalg import ParAdd
-
-        dom = assemble_matrix(ti, tj, self.batches.groups, mats, self.nelem)
-        bdr = assemble_boundary_matrix(ti, tj, self.bdr_batches.groups, bmats)
-        A = ParAdd(dom, bdr)
-        del dom, bdr
-        return _eliminate(A, ti, tj, test_ess, None, diag_policy, ti.fes is tj.fes)
+        return assemble_matrix_csr(
+            ti, tj, self.batches.groups, mats, self.nelem, test_ess=test_ess,
+            diag_policy=diag_policy,
+            boundary=(self.bdr_batches.tables(ti), self.bdr_batches.tables(tj), bmats))
 
     def _step_blocks(self, names, u_new, u_old, m, p, t):
         """Several blocks of one step from **one** differentiation pass.

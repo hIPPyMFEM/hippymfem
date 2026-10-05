@@ -70,6 +70,3 @@ def varianceReductionMC(prior, p2qoimap, taylor_qoi, nsamples, order=2,
         "samples_taylor": qtay,
     }
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-variance_reduction_mc = varianceReductionMC

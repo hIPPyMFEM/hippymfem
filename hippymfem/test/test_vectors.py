@@ -422,15 +422,24 @@ def test_config_knobs():
         c.show()
     check("config.show() lists every knob", all(n in buf.getvalue() for n in names),
           "(%d knobs)" % len(names))
-    saved = (c.gpu_mem_reserve, c.fused_keep)
+    saved = (c.gpu_mem_reserve, c.fused_keep, c.fold_elimination, c.pattern_sort)
     try:
         c.gpu_mem_reserve = 2.5
         c.fused_keep = "0"
+        c.fold_elimination = "0"
         check("a fractional reserve in GiB and a false string keep their meaning",
-              c.gpu_mem_reserve == 2.5 and c.fused_keep is False,
-              "(%r, %r)" % (c.gpu_mem_reserve, c.fused_keep))
+              c.gpu_mem_reserve == 2.5 and c.fused_keep is False
+              and c.fold_elimination is False,
+              "(%r, %r, %r)" % (c.gpu_mem_reserve, c.fused_keep, c.fold_elimination))
+        try:
+            c.pattern_sort = "no such route"
+            refused = False
+        except ValueError:
+            refused = True
+        check("a route name that does not exist is refused",
+              refused and c.pattern_sort == saved[3], "(%r)" % (c.pattern_sort,))
     finally:
-        c.gpu_mem_reserve, c.fused_keep = saved
+        c.gpu_mem_reserve, c.fused_keep, c.fold_elimination, c.pattern_sort = saved
 
 
 def test_ensemble():

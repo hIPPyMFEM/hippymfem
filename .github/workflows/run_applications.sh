@@ -22,7 +22,7 @@ run() {   # run <ranks> <python arguments...>
 for n in 1 2; do
   run $n applications/poisson/model_subsurf.py --nx 16 --ny 16 --neig 10 --nsamples 1 --out "$OUT/poisson"
   run $n applications/ad_diff/model_ad_diff.py --nx 16 --nt 8 --ntargets 40 --neig 10 --out "$OUT/ad_diff"
-  run $n applications/boundary/model_robin.py --nx 12 --ntargets 20 --nmodes 10
+  run $n applications/boundary/model_robin.py --nx 12 --ntargets 20 --nmodes 10 --out "$OUT/boundary"
   run $n applications/forward_uq/model_subsurf_effperm.py --nx 12 --neig 10 --nsamples 20 --out "$OUT/forward_uq"
   run $n applications/mcmc/model_subsurf_mcmc.py --nx 12 --ntargets 20 --neig 10 --nsamples 100 \
       --burn-in 20 --tune 20 --tune-steps 0.3 --out "$OUT/mcmc"

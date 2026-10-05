@@ -195,6 +195,3 @@ def _plot(eps, err_grad, err_H, comm, filename):
         plt.close(fig)
     return fig
 
-
-#: snake_case spellings (see :mod:`hippymfem.common.naming`)
-model_verify = modelVerify

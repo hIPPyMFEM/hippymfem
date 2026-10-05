@@ -11,6 +11,7 @@ rather than against itself.  Run with
 """
 
 import math
+import os
 
 import numpy as np
 from mpi4py import MPI
@@ -213,6 +214,85 @@ def test_mcmc_mala():
     check("MALA chain mean ~ posterior mean", e < 0.35, "(rel %.3f)" % e)
 
 
+def test_importance_sampling():
+    """Importance sampling from the Laplace approximation of a linear problem.
+
+    There the Laplace approximation is the posterior, so every sample carries the
+    same weight, and the samples have the posterior's mean and variance.
+    """
+    if RANK == 0:
+        print("MCMC: importance sampling from the Laplace approximation")
+    model, Vh, mtrue = build_linear_problem(nx=6, ntargets=8, noise_std=0.05)
+    Vm = Vh[PARAMETER]
+    mean_ex, cov_ex, xmap, _ref = exact_gaussian_posterior(model, Vm)
+    model.setPointForHessianEvaluations(xmap, gauss_newton_approx=True)
+    Hmisfit = hm.ReducedHessian(model, misfit_only=True)
+    k = 8                               # eight observations: the misfit Hessian has rank eight
+    Omega = hm.MultiVector(xmap[PARAMETER], k + 10)
+    hm.parRandom.set_seed(78)
+    hm.parRandom.normal_multivector(1.0, Omega)
+    d, U = hm.doublePassG(Hmisfit, model.prior.R, model.prior.Rsolver, Omega, k, s=2)
+    nu = hm.GaussianLRPosterior(model.prior, d, U, mean=xmap[PARAMETER])
+
+    nsamp = 600
+    chain = hm.MCMC(hm.ISKernel(model, nu))
+    chain.parameters["number_of_samples"] = nsamp
+    chain.parameters["burn_in"] = 0
+    chain.parameters["print_level"] = 0
+    tracer = _WeightTracer(Vm)
+    hm.parRandom.set_seed(4321)
+    naccept = chain.run(xmap[PARAMETER].copy(), qoi=_FirstDofQoi(Vm), tracer=tracer)
+    check("every draw is kept", naccept == nsamp, "(%d of %d)" % (naccept, nsamp))
+    w = np.array(tracer.weights)
+    spread = float((w.max() - w.min()) / w.mean())
+    check("the weights are equal where the approximation is exact", spread < 1e-5,
+          "(relative spread %.2e)" % spread)
+    sd = np.sqrt(np.diag(cov_ex))
+    e = float(np.abs(tracer.mean() - mean_ex).max() / sd.max())
+    check("the sample mean is the posterior mean", e < 0.2, "(%.3f of the largest std)" % e)
+    ev = float(np.abs(tracer.variance() - sd ** 2).max() / (sd ** 2).max())
+    check("the sample variance is the posterior variance", ev < 0.3, "(rel %.3f)" % ev)
+
+
+def test_full_tracer():
+    """FullTracer keeps every value and writes every ``every``-th field."""
+    import glob
+    import re
+    import shutil
+    import tempfile
+
+    if RANK == 0:
+        print("FullTracer")
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.TRIANGLE))
+    Vm = hm.FunctionSpace.H1(pmesh, 1)
+    where = COMM.bcast(tempfile.mkdtemp(prefix="hippymfem_tracer_") if RANK == 0 else None)
+
+    class _Sample:
+        m = Vm.project(lambda x: x[0] + 2.0 * x[1])
+
+    plain = hm.FullTracer(3)
+    for q in (1.0, 2.0, 3.0, 4.0):                 # one more than it has room for
+        plain.append(_Sample, q)
+    check("values recorded up to the size given", np.array_equal(plain.trim(), [1.0, 2.0, 3.0])
+          and plain.i == 4)
+
+    tracer = hm.FullTracer(5, Vm, os.path.join(where, "chain"), every=2)
+    for k in range(5):
+        tracer.append(_Sample, float(k))
+    check("every value recorded", np.array_equal(tracer.trim(), np.arange(5.0)))
+    COMM.Barrier()
+    steps, pieces = None, None
+    if RANK == 0:
+        pvd = glob.glob(os.path.join(where, "chain", "*.pvd"))
+        steps = [float(t) for t in re.findall(r'timestep="([^"]+)"', open(pvd[0]).read())] if pvd else []
+        pieces = len(glob.glob(os.path.join(where, "chain", "Cycle*", "*.vtu")))
+    steps, pieces = COMM.bcast(steps), COMM.bcast(pieces)
+    check("fields written at samples 0, 2 and 4", steps == [0.0, 2.0, 4.0], "(%s)" % steps)
+    check("one piece per rank and written sample", pieces == 3 * NP, "(%d)" % pieces)
+    if RANK == 0:
+        shutil.rmtree(where, ignore_errors=True)
+
+
 def test_diagnostics():
     if RANK == 0:
         print("chain diagnostics")
@@ -286,6 +366,24 @@ class _MeanTracer:
     def variance(self):
         m = self.mean()
         return np.maximum(self.s2 / max(self.n, 1) - m * m, 0.0)
+
+
+class _WeightTracer:
+    """As :class:`_MeanTracer`, and keeps every sample's importance weight."""
+
+    def __init__(self, Vm):
+        self.stats = _MeanTracer(Vm)
+        self.weights = []
+
+    def append(self, current, q):
+        self.weights.append(current.weight)
+        self.stats.append(current, q)
+
+    def mean(self):
+        return self.stats.mean()
+
+    def variance(self):
+        return self.stats.variance()
 
 
 # ------------------------------------------------------------------ forward UQ
@@ -548,6 +646,8 @@ if __name__ == "__main__":
     test_mcmc_pcn()
     test_mcmc_gpcn()
     test_mcmc_mala()
+    test_importance_sampling()
+    test_full_tracer()
     test_forward_uq()
     test_taylor_under_posterior()
     test_mass_functional()

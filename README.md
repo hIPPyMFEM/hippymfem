@@ -15,7 +15,7 @@ Gradients, Hessians, the MAP point and the posterior follow by automatic differe
   <img src="https://img.shields.io/badge/GPU-NVIDIA%20%7C%20AMD-76b900.svg" alt="NVIDIA and AMD GPUs">
 </p>
 
-*Above: a geothermal inversion at 128³ (36 million unknowns) run end to end on four GPUs: the true
+*Above: a geothermal inversion at 128³ (36 million unknowns) on four GPUs: the true
 log conductivity, the MAP estimate from temperatures logged in 60 boreholes, and the posterior
 standard deviation, lowest where the boreholes reach.*
 
@@ -40,41 +40,36 @@ Newton solve, a table lookup, and its derivatives stay exact.
 | | |
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
-| **80 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 77 s on 32 GPU ranks (16 RTX PRO 6000 Blackwell GPUs), against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) and 2859 s for hIPPyMFEM itself on 32 CPU cores, all at the same CG count. At 36 million unknowns, four L40S GPUs take 50 s against 2669 s on four CPU cores of the same node: 54 times, 60 at equal CG counts. |
-| **A billion unknowns** | Two Newton-CG steps at 1.09 billion unknowns (400³ P2 hexahedra) take 191 s on 24 RTX PRO 6000 Blackwell GPUs. |
-| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 19 minutes on four GPUs. |
+| **134 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 46 s on 16 GPUs, against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on 32 CPU cores, at the same CG count. |
+| **A billion unknowns** | Two Newton-CG steps at 1.09 billion unknowns (400³ P2 hexahedra) take 134 s on 24 RTX PRO 6000 Blackwell GPUs. |
+| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 14 minutes on four GPUs. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
-| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 18.7 s on one AMD MI210 and 18.5 s on one NVIDIA H100, with the same cost and CG counts. |
+| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 11.2 s on one AMD MI210 and 6.1 s on one NVIDIA H100, with the same cost and CG counts. |
 
 ## How it compares
 
-<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 18 to 80 times faster than hIPPYlibx" width="760"></p>
+<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 28 to 134 times faster than hIPPYlibx" width="760"></p>
 
 *Two Newton-CG steps of a P2 hexahedral benchmark, rank for rank, with the same PDE, prior and
 BoomerAMG settings in both libraries ([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is
-hIPPYlib on FEniCSx). Up to 128³: four CPU cores against the four L40S GPUs of one node (two
-AMD EPYC 9334). At 256³: 32 cores of that node against 32 GPU ranks, the 48 GB MIG slices of
-16 RTX PRO 6000 Blackwell (BW) cards. The bars are measured wall times; the ratios charge each
-CPU run the GPU run's CG count, since the two libraries stop CG at different iterations.*
+hIPPYlib on FEniCSx): four CPU cores against four L40S GPUs up to 128³, and 32 cores against
+16 RTX PRO 6000 Blackwell (BW) GPUs at 256³. The bars are measured wall times; the ratios
+charge each CPU run the GPU run's CG count.*
 
 ## How it scales
 
 | mesh | unknowns | GPUs | two Newton-CG steps |
 |---|---|---|---|
-| 64³ | 4.57 M | 1 L40S | 27.9 s |
-| 128³ | 36.1 M | 4 L40S | 49.5 s |
-| 128³ | 36.1 M | 4 AMD Instinct MI210 | 31.9 s |
-| 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 140 s |
-| 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 77 s |
-| 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 191 s |
+| 64³ | 4.57 M | 1 L40S | 13.6 s |
+| 128³ | 36.1 M | 4 L40S | 29.1 s |
+| 128³ | 36.1 M | 4 AMD Instinct MI210 | 23.6 s |
+| 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 101 s |
+| 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 46.3 s |
+| 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 134 s |
 
 The Blackwell GPUs were split into two 48 GB MIG slices each, one MPI rank per slice. The
-MI210 row runs the same code with MFEM and hypre built for ROCm, on the same flags and the
-same CG count as the L40S row above it. Doubling the Blackwell cards at 256³ is 1.81×, 90 %
-of linear. Like every row, the 400³ one is warm: the first Hessian-block build, 116 s with its
-JAX compilation, is timed before the steps.
-[`docs/source/guide/gpu.rst`](docs/source/guide/gpu.rst) has the per-stage times, the memory
-per rank, and what they depend on.
+[GPU guide](https://hippymfem.readthedocs.io/en/latest/guide/gpu.html) has the per-stage
+times, the memory per rank, and what they depend on.
 
 ## How it works
 
@@ -203,24 +198,11 @@ with a tabulated, temperature-dependent conductivity.
 ## Cross-validation against hIPPYlibx
 
 [`validation/`](validation/) solves the *same discrete problem* with hIPPyMFEM and with
-[hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx): the same mesh arrays, quadrature degree, observation targets, data and
-deterministic sketch, so the comparison is not limited by discretization error. On the
-subsurface flow benchmark:
-
-| quantity | relative difference |
-|---|---|
-| cost, regularization, misfit at a fixed `m₀` | 2e-14 |
-| gradient norm, `g · m_true` | 2e-14 |
-| `m_trueᵀ H m_true`, full and Gauss-Newton | 2e-14 |
-| prior cost and trace | 1e-15 |
-| **generalized spectrum of the misfit Hessian at a fixed point (40 values)** | **3.7e-13** |
-| MAP total cost | 1.3e-14 |
-| MAP state field at 441 points | 1.4e-09 |
-| MAP parameter field at 441 points | 3.1e-08 |
-
-The discrete operators agree to machine precision. The MAP fields agree less closely because
-the two optimizers stop at different iterations inside the same gradient tolerance, where the
-cost is flat; that is why the spectrum is also compared at a fixed point.
+[hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx): the same mesh arrays, quadrature degree,
+observation targets and data, so the comparison is not limited by discretization error. On the
+subsurface flow benchmark the cost, the gradient and the Hessian actions agree to 2 × 10⁻¹⁴,
+the generalized spectrum of the misfit Hessian to 3.7 × 10⁻¹³ and the MAP cost to
+1.3 × 10⁻¹⁴ ([the full table](validation/README.md)).
 
 ## Tests
 
@@ -230,61 +212,30 @@ cost is flat; that is why the spectrum is also compared at a fixed point.
 python -m pytest          # the same suites through pytest, on one and two ranks
 ```
 
-Each suite checks one layer against something external rather than against itself:
-
-| suite | what it checks |
-|---|---|
-| `test_vectors` | vectors, operators, MultiVector, the parallel RNG; **bit-identical random vectors on 1 to 4 ranks** |
-| `test_kernels` | every AD-generated block against MFEM's own integrators on tri/quad/tet/hex, P1 and P2, scalar and vector; finite-difference consistency of second and third derivatives |
-| `test_solves` | linear and nonlinear forward solves, adjoint and incremental systems, the adjoint gradient against finite differences |
-| `test_modeling` | prior sample covariance against `R⁻¹`, observation operators, `modelVerify` slopes, `ReducedHessian` against a finite-difference Hessian |
-| `test_optimization` | trust-region CG, randomized eigensolvers against dense `eigh`, **BFGS independently reproducing the Newton-CG minimizer**, the Laplace approximation |
-| `test_timedependent` | time-dependent inversion: first-order gradient, an exact Hessian for the quadratic cost |
-| `test_uq` | pCN, gpCN and MALA against an **exact Gaussian posterior**, autocorrelation times, QoI derivatives, Taylor moments, variance-reduced Monte Carlo |
-| `test_assembly` | the direct-CSR assembly against MFEM's callback route: every block, every geometry, **exactly zero difference** |
-| `test_solvers` | exact parallel solves against dense ones, **the same answer on 1, 2 and 4 ranks**, and the PETSc bridge |
-| `test_boundary` | boundary (`ds`) integrals against MFEM's boundary integrators, a Robin problem, parameter-dependent boundary blocks |
-| `test_facets` | interior-penalty DG against MFEM's `DGDiffusionIntegrator`, faces shared between ranks, a DG inverse problem's gradient and Hessian |
-| `test_vectorfe` | H(curl) and H(div) blocks against MFEM, mixed Darcy and Biot poroelasticity blocks, an H(curl) inverse problem |
-| `test_nb` | the plotting helpers, exact at every sample point on every rank count |
-| `test_gpu`, `test_device` | the GPU path against the CPU path at round-off, and MFEM and hypre on the device with a CUDA or HIP build of PyMFEM |
-
-The random streams do not depend on the number of ranks, so prior samples, synthetic data and
-MAP points agree across rank counts to the tolerance of the solves, which is how ghost and
-true-dof mistakes get caught.
+Each suite checks one layer against something external rather than against itself: MFEM's own
+integrators, dense linear algebra, finite differences, an exact Gaussian posterior, the CPU
+path for the GPU path. The random streams do not depend on the number of ranks, so prior
+samples, synthetic data and MAP points agree across rank counts to the tolerance of the solves,
+which is how ghost and true-dof mistakes get caught.
+[Verification and validation](https://hippymfem.readthedocs.io/en/latest/validation.html)
+lists the suites and what each one checks.
 
 ## Known limits
 
-The full list, with measurements, is in the documentation (`docs/source/limits.rst`). In short:
+[The documentation](https://hippymfem.readthedocs.io/en/latest/limits.html) has the full list.
+In short:
 
-1. **Interior facet terms need conforming faces**; a mesh with a hanging node is refused
-   by the facet kernels with an error, and variable-order spaces are rejected. The
-   time-dependent problem class takes domain and boundary densities, not facet terms.
-2. **A distributed direct solve needs a PETSc with MUMPS.** `hm.LUSolver` is exact on any
-   number of ranks but serial: it gathers the matrix onto rank 0, factorizes it there (on
-   every rank with `replicate=True`) and refuses problems above 400 000 unknowns.
-   `hm.PETScLUSolver` factorizes in parallel with MUMPS when petsc4py was built against a
-   PETSc that has it, which the one on PyPI is not; `tools/install_petsc_mumps.sh` builds
-   that pair. Measured on a 3D P2 problem, the factorization of 275 000 unknowns takes 105 s
-   on four ranks and a solve 0.14 s, against 0.84 s per CG+BoomerAMG solve, so
-   `hm.KrylovSolver` remains the choice unless hundreds of exact solves follow.
-3. **A rank holds at most about four million P2 hexahedra**, because hypre addresses its
-   nonzeros with a 32-bit int and MFEM does not accept hypre's 64-bit local-index build; past
-   that, add ranks. Assemblies that large also want JAX's arena preallocated rather than grown
-   (`XLA_PYTHON_CLIENT_PREALLOCATE=true`, sized by `HIPPYMFEM_GPU_MEM_FRACTION`; see
-   [`docs/source/guide/gpu.rst`](docs/source/guide/gpu.rst)).
-4. **GPU execution is a switch**: `HIPPYMFEM_DEVICE=gpu`, or `auto` for a GPU whenever the
-   process can see one, and it pays off above roughly 10⁴ elements per rank. The kernels
-   move to the GPU with JAX alone; moving the solves needs a CUDA or HIP build of PyMFEM,
-   which the scripts in `tools/` produce, and `HIPPYMFEM_HYPRE_DEVICE=1`.
-5. **The tail of a randomized spectrum is its least accurate part**, and what limits it is
-   the sketch, not round-off: at a spectral ratio of 3 × 10⁶ across 40 eigenpairs, the 40th
-   eigenvalue is off by 21 % with 10 extra vectors and one power iteration, by 0.2 % with 25
-   and two, and by 6 × 10⁻⁵ with 25 and three. The trace, pointwise variance and KL
-   divergence inherit that, and the inner solver's tolerance is a floor under all of it.
-6. **Object lifetime.** PyMFEM hands raw pointers to MFEM, so a garbage-collected wrapper is a
-   crash rather than an exception. The library keeps alive what it hands over; code that calls
-   MFEM directly has to do the same.
+- **Interior facet terms need conforming faces**, and variable-order spaces are rejected.
+- **A distributed direct solve needs a PETSc with MUMPS** (`tools/install_petsc_mumps.sh`
+  builds one); `hm.LUSolver` is exact on any number of ranks but factorizes on one.
+- **A rank holds at most about four million P2 hexahedra**, because hypre addresses its
+  nonzeros with a 32-bit int; past that, add ranks.
+- **GPU execution pays off above roughly 10⁴ elements per rank**, and moving the solves to the
+  card needs a CUDA or HIP build of PyMFEM.
+- **The tail of a randomized spectrum is its least accurate part**; oversampling and power
+  iterations control it.
+- **Object lifetime.** PyMFEM hands raw pointers to MFEM. The library keeps alive what it hands
+  over; code that calls MFEM directly has to do the same.
 
 ## Documentation
 

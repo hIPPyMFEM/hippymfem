@@ -105,3 +105,47 @@ MAP point pass through linear solves, so they agree across rank counts to the to
 of those solves: to round-off with the exact solvers, and to 1e-14 for a prior sample
 whose Krylov solve is run to that tolerance.  This is the check that catches ghost-dof
 and true-dof mistakes, which symmetry tests do not.
+
+The test suites
+---------------
+
+.. code-block:: bash
+
+   ./run_tests.sh            # every suite on one rank, a few minutes
+   ./run_tests.sh 1 2 4      # and on two and four ranks
+   python -m pytest          # the same suites through pytest, on one and two ranks
+
+.. list-table::
+   :header-rows: 1
+   :widths: 24 76
+
+   * - suite
+     - what it checks
+   * - ``test_vectors``
+     - vectors, operators, MultiVector, the parallel RNG; bit-identical random vectors on 1 to 4 ranks
+   * - ``test_kernels``
+     - every AD-generated block against MFEM's own integrators on triangles, quadrilaterals, tetrahedra and hexahedra, P1 and P2, scalar and vector; finite-difference consistency of second and third derivatives
+   * - ``test_solves``
+     - linear and nonlinear forward solves, adjoint and incremental systems, the adjoint gradient against finite differences
+   * - ``test_modeling``
+     - prior sample covariance against :math:`R^{-1}`, the vector and mollified priors against MFEM's forms, observation operators, the multiplicative-noise and multi-state misfits against their formulas, ``modelVerify`` slopes, ``ReducedHessian`` against a finite-difference Hessian
+   * - ``test_optimization``
+     - trust-region CG, randomized eigensolvers against dense ``eigh``, BFGS reproducing the Newton-CG minimizer, steepest descent against a dense solve, the Laplace approximation
+   * - ``test_timedependent``
+     - time-dependent inversion: first-order gradient, an exact Hessian for the quadratic cost
+   * - ``test_uq``
+     - pCN, gpCN, MALA and importance sampling against an exact Gaussian posterior, autocorrelation times, QoI derivatives, Taylor moments, variance-reduced Monte Carlo
+   * - ``test_assembly``
+     - the direct-CSR assembly against MFEM's callback route: every block, every geometry, exactly zero difference
+   * - ``test_solvers``
+     - exact parallel solves against dense ones, the same answer on 1, 2 and 4 ranks, the lumped-mass and transpose solvers, the bookkeeping of hypre's device memory pool, and the PETSc bridge
+   * - ``test_boundary``
+     - boundary (``ds``) integrals against MFEM's boundary integrators, a Robin problem, parameter-dependent boundary blocks
+   * - ``test_facets``
+     - interior-penalty DG against MFEM's ``DGDiffusionIntegrator``, faces shared between ranks, a DG inverse problem's gradient and Hessian
+   * - ``test_vectorfe``
+     - H(curl) and H(div) blocks against MFEM, mixed Darcy and Biot poroelasticity blocks, an H(curl) inverse problem
+   * - ``test_nb``
+     - the plotting helpers, exact at every sample point on every rank count
+   * - ``test_gpu``, ``test_device``
+     - the GPU path against the CPU path at round-off, and MFEM and hypre on the device with a CUDA or HIP build of PyMFEM

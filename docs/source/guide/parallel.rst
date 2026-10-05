@@ -73,9 +73,8 @@ vectors.
 Assembly in parallel
 --------------------
 
-Two routes turn the local element arrays into a parallel matrix, and
-``HIPPYMFEM_PARMAT`` (``auto`` by default) chooses between them per block,
-collectively.
+Two routes turn the local element arrays into a parallel matrix, chosen per block and
+collectively (``HIPPYMFEM_PARMAT=mfem`` takes the second for every block).
 
 Where **both prolongations are boolean**, which is every conforming space without a
 ``DofTransformation``, the entries go straight into true-dof rows: for a boolean ``P``
@@ -85,10 +84,10 @@ reach their owner in one ``Alltoallv``.  ``P^T A P`` is never formed.
 
 Otherwise, a non-conforming space or one with a ``DofTransformation``, the local
 ``ldof x ldof`` matrix is wrapped as a block-diagonal ``HypreParMatrix`` over the
-**ldof** partition and ``P^T A P`` is formed with ``RAP`` against
-``Dof_TrueDof_Matrix``, which is exactly what ``ParBilinearForm::ParallelAssemble``
-does.  All communication, including the non-conforming interfaces, then stays inside
-hypre, and nothing about that reduction is reimplemented.
+**ldof** partition and ``P^T A P`` is formed against ``Dof_TrueDof_Matrix`` by hypre's
+sparse products, which gives the matrix of ``ParBilinearForm::ParallelAssemble``.  All
+communication, including the non-conforming interfaces, then stays inside hypre, and
+nothing about that reduction is reimplemented.
 
 The two routes agree to round-off on every block, which ``test_assembly`` checks by
 assembling the same problem both ways (``tdof`` and ``mfem``), and the result of either

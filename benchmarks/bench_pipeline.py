@@ -21,9 +21,9 @@ build ldof matrix          that CSR as a block-diagonal ``HypreParMatrix``
 eliminate                  essential rows and columns, and the diagonal
 =========================  ===================================================
 
-This is the measurement that showed the AD layer was not the bottleneck: at four
-ranks the kernel was 10% of an assembly while the triple product was 55% and the
-elimination 25%.  See ``NOTES.md`` for what changed as a result.
+This is the measurement that shows where an assembly's time goes besides the AD
+layer: the parallel reduction and the elimination, which the library therefore folds
+into the scatter where it can (``docs/source/guide/performance.rst``).
 
 Usage::
 
@@ -154,15 +154,13 @@ def pipelines(kind, n, order, dev, reps):
             return pat.data(E(), zero_slots=kill)
 
         def p_build():
-            return C.local_par_matrix(pat, pat.data(E(), zero_slots=kill), Vu, Vu,
-                                      reuse=not ident)
+            return C.local_par_matrix(pat, pat.data(E(), zero_slots=kill), Vu, Vu)
 
         def p_triple():
-            A = C.local_par_matrix(pat, pat.data(E(), zero_slots=kill), Vu, Vu,
-                                   reuse=not ident)
+            A = C.local_par_matrix(pat, pat.data(E(), zero_slots=kill), Vu, Vu)
             if ident:
                 return A
-            return C._triple(A, None, P, COMM, (id(Vu.fes),))
+            return C._triple(A, None, P, (Vu.fes,))
 
         fns = (p_kernel, p_scatter, p_build, p_triple, p_full)
     t = [timed(f, reps) for f in fns]
@@ -175,7 +173,6 @@ def pipelines(kind, n, order, dev, reps):
         "prolongation": "identity" if ident else "real",
         "route": ("identity" if ident else "true-dof" if tdof else "triple product"),
         "folded_elimination": bool(fold),
-        "triple_form": C._TRIPLE_CHOICE.get((id(Vu.fes),), "n/a"),
         "stages": stages,
         "cumulative_s": dict(zip(stages, t)),
     }
@@ -187,11 +184,10 @@ def report(rows):
         stages = row.get("stages", STAGES)
         t = [row["cumulative_s"][s] for s in stages]
         total = t[-1]
-        say("%s order %d | %d rank(s) | %d elem/rank | %d dofs | route: %s | "
-            "triple=%s | folded=%s"
+        say("%s order %d | %d rank(s) | %d elem/rank | %d dofs | route: %s | folded=%s"
             % (row["kind"], row["order"], row["ranks"], row["elements_local"],
                row["state_dofs"], row.get("route", row["prolongation"]),
-               row["triple_form"], row["folded_elimination"]))
+               row["folded_elimination"]))
         say("  %-40s %11s %11s %8s" % ("stage", "cumul. ms", "stage ms", "share"))
         prev = 0.0
         for name, v in zip(stages, t):

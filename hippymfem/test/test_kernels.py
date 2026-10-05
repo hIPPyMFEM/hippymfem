@@ -779,14 +779,8 @@ def test_host_chunk_budget():
 
 
 def test_chunk_plan_per_pass():
-    """A pass's chunk size is its own, and the unsplit route knows when it cannot fit.
-
-    XLA's analysis sizes each pass from the compiled program, so a gradient pass may fit
-    whole where a Hessian pass of the same weight must split.  Kept under the weight, as
-    the estimate is, the gradient's answer reached :meth:`will_chunk`, and a 128^3
-    assembly on two L40S took the unsplit route with a batch whose joined output did not
-    fit, then halved its chunk down to five elements before failing.
-    """
+    """A split batch assembles the unsplit matrix, a pass remembers its own chunk, and
+    a chunk that cannot fit fails or shrinks cleanly."""
     import jax
 
     from hippymfem.fem import kernel as kern
@@ -807,35 +801,26 @@ def test_chunk_plan_per_pass():
         for g in K.group_kernels:
             g._chunk.clear()
 
-    saved = (kern._free_budget, kern.CHUNK_PLAN, kern.ELEMENT_CHUNK)
+    saved = (kern._free_budget, kern.ELEMENT_CHUNK)
     try:
-        # a budget the estimate splits a Hessian pass under and a gradient pass fits in
+        # a budget under which the estimate splits the batch
         kern._free_budget = lambda dev: 200 * 2 ** 20
-        kern.CHUNK_PLAN = "xla"
         forget()
         before = K.will_chunk()
         K.element_vectors(ADJOINT, loc)
         grad_n = gk._chunk.get((d, "plan", gk.grad_block(ADJOINT)._raw, True))
-        after = K.will_chunk()
-        check("a gradient pass that fits whole leaves the Hessian's route alone",
-              before and after and grad_n == gk.group.ne,
-              "(will_chunk %s then %s; gradient chunk %s of %d)"
-              % (before, after, grad_n, gk.group.ne))
+        check("a gradient pass plans its own chunk and leaves the Hessian's route alone",
+              before and K.will_chunk() and grad_n is not None
+              and gk._chunk.get((d, 1)) is None,
+              "(gradient chunk %s of %d)" % (grad_n, gk.group.ne))
 
         A_split = assemble_matrix(Vu, Vu, batches.groups,
                                   K.element_matrices_or_chunks(ADJOINT, STATE, loc), ne)
         hess = gk.hess_block(ADJOINT, STATE)
-        n_xla = gk._chunk.get((d, "plan", hess._raw, False))
-        n_est = gk._plan(gk.group.ne, d, hess._weight, announce=False, remember=False)
-        probe = kern._analysed_per_element(
-            hess._slot_raws, (gk.gather(loc),) + tuple(gk.mapped()) + (kern._params(()),),
-            gk._axes(), 64)
-        check("the analysed Hessian chunk is never smaller than the estimate",
-              n_xla is not None and n_xla >= n_est
-              and (probe is None or n_xla > n_est or n_xla == gk.group.ne),
-              "(%s against %d of %d; analysis %s)"
-              % (n_xla, n_est, gk.group.ne, "none" if probe is None else
-                 "%.0f kB an element" % (probe[0] / 1e3)))
+        n_hess = gk._chunk.get((d, "plan", hess._raw, False))
+        check("the Hessian pass was split under that budget",
+              n_hess is not None and n_hess < gk.group.ne,
+              "(chunks of %s of %d)" % (n_hess, gk.group.ne))
 
         kern._free_budget = lambda dev: None
         forget()
@@ -848,7 +833,7 @@ def test_chunk_plan_per_pass():
         A_split.Mult(v.hypre, y1.hypre)
         A_whole.Mult(v.hypre, y2.hypre)
         e = y1.copy().axpy(-1.0, y2).norm("linf") / max(y2.norm("linf"), 1e-300)
-        check("the analysed split assembles the unsplit matrix", e < 1e-14, "(rel %.2e)" % e)
+        check("the split assembles the unsplit matrix", e < 1e-14, "(rel %.2e)" % e)
 
         # the unsplit route, split by a pin, on a device whose free memory cannot hold
         # its joined output twice: one clear error, not a halving down to one element
@@ -907,7 +892,7 @@ def test_chunk_plan_per_pass():
               "(%d chunks of at most %d, rel %.1e)"
               % (len(spans), max(b - a for a, b in spans), err))
     finally:
-        kern._free_budget, kern.CHUNK_PLAN, kern.ELEMENT_CHUNK = saved
+        kern._free_budget, kern.ELEMENT_CHUNK = saved
         forget()
 
 

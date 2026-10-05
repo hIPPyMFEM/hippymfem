@@ -41,10 +41,12 @@ import os
 
 import numpy as np
 
+from ..config import env_choice
+
 #: ``auto`` uses this builder when numba is importable and the pattern has at least
 #: :data:`MIN_ENTRIES` entries, ``numba`` forces it, ``sort`` never uses it.  Set
 #: ``HIPPYMFEM_PATTERN_BUILDER``.
-MODE = os.environ.get("HIPPYMFEM_PATTERN_BUILDER", "auto").strip().lower()
+MODE = env_choice("HIPPYMFEM_PATTERN_BUILDER", "auto", ("auto", "numba", "sort"))
 #: Below this many element-matrix entries the sort route is quicker than compiling
 #: this one; above it the compilation is a rounding error.  Set
 #: ``HIPPYMFEM_PATTERN_BUILDER_MIN``.
@@ -87,9 +89,8 @@ def threads():
     """This rank's share of the cores, never more than its affinity mask allows.
 
     numba's default is every core of the machine, which on a node shared by 32 ranks
-    would put 2048 threads on 64 cores; the element kernels' XLA pool did exactly that
-    and a 64^3 run on 32 ranks never finished.  So the count is the smaller of the cores
-    this process may run on and the node's cores divided by the ranks on it.
+    would put 2048 threads on 64 cores.  So the count is the smaller of the cores this
+    process may run on and the node's cores divided by the ranks on it.
     """
     if THREADS > 0:
         return THREADS
