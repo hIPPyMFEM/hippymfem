@@ -27,4 +27,5 @@ for n in 1 2; do
   run $n applications/mcmc/model_subsurf_mcmc.py --nx 12 --ntargets 20 --neig 10 --nsamples 100 \
       --burn-in 20 --tune 20 --tune-steps 0.3 --out "$OUT/mcmc"
   run $n applications/dg/model_transport_dg.py --nx 12 --ntargets 20 --nmodes 10 --out "$OUT/dg"
+  run $n applications/precision/model_subsurf_single.py --n 6 --neig 8 --nsamples 4
 done
