@@ -862,9 +862,9 @@ def test_chunk_plan_per_pass():
               raised == "MemoryError" and len(calls) == 1,
               "(%s after %d attempts)" % (raised, len(calls)))
 
-        # the wait inside that retry: a split batch is waited for until its chunk size
-        # has got through with no more room on the device than there is now, and after
-        # that its arrays are returned while they are computed
+        # the wait inside that retry: a split batch is always waited for, except where
+        # the caller overlaps with it (the element matrices), and there until its chunk
+        # size has got through with no more room on the device than there is now
         waits, room = [], [None]
 
         def counted(x):
@@ -874,17 +874,23 @@ def test_chunk_plan_per_pass():
         kern._room = lambda dev: room[0]
         jax.block_until_ready = counted
         forget()
-        wrapped = gk._chunked(real, gk._axes())
-        seen, runs = [], []
-        for megabytes in (1000, 1000, 900, 950, None, 950):
-            room[0] = None if megabytes is None else megabytes * 2 ** 20
-            runs.append(np.asarray(wrapped(gk.gather(loc), *gk.mapped(), kern._params(()))))
-            seen.append(len(waits))
+        seen, runs = {}, []
+        for overlap in (True, False):
+            wrapped = gk._chunked(real, gk._axes(), overlap=overlap)
+            del waits[:]
+            seen[overlap] = []
+            for megabytes in (1000, 1000, 900, 950, None, 950):
+                room[0] = None if megabytes is None else megabytes * 2 ** 20
+                runs.append(np.asarray(
+                    wrapped(gk.gather(loc), *gk.mapped(), kern._params(()))))
+                seen[overlap].append(len(waits))
         kern._room, jax.block_until_ready = saved[2], saved[3]
-        check("a split batch is waited for until its chunk has got through with as little "
-              "room, and wherever the room cannot be told",
-              seen == [1, 1, 2, 2, 3, 3] and all((r == runs[0]).all() for r in runs),
-              "(waits %s over six runs with 1000, 1000, 900, 950, unknown and 950 MB)" % seen)
+        check("a split batch is waited for, or with a caller that overlaps until its chunk "
+              "has got through with as little room",
+              seen[False] == [1, 2, 3, 4, 5, 6] and seen[True] == [1, 1, 2, 2, 3, 3]
+              and all((r == runs[0]).all() for r in runs),
+              "(waits %s, with overlap %s, over six runs with 1000, 1000, 900, 950, "
+              "unknown and 950 MB)" % (seen[False], seen[True]))
 
         # the streamed route: a chunk over 40 elements does not fit, so the pinned 100
         # is shrunk from what the allocator asked for and the same stretch tried again
