@@ -414,10 +414,10 @@ stops after two passes and one evaluation of the residual, with the state exact 
 4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
 functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
 decrease, which is why it is not the default.  The incremental solves of a Hessian
-action are used as they are, which the
-reorthogonalized CG of a Newton step allows (:doc:`optimization`).  It applies when the
-three solvers that hold the Jacobian are CG with BoomerAMG and the Jacobian is
-symmetric; any other problem keeps its double-precision solves.
+action are used as they are, which the reorthogonalized CG of a Newton step allows
+(:doc:`optimization`).  All of this applies when the three solvers that hold the
+Jacobian are CG with BoomerAMG and the Jacobian is symmetric; any other problem keeps
+its double-precision solves.
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.

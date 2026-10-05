@@ -91,11 +91,12 @@ for a host build PyMFEM has to be built from a checkout that is kept.  The HIP b
 ``tools/build_pymfem_hip.sh`` configures its hypre without CMake and is not supported.
 ``MODULES="gcc/12.3.0 openmpi/4.1.8"`` makes the script load the modules itself, and
 ``JOBS`` (default 12) sets the parallel build, which takes about three minutes with
-twelve.  The script stops if the new library links another MPI than the installed one,
+twelve for a CUDA build and half a minute for a host build.  The script stops if the new library links another MPI than the installed one,
 since it would not load next to it.  Into the output directory it writes
 ``libHYPRE_single.so``; ``libHYPRE_single.json``, the offsets of the few fields of
 hypre's structures that the library reads, taken from this build's own headers (keep it
-next to the ``.so``); the CMake tree ``build/``; and ``configure.log`` and ``build.log``.
+next to the ``.so``); and the build itself (``build/``, ``initial_cache.cmake``,
+``hypre_offsets``, ``configure.log``, ``build.log``).
 It has been built and used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell
 cards and with a host build.
 

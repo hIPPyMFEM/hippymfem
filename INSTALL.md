@@ -121,11 +121,12 @@ The first argument is a PyMFEM source tree in which PyMFEM's build compiled hypr
 keeps one under its prefix; `tools/install_pymfem_parallel.sh` builds in a temporary
 directory and removes it, so for a host build PyMFEM has to be built from a checkout that is
 kept. The HIP build (`tools/build_pymfem_hip.sh`) configures its hypre without CMake and is
-not supported. The build takes about three minutes with twelve jobs (`JOBS`, default 12) and
-stops if the new library links another MPI than the installed one. It writes
+not supported. The build takes about three minutes with twelve jobs (`JOBS`, default 12) for
+a CUDA build and half a minute for a host build, and stops if the new library links another
+MPI than the installed one. It writes
 `libHYPRE_single.so` and `libHYPRE_single.json` (the offsets of the structure fields the
-library reads, from this build's headers; keep the two together), the CMake tree `build/`
-and the logs `configure.log` and `build.log`. It has been built and used with CUDA builds for
+library reads, from this build's headers; keep the two together), and the build itself
+(`build/`, `initial_cache.cmake`, `hypre_offsets`, `configure.log`, `build.log`). It has been built and used with CUDA builds for
 H100, L40S and RTX PRO 6000 Blackwell cards and with a host build.
 
 Check that it loads, in the environment of the runs (on a GPU build with
