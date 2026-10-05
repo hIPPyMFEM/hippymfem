@@ -341,6 +341,12 @@
   assembly the host won there (0.8x for first-order hexahedra on four MI250X). The
   meshes grow with the rank count now, so that a rank holds the elements of the one-rank
   run (4.8x).
+- The geothermal application at 256^3. Its forward Newton solve kept the library's
+  absolute tolerance of 1e-14, which the residual of a mesh that size does not reach in
+  double precision: it stops at 1.2e-14 (at 4.8e-15 at 16^3). A solve that a line search
+  warm-starts has a relative tolerance smaller still, so it ran its 30 iterations and
+  failed, every trial of the line search with it, and Newton-CG stopped at its sixth step
+  with "Forward solve failed during backtracking". The application asks for 1e-13 now.
 
 ## Version 0.1.0, released on September 21, 2026
 

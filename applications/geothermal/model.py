@@ -136,6 +136,11 @@ class Geothermal:
         # is what decides whether the largest cases fit the cards.
         self.pde.newton_parameters["max_iter"] = 30
         self.pde.newton_parameters["rel_tolerance"] = 1e-9
+        # The library's 1e-14 is below what the residual reaches in double precision on a
+        # large mesh: it stops at 4.8e-15 at 16^3 and at 1.2e-14 at 256^3.  A solve that a
+        # line search warm-starts has a relative tolerance smaller still, so there the
+        # absolute one decides, and at 256^3 that solve never converged.
+        self.pde.newton_parameters["abs_tolerance"] = 1e-13
         # the three solves the records were taken with; the adjoint keeps its default
         self.pde.set_solvers(hm.auto_solver, self.Vu, comm, max_direct=0, method="gmres",
                              rel_tolerance=1e-10, max_iter=3000,
