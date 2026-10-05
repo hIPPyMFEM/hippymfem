@@ -1403,6 +1403,8 @@ class GroupKernel:
             nslots = self.nslots
             Vj = jnp.asarray(self._low_modes(j))
             Vi = Vj if symmetric else jnp.asarray(self._low_modes(i))
+            a, b = np.meshgrid(*(np.arange(int(Vj.shape[1])),) * 2, indexing="ij")
+            upper = (np.minimum(a, b), np.maximum(a, b))
 
             def f(dofs, tabs, geo, params):
                 K = slot(dofs, tabs, geo, params)[i]
@@ -1416,13 +1418,18 @@ class GroupKernel:
 
                 Rj = jax.vmap(lambda v: action(i, j, v), out_axes=1)(Vj)       # (nd_i, kj)
                 if symmetric:
-                    # every term symmetric bit for bit, and so is their sum
                     K = 0.5 * (K + K.T)
                     Dj = Rj - K @ Vj.T
                     U = Dj @ Vj
                     S = Vj @ Dj
                     W = Vj.T @ (0.5 * (S + S.T)) @ Vj
-                    return K + (U + U.T) - 0.5 * (W + W.T)
+                    # Every term is symmetric as written but not always as compiled: a
+                    # product that feeds a sum may be fused with it, and a factor that
+                    # depends on the row alone may be computed outside the loop over the
+                    # columns, after which entries (a, b) and (b, a) can differ in the
+                    # last bit.  Both are read from the upper triangle, so they are one
+                    # number.
+                    return (K + (U + U.T) - 0.5 * (W + W.T))[upper]
                 Ri = jax.vmap(lambda v: action(j, i, v), out_axes=1)(Vi)       # (nd_j, ki)
                 Dj = Rj - K @ Vj.T
                 Di = Ri - K.T @ Vi.T
