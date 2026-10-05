@@ -161,6 +161,9 @@ def main():
                     help="the Newton-CG solve is run this many times and the last is reported: the "
                     "first compiles the kernels that only an optimization reaches")
     ap.add_argument("--ntargets", type=int, default=200)
+    ap.add_argument("--noise", type=float, default=0.01,
+                    help="standard deviation of the noise, relative to the largest datum: smaller is a more "
+                    "informative problem (larger eigenvalues of the misfit Hessian)")
     ap.add_argument("--device", default=("cuda" if hm.config.hypre_device else "cpu"))
     ap.add_argument("--symmetric-jacobian", action="store_true")
     ap.add_argument("--newton-print", action="store_true", help="print the Newton-CG iterations")
@@ -245,7 +248,7 @@ def main():
     pde.solveFwd(utrue, [utrue, mtrue, None])           # the data, in double precision
     data = B.createVecLeft()
     B.mult(utrue, data)
-    nstd = 0.01 * max(data.norm("linf"), 1e-30)
+    nstd = args.noise * max(data.norm("linf"), 1e-30)
     B.perturb(data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
@@ -259,6 +262,7 @@ def main():
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "solve_tol": args.solve_tol, "inc_tol": args.inc_tol if args.inc_tol is not None else args.solve_tol,
            "single_goal": args.single_goal, "release_linearization": bool(args.release_linearization),
+           "ntargets": args.ntargets, "noise": args.noise,
            "cg_preconditioner_tolerance": (hm.ReducedSpaceNewtonCG_ParameterList()["cg_preconditioner_tolerance"]
                                            if args.cg_prec_tol is None else args.cg_prec_tol),
            "cg_hessian_relaxation": (hm.ReducedSpaceNewtonCG_ParameterList()["cg_hessian_relaxation"]

@@ -110,7 +110,15 @@ instead of eleven, in the same Newton and CG counts at 32\ :sup:`3` and 64\ :sup
 the gradient norm after each Newton step within two percent, and the Newton-CG solve
 with single-precision solves took 32.4 s instead of 39.9 s on an L40S; with
 ``c = 1e-1`` the iteration took a different path (twelve Newton steps instead of eleven
-at 32\ :sup:`3`).
+at 32\ :sup:`3`).  It is off by default because it was not as safe on other problems.
+With ten times more observations the steps stayed fifteen at ``c = 1e-2`` and became
+sixteen at ``1e-3``.  With noise ten times smaller, a more informative problem whose CG
+runs into ``cg_max_iter`` in most late steps, the eighteen Newton steps and 488 CG
+iterations became 23 and 597 at ``1e-2`` (20 and 514 at ``1e-3``), slower overall.  Linear
+elements at 128\ :sup:`3` kept their twelve steps and 149 CG iterations at ``1e-2`` and
+took 9 % less time.  The incremental solves' error enters through the misfit Hessian,
+whose largest eigenvalues grow with the information in the data, so the ``c`` that is
+safe shrinks with it, and nothing here knows them in advance.
 
 **Counting the last Newton step.**  The twelve steps of the model problem at
 64\ :sup:`3` end with a gradient norm of 0.0976 against a tolerance of 0.1158, and the CG
