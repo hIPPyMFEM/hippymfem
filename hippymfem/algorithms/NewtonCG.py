@@ -104,8 +104,9 @@ def ReducedSpaceNewtonCG_ParameterList():
                                      "relative residual at which the refinement of the "
                                      "forward and the adjoint solve may stop while this "
                                      "solver runs (PDEVariationalProblem."
-                                     "SINGLE_REFINE_GOAL, if the problem leaves it at 0): "
-                                     "two passes instead of three; 0: the problem's own"],
+                                     "SINGLE_REFINE_GOAL, if the problem leaves it at 0), "
+                                     "never more than a thousandth of rel_tolerance: two "
+                                     "passes instead of three; 0: the problem's own"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })
@@ -182,11 +183,14 @@ class ReducedSpaceNewtonCG:
         g = self.parameters["globalization"]
         if g not in ("LS", "TR"):
             raise ValueError("unknown globalization %r" % (g,))
-        # The gradient of a Newton step needs nine digits, not twelve: the refinement of
-        # a single-precision forward or adjoint solve may stop after two passes while
-        # this solver runs (a problem that sets its own goal keeps it).
+        # The gradient of a Newton step to 1e-6 needs nine digits, not twelve: the
+        # refinement of a single-precision forward or adjoint solve may stop after two
+        # passes while this solver runs (a problem that sets its own goal keeps it).  A
+        # thousandth of the tolerance keeps the costs the line search compares exact to
+        # well below the decrease it asks for when the tolerance is tighter.
         pde = getattr(self.model, "problem", None)
-        goal = float(self.parameters["single_refine_goal"] or 0.0)
+        goal = min(float(self.parameters["single_refine_goal"] or 0.0),
+                   1e-3 * float(self.parameters["rel_tolerance"]))
         own = None
         if goal > 0.0 and pde is not None and not getattr(pde, "SINGLE_REFINE_GOAL", 1.0):
             own = pde.__dict__.get("SINGLE_REFINE_GOAL", _UNSET)
