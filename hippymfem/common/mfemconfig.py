@@ -177,6 +177,11 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     local = _node_rank(comm)
     idx = local % max(n, 1)
     dev = mfem.Device(kind, idx)
+    # Never destroyed from Python: MFEM's memory manager goes with the Device, and at the
+    # interpreter's exit this module may be cleared before a script's own MFEM objects,
+    # whose hypre matrices then read the memory manager in their destructor and fault
+    # (HypreParMatrix::Destroy).  It lives until the process ends.
+    dev.thisown = False
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
     set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)

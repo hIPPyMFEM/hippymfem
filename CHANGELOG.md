@@ -24,6 +24,13 @@
   where the failures above showed as `jit__reduce_all`), past the retry. The loops now wait
   for their results inside it, and the size of the failed request is read as JAX 0.11 words
   it.
+- **A script that holds MFEM objects at module level no longer ends with a segmentation
+  fault on a GPU.** MFEM's memory manager goes with the `mfem.Device` that
+  `mfemconfig.configure_device` creates, and at the interpreter's exit the module holding
+  it could be cleared before the script's own objects, whose hypre matrices then faulted
+  in their destructor (`HypreParMatrix::Destroy`), after all the work was done (exit code
+  139). The device is now never destroyed from Python. Seen on RTX PRO 6000 Blackwell
+  instances with the library of 2 October as well.
 - **A streamed geometry is copied to the device at the rate of the bus**
   (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
   geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
