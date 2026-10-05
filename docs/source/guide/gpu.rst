@@ -356,9 +356,10 @@ right-hand sides of incremental solves, solved to 1e-5) it took the iterations f
 to 6 and a solve from 76 to 48 ms with the same setup time, at the MAP point, at the
 prior mean and at the true parameter alike, and Newton-CG to 1e-6 from 38.5 to 29.0 s on
 a Blackwell instance and from 19.8 to 15.7 s on an H100, with the same twelve Newton steps
-and 131 CG iterations.  Jacobi alone (``"relax=7"``) kept the steps and CG iterations of
-ten times more observations (68.3 to 54.0 s) and of noise ten times smaller (116.5 to
-91.1 s).  It is not the default: plain Jacobi is not guaranteed to smooth a matrix that
+and 131 CG iterations.  It kept the steps and CG iterations of the problem with ten times
+more observations (68.3 to 52.0 s, 15 Newton steps and 273 CG iterations) and of the one
+with noise ten times smaller, whose CG runs into its cap of 50 iterations in most late
+steps (113.1 to 84.7 s, 18 and 488).  It is not the default: plain Jacobi is not guaranteed to smooth a matrix that
 is far from diagonally dominant, and it has been checked on this model problem only.
 Of the other settings tried, Chebyshev relaxation halved the iterations at more than
 twice their cost, a strength threshold of 0.5 and fewer interpolation entries cost
