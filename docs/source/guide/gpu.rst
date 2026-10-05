@@ -335,11 +335,34 @@ double-precision one to 1e-12.  ``PDEVariationalProblem.SINGLE_REFINE_GOAL = 1e-
 stops after two passes and one evaluation of the residual, with the state exact to
 4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
 functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
-decrease, which is why it is not the default.  The incremental solves of a Hessian
-action are used as they are, which the
+decrease, which is why it is not the problem's default.  Newton-CG sets it while it runs
+(``single_refine_goal``, 1e-9, never above a thousandth of its own tolerance): at
+64\ :sup:`3` on a Blackwell instance 38.8 s instead of 40.8 s, the same twelve steps and
+131 CG iterations, the cost functional equal to 8e-10.  The incremental solves of a
+Hessian action are used as they are, which the
 reorthogonalized CG of a Newton step allows (:doc:`optimization`).  It applies when the
 three solvers that hold the Jacobian are CG with BoomerAMG and the Jacobian is
 symmetric; any other problem keeps its double-precision solves.
+
+The BoomerAMG of that library takes MFEM's defaults for a device, and
+``HIPPYMFEM_SINGLE_AMG`` sets any of hypre's BoomerAMG options by name
+(:data:`hippymfem.algorithms.singlesolve.AMG_OPTIONS`).  ``"relax=7,pmax=6"``, Jacobi
+relaxation (hypre's type 7) instead of l1-Jacobi (18) and six interpolation entries a
+row instead of four, is the one worth setting on the model problem.  l1-Jacobi divides
+by the sum of the magnitudes of a row, a few times the diagonal for quadratic elements,
+and smooths that much less.  On the Jacobian at 64\ :sup:`3` (Blackwell instance, the
+right-hand sides of incremental solves, solved to 1e-5) it took the iterations from 11
+to 6 and a solve from 76 to 48 ms with the same setup time, at the MAP point, at the
+prior mean and at the true parameter alike, and Newton-CG to 1e-6 from 38.5 to 29.0 s on
+a Blackwell instance and from 19.8 to 15.7 s on an H100, with the same twelve Newton steps
+and 131 CG iterations.  Jacobi alone (``"relax=7"``) kept the steps and CG iterations of
+ten times more observations (68.3 to 54.0 s) and of noise ten times smaller (116.5 to
+91.1 s).  It is not the default: plain Jacobi is not guaranteed to smooth a matrix that
+is far from diagonally dominant, and it has been checked on this model problem only.
+Of the other settings tried, Chebyshev relaxation halved the iterations at more than
+twice their cost, a strength threshold of 0.5 and fewer interpolation entries cost
+iterations, HMIS coarsening set up on the host (2.2 s), aggressive coarsening cost
+iterations, and its extended+i interpolation does not run on a device (it crashes).
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
