@@ -592,10 +592,12 @@ def _fits(exc, n):
     import re
 
     try:
-        m = re.search(r"allocate (\d+) bytes", str(exc))
+        # "allocate 3623878656 bytes", or as JAX 0.11 words it, "allocate 3.38GiB"
+        m = re.search(r"allocate (\d+(?:\.\d+)?) ?(bytes|B|KiB|MiB|GiB|TiB)\b", str(exc))
         if not m:
             return max(1, n // 2)
-        want = int(m.group(1))
+        want = int(float(m.group(1)) * {"bytes": 1, "B": 1, "KiB": 2 ** 10, "MiB": 2 ** 20,
+                                         "GiB": 2 ** 30, "TiB": 2 ** 40}[m.group(2)])
         free = _free_budget(device()) or 0
         if free <= 0 or want <= 0:
             return max(1, n // 2)
@@ -1027,14 +1029,21 @@ class GroupKernel:
                 n = self._planned(fn, args, axes, d, weight, ne, glued=True)
             n = min(n, ne)
             while True:
+                parts = None
                 try:
                     if n >= ne:
                         return fn(*args)
                     parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne), fn))
                              for a in range(0, ne, n)]
-                    return jax.tree_util.tree_map(
+                    out = jax.tree_util.tree_map(
                         lambda *p: jnp.concatenate(p, axis=0), *parts)
+                    parts = None
+                    # Waited for here: JAX reports an allocation that fails while a
+                    # launch runs at the next synchronization, which would otherwise
+                    # be the caller's (the finiteness check), past this retry.
+                    return jax.block_until_ready(out)
                 except Exception as exc:
+                    parts = out = None          # what the failed attempt holds goes first
                     if n <= 1 or not _is_oom(exc):
                         raise
                     _release_for_retry()
@@ -1108,7 +1117,9 @@ class GroupKernel:
         while a < ne:
             bnd = min(a + n, ne)
             try:
-                out = raw(*_chunk_slices(args, axes, a, bnd, raw))
+                # (waited for, as in _chunked; the consumers check every chunk for
+                # finiteness, which waits for it anyway)
+                out = jax.block_until_ready(raw(*_chunk_slices(args, axes, a, bnd, raw)))
             except Exception as exc:
                 # the streaming path had no retry: a chunk that does not fit is
                 # shrunk from what the allocator asked for, as _chunked does, and the
