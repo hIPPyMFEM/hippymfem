@@ -653,8 +653,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: or the matrix is not the operator of its residual (a Jacobian taken for symmetric
     #: where it is not, :attr:`symmetric_jacobian`).  The system is then solved once more
     #: with the Jacobian assembled in double precision (:meth:`_solve_in_double`), with a
-    #: ``RuntimeWarning`` once per process.  A refinement that converges ends at its
-    #: goal (about 1e-11 for a tolerance of 1e-12) in two or three passes.
+    #: ``RuntimeWarning`` once per process; so is one whose single-precision solver gives
+    #: up in a pass.  A refinement that converges ends at its goal (about 1e-11 for a
+    #: tolerance of 1e-12) in two or three passes.
     REFINE_STALL = (1e3, 1e-8)
 
     def _probe_symmetry(self, A, tol=None):
@@ -907,7 +908,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._refine_measured = True
         if r0 == 0.0:
             return 0, r
-        rn = r0
+        rn, gave_up = r0, ""
         verbose = self.newton_parameters["print_level"] >= 0 and self.comm.rank == 0
         try:
             for steps in range(1, 2 + int(self.REFINE_MAX_STEPS)):
@@ -921,7 +922,15 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                     prm["rel_tolerance"] = inner
                 if negate:
                     r.scale(-1.0)
-                solver.solve(dx, r)
+                try:
+                    solver.solve(dx, r)
+                except RuntimeError as e:
+                    # the single-precision solver itself gave up (hypre's PCG broke off,
+                    # or ran out of iterations): the way out below, as for a stall
+                    if not low > 0.0 or point is None or getattr(solver, "converged", True):
+                        raise
+                    gave_up = str(e) or "no reason given"
+                    break
                 x.axpy(1.0, dx)
                 if self.REFINE_PREDICT and ratio is not None and inner is not None:
                     # The residual is an assembly of the element kernels.  When the
@@ -949,16 +958,18 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             if tight is not None:
                 prm["rel_tolerance"] = tight
         factor, worst = self.REFINE_STALL
-        if (point is not None and self._refine_measured
-                and rn > max(factor * goal, max(worst, 100.0 * _kernel.residual_floor()) * r0)):
+        if gave_up or (point is not None and self._refine_measured
+                       and rn > max(factor * goal,
+                                    max(worst, 100.0 * _kernel.residual_floor()) * r0)):
             _warn_stall(what, rn / r0, goal / r0,
-                        self.symmetric_jacobian == "auto" and bool(self._symmetric_verdict))
-            if negate:
+                        self.symmetric_jacobian == "auto" and bool(self._symmetric_verdict),
+                        gave_up)
+            if negate and not gave_up:           # (the pass that gave up left it negated)
                 r.scale(-1.0)
             self._solve_in_double(point, dx, r, what == "adjoint", prm)
             x.axpy(1.0, dx)
             r = residual()
-            steps += 1
+            steps += 0 if gave_up else 1
         return steps, r
 
     def _solve_in_double(self, x, out, rhs, transpose, prm):
@@ -1443,21 +1454,23 @@ def require_finite(v, what):
 _STALL_WARNED = []
 
 
-def _warn_stall(what, rel, goal, kept):
-    """The warning of a refinement that stalled (:data:`PDEVariationalProblem.REFINE_STALL`),
-    once per process."""
+def _warn_stall(what, rel, goal, kept, gave_up=""):
+    """The warning of a refinement that stalled (:data:`PDEVariationalProblem.REFINE_STALL`)
+    or whose solver gave up, with the solver's words, once per process."""
     if _STALL_WARNED:
         return
     _STALL_WARNED.append(True)
     import warnings
 
-    warnings.warn(
-        "a refined %s solve stopped at %.1e of its first residual, its goal %.1e: single "
-        "precision cannot carry this solve at this point%s; it is solved again with the "
-        "Jacobian in double precision (said once)"
-        % (what, rel, goal, (", or the Jacobian is not symmetric here although the first "
-                             "one was (symmetric_jacobian)" if kept else "")),
-        RuntimeWarning, stacklevel=4)
+    if gave_up:
+        said = "the single-precision solver of a refined %s solve gave up (%s)" % (what, gave_up)
+    else:
+        said = ("a refined %s solve stopped at %.1e of its first residual, its goal %.1e: "
+                "single precision cannot carry this solve at this point%s"
+                % (what, rel, goal, (", or the Jacobian is not symmetric here although the "
+                                     "first one was (symmetric_jacobian)" if kept else "")))
+    warnings.warn(said + "; it is solved again with the Jacobian in double precision "
+                  "(said once)", RuntimeWarning, stacklevel=4)
 
 
 def _same(a, b):

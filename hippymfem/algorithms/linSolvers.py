@@ -403,23 +403,59 @@ class KrylovSolver(_SolverBase):
         return self
 
     def _solve_single(self, x, b):
-        from .singlesolve import SINGLE_TOL_FLOOR
+        from .singlesolve import AMG_OPTIONS
 
         p = self.parameters
         if p["nonzero_initial_guess"]:
             raise ValueError("a single-precision solve starts from zero: its matrix cannot "
                              "form the residual of a double-precision guess")
-        self.iterations, final = self._pc.solve(x.hypre, b.hypre, p["rel_tolerance"],
-                                                p["abs_tolerance"], p["max_iter"])
-        self.converged = (self.iterations < int(p["max_iter"])
-                          or final <= max(float(p["rel_tolerance"]), SINGLE_TOL_FLOOR))
+        tol, atol, most = p["rel_tolerance"], float(p["abs_tolerance"]), int(p["max_iter"])
+        self.iterations, final = self._pc.solve(x.hypre, b.hypre, tol, atol, most)
+        # Not the count.  With a preconditioner that is not positive definite (BoomerAMG
+        # with plain Jacobi relaxation outside the meshes that suit it) the squared
+        # residual in the preconditioner's norm turns negative: hypre's test takes that
+        # for converged after a few iterations and returns a residual that is not a
+        # number, with the true one of order one.  So: hypre's verdict, and a residual
+        # that is a number.
+        self.converged = bool(self._pc.converged) and math.isfinite(final)
+        size = 1.0
+        if not self.converged and self.iterations < most:
+            # hypre's PCG stopped by itself.  It works with squares, <C b, b> and
+            # <C r, r>, and in single precision those leave the range of numbers long
+            # before the vectors do: with a right-hand side of size 1e-16 the second is
+            # subnormal at a relative residual of 1e-4, and hypre breaks off there; one
+            # of size 1e-23 it takes for zero, and one of size 1e20 for a wrong input.
+            # The system is linear: it is solved again for the right-hand side in units
+            # in which its size is near one (a power of two, so that only exponents
+            # change).  A preconditioner that is not positive definite fails again.
+            size = b.norm("l2")
+            if size < 1e-300:
+                x.zero()                       # zero (or nothing a double can scale)
+                self.iterations, final, size, self.converged = 0, 0.0, 0.0, True
+            elif math.isfinite(size):
+                power = math.frexp(size)[1]
+                unit = b.copy().scale(math.ldexp(1.0, -power))
+                self.iterations, final = self._pc.solve(x.hypre, unit.hypre, tol,
+                                                        math.ldexp(atol, -power), most)
+                x.scale(math.ldexp(1.0, power))
+                self.converged = bool(self._pc.converged) and math.isfinite(final)
         # the norm over all ranks: one that judged its own part would raise alone
         if self.converged and not math.isfinite(x.norm("l2")):
             self.converged = False
         if not self.converged and p["error_on_nonconvergence"]:
+            why = ""
+            if not math.isfinite(size):
+                why = ": the right-hand side is not a number"
+            elif math.isnan(final):
+                why = ": the preconditioner is not positive definite on this matrix"
+                if AMG_OPTIONS:
+                    why += " (BoomerAMG with %s)" % ", ".join(
+                        "%s=%s" % kv for kv in AMG_OPTIONS.items())
+            elif self.iterations < most:
+                why = ": hypre's PCG broke off"
             raise RuntimeError(
                 "cg(amg) in single precision failed to converge in %d iterations "
-                "(final rel. norm %.3e)" % (self.iterations, final))
+                "(final rel. norm %.3e)%s" % (self.iterations, final, why))
         return self.iterations
 
     def _mfem_cg(self):

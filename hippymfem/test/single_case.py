@@ -254,3 +254,74 @@ def run(check, COMM=MPI.COMM_WORLD):
         check("accumulated in single precision the Jacobian is the one rounded from double precision",
               products[0][0] == "SingleParMatrix" and seen == ["float32", "float64"] and d < 1e-5,
               "(accumulators %s; a product differs by %.1e)" % (seen, d))
+
+    # The verdict of a solve.  hypre's PCG works with the square of the right-hand side's
+    # size and of the residual's, which leave the range of single precision long before
+    # the vectors do: it breaks off after a few iterations on a right-hand side of size
+    # 1e-16 and takes one of size 1e-30 for zero.  Such a system is solved in units in
+    # which the size is near one, and a zero right-hand side gives zero without an
+    # iteration.
+    S, _ = pde._jacobian([got[True]["u"], m, None])
+
+    def krylov(S):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-5
+        ks.parameters["abs_tolerance"] = 0.0
+        ks.parameters["max_iter"] = 200
+        return ks.set_operator(S)
+
+    ks = krylov(S)
+    one, y = Vu.vector(), Vu.vector()
+    its, off, powers = [ks.solve(one, rhs)], [], (-100, -60, 60, 100)
+    for power in powers:
+        its.append(ks.solve(y, rhs.copy().scale(2.0 ** power)))
+        off.append(y.scale(2.0 ** -power).axpy(-1.0, one).norm("l2") / one.norm("l2"))
+    none = ks.solve(y, Vu.vector())
+    check("right-hand sides of size 1e-30 to 1e30 are solved as one of size one, and zero gives zero",
+          max(abs(k - its[0]) for k in its[1:]) <= 1 and max(off) < 1e-3 and none == 0
+          and ks.converged and y.norm("l2") == 0.0,
+          "(%d iterations, and %s for the sizes 2^%s; the solutions differ by at most %.1e; "
+          "zero: %d iterations)" % (its[0], its[1:], list(powers), max(off), none))
+    del ks, S
+
+    # With a preconditioner that is not positive definite hypre's PCG stops after a few
+    # iterations and reports convergence, the true residual of order one.  Plain Jacobi
+    # relaxation (relax=7) makes one where the largest eigenvalue of D^-1 A is above 2:
+    # here with a parameter three times the sample (6.9).  The solver says so, and the
+    # problem's forward solve goes through double precision instead.
+    import warnings
+
+    big = mtrue.copy().scale(3.0)
+    pde.set_single_solves(False)
+    pde.invalidate_jacobian()
+    pde._release_operators("solver", "solver_adj")
+    ud = pde.generate_state()
+    pde.solveFwd(ud, [ud, big, None])
+    pde.set_single_solves(True)
+    said, eu = "", float("nan")
+    options, singlesolve.AMG_OPTIONS = (singlesolve.AMG_OPTIONS,
+                                        singlesolve.parse_amg_options("relax=7,pmax=6"))
+    try:
+        pde.invalidate_jacobian()
+        pde._release_operators("solver", "solver_adj")
+        S, _ = pde._jacobian([ud, big, None])
+        ks = krylov(S)
+        try:
+            ks.solve(y, rhs)
+        except RuntimeError as e:
+            said = str(e)
+        accepted = ks.converged
+        del ks, S
+        us = pde.generate_state()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)      # (said once per process)
+            pde.solveFwd(us, [us, big, None])
+        eu = us.copy().axpy(-1.0, ud).norm("l2") / ud.norm("l2")
+    finally:
+        singlesolve.AMG_OPTIONS = options
+        pde.invalidate_jacobian()
+        pde._release_operators("solver", "solver_adj")
+    check("a solve that hypre's PCG abandons is not taken for converged, and the forward solve "
+          "falls back on double precision",
+          not accepted and "not positive definite" in said and eu < 1e-9,
+          "(the state against double precision %.1e; %s)" % (eu, said[said.find("failed"):] or "no error"))

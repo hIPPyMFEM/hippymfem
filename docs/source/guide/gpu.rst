@@ -97,8 +97,12 @@ all of it.
   interpolation entries a row in the BoomerAMG of the single-precision solves) took the
   Newton-CG solve at 64\ :sup:`3` from 38.5 to 29.0 s on a Blackwell instance and from
   19.8 to 15.7 s on an H100, with the same Newton and CG counts, also on the problems with
-  ten times more observations and with noise ten times smaller.  Measured on this model
-  problem only, so not the default (:ref:`single-precision`).
+  ten times more observations and with noise ten times smaller.  It is for problems like
+  this one only, first- or second-order hexahedra on a regular mesh with a moderate
+  contrast in the coefficient: on quadratic tetrahedra, a stretched mesh, an anisotropic
+  coefficient or a strong contrast the solves fail, with an error.
+  ``"relax=16,cheby_order=1,pmax=6"`` (Chebyshev relaxation of order one) converged on
+  all of these and has half the gain here (:ref:`single-precision`).
 
 **The Laplace approximation.**  Keep the single-precision solves for the stages after the
 MAP point.  Their incremental solves stop near 1e-5, and the eigenpairs come out to about
@@ -297,7 +301,10 @@ the installed build (:ref:`hypre-single-install`); the library loads it next to 
 other one.  The Jacobian of a PDE problem is then assembled into that library and exists
 there alone, with its BoomerAMG hierarchy, and the CG solves with it run there
 (:mod:`hippymfem.algorithms.singlesolve`).  A single-precision solve reaches a relative
-residual near 1e-5.  The forward and the adjoint solve are therefore refined against
+residual near 1e-5, for a right-hand side of any size: hypre's PCG works with squares
+that leave the range of single precision where the right-hand side is far from one
+(it breaks off at a size of 1e-16), and such a system is solved for the right-hand side
+scaled by a power of two.  The forward and the adjoint solve are therefore refined against
 double-precision residuals, which the element kernels compute, to the solver's own
 tolerance: three passes for 1e-12, with the iterations of one double-precision solve
 in all, the last pass not followed by another evaluation of the residual when the
@@ -337,12 +344,39 @@ a Blackwell instance and from 19.8 to 15.7 s on an H100, with the same twelve Ne
 and 131 CG iterations.  It kept the steps and CG iterations of the problem with ten times
 more observations (68.3 to 52.0 s, 15 Newton steps and 273 CG iterations) and of the one
 with noise ten times smaller, whose CG runs into its cap of 50 iterations in most late
-steps (113.1 to 84.7 s, 18 and 488).  It is not the default: plain Jacobi is not guaranteed to smooth a matrix that
-is far from diagonally dominant, and it has been checked on this model problem only.
-Of the other settings tried, Chebyshev relaxation halved the iterations at more than
-twice their cost, a strength threshold of 0.5 and fewer interpolation entries cost
-iterations, HMIS coarsening set up on the host (2.2 s), aggressive coarsening cost
-iterations, and its extended+i interpolation does not run on a device (it crashes).
+steps (113.1 to 84.7 s, 18 and 488).
+
+It is not the default, and it is not for every problem.  Plain Jacobi smooths only where
+the largest eigenvalue of D\ :sup:`-1`\ A is below 2: it is 1.50 for trilinear and 1.71
+for triquadratic hexahedra on the model problem's mesh and 1.98 for linear tetrahedra,
+but 2.47 for cubic hexahedra, 2.38 for quadratic tetrahedra, 2.27 on a mesh stretched by
+ten, 3.69 with an anisotropy of 100 and 6.85 with a parameter three times as large (a
+contrast of 1e14).  Above 2 the preconditioner is not positive definite.  The cubic
+hexahedra converged all the same (one system in 24 iterations instead of 21, Newton-CG
+at 32\ :sup:`3` on an H100 in 13.8 s instead of 16.3 s).  In the other cases hypre's PCG
+stops after two or three iterations with a residual of order one: the solver then raises
+an error (``the preconditioner is not positive definite on this matrix``), and a forward
+or an adjoint solve is solved with the Jacobian in double precision instead, with a
+warning that says the same.
+
+``"relax=16,cheby_order=1,pmax=6"`` is the setting that is safe on all of them.
+Chebyshev relaxation of order one is a Jacobi whose weight hypre takes from an estimate
+of that eigenvalue on every level.  On one small system of each kind (9,000 to 36,000
+rows on a host, solved to 1e-5) it converged in every case above and never in more
+iterations than l1-Jacobi: 13 against 19 on the model problem's hexahedra, 15 against 21
+on cubic hexahedra, 17 against 22 on quadratic tetrahedra, 18 against 37 with the
+parameter three times as large, 72 against 105 on the stretched mesh.  On a GPU its
+iteration costs half as much again (4.85 ms against 3.26 ms at 64\ :sup:`3` on an H100),
+so it pays where it removes more than a third of the iterations.  On the model problem
+it does: six iterations instead of eleven, a solve in 29.1 ms against 35.9 ms with the
+defaults and 22.9 ms with plain Jacobi, and in one series of Newton-CG runs on an H100
+18.0 s against 20.0 s and 16.0 s.
+
+Of the other settings tried, Chebyshev relaxation of order two (hypre's default order)
+halved the iterations at more than twice their cost, a strength threshold of 0.5 and
+fewer interpolation entries cost iterations, HMIS coarsening set up on the host (2.2 s),
+aggressive coarsening cost iterations, and its extended+i interpolation does not run on
+a device (it crashes).
 In MFEM's BoomerAMG, which PyMFEM lets set the relaxation but not the interpolation
 entries, ``HIPPYMFEM_AMG_RELAX=7`` (read by every AMG solver, the prior's too) took
 Newton-CG in double precision throughout from 73.0 to 56.1 s on a Blackwell instance with

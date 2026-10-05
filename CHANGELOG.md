@@ -240,6 +240,28 @@
 
 ### Fixed
 
+- **A single-precision solve that hypre's PCG abandons is no longer taken for converged.**
+  A solve counted as converged when it had used fewer than `max_iter` iterations. With a
+  preconditioner that is not positive definite hypre's PCG stops after two or three
+  iterations and reports convergence, with a residual that is not a number and a true one
+  of order one. BoomerAMG with plain Jacobi relaxation (`HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`)
+  is such a preconditioner outside first- and second-order hexahedra on a regular mesh with
+  moderate contrast (quadratic tetrahedra, a stretched mesh, an anisotropic coefficient, a
+  strong contrast); the default smoother never is. The verdict is now hypre's own together
+  with a finite residual: the solver raises, and a forward or adjoint solve is solved with
+  the Jacobian in double precision instead (`PDEVariationalProblem.REFINE_STALL`). The
+  guide says where `relax=7` is safe and names `relax=16,cheby_order=1,pmax=6` (Chebyshev
+  relaxation of order one), which converged in every case tried, at half the gain on the
+  model problem.
+- **Small and large right-hand sides in the single-precision solves.** hypre's PCG works
+  with the squares of the right-hand side's and the residual's size, and in single precision
+  those leave the range of numbers long before the vectors do. On a right-hand side of size
+  1e-16 it broke off after two to four iterations with a residual of 4e-5 to 2e-2, one below
+  about 1e-23 it took for zero, and one above 1e19 for a wrong input; all three came back as
+  converged (seven of the 2,225 incremental solves of the Taylor approximation in `test_uq`
+  on two ranks). Such a system is now solved again for the right-hand side scaled by a
+  power of two to a size near one, which changes nothing but exponents, and a zero
+  right-hand side returns zero without an iteration.
 - **A script that holds MFEM objects at module level no longer ends with a segmentation
   fault on a GPU.** MFEM's memory manager goes with the `mfem.Device` that
   `mfemconfig.configure_device` creates, and at the interpreter's exit the module holding

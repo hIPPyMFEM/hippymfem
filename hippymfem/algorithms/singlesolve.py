@@ -60,6 +60,9 @@ HYPRE_SINGLE = os.environ.get("HIPPYMFEM_HYPRE_SINGLE", "").strip()
 #: to it: the solve would stagnate above the tolerance and run to its iteration limit.
 SINGLE_TOL_FLOOR = 1e-5
 
+#: The bit of hypre's error flag for an iteration that ended without meeting its tolerance.
+HYPRE_ERROR_CONV = 256
+
 #: Entries converted per pass between the two precisions (a transient of twelve bytes
 #: each in the element kernels' device memory).
 CHUNK = 1 << 24
@@ -231,6 +234,7 @@ class _Library:
             "HYPRE_PCGSetPrecond": ([p, p, p, p], i),
             "HYPRE_ParCSRPCGSetup": ([p, p, p, p], i), "HYPRE_ParCSRPCGSolve": ([p, p, p, p], i),
             "HYPRE_PCGGetNumIterations": ([p, P(i)], i),
+            "HYPRE_PCGGetConverged": ([p, P(i)], i),
             "HYPRE_PCGGetFinalRelativeResidualNorm": ([p, P(r)], i),
             "hypre_Free": ([p, i], None),
         }
@@ -615,6 +619,7 @@ class SingleEngine:
         self.matrix, self.lib = S, S.lib
         H, lib, p = S.lib.H, S.lib, parameters
         self.amg = self.pcg = None
+        self.converged, self.refused, self.error = False, False, 0
         self.b, self.x = S.vector(), S.vector(columns=True)
         amg = ctypes.c_void_p()
         H.HYPRE_BoomerAMGCreate(ctypes.byref(amg))
@@ -627,8 +632,13 @@ class SingleEngine:
         # (Blackwell instance, to 1e-5) from 11 to 6 iterations and from 76 to 48 ms at
         # the MAP point, the prior mean and the truth alike, and Newton-CG to 1e-6 from
         # 38.5 to 29.0 s (H100: 19.8 to 15.7 s) with the same Newton and CG counts.  Opt-in
-        # until it is checked on more problems: plain Jacobi needs no diagonal dominance
-        # to be defined, but it is not guaranteed to smooth without it.
+        # for good: plain Jacobi smooths only where the largest eigenvalue of D^-1 A is
+        # below 2 (1.71 on the model problem; 2.38 on quadratic tetrahedra, 6.85 with a
+        # parameter three times as large).  Above, the preconditioner is not positive
+        # definite and hypre's PCG stops after a few iterations, which the solver reports
+        # as a failure (KrylovSolver._solve_single).  "relax=16,cheby_order=1,pmax=6"
+        # takes the weight from an eigenvalue estimate on every level and converged in
+        # every case tried, with half the gain on the model problem.
         gpu = lib.device
         relax = int(p["amg_relax_type"])
         levels = int(p["amg_max_levels"])
@@ -679,7 +689,21 @@ class SingleEngine:
 
     def solve(self, x, b, rel_tol, abs_tol, max_iter):
         """``x = A^{-1} b`` for two of MFEM's vectors, from a zero guess; returns the
-        iterations and the final relative residual in the preconditioner's norm."""
+        iterations and the final relative residual in the preconditioner's norm.
+
+        :attr:`converged` is hypre's own verdict on the solve and :attr:`error` its
+        error flag.  The count says nothing, and the verdict is not enough: with a
+        preconditioner ``C`` that is not positive definite, ``<C r, r>`` turns negative,
+        hypre's test ``<C r, r> < eps <C b, b>`` then holds, and the solve returns as
+        converged after a few iterations with a residual that is not a number (and a
+        true one of order one).
+
+        :attr:`refused`: hypre did not iterate.  Where ``<C b, b>`` is not positive in
+        single precision it takes the right-hand side for zero, and where it is not
+        finite for a wrong input; it returns at once, without a verdict and with the
+        count and the residual of the solve before.  0 and not-a-number are returned
+        then.  (``KrylovSolver._solve_single`` solves such a system, and one on which
+        the iteration breaks off, in units that suit the right-hand side.)"""
         H, lib = self.lib.H, self.lib
         H.HYPRE_PCGSetTol(self.pcg, max(float(rel_tol), SINGLE_TOL_FLOOR))
         H.HYPRE_PCGSetAbsoluteTol(self.pcg, float(abs_tol))
@@ -688,11 +712,21 @@ class SingleEngine:
         self.x.zero()
         rc = H.HYPRE_ParCSRPCGSolve(self.pcg, self.matrix.par, self.b.par, self.x.par)
         if rc:
-            H.HYPRE_ClearAllErrors()                # not converged sets an error
+            H.HYPRE_ClearAllErrors()                # the flag is the process's and stays up
         self.x.get(x)
-        its, norm = ctypes.c_int(), ctypes.c_float()
+        its, norm, conv = ctypes.c_int(), ctypes.c_float(), ctypes.c_int()
         H.HYPRE_PCGGetNumIterations(self.pcg, ctypes.byref(its))
         H.HYPRE_PCGGetFinalRelativeResidualNorm(self.pcg, ctypes.byref(norm))
+        H.HYPRE_PCGGetConverged(self.pcg, ctypes.byref(conv))
+        self.converged, self.error, self.refused = bool(conv.value), int(rc), False
+        if not conv.value:
+            # An iteration that fails, by a breakdown or at its limit, raises the bit.
+            # The verdict is one for all ranks, but the flag is a process's: what is
+            # read from it is reduced over them, or one rank would go on alone.
+            failed = self.matrix.comm.allreduce(1 if rc & HYPRE_ERROR_CONV else 0, op=MPI.MAX)
+            self.refused = not failed
+        if self.refused:
+            return 0, float("nan")
         return int(its.value), float(norm.value)
 
     def destroy(self):

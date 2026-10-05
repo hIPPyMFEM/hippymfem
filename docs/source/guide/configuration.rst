@@ -175,6 +175,6 @@ variable                            what it decides
 ``HIPPYMFEM_SINGLE_POOL``           the single-precision hypre allocates device memory
                                     from the recycling pool of the double-precision one
 ``HIPPYMFEM_SINGLE_AMG``            BoomerAMG options of the single-precision solves by
-                                    name, such as ``relax=7,pmax=6``
+                                    name, such as ``relax=16,cheby_order=1,pmax=6``
                                     (:ref:`single-precision`)
 ==================================  ======================================================
