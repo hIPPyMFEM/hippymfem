@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Newton-CG in double precision at 128^3 fits one H100.** With 2.1 million quadratic
+  hexahedra on one rank (17.0 million state dofs) it ran out of the card's memory in its
+  first Gauss-Newton step, at every share of JAX tried. A linearization point that needs one
+  block (`C`, at a Gauss-Newton step) took the glued route of the element kernels: a split
+  batch held every row block of the slot pass at once and all of it again while the chunks
+  were joined, and the scatter of the joined arrays kept the pattern's full map on the
+  device, 7.8, 7.8 and 1.7 GiB at that size. In single precision, which took the same route,
+  that took the kernels' pool from 11.2 to 21.2 GiB in use and its arena to the cap; in
+  double precision the 44 GiB needed outside the pool did not fit beside it. Such a block
+  is now assembled a chunk at a time through the fused scatter, as the Jacobian and a full
+  point are; an unsplit batch is computed whole, into the same arrays as before. 128^3 on
+  one H100 at the default share, Newton-CG to 1e-6 with `release_linearization_on_move`:
+  253.8 s in double precision, 13 Newton and 191 CG iterations, the card at 64.1 GiB at its
+  peak (the kernels' pool 12.6 GiB in use); with single-precision solves 197.7 s as before,
+  the card at 58.4 GiB instead of 74.0. 64^3 is unchanged within the noise of the H100
+  (double 27.2 to 27.9 s, single 21.4 to 22.2 s, before and after). **An out-of-memory error
+  inside a chunk loop is retried again.** JAX 0.11 reports an allocation that fails while a
+  launch runs at the next synchronization, under the name of the program waited on; in the
+  chunk loops that was the finiteness check of the element arrays (`kernel.all_finite`,
+  where the failures above showed as `jit__reduce_all`), past the retry. The loops now wait
+  for their results inside it, and the size of the failed request is read as JAX 0.11 words
+  it.
 - **A streamed geometry is copied to the device at the rate of the bus**
   (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
   geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
