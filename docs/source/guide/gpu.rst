@@ -339,7 +339,9 @@ decrease, which is why it is not the default.  The incremental solves of a Hessi
 action are used as they are, which the
 reorthogonalized CG of a Newton step allows (:doc:`optimization`).  It applies when the
 three solvers that hold the Jacobian are CG with BoomerAMG and the Jacobian is
-symmetric; any other problem keeps its double-precision solves.
+symmetric; any other problem keeps its double-precision solves.  On a GPU it is CUDA
+only: with a HIP build (AMD GPUs) the library is refused with a warning and the solves
+stay in double precision.
 
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.

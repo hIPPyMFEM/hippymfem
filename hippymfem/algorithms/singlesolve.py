@@ -36,7 +36,9 @@ wrote next to the library.
 
 ``HIPPYMFEM_HYPRE_SINGLE`` names the library and turns the mode on
 (``hm.config.hypre_single``).  CG with BoomerAMG on a symmetric Jacobian only; anything
-else keeps the double-precision solve.
+else keeps the double-precision solve.  On a GPU it needs a CUDA build: with MFEM and
+hypre on an AMD GPU (a HIP build) the library is refused before it is loaded
+(:func:`unsupported`), with a warning, and the solves stay in double precision.
 """
 
 import ctypes
@@ -84,6 +86,19 @@ def why_not():
     return _WHY
 
 
+def unsupported():
+    """Why this build cannot run the single-precision solves at all, or ``""``.
+
+    They are built (``tools/build_hypre_single.sh``) and tested with CUDA builds of MFEM
+    and hypre and with host builds.  With hypre on an AMD GPU (a HIP build) the device
+    code of the library is untried, and :func:`library` refuses it before loading it."""
+    backend = mfemconfig.mfem_gpu_backend()
+    if device_active() and backend not in (None, "cuda"):
+        return ("the single-precision solves run with CUDA and host builds only, and this "
+                "MFEM and hypre run on %s" % backend)
+    return ""
+
+
 def library():
     """The single-precision library, loaded and initialized at the first call, or
     ``None`` when none is named or it cannot be used (:func:`why_not`)."""
@@ -121,6 +136,9 @@ class _Library:
     settings of the double-precision one."""
 
     def __init__(self, path):
+        why = unsupported()
+        if why:
+            raise RuntimeError(why)
         path = os.path.realpath(path)
         with open(os.path.splitext(path)[0] + ".json") as f:
             self.off = json.load(f)

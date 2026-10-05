@@ -97,6 +97,9 @@
   release each linearization point the busiest instance held 18.3 GiB with
   single-precision kernels and solves against 20.4 GiB in double precision (21.9 GiB
   with the accumulator in double precision and a rounded copy, as before).
+  The single-precision solves run with CUDA builds (H100, L40S, RTX PRO 6000 Blackwell)
+  and host builds; with a HIP build (MI210) the library is refused before it is loaded,
+  with a warning, and the solves stay in double precision (`singlesolve.unsupported`).
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.

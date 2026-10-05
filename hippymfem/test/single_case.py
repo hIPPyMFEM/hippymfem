@@ -30,6 +30,13 @@ def run(check, COMM=MPI.COMM_WORLD):
         if RANK == 0:
             print("  [ok  ] skipped: HIPPYMFEM_HYPRE_SINGLE is not set")
         return
+    why = singlesolve.unsupported()
+    if why:
+        # (a HIP build: the library is refused before it is loaded, with a warning)
+        check("the single-precision library is refused on this build, and the solves stay "
+              "in double precision", singlesolve.library() is None and why in singlesolve.why_not()
+              and singlesolve.action_tolerance(1e-9) == 1e-9, "(%s)" % why)
+        return
     check("the single-precision library loads", singlesolve.library() is not None,
           "(%s)" % (singlesolve.why_not() or singlesolve.HYPRE_SINGLE))
     if singlesolve.library() is None:

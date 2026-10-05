@@ -21,7 +21,9 @@
 # openmpi/4.1.8" loads them here): a library linked against another MPI does not load
 # next to the installed one.  About three minutes with twelve jobs (JOBS).  Built and
 # used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell cards and with a host
-# build; not tried with a HIP build.
+# build.  Not for a HIP build: the hypre of tools/build_pymfem_hip.sh is configured with
+# autotools (no cmbuild/CMakeCache.txt here), and the library refuses a single-precision
+# hypre when MFEM runs on an AMD GPU (hippymfem.algorithms.singlesolve.unsupported).
 set -eo pipefail
 PYMFEM=${1:?PyMFEM source tree}
 NEW=${2:?output directory}
