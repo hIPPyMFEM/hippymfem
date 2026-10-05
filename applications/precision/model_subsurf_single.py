@@ -35,7 +35,13 @@ Run::
     python applications/precision/model_subsurf_single.py --n 8
     HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 HIPPYMFEM_PRECISION=mixed \
         HIPPYMFEM_HYPRE_SINGLE=/path/to/hypre_single/libHYPRE_single.so \
-        python applications/precision/model_subsurf_single.py --n 32
+        python applications/precision/model_subsurf_single.py --n 24
+
+The first run on a GPU compiles the element kernels, and on a Blackwell MIG instance
+that is most of its time: at 24^3 the MAP point took 46 s.  With JAX's persistent
+compilation cache (``JAX_COMPILATION_CACHE_DIR=<directory>``) filled by an earlier run
+of the same size, it took 8.5 s and the eigenpairs 2.7 s, in the same 12 Newton and 145
+CG iterations.
 """
 
 import argparse
