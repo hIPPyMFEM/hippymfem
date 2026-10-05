@@ -25,6 +25,11 @@ be in place before the first ``import jax``, because JAX reads them once:
     ``CUDA_ERROR_OUT_OF_MEMORY``.  Preallocation is off, and the per-process
     fraction is capped.
 
+``AMD_COMGR_CACHE_DIR``
+    On an AMD card, a directory of this node for the kernels the HIP runtime compiles,
+    unless the variable names another: the runtime's own place is under the home
+    directory, which the nodes of a cluster share (:data:`COMGR_CACHE`).
+
 Why the GPU is opt-in
 ---------------------
 
@@ -41,7 +46,9 @@ double-precision rate, which varies a hundredfold between cards:
 """
 
 import os
+import stat
 import sys
+import tempfile
 
 
 def _want_gpu():
@@ -374,6 +381,51 @@ elif (os.environ.get("HIPPYMFEM_PIN_GPU", "1").lower() not in ("0", "no", "false
     # runtime reads ROCR_VISIBLE_DEVICES instead.
     os.environ["ROCR_VISIBLE_DEVICES" if _vendor() == "rocm" else "CUDA_VISIBLE_DEVICES"] = ""
     HIDDEN_GPUS = True
+
+
+def node_dir(name):
+    """``hippymfem-<name>-<uid>`` under the system's temporary directory: a place for a
+    compiler's cache that the nodes of a cluster do not share, made for this user alone.
+    ``None`` where it cannot be had (it is not this user's, or others may write to it).
+    """
+    try:
+        path = os.path.join(tempfile.gettempdir(), "hippymfem-%s-%d" % (name, os.getuid()))
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.lstat(path)
+    except (AttributeError, OSError):
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        return None
+    return path
+
+
+def _point_comgr(environ=os.environ):
+    """Give AMD's code object manager a cache of this node, unless
+    ``AMD_COMGR_CACHE_DIR`` names one already; the directory, or ``None`` if none was set.
+
+    The HIP runtime compiles through ``libamd_comgr``, XLA's kernels and the code that a
+    HIP build of MFEM and hypre brings alike, and the manager keeps every result on disk:
+    in ``comgr`` under ``$XDG_CACHE_HOME`` or ``~/.cache``, 12 MB a kernel on average.
+    On a file system shared by the nodes, ranks that compile the same kernel replace one
+    another's file while others have it open.  Of 32 ranks on four nodes of Frontier,
+    where home is NFS projected through DVS, ten waited there for ever, and the others
+    for them.  A first run on a node pays about half a second a kernel for the empty
+    cache.
+    """
+    if "AMD_COMGR_CACHE_DIR" in environ:
+        return None
+    path = node_dir("comgr")
+    if path:
+        environ["AMD_COMGR_CACHE_DIR"] = path
+    return path
+
+
+#: Where this import pointed the cache of AMD's code object manager (:func:`_point_comgr`):
+#: ``None`` on a run that uses no AMD card, or with ``AMD_COMGR_CACHE_DIR`` set already.
+COMGR_CACHE = (_point_comgr()
+               if "rocm" in os.environ["JAX_PLATFORMS"]
+               or (hypre_on_device() and "cuda" not in os.environ["JAX_PLATFORMS"]
+                   and _vendor() == "rocm") else None)
 
 
 def platforms():

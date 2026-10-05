@@ -923,6 +923,17 @@ counterpart of CUDA graphs) segfault inside ``libamdhip64`` once an element batc
 a size that depends on the block, so ``--xla_gpu_enable_command_buffer=`` is added to
 ``XLA_FLAGS`` when ROCm is selected.
 
+**The kernel cache.**  The HIP runtime compiles through ``libamd_comgr``, XLA's kernels
+and the code of a HIP build of MFEM and hypre alike, and keeps every result on disk, 12 MB
+a kernel on average: by default in ``comgr`` under ``$XDG_CACHE_HOME`` or ``~/.cache``.
+The library points it to a directory of the node, ``hippymfem-comgr-<uid>`` under the
+system's temporary directory, unless ``AMD_COMGR_CACHE_DIR`` names another.  The home
+directory is shared by the nodes of a cluster, and ranks that compile the same kernel
+replace one another's file there while others have it open: of 32 ranks on four nodes of
+Frontier, where home is NFS projected through DVS, ten waited there for ever and the
+others for them.  The first run on a node compiles into an empty cache, at about half a
+second a kernel.
+
 **MFEM and hypre.**  PyMFEM's build system knows only CUDA, so
 ``CPU_PYMFEM=<a CPU PyMFEM tree> tools/build_pymfem_hip.sh <prefix> gfx90a`` builds the
 three pieces itself:

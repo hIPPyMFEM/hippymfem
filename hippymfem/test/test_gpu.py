@@ -507,6 +507,29 @@ def test_device_assignment():
           % (NP, len(devs), distinct, sorted(set(allof))))
 
 
+def test_compiled_kernels_on_the_node():
+    """On an AMD card the kernels the HIP runtime compiled are where the library pointed
+    the code object manager, a directory of the node, or where ``AMD_COMGR_CACHE_DIR``
+    named one: not under the home directory, which the nodes of a cluster share.
+    """
+    if accel() != "rocm" or os.environ.get("AMD_COMGR_CACHE", "") == "0":   # or the cache is off
+        return
+    from hippymfem import _jaxconfig
+
+    if RANK == 0:
+        print("the kernels the HIP runtime compiled")
+    where = os.environ.get("AMD_COMGR_CACHE_DIR", "")
+    try:
+        found = sum(1 for f in os.listdir(where) if f.startswith("llvmcache-"))
+    except OSError:
+        found = 0
+    ok = bool(where) and found > 0
+    check("they are cached on this node, or where AMD_COMGR_CACHE_DIR says",
+          bool(COMM.allreduce(int(ok), op=MPI.MIN)),
+          "(%d in %s%s)" % (found, where or "no directory",
+                            "" if _jaxconfig.COMGR_CACHE else ", named by the environment"))
+
+
 # Cases reported without an assertion.  All are two-dimensional, and at the element
 # counts a test can afford they sit near the crossover where the fixed per-assembly
 # device cost is not yet covered, so their speedup varies severalfold between
@@ -775,6 +798,7 @@ def main():
     test_pattern_sort_on_device()
     test_pattern_sort_kernels_agree()
     test_speed()
+    test_compiled_kernels_on_the_node()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)
