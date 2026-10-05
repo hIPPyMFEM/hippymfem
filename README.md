@@ -124,7 +124,8 @@ python -m pip install -e ".[all]"
 Or build the container: `docker build -t hippymfem .`. For GPUs, install JAX for your
 card (`jax[cuda12]` or `jax[rocm]`) to run the element kernels there; to put MFEM and hypre on
 the card as well, build PyMFEM with `tools/build_pymfem_cuda.sh` (NVIDIA) or
-`tools/build_pymfem_hip.sh` (AMD). [INSTALL.md](INSTALL.md) has the details.
+`tools/build_pymfem_hip.sh` (AMD). [INSTALL.md](INSTALL.md) has the details, and those of an
+optional single-precision hypre for the linear solves (`tools/build_hypre_single.sh`).
 
 ## Quick start
 

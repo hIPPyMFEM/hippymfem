@@ -24,8 +24,9 @@ numba               optional; builds large sparsity patterns without a global
 CuPy                optional; a faster device sort where the sort route runs
 hypre, single       optional; a single-precision build of the hypre that PyMFEM
 precision           uses (``tools/build_hypre_single.sh``, three minutes), loaded next
-                    to it for the linear solves of a PDE problem (:doc:`gpu`,
-                    "Single precision")
+                    to it for the linear solves of a PDE problem
+                    (`A single-precision hypre`_; :ref:`single-precision` in
+                    the GPU guide)
 ==================  ========================================================
 
 Everything except PyMFEM is a ``pip install``.  The ``mfem`` wheel on PyPI is serial
@@ -62,6 +63,60 @@ Check the installation with
 reading its configuration header.  Do not probe this by configuring an MFEM ``Device``:
 on a build without the requested backend MFEM responds with ``MFEM_ABORT``, which ends
 the MPI job instead of returning false.
+
+.. _hypre-single-install:
+
+A single-precision hypre
+------------------------
+
+Optional.  The linear solves of a PDE problem whose Jacobian is symmetric and solved by
+CG with BoomerAMG can run in a single-precision build of the hypre that PyMFEM uses,
+loaded next to it in the same process; :ref:`single-precision` in the GPU guide says
+what that gives.  ``tools/build_hypre_single.sh`` configures the same hypre source again
+with the options of PyMFEM's build of it (compilers and flags, MPI, CUDA architecture,
+hypre's own options) and single precision, so it needs ``cmake`` and the compiler, MPI
+and CUDA toolkit of that build:
+
+.. code-block:: bash
+
+   module load gcc/12.3.0 openmpi/4.1.8        # the compiler and MPI PyMFEM was built with
+   tools/build_hypre_single.sh <prefix>/PyMFEM /path/to/hypre_single
+   export HIPPYMFEM_HYPRE_SINGLE=/path/to/hypre_single/libHYPRE_single.so
+
+The first argument is a PyMFEM source tree in which PyMFEM's build compiled hypre with
+CMake: the script reads ``external/hypre/src/cmbuild/CMakeCache.txt`` there.
+``tools/build_pymfem_cuda.sh`` keeps that tree under its prefix (``<prefix>/PyMFEM``).
+``tools/install_pymfem_parallel.sh`` builds in a temporary directory and removes it, so
+for a host build PyMFEM has to be built from a checkout that is kept.  The HIP build of
+``tools/build_pymfem_hip.sh`` configures its hypre without CMake and is not supported.
+``MODULES="gcc/12.3.0 openmpi/4.1.8"`` makes the script load the modules itself, and
+``JOBS`` (default 12) sets the parallel build, which takes about three minutes with
+twelve.  The script stops if the new library links another MPI than the installed one,
+since it would not load next to it.  Into the output directory it writes
+``libHYPRE_single.so``; ``libHYPRE_single.json``, the offsets of the few fields of
+hypre's structures that the library reads, taken from this build's own headers (keep it
+next to the ``.so``); the CMake tree ``build/``; and ``configure.log`` and ``build.log``.
+It has been built and used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell
+cards and with a host build.
+
+Set the variable before ``import hippymfem``, or set ``hm.config.hypre_single`` before
+the problem is built.  To see whether the library loads, run in the environment of the
+runs (on a GPU build with ``HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1``, since the
+library is set up for the device MFEM uses):
+
+.. code-block:: bash
+
+   python -c "
+   import hippymfem
+   from hippymfem.algorithms import singlesolve
+   lib = singlesolve.library()
+   print('loaded', lib.path) if lib else print('not loaded:', singlesolve.why_not() or 'HIPPYMFEM_HYPRE_SINGLE is not set')"
+
+A library that is named but cannot be used (no ``libHYPRE_single.json`` next to it, a
+build that is not single precision, no device bridge on a GPU) gives a
+``RuntimeWarning`` at its first use, and the solves stay in double precision.  With the
+variable set, ``test_solvers`` and ``test_device`` also compare the solves in the
+single-precision library with the double-precision ones (`Running the tests`_).
 
 Docker
 ------
