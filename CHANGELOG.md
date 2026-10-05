@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Newton-CG sets the refinement goal of the single-precision solves** (`single_refine_goal`
+  of `ReducedSpaceNewtonCG`, 1e-9, at most 1e3 times the square of its tolerance, so a run to
+  1e-8 is unchanged): the forward and adjoint solves stop after two passes instead of three.
+  64^3 on a Blackwell instance 40.8 -> 38.8 s, the same counts, the cost functional the same
+  to 8e-10. The problem's own `SINGLE_REFINE_GOAL` stays 0 for other optimizers. **The
+  stages after the MAP point may keep the single-precision solves**
+  (`PDEVariationalProblem.set_single_solves`): at 64^3 the eigenvalues came out within 1e-5
+  of double precision and the pointwise posterior variance within 6e-6, and the eigensolver
+  took 26.0 s instead of 52.3 s. **BoomerAMG options of the single-precision solves**
+  (`HIPPYMFEM_SINGLE_AMG`, opt-in) and the relaxation of MFEM's BoomerAMG
+  (`HIPPYMFEM_AMG_RELAX`, opt-in): `relax=7,pmax=6` took Newton-CG at 64^3 from 19.8 to
+  15.7 s on an H100 with the same counts; checked on the model problem only.
 - **Newton-CG in double precision at 128^3 fits one H100.** With 2.1 million quadratic
   hexahedra on one rank (17.0 million state dofs) it ran out of the card's memory in its
   first Gauss-Newton step, at every share of JAX tried. A linearization point that needs one
