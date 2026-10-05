@@ -64,6 +64,50 @@ CHUNK = 1 << 24
 
 HOST, DEVICE = 0, 1
 
+#: BoomerAMG settings of the single-precision solves that replace MFEM's defaults, by
+#: name: ``coarsen``, ``agg``, ``agg_interp``, ``agg_pmax``, ``relax``, ``sweeps``,
+#: ``theta``, ``interp``, ``pmax``, ``levels``, ``coarse_size``, ``coarse_relax``,
+#: ``keep_transpose``, ``rap2``, ``cheby_order``, ``trunc`` (the hypre call each one
+#: makes is in :data:`_AMG_SETTERS`).  From ``HIPPYMFEM_SINGLE_AMG``, a comma-separated
+#: list such as ``"theta=0.5,pmax=3"``; matrices set up before a change keep theirs.
+_AMG_SETTERS = {
+    "coarsen": ("HYPRE_BoomerAMGSetCoarsenType", int),
+    "agg": ("HYPRE_BoomerAMGSetAggNumLevels", int),
+    "agg_interp": ("HYPRE_BoomerAMGSetAggInterpType", int),
+    "agg_pmax": ("HYPRE_BoomerAMGSetAggPMaxElmts", int),
+    "relax": ("HYPRE_BoomerAMGSetRelaxType", int),
+    "sweeps": ("HYPRE_BoomerAMGSetNumSweeps", int),
+    "theta": ("HYPRE_BoomerAMGSetStrongThreshold", float),
+    "interp": ("HYPRE_BoomerAMGSetInterpType", int),
+    "pmax": ("HYPRE_BoomerAMGSetPMaxElmts", int),
+    "levels": ("HYPRE_BoomerAMGSetMaxLevels", int),
+    "coarse_size": ("HYPRE_BoomerAMGSetMaxCoarseSize", int),
+    "coarse_relax": ("HYPRE_BoomerAMGSetCycleRelaxType", int),     # (type, 3): the coarsest level
+    "keep_transpose": ("HYPRE_BoomerAMGSetKeepTranspose", int),
+    "rap2": ("HYPRE_BoomerAMGSetRAP2", int),
+    "cheby_order": ("HYPRE_BoomerAMGSetChebyOrder", int),
+    "trunc": ("HYPRE_BoomerAMGSetTruncFactor", float),
+}
+
+
+def parse_amg_options(text):
+    """``"theta=0.5,pmax=3"`` as a dict of the names of :data:`_AMG_SETTERS`."""
+    out = {}
+    for item in (text or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, _, val = item.partition("=")
+        key = key.strip()
+        if key not in _AMG_SETTERS:
+            raise ValueError("HIPPYMFEM_SINGLE_AMG: unknown setting %r (known: %s)"
+                             % (key, ", ".join(sorted(_AMG_SETTERS))))
+        out[key] = _AMG_SETTERS[key][1](val)
+    return out
+
+
+AMG_OPTIONS = parse_amg_options(os.environ.get("HIPPYMFEM_SINGLE_AMG", ""))
+
 _LIB = None
 _WHY = ""
 
@@ -574,6 +618,20 @@ class SingleEngine:
         H.HYPRE_BoomerAMGSetMaxLevels(amg, levels if levels > 0 else 25)
         H.HYPRE_BoomerAMGSetMaxIter(amg, 1)
         H.HYPRE_BoomerAMGSetTol(amg, 0.0)
+        for key, val in AMG_OPTIONS.items():
+            name, kind = _AMG_SETTERS[key]
+            fn = getattr(H, name)
+            if kind is float:
+                fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_float], ctypes.c_int
+            elif key == "coarse_relax":
+                fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int], ctypes.c_int
+            else:
+                fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_int
+            rc = fn(amg, val, 3) if key == "coarse_relax" else fn(amg, val)
+            if rc:
+                H.HYPRE_ClearAllErrors()
+                raise ValueError("the single-precision hypre refused %s=%r (%s returned %d)"
+                                 % (key, val, name, rc))
         pcg = ctypes.c_void_p()
         H.HYPRE_ParCSRPCGCreate(lib.comm(S.comm), ctypes.byref(pcg))
         self.pcg = pcg
