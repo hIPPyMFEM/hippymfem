@@ -281,6 +281,14 @@
   handle` and the others waited for it. The cache is now in a directory of the node and of
   the user, `hippymfem-numba-<uid>` under the system's temporary directory
   (`patternbuild.cache_dir`), unless `NUMBA_CACHE_DIR` names another.
+- The cache of AMD's code object manager was under the home directory (the manager's
+  default, `~/.cache/comgr`). The HIP runtime keeps every kernel it compiles there, XLA's
+  and those of a HIP build of MFEM and hypre, and on a file system shared by the nodes the
+  ranks of a run replace one another's files while others have them open: of 32 ranks on
+  four nodes of Frontier (NFS projected through DVS) ten waited for ever and the others
+  for them. On an AMD card the cache is now in a directory of the node and of the user,
+  `hippymfem-comgr-<uid>` under the system's temporary directory
+  (`_jaxconfig.COMGR_CACHE`), unless `AMD_COMGR_CACHE_DIR` names another.
 - **A script that holds MFEM objects at module level no longer ends with a segmentation
   fault on a GPU.** MFEM's memory manager goes with the `mfem.Device` that
   `mfemconfig.configure_device` creates, and at the interpreter's exit the module holding

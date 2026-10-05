@@ -409,6 +409,36 @@ def test_device_auto_without_gpu():
     check("auto without a visible GPU runs on the host", ok, COMM.bcast(detail, root=0))
 
 
+def test_comgr_cache_of_the_node():
+    """AMD's code object manager gets a cache of this node, and one it was given is kept.
+
+    The rule is applied to an environment of the test's own, so it is held on every
+    machine; ``test_gpu`` looks at where the kernels of a run on an AMD card went.
+    """
+    import os
+    import tempfile
+
+    from hippymfem import _jaxconfig as j
+
+    if RANK == 0:
+        print("the cache of AMD's code object manager")
+    env = {}
+    path = j._point_comgr(env)
+    if path is None:
+        ok, detail = not env, "(no directory of this user under the temporary one)"
+    else:
+        st = os.stat(path)
+        ok = (env == {"AMD_COMGR_CACHE_DIR": path} and st.st_uid == os.getuid()
+              and not st.st_mode & 0o022
+              and os.path.realpath(path).startswith(os.path.realpath(tempfile.gettempdir())))
+        detail = "(%s)" % path
+    check("it is a directory of this node and of this user",
+          bool(COMM.allreduce(int(ok), op=MPI.MIN)), detail)
+    env = {"AMD_COMGR_CACHE_DIR": "/a/place/of/the/user"}
+    kept = j._point_comgr(env) is None and env == {"AMD_COMGR_CACHE_DIR": "/a/place/of/the/user"}
+    check("a directory that AMD_COMGR_CACHE_DIR names is kept", kept)
+
+
 def test_config_knobs():
     """Every knob of ``hm.config`` reads, and a written value arrives as the type it names.
 
@@ -507,6 +537,7 @@ if __name__ == "__main__":
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
     test_device_auto_without_gpu()
+    test_comgr_cache_of_the_node()
     if RANK == 0:
         print("-" * 70)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

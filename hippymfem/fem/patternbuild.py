@@ -38,11 +38,10 @@ repay the compilation (:data:`MIN_ENTRIES`); otherwise the sort route runs, unch
 """
 
 import os
-import stat
-import tempfile
 
 import numpy as np
 
+from .. import _jaxconfig
 from ..config import env_choice
 
 #: ``auto`` uses this builder when numba is importable and the pattern has at least
@@ -118,15 +117,7 @@ def cache_dir():
     cannot be had (it is not this user's, or others may write to it): numba's own choice
     stays then.
     """
-    try:
-        path = os.path.join(tempfile.gettempdir(), "hippymfem-numba-%d" % os.getuid())
-        os.makedirs(path, mode=0o700, exist_ok=True)
-        st = os.lstat(path)
-    except (AttributeError, OSError):
-        return None
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
-        return None
-    return path
+    return _jaxconfig.node_dir("numba")
 
 
 def _passes():
