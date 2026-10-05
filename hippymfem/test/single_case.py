@@ -159,6 +159,24 @@ def run(check, COMM=MPI.COMM_WORLD):
           "(%d Newton and %d CG iterations, %d and %d in double; MAP differs by %.1e)"
           % (got[True]["newton"], got[True]["cg"], got[False]["newton"], got[False]["cg"], em))
 
+    # Newton-CG may stop the refinement of the forward and the adjoint solve early while
+    # it runs (single_refine_goal, off by default; never above 1e3 times the square of
+    # its tolerance): fewer passes, the same MAP point, and the problem's own goal back
+    # when it returns.
+    params = hp.ReducedSpaceNewtonCG_ParameterList()
+    params["rel_tolerance"] = 1e-6
+    params["max_iter"] = 40
+    params["print_level"] = -1
+    params["single_refine_goal"] = 1e-9
+    solver = hp.ReducedSpaceNewtonCG(model, params)
+    x = solver.solve([None, prior.mean.copy(), None])
+    eg = x[PARAMETER].copy().axpy(-1.0, got[False]["m"]).norm("l2") / got[False]["m"].norm("l2")
+    check("with single_refine_goal Newton-CG refines in fewer passes to the same MAP point",
+          solver.converged and pde.fwd_iterations < got[True]["passes"] and eg < 1e-3
+          and "SINGLE_REFINE_GOAL" not in pde.__dict__ and pde.SINGLE_REFINE_GOAL == 0.0,
+          "(%d passes instead of %d; MAP differs by %.1e; the problem's goal afterwards %g)"
+          % (pde.fwd_iterations, got[True]["passes"], eg, pde.SINGLE_REFINE_GOAL))
+
     # Every single-precision matrix of a pattern lends the pattern's one copy of the
     # column indices (singlesolve.SHARE_COLUMNS), also two that live at once, and a
     # matrix made after the others are gone finds it still.

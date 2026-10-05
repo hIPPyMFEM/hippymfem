@@ -149,11 +149,12 @@ points last (:ref:`gpu-memory`).
 solve on a small mesh, which has no single-precision counterpart.  Measured and left
 opt-in: the index arrays of the assembly kept on the device
 (``HIPPYMFEM_DEVICE_PATTERN=1``, memory permitting), Hessian actions relaxed as the CG
-converges (``cg_hessian_relaxation``, which lost on a more informative problem), and Jacobi
+converges (``cg_hessian_relaxation``, which lost on a more informative problem), Jacobi
 relaxation in MFEM's BoomerAMG of the double-precision solves (``HIPPYMFEM_AMG_RELAX=7``,
-which took one problem from 329 to 364 CG iterations).  Newton-CG refines the forward and
-the adjoint solve to 1e-9 only by itself (``single_refine_goal``); the problem's own
-``SINGLE_REFINE_GOAL`` stays 0 for other optimizers (BFGS to 1e-8 failed with 1e-9).
+which took one problem from 329 to 364 CG iterations), and a refinement of the forward
+and the adjoint solve that stops at 1e-9 while Newton-CG runs (``single_refine_goal``:
+at 128\ :sup:`3` on an H100 187 s instead of 199 s while the iteration kept its path, and
+223 s the one time in five that it did not).
 
 .. _mfem-device:
 
@@ -305,11 +306,17 @@ double-precision one to 1e-12.  ``PDEVariationalProblem.SINGLE_REFINE_GOAL = 1e-
 stops after two passes and one evaluation of the residual, with the state exact to
 4e-10: Newton-CG with a tolerance of 1e-6 then took the same steps to the same cost
 functional to nine digits, while BFGS run to 1e-8 ended in a line search that found no
-decrease, which is why it is not the problem's default.  Newton-CG sets it while it runs
-(``single_refine_goal``, 1e-9, never above 1e3 times the square of its own tolerance,
-which leaves a run to 1e-8 as it was): at 64\ :sup:`3` on a Blackwell instance 38.8 s
-instead of 40.8 s, the same twelve steps and 131 CG iterations, the cost functional the
-same to 8e-10.  The incremental solves of a Hessian action are used as they are, which
+decrease, which is why it is not the problem's default.  Newton-CG can set it while it
+runs (``single_refine_goal``, never above 1e3 times the square of its own tolerance,
+which leaves a run to 1e-8 as it is), and that is off by default as well.  With 1e-9 the
+solve at 64\ :sup:`3` took 3 to 5 % less time on an H100, an L40S and Blackwell instances,
+with the same twelve steps and 131 CG iterations (20.2 s instead of 20.8 s on the H100).
+At 128\ :sup:`3` it saves 6 % while the iteration keeps its path, 187 s instead of
+199 s on an H100 with thirteen steps and 191 CG iterations, but it did not always keep
+it: in one solve of five the last line search backtracked and a fourteenth step followed
+(223 s, 232 CG iterations), and on four L40S one solve took 178 s and the next 139 s,
+where every solve with full refinement took 143 s.  With 1e-10 one solve of three went
+the same way.  The incremental solves of a Hessian action are used as they are, which
 the reorthogonalized CG of a Newton step allows (:doc:`optimization`).  All of this
 applies when the three solvers that hold the Jacobian are CG with BoomerAMG and the
 Jacobian is symmetric; any other problem keeps its double-precision solves.  On a GPU it

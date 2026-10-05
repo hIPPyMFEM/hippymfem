@@ -100,13 +100,17 @@ def ReducedSpaceNewtonCG_ParameterList():
                                         "|r_k| at CG iteration k, where that is looser "
                                         "than their own tolerance (line search); 0: "
                                         "their own tolerance throughout"],
-        "single_refine_goal": [1e-9, "with the solves in a single-precision hypre, the "
-                                     "relative residual at which the refinement of the "
-                                     "forward and the adjoint solve may stop while this "
-                                     "solver runs (PDEVariationalProblem."
-                                     "SINGLE_REFINE_GOAL, if the problem leaves it at 0), "
-                                     "never more than 1e3 * rel_tolerance**2: two passes "
-                                     "instead of three at 1e-6; 0: the problem's own"],
+        "single_refine_goal": [0.0, "with the solves in a single-precision hypre, the "
+                                    "relative residual at which the refinement of the "
+                                    "forward and the adjoint solve may stop while this "
+                                    "solver runs (PDEVariationalProblem."
+                                    "SINGLE_REFINE_GOAL, if the problem leaves it at 0), "
+                                    "never more than 1e3 * rel_tolerance**2; 1e-9 is two "
+                                    "passes instead of three at a tolerance of 1e-6: "
+                                    "about 5 % less time while the iteration keeps its "
+                                    "path, and a Newton step more where it does not (one "
+                                    "solve in five at 128^3); 0, the default: the "
+                                    "problem's own"],
         "LS": [LS_ParameterList(), "line search parameters"],
         "TR": [TR_ParameterList(), "trust region parameters"],
     })
@@ -183,13 +187,16 @@ class ReducedSpaceNewtonCG:
         g = self.parameters["globalization"]
         if g not in ("LS", "TR"):
             raise ValueError("unknown globalization %r" % (g,))
-        # The gradient of a Newton step to 1e-6 needs nine digits, not twelve: the
-        # refinement of a single-precision forward or adjoint solve may stop after two
-        # passes while this solver runs (a problem that sets its own goal keeps it).  The
-        # decrease the line search must see near the end shrinks with the square of the
-        # gradient, so the goal does too: 1e-9 at a tolerance of 1e-6, 1e-13 at 1e-8,
-        # where it is tighter than the solvers' own and changes nothing (at 1e-11 a
-        # Newton-CG run to 1e-8 ended in a line search that found no decrease).
+        # On request (single_refine_goal, 0 by default) the refinement of a
+        # single-precision forward or adjoint solve stops early while this solver runs
+        # (a problem that sets its own goal keeps it): at 1e-9, two passes instead of
+        # three.  The decrease the line search must see near the end shrinks with the
+        # square of the gradient, so the goal does too: 1e-9 at a tolerance of 1e-6,
+        # 1e-13 at 1e-8, where it is tighter than the solvers' own and changes nothing
+        # (at 1e-11 a Newton-CG run to 1e-8 ended in a line search that found no
+        # decrease).  It is not the default because the last steps can need the digits:
+        # at 128^3 one solve in five backtracked in its last line search and took a
+        # fourteenth step with the goal at 1e-9, and never with full refinement.
         pde = getattr(self.model, "problem", None)
         goal = min(float(self.parameters["single_refine_goal"] or 0.0),
                    1e3 * float(self.parameters["rel_tolerance"]) ** 2)

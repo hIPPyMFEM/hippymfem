@@ -60,11 +60,14 @@
   `HIPPYMFEM_PRECISION=fp32`, everything in single precision, remains a tool for
   experiments: the optimizers now stop at the floor of that precision instead of
   failing in a line search.
-- **Newton-CG sets the refinement goal of the single-precision solves** (`single_refine_goal`
-  of `ReducedSpaceNewtonCG`, 1e-9, at most 1e3 times the square of its tolerance, so a run to
-  1e-8 is unchanged): the forward and adjoint solves stop after two passes instead of three.
-  64^3 on a Blackwell instance 40.8 -> 38.8 s, the same counts, the cost functional the same
-  to 8e-10. The problem's own `SINGLE_REFINE_GOAL` stays 0 for other optimizers. **The
+- **Newton-CG can set the refinement goal of the single-precision solves**
+  (`single_refine_goal` of `ReducedSpaceNewtonCG`, off by default; at most 1e3 times the
+  square of its tolerance, so a run to 1e-8 is unchanged): with 1e-9 the forward and adjoint
+  solves stop after two passes instead of three. That is 3 to 5 % less time at 64^3 with the
+  same counts. At 128^3 on an H100 it is 187 s instead of 199 s while the iteration keeps
+  its thirteen steps, and in one solve of five the last line search backtracked and a
+  fourteenth step followed (223 s); with full refinement every solve took the same path,
+  which is why that is the default. The problem's own `SINGLE_REFINE_GOAL` stays 0 too. **The
   stages after the MAP point may keep the single-precision solves**
   (`PDEVariationalProblem.set_single_solves`): at 64^3 the eigenvalues came out within 1e-5
   of double precision and the pointwise posterior variance within 6e-6, and the eigensolver
