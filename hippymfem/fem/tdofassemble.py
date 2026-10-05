@@ -415,16 +415,17 @@ class TrueDofPattern:
             got = self._diag.put((ess,), slots)
         return got
 
-    def device_columns(self, block):
+    def device_columns(self, block, create=True):
         """The device copy of a block's column indices that the pattern keeps
-        (:data:`hippymfem.fem.pattern.DEVICE_PATTERN`), or ``None``."""
+        (:data:`hippymfem.fem.pattern.DEVICE_PATTERN`), or ``None``; with ``create``
+        false, only one made already."""
         if not _pattern.DEVICE_PATTERN:
             return None
         from .kernel import _put, device
 
         key = (block, device())
         got = self._dev_J.get(key)
-        if got is None:
+        if got is None and create:
             got = self._dev_J[key] = _put(self.J_diag if block == "diag" else self.J_offd)
         return got
 

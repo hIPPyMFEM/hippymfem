@@ -170,6 +170,7 @@ class _Library:
             "HYPRE_ParCSRPCGSetup": ([p, p, p, p], i), "HYPRE_ParCSRPCGSolve": ([p, p, p, p], i),
             "HYPRE_PCGGetNumIterations": ([p, P(i)], i),
             "HYPRE_PCGGetFinalRelativeResidualNorm": ([p, P(r)], i),
+            "hypre_Free": ([p, i], None),
         }
         for name, (args, res) in sig.items():
             fn = getattr(H, name)
@@ -205,6 +206,10 @@ class _Library:
     def pointer(self, base, name):
         """The pointer stored at the field ``name`` of the structure at ``base``."""
         return ctypes.c_void_p.from_address(int(base) + self.off[name]).value
+
+    def set_pointer(self, base, name, value):
+        """Store the pointer ``value`` (``None`` for NULL) at the field ``name``."""
+        ctypes.c_void_p.from_address(int(base) + self.off[name]).value = value
 
     def integer(self, base, name):
         return ctypes.c_int.from_address(int(base) + self.off[name]).value
@@ -264,6 +269,42 @@ class _Library:
             raise RuntimeError("%s (on another rank)" % first)
 
 
+#: Every matrix of the single-precision library made from one true-dof pattern uses one
+#: copy of its column indices (:class:`_SharedColumns`): the first matrix's, which the
+#: pattern keeps when that matrix goes.  A new matrix then needs no upload of four bytes
+#: a nonzero from the host (52 ms of the 187 ms of an assembly at 2.1 million dofs on an
+#: H100), and two live matrices of one pattern (the Jacobian of the last point, still
+#: held by the incremental solvers, and that of the next) hold one copy instead of two.
+#: hypre neither reorders nor sorts the columns of a matrix that it solves with
+#: BoomerAMG and PCG (the diagonal leads every row of the pattern already, which is all
+#: its reordering does), so the copy stays as it was made.  Set
+#: ``HIPPYMFEM_SINGLE_SHARE_COLUMNS=0`` to give every matrix its own.
+SHARE_COLUMNS = os.environ.get("HIPPYMFEM_SINGLE_SHARE_COLUMNS", "1").lower() not in (
+    "0", "no", "false", "off")
+
+
+class _SharedColumns:
+    """The column indices of a pattern's two blocks in the single-precision library,
+    owned here and lent to every matrix made from the pattern.  Freed when the pattern
+    and the last matrix that uses them are gone."""
+
+    def __init__(self, lib, pointers, counts):
+        self.lib, self.pointers, self.counts = lib, tuple(pointers), tuple(counts)
+
+    def matches(self, lib, counts):
+        return self.lib is lib and self.counts == tuple(counts)
+
+    def __del__(self):
+        try:
+            location = DEVICE if self.lib.device else HOST
+            for ptr in self.pointers:
+                if ptr:
+                    self.lib.H.hypre_Free(ctypes.c_void_p(ptr), location)
+        except Exception:                                        # noqa: BLE001
+            pass
+        self.pointers = ()
+
+
 _FINITE = []
 
 
@@ -306,6 +347,7 @@ class SingleParMatrix:
         self.comm = tp.comm
         self.par = None
         self._vecs = None
+        self._columns = None
         n, nd, no = int(tp.ntd), int(tp.nnz_diag), int(tp.nnz_t - tp.nnz_diag)
         n_offd = int(tp.n_offd)
         self._height, self._width = n, int(tp.c1 - tp.c0)
@@ -323,6 +365,14 @@ class SingleParMatrix:
         try:
             if not par:
                 raise RuntimeError("the single-precision hypre could not create a matrix")
+            shared = getattr(tp, "_single_columns", None) if SHARE_COLUMNS else None
+            if shared is not None and shared.matches(lib, (nd, no)):
+                # the column indices of an earlier matrix of this pattern: set before
+                # the arrays are allocated, so that hypre allocates none for them
+                for name, ptr in zip(("par_diag", "par_offd"), shared.pointers):
+                    if ptr:
+                        lib.set_pointer(lib.pointer(par, name), "csr_j", ptr)
+                self._columns = shared
             lib.check(H.hypre_ParCSRMatrixInitialize_v2(self.par, DEVICE if lib.device else HOST),
                       "ParCSRMatrixInitialize")
             on_host = isinstance(acc, np.ndarray)
@@ -353,11 +403,14 @@ class SingleParMatrix:
                 lib.put(lib.pointer(csr, "csr_i"), np.ascontiguousarray(I, dtype=np.int32))
                 if not count:
                     continue
-                dev_J = tp.device_columns(block) if lib.device else None
-                if dev_J is not None:
-                    bridge.copy_from_jax(lib.pointer(csr, "csr_j"), dev_J)
-                else:
-                    lib.put(lib.pointer(csr, "csr_j"), np.ascontiguousarray(J[:count], dtype=np.int32))
+                if self._columns is None:
+                    # (a device copy the pattern already keeps is used, none is made for
+                    # this: the matrix's own copy is the one kept from now on)
+                    dev_J = tp.device_columns(block, create=False) if lib.device else None
+                    if dev_J is not None:
+                        bridge.copy_from_jax(lib.pointer(csr, "csr_j"), dev_J)
+                    else:
+                        lib.put(lib.pointer(csr, "csr_j"), np.ascontiguousarray(J[:count], dtype=np.int32))
                 if on_host:
                     lib.put(lib.pointer(csr, "csr_data"), vals[start:start + count])
                 else:
@@ -367,6 +420,13 @@ class SingleParMatrix:
                 ctypes.memmove(lib.pointer(par, "par_col_map_offd"), cm.ctypes.data, cm.nbytes)
             if lib.device:
                 bridge.synchronize()               # before ``vals`` is released
+            if self._columns is None and SHARE_COLUMNS:
+                # the first matrix of the pattern: its column indices become the
+                # pattern's, lent to it and to every later matrix
+                self._columns = tp._single_columns = _SharedColumns(
+                    lib, (lib.pointer(lib.pointer(par, "par_diag"), "csr_j") if nd else None,
+                          lib.pointer(lib.pointer(par, "par_offd"), "csr_j") if no else None),
+                    (nd, no))
         except Exception as e:                                   # noqa: BLE001
             failed = e
         del vals
@@ -428,6 +488,15 @@ class SingleParMatrix:
                 v.destroy()
             self._vecs = None
         if self.par is not None:
+            shared = getattr(self, "_columns", None)
+            if shared is not None:
+                # the borrowed column indices are not hypre's to free
+                for name, ptr in zip(("par_diag", "par_offd"), shared.pointers):
+                    if ptr:
+                        csr = self.lib.pointer(self.par.value, name)
+                        if self.lib.pointer(csr, "csr_j") == ptr:
+                            self.lib.set_pointer(csr, "csr_j", None)
+                self._columns = None
             self.lib.H.hypre_ParCSRMatrixDestroy(self.par)
             self.par = None
 

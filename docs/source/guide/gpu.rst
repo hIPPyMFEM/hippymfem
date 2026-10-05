@@ -458,10 +458,12 @@ in single precision instead of rounded once, the matrix differs in the last bit 
 entries (a product by 4e-8).
 
 **At a larger size.**  At 128\ :sup:`3` (17.0 million state dofs) on four L40S the same
-solve took 240 s in double precision and 162 s with single-precision element matrices
-and solves, 1.5 times faster, in the same 13 Newton and 191 CG iterations and to the
-same cost in ten digits.  A Hessian action took 0.72 and 0.43 s.  The busiest card held
-39.2 GiB at its peak in double precision and 34.5 GiB in single, 22.1 and 17.5 GiB of it
+solve took 222 s in double precision and 141 s with single-precision element matrices
+and solves, 1.57 times faster, in the same 13 Newton and 191 CG iterations and to the
+same cost in ten digits (111 s with the Hessian actions relaxed, :doc:`optimization`;
+before the changes of 4 October 240 s and 162 s).  A Hessian action took 0.71 and
+0.42 s, a forward solve at a new parameter 2.26 and 1.41 s.  The busiest card held
+39.2 GiB at its peak in double precision and 33.5 GiB in single, 22.2 and 16.5 GiB of it
 outside the element kernels' pool.
 
 A run that releases each linearization point before the next
@@ -478,10 +480,34 @@ With the memory that single precision frees, the index arrays of the assembly ca
 on the device (``HIPPYMFEM_DEVICE_PATTERN=1``, :ref:`gpu-memory`), which saves their
 upload from the CPU at every assembly: at 64\ :sup:`3` on the H100 the forward solve took
 0.26 s instead of 0.39 s and the Newton-CG solve 21.1 s instead of 23.6 s (25.0 s
-instead of 27.6 s in double precision), on the L40S 39.9 s instead of 43.2 s.  It is a
-trade, and at a larger size an expensive one: in the two Newton steps at
-128\ :sup:`3` on four Blackwell instances above it saved one second of 13.2 and took the
-busiest instance from 18.3 to 26.2 GiB.
+instead of 27.6 s in double precision), on the L40S 39.9 s instead of 43.2 s.  As it
+was first, with a four-byte scatter map for every block and a JAX copy of the
+Jacobian's column indices, it took the busiest of four Blackwell instances at
+128\ :sup:`3` from 18.3 to 26.2 GiB: those 2.3 GiB took the use of the element kernels'
+arena to 8.9 of the 9.0 GiB it had, and the arena, which grows by whole regions, took
+another 8 GiB.  Now the scatter
+map is compact (below) and the single-precision matrices share their column indices
+with no copy in JAX, and the device pattern adds 1.0 GiB to the arena's use, which stays
+inside it: the busiest instance holds 18.0 GiB with it and without it, against 19.9 GiB
+in double precision (``benchmarks/bench_newton_device.py --release-linearization``,
+traced with ``fp32_1003/mem_trace.py``).
+
+Two things make every assembly into the single-precision library cheaper, with or
+without the device pattern.  Its matrices share one copy of the column indices of their
+pattern (``HIPPYMFEM_SINGLE_SHARE_COLUMNS``, on): a new matrix uploads only its row
+pointers and values, where it uploaded four more bytes a nonzero from the host (52 ms of
+an assembly of 187 ms at 64\ :sup:`3` on the H100), and two that live at once (the
+Jacobians of the last and the next point) hold one copy.  And the scatter map that every
+fused assembly, in either precision, takes from the host slice by slice is compact
+(``HIPPYMFEM_COMPACT_PATTERN``, on): for every element row two base slots, and for
+every entry one byte that picks one and adds an offset below 128, which is 1.3 bytes an
+entry for quadratic hexahedra instead of 4.  The slots rebuilt on the device are the
+same, so the matrices are the same to the last bit on a CPU (on a GPU the scatter's
+atomics add in an order of their own anyway).  At 64\ :sup:`3` on the H100 the two took
+a forward solve at a new parameter from 0.39 to 0.29 s and the Newton-CG solve from
+23.7 to 22.3 s; in double precision the compact map alone took a forward solve from
+0.41 to 0.36 s.  In the two Newton steps at 128\ :sup:`3` on four Blackwell instances the
+two took 13.2 s to 12.4 s without the device pattern, which gave 12.2 s.
 
 One limit follows from the 1e-5 of the incremental solves.  It is enough for the Newton
 directions, but the eigenpairs of a Laplace approximation come out to about that
@@ -926,11 +952,14 @@ produce pass over the same bridge.  What still leaves the card in an assembly: t
 values of rows of shared dofs that a rank does not own, which go to their owner in one
 ``Alltoallv`` (4.8 MB per Jacobian at 2.1 million dofs on sixteen ranks), and an
 accumulator that needs boundary-face entries.  What still arrives from the host: the
-row pointers, the column indices (0.55 GB per Jacobian at 2.1 million dofs) and the
-scatter map, slice by slice (0.76 GB).  ``HIPPYMFEM_DEVICE_PATTERN=1`` keeps the last
-two on the device as well, for 1.3 GB at that size: a forward solve went from 551 to
-534 ms on one H100 and from 2.31 to 2.19 s on sixteen MIG instances, where sixteen ranks
-upload at once.  It is off by default because of the memory.
+row pointers, the column indices (0.55 GB per Jacobian at 2.1 million dofs; a matrix of
+the single-precision library takes those of the earlier matrices of its pattern
+instead, :ref:`single-precision`) and the scatter map, slice by slice, in a compact form
+(one byte an entry and two bases an element row: 0.24 GB instead of 0.76 GB,
+``HIPPYMFEM_COMPACT_PATTERN``).  ``HIPPYMFEM_DEVICE_PATTERN=1`` keeps the last two on the
+device as well: with the full map that was 1.3 GB at that size, and a forward solve went
+from 551 to 534 ms on one H100 and from 2.31 to 2.19 s on sixteen MIG instances, where
+sixteen ranks upload at once.  It is off by default because of the memory.
 
 The bridge is used when MFEM is on a GPU, the element kernels are on the same card, the
 runtime's copy function is found among the libraries the process has loaded, and eight

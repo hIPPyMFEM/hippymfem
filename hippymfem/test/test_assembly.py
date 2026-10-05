@@ -774,6 +774,59 @@ def test_fused_scatter():
               not K.will_chunk(), "(will_chunk=%s)" % K.will_chunk())
 
 
+def test_compact_scatter_map():
+    """The compact scatter map gives the fused route the slots of the full one.
+
+    One byte an entry and two bases an element row (:data:`~hippymfem.fem.pattern.
+    COMPACT_PATTERN`) stand for the four-byte slot of every entry; the slots rebuilt
+    from them are the same, and the scatter adds the same values in the same order, so
+    the matrices are the same to the last bit.
+    """
+    from hippymfem.fem import pattern as pat
+
+    if RANK == 0:
+        print("compact scatter map")
+    asm.set_assembly_backend("csr")
+    old, orig = pat.COMPACT_PATTERN, pat._fused_add_coded
+    used = []
+
+    def counting(*a):
+        used.append(1)
+        return orig(*a)
+
+    pat._fused_add_coded = counting
+    try:
+        for kind, order in (("quad", 2), ("tri", 1), ("hex", 2)):
+            pm, Vh, b, K = build(kind, 5 if kind != "hex" else 3, order)
+            loc = locals_at(Vh)
+            bc = hp.DirichletBC(Vh[0], None, "all")
+            for name, ti, ri, i, j, tr in (("A", 0, 0, ADJOINT, STATE, True),
+                                           ("C", 0, 1, ADJOINT, PARAMETER, False)):
+                args = dict(test_ess=bc.ess_tdof,
+                            trial_ess=bc.ess_tdof if tr else None)
+                got = []
+                for compact in (False, True):
+                    pat.COMPACT_PATTERN = compact
+                    del used[:]
+                    got.append(to_dense(asm.assemble_matrix(
+                        Vh[ti], Vh[ri], b.groups,
+                        (lambda i=i, j=j: K.element_matrix_chunks(i, j, loc)),
+                        pm.GetNE(), **args), COMM))
+                    coded = COMM.allreduce(len(used), op=MPI.SUM)
+                d = float(np.abs(got[0] - got[1]).max())
+                # (on a GPU the scatter's atomics add in an order of their own, so
+                # there two assemblies agree to round-off only, whatever the map)
+                exact = kernel_mod.device().platform == "cpu"
+                scale = max(float(np.abs(got[0]).max()), 1e-300)
+                check("the compact scatter map gives the same matrix (%s %s order %d)"
+                      % (kind, name, order),
+                      (d == 0.0 if exact else d <= 1e-13 * scale) and coded > 0,
+                      "(largest difference %.1e%s; %d chunks through it)"
+                      % (d, "" if exact else " of %.1e, on a device" % scale, coded))
+    finally:
+        pat.COMPACT_PATTERN, pat._fused_add_coded = old, orig
+
+
 def test_geometric_factors_freed():
     """MFEM's cached geometric factors are dropped once the geometry is copied out.
 
@@ -1411,6 +1464,7 @@ def main():
     test_coordinates_and_project()
     test_matrix_reuse()
     test_fused_scatter()
+    test_compact_scatter_map()
     test_geometric_factors_freed()
     test_release_linearization_on_move()
     test_parmat_routes()

@@ -68,6 +68,82 @@ DEVICE_PATTERN = os.environ.get("HIPPYMFEM_DEVICE_PATTERN", "0").lower() in (
     "1", "true", "yes", "on")
 
 
+#: The scatter map of a fused assembly in a compact form: for every element and test dof
+#: (a row of the element matrix) two base slots, and for every entry one byte that picks
+#: one of them and adds an offset below 128 (two bytes and offsets below 32768 where
+#: that does not reach).  A row of an element matrix lands in at most two runs of its
+#: matrix row (the diagonal and the off-diagonal block of the true-dof layout, or the
+#: send buffer), each shorter than the row, so the map takes 1 + 8 / nd_trial bytes an
+#: entry instead of 4: for quadratic hexahedra 1.3.  The slot is rebuilt on the device,
+#: in the scatter, from the two, and the sum is the same.  It is a third of the upload
+#: of an assembly from the host, and a third of the device memory of
+#: :data:`DEVICE_PATTERN`.  A map that does not have the form (a row in three runs)
+#: stays as it is.  Set ``HIPPYMFEM_COMPACT_PATTERN=0`` for the full map always.
+COMPACT_PATTERN = os.environ.get("HIPPYMFEM_COMPACT_PATTERN", "1").lower() not in (
+    "0", "no", "false", "off")
+
+
+def _compact_slots(slot, shapes, sizes):
+    """``(codes, bases, bits)`` for :data:`COMPACT_PATTERN`, or ``None``.
+
+    ``codes`` has one entry per element-matrix entry: the offset from a base in its low
+    ``bits`` bits, and in the bit above them which of its row's two bases.  ``bases``
+    holds the two bases of every element row, ``(sum of ne * nd_test, 2)``, in the
+    order of the entries.
+    """
+    if slot.size == 0:
+        return None
+    for dtype, bits in ((np.uint8, 7), (np.uint16, 15)):
+        limit = (1 << bits) - 1
+        codes, bases, n0, ok = [], [], 0, True
+        for (ne, a, b), size in zip(shapes, sizes):
+            S = slot[n0:n0 + size].reshape(ne, a, b)
+            n0 += size
+            if ne == 0:
+                codes.append(np.zeros(0, dtype=dtype))
+                bases.append(np.zeros((0, 2), dtype=np.int32 if slot.dtype.itemsize <= 4 else slot.dtype))
+                continue
+            lo = S.min(axis=2)
+            off = S - lo[:, :, None]
+            first = off <= limit
+            big = np.iinfo(S.dtype).max
+            hi = np.where(first, big, S).min(axis=2)
+            hi = np.where(hi == big, lo, hi)
+            off2 = S - hi[:, :, None]
+            if not np.all(first | ((off2 >= 0) & (off2 <= limit))):
+                ok = False
+                break
+            codes.append(np.where(first, off, off2 + (1 << bits)).astype(dtype).reshape(-1))
+            # (bases as wide as the slots: int32 below two billion nonzeros)
+            bases.append(np.stack([lo, hi], axis=-1).reshape(-1, 2)
+                         .astype(np.int32 if S.dtype.itemsize <= 4 else S.dtype))
+            del off, off2, first
+        if ok:
+            return np.concatenate(codes), np.concatenate(bases), bits
+    return None
+
+
+def _fused_add_coded(acc, flat, code, base, sign, ndt, bits):
+    """:func:`_fused_add` with the slots of a compact map (:data:`COMPACT_PATTERN`):
+    ``code`` one per entry, ``base`` two per element row of ``ndt`` entries."""
+    import jax
+    import jax.numpy as jnp
+
+    key = ("coded", sign is not None, int(ndt), int(bits))
+    fn = _FUSED_ADD.get(key)
+    if fn is None:
+        mask = (1 << bits) - 1
+
+        def step(a, v, c, bs, sg):
+            c = c.astype(jnp.int32).reshape(-1, ndt)
+            which = c >> bits
+            idx = jnp.where(which == 1, bs[:, 1:2], bs[:, 0:1]) + (c & mask)
+            return a.at[idx.reshape(-1)].add((v if sg is None else v * sg).astype(a.dtype))
+
+        fn = _FUSED_ADD[key] = jax.jit(step, donate_argnums=(0,))
+    return fn(acc, flat, code, base, sign)
+
+
 def set_device_pattern(flag):
     """Turn the device copies of the index arrays on or off; returns the old setting."""
     global DEVICE_PATTERN
@@ -717,8 +793,14 @@ class ScatterPattern(KeepAlive):
             raise ValueError("chunk [%d, %d) of group %d holds %d entries, "
                              "pattern expects %d"
                              % (a, bnd, g, flat.shape[0], hi - lo))
-        return _fused_add(acc, flat, maps["slot"][lo:hi],
-                          None if maps["sign"] is None else maps["sign"][lo:hi])
+        sign = None if maps["sign"] is None else maps["sign"][lo:hi]
+        if "code" in maps:
+            ndt = maps["ndt"][g]
+            r0 = maps["rbase"][g]
+            return _fused_add_coded(acc, flat, maps["code"][lo:hi],
+                                    maps["rows"][r0 + a * ndt:r0 + bnd * ndt], sign,
+                                    maps["ndj"][g], maps["bits"])
+        return _fused_add(acc, flat, maps["slot"][lo:hi], sign)
 
     def fused_end(self, acc, zero_slots=None, host=True):
         """Bring the accumulator to the host and zero the eliminated slots there.
@@ -771,22 +853,41 @@ class ScatterPattern(KeepAlive):
         :data:`DEVICE_PATTERN` keeps the maps on the device for those who have the
         memory.
         """
-        key = (d, DEVICE_PATTERN)
+        key = (d, DEVICE_PATTERN, COMPACT_PATTERN)
         got = self._fused.get(key)
         if got is None:
             base, n = [], 0
             for size in self.sizes:
                 base.append(n)
                 n += int(size)
-            slot, sign = self.slot, self.sign
-            if DEVICE_PATTERN and getattr(d, "platform", "cpu") != "cpu":
-                slot, _perm, sign = self._device_maps()
-            got = self._fused[key] = {
-                "slot": slot,
-                "sign": sign,
+            on_device = DEVICE_PATTERN and getattr(d, "platform", "cpu") != "cpu"
+            got = {
                 "base": base,
                 "nent": [int(a) * int(b) for _, a, b in self.shapes],
             }
+            compact = _compact_slots(self.slot, self.shapes, self.sizes) if COMPACT_PATTERN else None
+            if compact is not None:
+                # (the full map is not kept on the device beside the compact one)
+                code, rows, bits = compact
+                rbase, r = [], 0
+                for ne, a, _b in self.shapes:
+                    rbase.append(r)
+                    r += int(ne) * int(a)
+                sign = self.sign
+                if on_device:
+                    from .kernel import _put
+
+                    code, rows = _put(code), _put(rows)
+                    sign = None if sign is None else _put(sign)
+                got.update(code=code, rows=rows, bits=bits, rbase=rbase,
+                           ndt=[int(a) for _, a, _b in self.shapes],
+                           ndj=[int(b) for _, _a, b in self.shapes], sign=sign)
+            else:
+                slot, sign = self.slot, self.sign
+                if on_device:
+                    slot, _perm, sign = self._device_maps()
+                got.update(slot=slot, sign=sign)
+            self._fused[key] = got
         return got
 
     def _data_device(self, element_matrices, zero_slots=None):

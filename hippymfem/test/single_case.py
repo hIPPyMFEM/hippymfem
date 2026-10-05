@@ -147,6 +147,36 @@ def run(check, COMM=MPI.COMM_WORLD):
           "(%d Newton and %d CG iterations, %d and %d in double; MAP differs by %.1e)"
           % (got[True]["newton"], got[True]["cg"], got[False]["newton"], got[False]["cg"], em))
 
+    # Every single-precision matrix of a pattern lends the pattern's one copy of the
+    # column indices (singlesolve.SHARE_COLUMNS), also two that live at once, and a
+    # matrix made after the others are gone finds it still.
+    from hippymfem.algorithms import singlesolve as ss
+
+    if ss.SHARE_COLUMNS:
+        pde.invalidate_jacobian()
+        A1, _ = pde._jacobian([got[True]["u"], m, None])
+        pde._jac_cache = None              # (A1 stays alive, held here)
+        A2, _ = pde._jacobian([got[True]["u"], m, None])
+        ys = []
+        for A in (A1, A2):
+            y = Vu.vector()
+            A.Mult(rhs.hypre, y.hypre)
+            ys.append(y)
+        shared = A1._columns is not None and A1._columns is A2._columns
+        del A1, A2
+        pde.invalidate_jacobian()
+        A3, _ = pde._jacobian([got[True]["u"], m, None])
+        y3 = Vu.vector()
+        A3.Mult(rhs.hypre, y3.hypre)
+        again = A3._columns is not None
+        del A3
+        pde.invalidate_jacobian()
+        d = max(ys[0].copy().axpy(-1.0, ys[1]).norm("l2"), ys[0].copy().axpy(-1.0, y3).norm("l2"))
+        check("the single-precision matrices of a pattern share its column indices",
+              shared and again and d == 0.0,
+              "(two live ones share: %s; a later one finds them: %s; products differ by %.1e)"
+              % (shared, again, d))
+
     # On a device the Jacobian is accumulated in single precision where it is assembled
     # a chunk of elements at a time (the route of a mesh that does not fit whole; forced
     # here by a small chunk).  Accumulated in double precision and rounded once it is

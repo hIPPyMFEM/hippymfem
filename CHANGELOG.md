@@ -18,6 +18,20 @@
   Newton-CG iterations (`bench_newton_device.py --steps 2`) keeps its eight CG
   iterations at 64^3 and takes 13.6 -> 11.5 s on an L40S with hypre's PCG below and the
   device geometry of the chunked assemblies.
+- **The scatter map of a fused assembly in a compact form** (`HIPPYMFEM_COMPACT_PATTERN`,
+  on): for every element row two base slots and for every entry one byte (two where an
+  offset does not fit in seven bits) that picks one and adds an offset, 1.3 bytes an
+  entry for quadratic hexahedra instead of 4. The slots are rebuilt in the scatter on the
+  device and are the same, so the matrices are bit for bit the same on a CPU. It is a
+  third of the map that an assembly uploads from the host slice by slice, and a third of
+  what `HIPPYMFEM_DEVICE_PATTERN=1` keeps on the device. **The matrices of the
+  single-precision library share the column indices of their pattern**
+  (`HIPPYMFEM_SINGLE_SHARE_COLUMNS`, on): no upload of four bytes a nonzero per matrix
+  (52 ms of a 187 ms assembly at 64^3 on an H100), and one copy for two matrices alive at
+  once. With both the device pattern no longer grows the element kernels' arena by a
+  region: at 128^3 on four Blackwell instances in the two-iteration benchmark the busiest
+  instance held 26.2 GiB with it before and 18.0 GiB now, as much as without it (double
+  precision: 19.9 GiB).
 - **Cheaper solves inside the CG of a Newton step** (`docs/source/guide/optimization.rst`,
   "The CG of a Newton step"). The prior's solves, where they precondition that CG, stop
   at 1e-6 (`cg_preconditioner_tolerance` of `ReducedSpaceNewtonCG`, the default; never
