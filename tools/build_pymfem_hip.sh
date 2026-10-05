@@ -16,9 +16,10 @@
 # private source copy, so the installed header is right from the start.
 #
 # Usage:  CPU_PYMFEM=<tree> tools/build_pymfem_hip.sh <prefix> [gpu-arch]   (MI210: gfx90a)
-# Needs:  /opt/rocm, an MPI compiler on PATH, and CPU_PYMFEM pointing at a CPU PyMFEM
-#         tree of the same MFEM version, whose wrappers are recompiled here.  PYTHON
-#         names the interpreter to build for (python3 by default).
+# Needs:  ROCm (ROCM_PATH, which a cluster's module exports; /opt/rocm otherwise), an MPI
+#         compiler on PATH (OpenMPI, or an MPICH such as Cray's), and CPU_PYMFEM pointing
+#         at a CPU PyMFEM tree of the same MFEM version, whose wrappers are recompiled
+#         here.  PYTHON names the interpreter to build for (python3 by default).
 set -eu
 PREFIX="$1"
 ARCH="${2:-gfx90a}"
@@ -31,10 +32,15 @@ fi
 PY="${PYTHON:-${PY:-python3}}"
 NJ="${NJ:-$(nproc)}"
 HYPRE_TAG="${HYPRE_TAG:-v3.2.0}"
-export ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm
+export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+export HIP_PATH="${HIP_PATH:-$ROCM_PATH}"
 MPICXX=$(command -v mpicxx)
 MPICC=$(command -v mpicc)
-MPIINC=$($MPICXX -showme:incdirs | tr ' ' '\n' | sed 's/^/-I/' | tr '\n' ' ')
+# the MPI include directories, for the two compilers that are not the MPI wrapper (hipcc
+# and CMake's HIP language): OpenMPI's wrapper lists them, an MPICH one shows its command
+MPIINC=$($MPICXX -showme:incdirs 2>/dev/null | tr ' ' '\n' | sed '/^$/d; s/^/-I/' | tr '\n' ' ')
+[ -n "$MPIINC" ] || MPIINC=$($MPICXX -show 2>/dev/null | tr ' ' '\n' | grep '^-I' | tr '\n' ' ')
+[ -n "$MPIINC" ] || { echo "cannot read the MPI include directories from $MPICXX" >&2; exit 1; }
 echo "prefix $PREFIX  arch $ARCH  jobs $NJ  mpicxx $MPICXX"
 mkdir -p "$PREFIX/src" "$PREFIX/logs"
 LOG="$PREFIX/logs"
@@ -58,11 +64,25 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # ROCm 7's rocprim headers need C++17 (std::variant); older hypre hard-codes C++14
    # for its HIP sources and --with-cxxstandard does not reach HIPCXXFLAGS
    sed -i 's/HIPCXXFLAGS="-x hip -std=c++14 /HIPCXXFLAGS="-x hip -std=c++17 /' configure
-   # hypre 3 turns Umpire on for GPU builds; MFEM manages device memory itself
+   # hypre 3 turns Umpire on for GPU builds; MFEM manages device memory itself.  Its
+   # device sources go to hipcc, which is not the MPI wrapper and finds mpi.h only if
+   # it is told where (an MPI module that sets CPATH hides this; Cray's does not)
    ./configure --prefix="$PREFIX/hypre" --with-hip --with-gpu-arch="$ARCH" --enable-shared --without-umpire \
-       CC="$MPICC" CXX="$MPICXX" > "$LOG/hypre_configure.log" 2>&1
+       CC="$MPICC" CXX="$MPICXX" HIPCXXFLAGS="$MPIINC" > "$LOG/hypre_configure.log" 2>&1
    make clean > /dev/null 2>&1 || true
-   make -j "$NJ" > "$LOG/hypre_make.log" 2>&1
+   # A compiler that cannot build a device source at -O2 gets that one source at -Os.
+   # The clang of ROCm 7.2.0 on Frontier (22.0.0git, roc-7.2.0 26014) stops in its AMDGPU
+   # backend on three SpGEMM kernels (csr_spgemm_device_numer1 to 3: "Illegal
+   # instruction detected: Operand has incorrect register class"); they compile at -Os
+   # and -O1, and at -O2 with the compilers of ROCm 7.1.1 and 7.14.1.
+   n=0
+   until make -j "$NJ" > "$LOG/hypre_make.log" 2>&1; do
+     bad=$(grep -o '[A-Za-z0-9_]*\.obj\] Error' "$LOG/hypre_make.log" | sed 's/\] Error//' | sort -u | tr '\n' ' ')
+     n=$((n + 1))
+     [ -n "$bad" ] && [ "$n" -le 8 ] || { echo "hypre did not build: $LOG/hypre_make.log" >&2; exit 1; }
+     echo "  the compiler failed at -O2, building at -Os: $bad"
+     echo "$bad: CUFLAGS += -Os" >> config/Makefile.config
+   done
    make install > "$LOG/hypre_install.log" 2>&1)
 fi
 ls "$PREFIX/hypre/lib/libHYPRE.so"
@@ -112,9 +132,10 @@ else:
     print("  patched", p)
 SPMV
   # MFEM's HIP build compiles its C++ with the HIP flags (--offload-arch), so the C++
-  # compiler must be ROCm's clang; OpenMPI's wrapper drives it through OMPI_CXX, which
-  # keeps cmake's MPI detection working
+  # compiler must be ROCm's clang; the MPI wrapper drives it (OMPI_CXX for OpenMPI's,
+  # MPICH_CXX for an MPICH one), which keeps cmake's MPI detection working
   export OMPI_CXX="$ROCM_PATH/lib/llvm/bin/clang++"
+  export MPICH_CXX="$OMPI_CXX"
   cmake -S "$PREFIX/src/mfem" -B "$PREFIX/src/mfem/cmbuild_par" \
       -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
       -DCMAKE_INSTALL_PREFIX="$PREFIX/mfem/par" \
@@ -129,7 +150,7 @@ SPMV
       > "$LOG/mfem_cmake.log" 2>&1
   cmake --build "$PREFIX/src/mfem/cmbuild_par" -j "$NJ" > "$LOG/mfem_make.log" 2>&1
   cmake --install "$PREFIX/src/mfem/cmbuild_par" > "$LOG/mfem_install.log" 2>&1
-  unset OMPI_CXX
+  unset OMPI_CXX MPICH_CXX
 fi
 ls "$PREFIX/mfem/par/lib/libmfem.so"
 

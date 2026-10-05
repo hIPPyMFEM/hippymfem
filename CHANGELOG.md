@@ -224,6 +224,13 @@
   run needs, `benchmarks/README.md` maps each published table to its script,
   `docs/source/guide/configuration.rst` lists every setting, and the profiling scripts of
   finished investigations are gone from `benchmarks/` and `tools/`.
+- `tools/build_pymfem_hip.sh` builds where ROCm and MPI come from modules. It took ROCm
+  from `/opt/rocm` and the MPI include directories from OpenMPI's wrapper; it now reads
+  `ROCM_PATH`, takes the include directories from an MPICH wrapper too and hands them to
+  hypre's `hipcc`, and drives ROCm's clang through `MPICH_CXX` beside `OMPI_CXX`. A
+  device source of hypre that the compiler cannot build at `-O2` is built at `-Os`: the
+  clang of ROCm 7.2.0 stops in its AMDGPU backend on three SpGEMM kernels. The build
+  was run on Frontier (Cray MPICH 9.1.0, ROCm 7.2.0, MI250X).
 
 ### Removed
 
