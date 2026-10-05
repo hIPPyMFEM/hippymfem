@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **A streamed geometry is copied to the device at the rate of the bus**
+  (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
+  geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move
+  each chunk's slice from a numpy array, through a staging buffer of its own, at 5 to
+  11 GB/s on an H100 against the 55 GB/s of its PCIe 5 link. The geometry is now locked
+  in RAM once (`devicebridge.pin`) and each slice is copied by the CUDA runtime
+  (`devicebridge.host_to_jax`), of the arrays the kernel reads only. The element arrays
+  are bit for bit the same. 128^3 on one H100 with single-precision solves: forward solve
+  5.51 -> 2.86 s, adjoint 2.52 -> 1.25 s, gradient 1.05 -> 0.40 s, Newton-CG 326 -> 197 s
+  in the same 13 Newton and 191 CG iterations.
 - **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
   of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
   recurrence of CG loses that orthogonality to rounding on a prior-preconditioned

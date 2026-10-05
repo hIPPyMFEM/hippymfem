@@ -898,6 +898,53 @@ def test_residual_on_device():
           err < 1e-10, "(largest relative difference %.1e)" % err)
 
 
+def test_streamed_geometry_pinned():
+    """A geometry the chunk loops stream, copied by the runtime from registered host
+    memory (``kernel.PINNED_STREAM``), gives the element arrays of the geometry kept
+    on the device and of the one JAX moves, bit for bit, and only the arrays the
+    kernel reads are copied (this density does not read ``x``)."""
+    from hippymfem.common import devicebridge as bridge
+    from hippymfem.fem import kernel as km
+
+    if not bridge.available():
+        check("streamed geometry over the bridge", True, "(skipped: %s)" % bridge.why_not())
+        return
+    pm, Vh, b, K, bc = problem(6)
+    loc = locals_at(Vh, seed=11)
+    old = km.ELEMENT_CHUNK, km.GEOMETRY_STREAM_FRACTION, km.PINNED_STREAM
+
+    def reset(chunk, frac, pinned):
+        km.ELEMENT_CHUNK, km.GEOMETRY_STREAM_FRACTION, km.PINNED_STREAM = chunk, frac, pinned
+        for gk in K.group_kernels:
+            gk._cache.clear()
+            gk._chunk.clear()
+            gk._dev.clear()
+
+    out, moved = {}, {}
+    try:
+        for label, frac, pinned in (("cached", 0.0, True), ("by JAX", 1e-12, False),
+                                    ("pinned", 1e-12, True)):
+            reset(37, frac, pinned)
+            before = bridge.stats()[1]
+            out[label] = ([np.asarray(a) for a in K.element_matrices(ADJOINT, STATE, loc)]
+                          + [np.asarray(a) for a in K.element_vectors(ADJOINT, loc)])
+            moved[label] = bridge.stats()[1] - before
+    finally:
+        reset(*old)
+    diff = max(max(float(np.abs(x - y).max()) for x, y in zip(out["cached"], out[k]))
+               for k in ("by JAX", "pinned"))
+    groups = [gk.group for gk in K.group_kernels]
+    pinned = all(getattr(g, "_pinned_geometry", None) for g in groups)
+    read = sum(g.Jinv.nbytes + g.wdet.nbytes for g in groups)
+    passes = moved["pinned"] / max(read, 1)
+    check("a geometry streamed from registered memory gives the same element arrays",
+          diff == 0.0 and pinned and moved["by JAX"] == 0 and moved["cached"] == 0,
+          "(largest difference %.1e; registered: %s)" % (diff, pinned))
+    check("and only what the kernel reads is copied",
+          passes >= 1 and passes == int(passes),
+          "(%.2f passes over Jinv and wdet; x is not read)" % passes)
+
+
 def test_single_precision_solves():
     """The solves in a single-precision hypre (``HIPPYMFEM_HYPRE_SINGLE``) against the
     double-precision ones; skipped when no library is named."""
@@ -925,6 +972,7 @@ if __name__ == "__main__":
     test_vectors_on_device()
     test_observation_on_device()
     test_residual_on_device()
+    test_streamed_geometry_pinned()
     test_hypre_pool_setup_scope()
     test_hypre_pool()
     test_single_precision_solves()

@@ -40,6 +40,7 @@ import functools
 import os
 import time
 import warnings
+import weakref
 from typing import NamedTuple
 
 import numpy as np
@@ -399,6 +400,17 @@ AD_DOUBLES_PER_TANGENT_QP = float(
 GEOMETRY_STREAM_FRACTION = float(
     os.environ.get("HIPPYMFEM_GEOMETRY_STREAM", "0.25") or 0)
 
+#: How a chunk loop moves the geometry it streams.  On (the default, where
+#: :mod:`hippymfem.common.devicebridge` can be used), the group's geometry is
+#: registered with the GPU runtime once (locked in RAM), and each chunk's slice of it
+#: goes to the device by one copy of the runtime at the rate of the bus, and only the
+#: arrays the kernel reads.  Off, the slices are handed to the kernel as numpy arrays
+#: and JAX moves them through a staging buffer of its own: 5 to 10 GB/s on an H100
+#: against 55, which made an element pass over two million quadratic hexahedra on one
+#: card take a second.  Set ``HIPPYMFEM_PINNED_STREAM=0`` for that route.
+PINNED_STREAM = os.environ.get("HIPPYMFEM_PINNED_STREAM", "1").lower() not in (
+    "0", "no", "false", "off")
+
 
 #: Device memory, in GiB, kept aside for whatever else shares the card (above all
 #: hypre's matrices and multigrid hierarchy).  The chunk planner subtracts it from
@@ -746,7 +758,7 @@ def _chunk_args(args, axes, a, b):
 _SLICE = {}
 
 
-def _chunk_slices(args, axes, a, b):
+def _chunk_slices(args, axes, a, b, fn=None):
     """:func:`_chunk_args` for the chunk loops, in one compiled call on a GPU.
 
     Sliced eagerly, every element-mapped array of a chunk is an operation of its own
@@ -756,19 +768,113 @@ def _chunk_slices(args, axes, a, b):
     large ones, with the working memory they need, the faster choice.  Here one
     program cuts them all, with the start as an argument, so every chunk of one
     length reuses it.
+
+    Arrays still on the host (a streamed geometry, :meth:`GroupKernel.mapped`) are
+    moved by :func:`hippymfem.common.devicebridge.host_to_jax` where it can be used
+    (:data:`PINNED_STREAM`), those that the kernel ``fn`` reads only.
     """
     mapped = []
     _extract_mapped(args, axes, mapped)
     leaves, treedef = jax.tree_util.tree_flatten(mapped)
-    if not leaves or not on_gpu() or not all(isinstance(z, jax.Array) for z in leaves):
+    if not leaves or not on_gpu():
+        return _chunk_args(args, axes, a, b)
+    host = [not isinstance(z, jax.Array) for z in leaves]
+    if any(host) and not (PINNED_STREAM and _bridge_available()):
         return _chunk_args(args, axes, a, b)
     n = int(b - a)
-    fn = _SLICE.get(n)
-    if fn is None:
-        fn = _SLICE[n] = jax.jit(
-            lambda zs, start: [jax.lax.dynamic_slice_in_dim(z, start, n, 0) for z in zs])
-    cut = treedef.unflatten(fn(leaves, a))
-    return _inject_mapped(args, axes, iter(cut))
+    out = list(leaves)
+    if not all(host):
+        cut = _SLICE.get(n)
+        if cut is None:
+            cut = _SLICE[n] = jax.jit(
+                lambda zs, start: [jax.lax.dynamic_slice_in_dim(z, start, n, 0) for z in zs])
+        it = iter(cut([z for z, h in zip(leaves, host) if not h], a))
+        out = [z if h else next(it) for z, h in zip(leaves, host)]
+    if any(host):
+        from ..common import devicebridge as bridge
+
+        used = _used_mapped(fn, args, axes, n)
+        for i, h in enumerate(host):
+            if h:
+                # (a slice the kernel does not read stays a numpy array: JAX drops an
+                # unused argument of a compiled function and moves nothing for it)
+                part = leaves[i][a:b]
+                out[i] = bridge.host_to_jax(part) if used[i] else part
+    return _inject_mapped(args, axes, iter(treedef.unflatten(out)))
+
+
+def _bridge_available():
+    from ..common import devicebridge as bridge
+
+    return bridge.available()
+
+
+def _pin_geometry(group, names):
+    """Register the geometry a group streams with the GPU runtime, once, so that the
+    chunk loops copy it to the device directly (:data:`PINNED_STREAM`); undone when
+    the group goes.  Where it cannot be registered the copies are only slower."""
+    if getattr(group, "_pinned_geometry", None) is not None or not _bridge_available():
+        return
+    from ..common import devicebridge as bridge
+
+    arrays = [getattr(group, n) for n in names]
+    pinned = [int(z.ctypes.data) for z in arrays
+              if isinstance(z, np.ndarray) and bridge.pin(z)]
+    group._pinned_geometry = pinned
+    if pinned:
+        try:
+            weakref.finalize(group, _unpin, pinned)
+        except TypeError:                  # a group without weak references keeps them
+            pass
+
+
+def _unpin(addresses):
+    from ..common import devicebridge as bridge
+
+    for addr in addresses:
+        bridge.unpin(addr)
+
+
+#: ``{kernel: [whether it reads each element-mapped array]}``, see :func:`_used_mapped`.
+_USED = weakref.WeakKeyDictionary()
+
+
+def _used_mapped(fn, args, axes, n):
+    """For each element-mapped array of ``args`` (in the order of
+    :func:`_extract_mapped`), whether the kernel ``fn`` reads it: from its jaxpr at a
+    chunk of ``n``, with the equations nothing depends on removed.  All ``True`` where
+    that cannot be told."""
+    mapped = []
+    _extract_mapped(args, axes, mapped)
+    leaves, treedef = jax.tree_util.tree_flatten(mapped)
+    try:
+        got = _USED.get(fn)
+    except TypeError:
+        got = None
+    if got is not None and len(got) == len(leaves):
+        return got
+    used = None
+    if fn is not None:
+        try:
+            from jax._src.interpreters import partial_eval as pe
+
+            def g(*zs):
+                return fn(*_inject_mapped(args, axes, iter(treedef.unflatten(list(zs)))))
+
+            closed = jax.make_jaxpr(g)(*[jax.ShapeDtypeStruct((n,) + tuple(np.shape(z)[1:]),
+                                                              z.dtype) for z in leaves])
+            _jaxpr, keep = pe.dce_jaxpr(closed.jaxpr, [True] * len(closed.jaxpr.outvars))
+            if len(keep) == len(leaves):
+                used = [bool(k) for k in keep]
+        except Exception:                                        # noqa: BLE001
+            used = None
+    if used is None:
+        used = [True] * len(leaves)
+    try:
+        _USED[fn] = used
+    except TypeError:
+        pass
+    return used
 
 
 def _takes(density, n):
@@ -924,7 +1030,7 @@ class GroupKernel:
                 try:
                     if n >= ne:
                         return fn(*args)
-                    parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne)))
+                    parts = [fn(*_chunk_slices(args, axes, a, min(a + n, ne), fn))
                              for a in range(0, ne, n)]
                     return jax.tree_util.tree_map(
                         lambda *p: jnp.concatenate(p, axis=0), *parts)
@@ -1002,7 +1108,7 @@ class GroupKernel:
         while a < ne:
             bnd = min(a + n, ne)
             try:
-                out = raw(*_chunk_slices(args, axes, a, bnd))
+                out = raw(*_chunk_slices(args, axes, a, bnd, raw))
             except Exception as exc:
                 # the streaming path had no retry: a chunk that does not fit is
                 # shrunk from what the allocator asked for, as _chunked does, and the
@@ -1126,6 +1232,8 @@ class GroupKernel:
             geo = None if self._stream_geometry(d) else tuple(
                 _shared_put(self.group, n, getattr(self.group, n))
                 for n in self._geo_names)
+            if geo is None and PINNED_STREAM:
+                _pin_geometry(self.group, self._geo_names)
             ent = self._dev[d] = (tabs, geo)
         tabs, geo = ent
         if geo is None:

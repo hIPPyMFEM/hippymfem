@@ -849,6 +849,22 @@ sliced per chunk (above ``HIPPYMFEM_GEOMETRY_STREAM``, 0.25 of the budget, for t
 geometry).  Chunking changes results at round-off only (about 1e-15 relative), and an
 unsplit batch stays bit-identical.
 
+A streamed geometry is copied to the card once per element pass, and how it is copied
+decides what such a pass costs.  JAX moves a numpy array through a staging buffer of its
+own, at 5 to 11 GB/s on an H100, whose PCIe 5 link moves 55 GB/s from memory locked for
+the device.  Where the device bridge can be used (hypre and the kernels on one card), a
+group that streams its geometry has it locked once (``cudaHostRegister``) and each
+chunk's slice is copied by the CUDA runtime, of the arrays the kernel reads only (the
+coordinates ``X`` of the quadrature points not at all where the density does not use
+them); ``HIPPYMFEM_PINNED_STREAM=0`` restores JAX's copy.  The element arrays are the
+same to the last bit.  At 64\ :sup:`3` on the H100 with the streaming forced
+(``HIPPYMFEM_ELEMENT_CHUNK=23000``), the gradient took 0.063 s instead of 0.169 s
+(0.027 s with the geometry kept on the card), a forward solve 0.48 s instead of 0.73 s.
+At 128\ :sup:`3` on one H100, where the geometry (13.9 GB) has to stream, the forward
+solve took 2.86 s instead of 5.51 s, the adjoint solve 1.25 s instead of 2.52 s, the
+gradient 0.40 s instead of 1.05 s, and the Newton-CG solve with single-precision solves
+197 s instead of 326 s, in the same 13 Newton and 191 CG iterations.
+
 The chunk count is a memory choice, not a speed one.  A launch costs about 5 ms: at
 1 906 624 P2 hexahedra on one L40S a warm Jacobian assembly takes 9.3 s in 128 chunks and
 9.1 s in 16, while the 16 chunks raise JAX's peak from 10.8 GiB to 26.2.

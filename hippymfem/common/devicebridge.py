@@ -32,7 +32,8 @@ import warnings
 import numpy as np
 
 __all__ = ["available", "why_not", "jax_address", "copy_from_jax", "copy_from_host",
-           "copy_to_jax", "address", "synchronize", "set_device_bridge"]
+           "copy_to_jax", "host_to_jax", "pin", "unpin", "address", "synchronize",
+           "set_device_bridge"]
 
 #: ``"auto"`` (use the bridge when :func:`available`), ``"0"`` (never), or ``"1"``
 #: (as ``auto``, but say why when it cannot be used).  ``HIPPYMFEM_DEVICE_BRIDGE``.
@@ -41,7 +42,10 @@ DEVICE_BRIDGE = os.environ.get("HIPPYMFEM_DEVICE_BRIDGE", "auto").lower()
 _H2D, _D2H, _D2D = 1, 2, 3          # cudaMemcpyKind and hipMemcpyKind agree on these
 
 _STATE = {"checked": False, "ok": False, "why": "not checked", "memcpy": None,
-          "sync": None, "copies": 0, "bytes": 0}
+          "sync": None, "pinning": (None, None, None), "copies": 0, "bytes": 0}
+
+#: Host ranges this module registered with the runtime (:func:`pin`): address -> bytes.
+_PINNED = {}
 
 
 def set_device_bridge(mode):
@@ -60,7 +64,9 @@ def set_device_bridge(mode):
 
 
 def _runtime(backend):
-    """``(memcpy, synchronize, set_device)`` of the GPU runtime this process has loaded."""
+    """``(memcpy, synchronize, set_device, (host_register, host_unregister,
+    get_last_error))`` of the GPU runtime this process has loaded; the last three are
+    ``None`` where the runtime lacks them."""
     name, prefix = (("libcudart.so", "cuda") if backend == "cuda"
                     else ("libamdhip64.so", "hip"))
     path = None
@@ -87,7 +93,19 @@ def _runtime(backend):
     sync.restype = ctypes.c_int
     setdev.argtypes = [ctypes.c_int]
     setdev.restype = ctypes.c_int
-    return memcpy, sync, setdev
+    try:
+        reg = getattr(lib, prefix + "HostRegister")
+        unreg = getattr(lib, prefix + "HostUnregister")
+        last = getattr(lib, prefix + "GetLastError")
+    except AttributeError:
+        return memcpy, sync, setdev, (None, None, None)
+    reg.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+    reg.restype = ctypes.c_int
+    unreg.argtypes = [ctypes.c_void_p]
+    unreg.restype = ctypes.c_int
+    last.argtypes = []
+    last.restype = ctypes.c_int
+    return memcpy, sync, setdev, (reg, unreg, last)
 
 
 def _check():
@@ -123,11 +141,11 @@ def _check():
     if rt is None:
         _STATE["why"] = "the %s runtime's copy function was not found" % backend
         return
-    memcpy, sync, setdev = rt
+    memcpy, sync, setdev, pinning = rt
     if setdev(int(index)) != 0:
         _STATE["why"] = "the runtime refused device %d" % int(index)
         return
-    _STATE["memcpy"], _STATE["sync"] = memcpy, sync
+    _STATE["memcpy"], _STATE["sync"], _STATE["pinning"] = memcpy, sync, pinning
     # One copy of eight numbers each way, read back through MFEM: the two libraries
     # must be in one context of one card for an address of one to mean anything to
     # the other, and this is the cheapest way to be sure of it.
@@ -242,6 +260,63 @@ def copy_to_jax(src, count, dtype=np.float64):
     _copy(base, int(src), int(count) * dtype.itemsize, _D2D)
     synchronize()
     return out
+
+
+def host_to_jax(array):
+    """A new JAX array on the GPU holding a copy of the contiguous host ``array``.
+
+    One copy of the runtime moves it.  From memory registered with :func:`pin` that is
+    a transfer at the rate of the bus (55 GB/s on the PCIe 5 of an H100), where
+    ``jax.device_put`` of a numpy array reaches 5 to 10 GB/s, since JAX first copies
+    it into a staging buffer of its own, registered or not.  The array is allocated
+    by JAX and filled before anything has read it; the call returns once it is.
+    """
+    import jax.numpy as jnp
+
+    array = np.ascontiguousarray(array)
+    out = jnp.zeros(array.shape, dtype=array.dtype) + array.dtype.type(0)
+    # (the wait for ``out`` is also one for everything queued before it, which may
+    # still read the memory it was given)
+    base, total = jax_address(out)
+    _copy(base, int(array.ctypes.data), array.nbytes, _H2D)
+    synchronize()                    # from memory that is not registered it may still run
+    return out
+
+
+def pin(array):
+    """Register the memory of a contiguous host array with the GPU runtime
+    (``cudaHostRegister``), so that :func:`host_to_jax` copies from it directly.
+    Returns whether it is registered (by this call or an earlier one).
+
+    Registered memory is locked in RAM.  :func:`unpin` releases it and has to come
+    before the memory is freed.  Where the runtime refuses (memory locked already, a
+    limit on locked memory), nothing changes but the rate of the copies, and the
+    runtime's error is cleared, since MFEM reads the last error after its kernels.
+    """
+    if not available() or not isinstance(array, np.ndarray) or array.nbytes == 0:
+        return False
+    if not array.flags.c_contiguous:
+        return False
+    reg, _unreg, last = _STATE["pinning"]
+    if reg is None:
+        return False
+    addr = int(array.ctypes.data)
+    if addr in _PINNED:
+        return _PINNED[addr] >= array.nbytes
+    if reg(ctypes.c_void_p(addr), ctypes.c_size_t(int(array.nbytes)), 1) != 0:  # portable
+        last()
+        return False
+    _PINNED[addr] = int(array.nbytes)
+    return True
+
+
+def unpin(addr):
+    """Undo :func:`pin` for the host memory at ``addr`` (an array's ``ctypes.data``)."""
+    if _PINNED.pop(int(addr), None) is None:
+        return
+    _reg, unreg, last = _STATE["pinning"]
+    if unreg is not None and unreg(ctypes.c_void_p(int(addr))) != 0:
+        last()
 
 
 _MEMINFO = []
