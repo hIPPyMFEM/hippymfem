@@ -254,8 +254,8 @@ The inverse-problem layer is adapted from hIPPYlib (U. Villa, N. Petra and O. Gh
 Transactions on Mathematical Software 47(2), 2021), whose interface conventions it keeps, and
 tutorials 1 to 7 are adapted from hIPPYlib's. The finite element machinery is MFEM's, the
 solvers are hypre's and the automatic differentiation is JAX's. Computations used a four-L40S
-node at Georgia Tech and the ICE cluster of Georgia Tech's Partnership for an Advanced
-Computing Environment (PACE).
+node at Georgia Tech and resources of Georgia Tech's Partnership for an Advanced Computing
+Environment (PACE).
 
 ## License
 
