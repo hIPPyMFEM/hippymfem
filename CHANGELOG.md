@@ -116,8 +116,9 @@
   the Laplace stages, of the ensemble and of the memory settings follow, and it has a table
   of the Newton-CG solve in double and in single precision on seven sets of GPUs. The 400^3
   row and the CPU rows are as they were. The README opens with an animation of the
-  geothermal application (`docs/images/geothermal_turn_dark.webp`) in the place of the
-  still picture.
+  geothermal application in the place of the still picture, on a light or on a dark
+  background after the theme of the page (`docs/images/geothermal_turn_light.webp` and
+  `geothermal_turn_dark.webp`).
 - **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
   of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
   recurrence of CG loses that orthogonality to rounding on a prior-preconditioned
