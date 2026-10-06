@@ -79,15 +79,19 @@ On 48 GB cards (NVIDIA L40S):
 
 | mesh | state unknowns | data | GPUs | MAP (Newton, CG iterations) | Laplace (eigenpairs) | QoI: truth, at the MAP, linearized std |
 |------|---------------:|-----:|-----:|-----------------------------|----------------------|----------------------------------------|
-| 32³  | 274 625        | 1 320 | 1   | 4 min (24, 790)             | 18 s (50)            | 85.09, 85.17, 0.45 K                   |
-| 64³  | 2 146 689      | 2 700 | 4   | 8 min (19, 690)             | 2.5 min (200)        | 45.00, 44.92, 0.10 K                   |
+| 32³  | 274 625        | 1 320 | 1   | 3 min (25, 856)             | 16 s (50)            | 85.09, 85.17, 0.45 K                   |
+| 64³  | 2 146 689      | 2 700 | 4   | 6 min (19, 678)             | 2.6 min (200)        | 45.00, 44.92, 0.10 K                   |
 
 The truth is a different prior sample on every mesh, hence the two target temperatures.
+The times are from the September 2026 runs that the records in `results/` hold; the MAP
+solve is about a quarter faster than it was before the block-matrix change, so older
+write-ups of this application quote 4 and 8 minutes.
 
 - **How many eigenpairs.**  The data inform more directions than the default `--k 50`
-  on a fine mesh: at 64³ the 200th eigenvalue is still 2.6, and at 128³ about 900 are
-  above one.  Raise `--k` until the eigenvalues pass one when the posterior variance
-  itself is the result.
+  on a fine mesh: at 64³ the 200th eigenvalue is still 2.6, and at 128³ every one of the
+  50 computed pairs is above one, so that run has not reached the informed directions
+  either.  Raise `--k` until the eigenvalues pass one when the posterior variance itself
+  is the result.
 - **Samples against the MAP.**  The QoI over posterior samples lies above its value at
   the MAP, by 1.6 and 3.6 linearized standard deviations at 32³ and 64³ (with a fixed
   basal flux the temperature at depth is convex in the log conductivity).
@@ -95,4 +99,5 @@ The truth is a different prior sample on every mesh, hence the two target temper
   it as `qoi_taylor2_hutchinson_mean_K`.
 - **Memory.**  `--gauss-newton` drops the second-order blocks of the Hessian; with it
   the MAP and the Laplace approximation at 128³ (17 million state unknowns) fit four
-  48 GB cards (`--gauss-newton --skip-qoi`).
+  48 GB cards (`--gauss-newton --skip-qoi`): 46 min for the MAP (30 Newton, 998 CG) and
+  4 min for 50 eigenpairs.
