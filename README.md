@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/geothermal_posterior.png" alt="A basin-scale geothermal inversion at 36 million unknowns: the true log conductivity, the MAP estimate recovered from 60 boreholes, and the posterior standard deviation" width="900">
+  <img src="docs/images/geothermal_turn_dark.webp" alt="An animation of the geothermal application: heat flowing through the rock of a reservoir, a forward solve at 1.08 billion state unknowns, and beside it the conductivity of the rock inferred from temperatures logged in 60 boreholes: the MAP estimate, posterior samples and the posterior standard deviation" width="900">
 </p>
 
 <h1 align="center">hIPPyMFEM</h1>
@@ -15,9 +15,10 @@ Gradients, Hessians, the MAP point and the posterior follow by automatic differe
   <img src="https://img.shields.io/badge/GPU-NVIDIA%20%7C%20AMD-76b900.svg" alt="NVIDIA and AMD GPUs">
 </p>
 
-*Above: a geothermal inversion at 128³ (36 million unknowns) on four GPUs: the true
-log conductivity, the MAP estimate from temperatures logged in 60 boreholes, and the posterior
-standard deviation, lowest where the boreholes reach.*
+*Above: the geothermal application. Left, heat flowing through the rock of a reservoir: a
+forward solve at 1.08 billion state unknowns (512³) on 30 GPUs. Right, the conductivity of the
+rock inferred on a 128³ mesh from temperatures logged in 60 boreholes: the MAP estimate, samples
+of the posterior, and its standard deviation, lowest where the boreholes reach.*
 
 ---
 
@@ -40,31 +41,33 @@ Newton solve, a table lookup, and its derivatives stay exact.
 | | |
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
-| **134 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 46 s on 16 GPUs, against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on 32 CPU cores, at the same CG count. |
+| **161 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 38 s on 16 GPUs, against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on 32 CPU cores, at the same CG count. |
 | **A billion unknowns** | Two Newton-CG steps at 1.09 billion unknowns (400³ P2 hexahedra) take 134 s on 24 RTX PRO 6000 Blackwell GPUs. |
-| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 14 minutes on four GPUs. |
+| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 10 minutes on four GPUs. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
-| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 11.2 s on one AMD MI210 and 6.1 s on one NVIDIA H100, with the same cost and CG counts. |
+| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 9.2 s on one AMD MI210 and 4.7 s on one NVIDIA H100, with the same cost and CG counts. |
 
 ## How it compares
 
-<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 28 to 134 times faster than hIPPYlibx" width="760"></p>
+<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 24 to 161 times faster than hIPPYlibx and 10 to 74 times faster than hIPPyMFEM on CPU ranks" width="760"></p>
 
 *Two Newton-CG steps of a P2 hexahedral benchmark, rank for rank, with the same PDE, prior and
 BoomerAMG settings in both libraries ([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is
-hIPPYlib on FEniCSx): four CPU cores against four L40S GPUs up to 128³, and 32 cores against
-16 RTX PRO 6000 Blackwell (BW) GPUs at 256³. The bars are measured wall times; the ratios
-charge each CPU run the GPU run's CG count.*
+hIPPYlib on FEniCSx). The GPUs are RTX PRO 6000 Blackwell cards, each split into two 48 GB MIG
+slices with one MPI rank per slice: four CPU ranks against four slices (two GPUs) up to 128³,
+and 32 CPU ranks against 32 slices (16 GPUs) at 256³. The bars and the ratios are measured wall
+times.*
 
 ## How it scales
 
 | mesh | unknowns | GPUs | two Newton-CG steps |
 |---|---|---|---|
-| 64³ | 4.57 M | 1 L40S | 13.6 s |
-| 128³ | 36.1 M | 4 L40S | 29.1 s |
-| 128³ | 36.1 M | 4 AMD Instinct MI210 | 23.6 s |
-| 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 101 s |
-| 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 46.3 s |
+| 64³ | 4.57 M | 1 L40S | 10.9 s |
+| 128³ | 36.1 M | 4 L40S | 23.4 s |
+| 128³ | 36.1 M | 4 AMD Instinct MI210 | 19.6 s |
+| 128³ | 36.1 M | 8 RTX PRO 6000 Blackwell | 10.9 s |
+| 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 82.6 s |
+| 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 38.5 s |
 | 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 134 s |
 
 The Blackwell GPUs were split into two 48 GB MIG slices each, one MPI rank per slice. The

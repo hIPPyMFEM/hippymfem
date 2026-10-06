@@ -104,6 +104,20 @@
 
 ### Changed
 
+- **The measurements quoted in the README and in the GPU guide are those of 5 October 2026**,
+  taken with the library as it is now (hypre's own PCG, the orthogonalized CG of a Newton
+  step, the compact scatter map). Two Newton-CG steps of the benchmark take 10.9 s at 64^3
+  on one L40S (13.6 s before), 23.4 s at 128^3 on four (29.1 s) and 38.5 s at 256^3 on 16
+  RTX PRO 6000 Blackwell cards (46.3 s); there the GPUs are 161 times faster than hIPPYlibx
+  and 74 times faster than hIPPyMFEM on 32 CPU ranks. The comparison chart of the README is
+  now on Blackwell cards at every size, four CPU ranks against the four MIG slices of two
+  cards up to 128^3, and its ratios are those of the measured wall times (24, 65, 95 and
+  161 over hIPPYlibx; 10, 29, 50 and 74 over hIPPyMFEM on CPU ranks). The guide's tables of
+  the Laplace stages, of the ensemble and of the memory settings follow, and it has a table
+  of the Newton-CG solve in double and in single precision on seven sets of GPUs. The 400^3
+  row and the CPU rows are as they were. The README opens with an animation of the
+  geothermal application (`docs/images/geothermal_turn_dark.webp`) in the place of the
+  still picture.
 - **Newton-CG keeps the residuals of its CG orthogonal explicitly** (`cg_reorthogonalize`
   of `ReducedSpaceNewtonCG`, on by default; `reorthogonalize` of `CGSolverSteihaug`). The
   recurrence of CG loses that orthogonality to rounding on a prior-preconditioned

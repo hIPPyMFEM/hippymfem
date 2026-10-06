@@ -88,11 +88,11 @@ all of it.
 * Set ``HIPPYMFEM_PRECISION=mixed`` together with ``HIPPYMFEM_HYPRE_SINGLE``, the path of
   a single-precision build of hypre (:ref:`hypre-single-install`).  The Newton and CG
   counts and the cost functional stay those of double precision; at 64\ :sup:`3` the
-  solve was 1.17 times faster on an H100 and 1.45 times on an L40S, and at
-  128\ :sup:`3` on four L40S 1.57 times, with 14 % less memory on the busiest card
-  (:ref:`single-precision`).  The single-precision solves need a Jacobian that is
-  symmetric and solved by CG with BoomerAMG; other problems keep their double-precision
-  solves.
+  solve was 1.29 times faster on an H100, 1.51 times on an L40S and 1.81 times on a
+  Blackwell instance, and at 128\ :sup:`3` on four L40S 1.57 times, with 11 % less memory
+  on the busiest card (:ref:`single-precision`).  The single-precision solves need a
+  Jacobian that is symmetric and solved by CG with BoomerAMG; other problems keep their
+  double-precision solves.
 * On a GPU, ``HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`` (Jacobi relaxation and six
   interpolation entries a row in the BoomerAMG of the single-precision solves) took the
   Newton-CG solve at 64\ :sup:`3` from 38.5 to 29.0 s on a Blackwell instance and from
@@ -114,7 +114,7 @@ within 5.7e-6, three orders of magnitude below what a posterior needs; the eigen
 Where eigenvalues are wanted to more digits than that, switch the single-precision solves
 off after the MAP point and run the incremental solves to about 1e-8 (below).  On several
 GPUs, if the problem fits on one, run these stages as an ensemble: at 64\ :sup:`3` the
-eigensolver took 17.6 s on four MIG instances as an ensemble and 30.4 s as a domain
+eigensolver took 15.1 s on four MIG instances as an ensemble and 28.1 s as a domain
 decomposition (`The Laplace approximation on the cards`_).
 
 **Several GPUs.**  Start the ranks through ``tools/mpirun_pinned.sh``, one card or MIG
@@ -128,9 +128,9 @@ Krylov iteration (:ref:`several-gpus`).  The settings above stay as they are.
 ``release_linearization_on_move=True`` for a line-search Newton-CG, which drops a
 linearization point before the next one is assembled (with both, the Newton-CG run at
 128\ :sup:`3`, 17.0 million state dofs, peaked at 59,785 MiB on one 80 GB H100, and at
-65,683 MiB in double precision with the release); ``HIPPYMFEM_GPU_MEM_FRACTION=0.20``, which saved 1.9 GiB a card for 13 %
-more time in two Newton steps at 128\ :sup:`3` on four L40S; matrix-free linearization
-points last (:ref:`gpu-memory`).
+65,683 MiB in double precision with the release); ``HIPPYMFEM_GPU_MEM_FRACTION=0.20``,
+which saved 2.8 GiB a card for 14 % more time in two Newton steps at 128\ :sup:`3` on four
+L40S; matrix-free linearization points last (:ref:`gpu-memory`).
 
 .. code-block:: python
 
@@ -188,19 +188,22 @@ the hIPPYlibx rows):
 mesh            unknowns   where it runs                forward  Hessian  Hessian  two Newton
                                                         solve    blocks   apply    steps
 ==============  =========  ===========================  =======  =======  =======  ==========
-64\ :sup:`3`    4.6 M      1 L40S                       1.19 s   0.47 s   0.59 s   13.6 s
-64\ :sup:`3`    4.6 M      1 H100                       0.54 s   0.31 s   0.23 s   6.1 s
-64\ :sup:`3`    4.6 M      1 AMD MI210                  1.02 s   0.37 s   0.46 s   11.2 s
-64\ :sup:`3`    4.6 M      4 L40S                       0.45 s   0.13 s   0.26 s   5.7 s
+64\ :sup:`3`    4.6 M      1 L40S                       0.94 s   0.29 s   0.49 s   10.9 s
+64\ :sup:`3`    4.6 M      1 H100                       0.40 s   0.16 s   0.20 s   4.7 s
+64\ :sup:`3`    4.6 M      1 AMD MI210                  0.84 s   0.23 s   0.38 s   9.2 s
+64\ :sup:`3`    4.6 M      4 L40S                       0.39 s   0.09 s   0.22 s   4.9 s
+64\ :sup:`3`    4.6 M      2 Blackwell cards            0.52 s   0.25 s   0.26 s   6.2 s
 64\ :sup:`3`    4.6 M      4 host ranks                 12.5 s   1.5 s    10.9 s   179.5 s
 64\ :sup:`3`    4.6 M      hIPPYlibx, 4 host ranks      29.4 s   8.7 s    13.8 s   402.5 s
-128\ :sup:`3`   36 M       1 H100                       5.6 s    2.4 s    1.6 s    42.9 s
-128\ :sup:`3`   36 M       4 L40S                       2.9 s    0.97 s   1.6 s    29.1 s
-128\ :sup:`3`   36 M       4 AMD MI210                  2.5 s    0.82 s   1.2 s    23.6 s
+128\ :sup:`3`   36 M       1 H100                       3.5 s    1.5 s    1.3 s    29.4 s
+128\ :sup:`3`   36 M       4 L40S                       2.3 s    0.56 s   1.4 s    23.4 s
+128\ :sup:`3`   36 M       4 AMD MI210                  2.1 s    0.48 s   1.1 s    19.6 s
+128\ :sup:`3`   36 M       2 Blackwell cards            2.9 s    1.9 s    1.4 s    28.1 s
+128\ :sup:`3`   36 M       8 Blackwell cards            1.2 s    0.60 s   0.45 s   10.9 s
 128\ :sup:`3`   36 M       4 host ranks                 108.5 s  11.9 s   101.3 s  1409 s
 128\ :sup:`3`   36 M       hIPPYlibx, 4 host ranks      241.0 s  71.4 s   140.7 s  2669 s
-256\ :sup:`3`   287 M      8 Blackwell cards            10.7 s   5.2 s    3.5 s    101 s
-256\ :sup:`3`   287 M      16 Blackwell cards           4.3 s    2.6 s    1.8 s    46.3 s
+256\ :sup:`3`   287 M      8 Blackwell cards            8.7 s    4.7 s    2.9 s    82.6 s
+256\ :sup:`3`   287 M      16 Blackwell cards           3.6 s    2.0 s    1.5 s    38.5 s
 256\ :sup:`3`   287 M      32 host ranks                --       --       --       2859 s
 256\ :sup:`3`   287 M      hIPPYlibx, 32 host ranks     423.9 s  102.4 s  378.9 s  6187 s
 400\ :sup:`3`   1.09 B     24 Blackwell cards           13.1 s   6.4 s    4.8 s    134 s
@@ -208,20 +211,23 @@ mesh            unknowns   where it runs                forward  Hessian  Hessia
 
 The GPU rows were measured in October 2026 on a cluster: the four L40S are two on each
 of two nodes, and the Blackwell cards (RTX PRO 6000) were split into two 48 GB MIG slices
-each, one rank per slice, so 16 cards are 32 ranks.  The host and hIPPYlibx rows were
-measured in September 2026 on one node with two AMD EPYC 9334, with as many ranks as the
-GPU rows beside them: they are a device swap at a fixed rank count, not the node's best
-host time.  Against host ranks of the same library the GPUs are 31, 48 and 62 times
-faster at the three sizes, with the same cost functional to eight digits and the same CG
-counts.
+each, one rank per slice, so two cards are four ranks and 16 cards are 32.  The host and
+hIPPYlibx rows were measured in September 2026 on one node with two AMD EPYC 9334, with
+as many ranks as the GPU rows beside them: they are a device swap at a fixed rank count,
+not the node's best host time.  Against four host ranks of the same library, the four
+slices of two Blackwell cards are 29 and 50 times faster at 64\ :sup:`3` and
+128\ :sup:`3` and four L40S 37 and 60 times; at 256\ :sup:`3` the 16 cards are 74 times
+faster than 32 host ranks.  The cost functional is the same to seven digits and the CG
+counts are the same.
 
 The hIPPYlibx rows are the same problem (mesh, spaces, PDE, data model, prior,
 Newton-CG settings) solved by `hIPPYlibx <https://github.com/hIPPyMFEM/hippylibx>`_ on
 dolfinx 0.10, with PETSc's CG and BoomerAMG given the same BoomerAMG options.  The two
 libraries draw different random data, so their CG counts differ at the two smaller
-sizes (11 and 6 against 8): four cards are 70 and 92 times faster as measured, and 63
-and 101 times when hIPPYlibx is charged the same CG counts.  At 256\ :sup:`3` every run
-takes 9 CG iterations, and the GPUs are 134 times faster.
+sizes (11 and 6 against 8): two Blackwell cards are 65 and 95 times faster as measured,
+and 58 and 105 times when hIPPYlibx is charged the same CG counts (four L40S 82 and 114
+times as measured).  At 256\ :sup:`3` every run takes 9 CG iterations, and the GPUs are
+161 times faster.
 
 Every row is warm.  The first linearization point of a run pays the sparsity patterns
 and JAX's compilation once (5 s at 64\ :sup:`3` on one card, 85 s at 400\ :sup:`3`,
@@ -434,6 +440,31 @@ point 1.45 times faster than double precision with the same settings, with all t
 of these 1.9 times faster than double precision with the default ones, and 5.0 times
 faster than the library of 2 October; on the H100 1.17, 1.5 and 3.5 times.
 
+The library as it is now, measured on 5 October at 64\ :sup:`3` and at 128\ :sup:`3`
+(17.0 million state dofs) with the settings of :ref:`gpu-recommended` (incremental solves
+to 1e-6, the forward and the adjoint solve refined to the solver's tolerance): double
+precision throughout against single-precision element matrices and solves, the time of
+a solve after a first one and the memory of the busiest card at its peak:
+
+.. table::
+   :widths: auto
+
+   ==============  ========================  ===================  ===================  =======
+   mesh            GPUs                      double precision     single precision     faster
+   ==============  ========================  ===================  ===================  =======
+   64\ :sup:`3`    1 H100                    26.7 s, 18.9 GiB     20.8 s, 13.0 GiB     1.29x
+   64\ :sup:`3`    1 L40S                    61.2 s, 18.7 GiB     40.6 s, 12.8 GiB     1.51x
+   64\ :sup:`3`    1 Blackwell instance      71.9 s, 14.7 GiB     39.8 s, 12.8 GiB     1.81x
+   64\ :sup:`3`    4 Blackwell instances     33.0 s, 6.3 GiB      22.7 s, 5.7 GiB      1.45x
+   128\ :sup:`3`   4 L40S                    224.2 s, 22.2 GiB    142.9 s, 19.8 GiB    1.57x
+   128\ :sup:`3`   4 Blackwell instances     252.5 s, 22.2 GiB    144.6 s, 19.8 GiB    1.75x
+   128\ :sup:`3`   1 H100                    249.9 s, 64.1 GiB    198.7 s, 58.4 GiB    1.26x
+   ==============  ========================  ===================  ===================  =======
+
+Every run at 64\ :sup:`3` took twelve Newton steps and 131 CG iterations and every run
+at 128\ :sup:`3` thirteen and 191, in both precisions; the runs at 128\ :sup:`3` release
+each linearization point before the next (``release_linearization_on_move``).
+
 What single precision itself gives, stage by stage: double
 precision throughout against single-precision element matrices and solves, the solves
 in both by hypre's PCG, the incremental ones to 1e-6 and to the 1e-5 that single
@@ -492,10 +523,10 @@ with single-precision element matrices and solves (``benchmarks/bench_precision.
 What lies outside the pool is hypre's matrices, hierarchies and vectors, MFEM and the
 CUDA context; a seventh of it goes.  Since a Gauss-Newton point assembles its single
 block a chunk at a time, the H100's card in single precision peaks at 13.0 GiB instead
-of the 17.5 GiB of the table (double precision unchanged; the other columns not yet
-measured again).  The other blocks of a linearization point stay in
-double precision (for a forward problem that is linear in the state these are ``C`` and
-``W_um``, 0.4 GB each at this size).  The Jacobian's accumulator does not.  Where the
+of the 17.5 GiB of this table, the L40S's at 12.8 GiB and the busiest of four Blackwell
+instances at 5.7 GiB (the table of 5 October above; double precision unchanged).  The
+other blocks of a linearization point stay in double precision (for a forward problem
+that is linear in the state these are ``C`` and ``W_um``, 0.4 GB each at this size).  The Jacobian's accumulator does not.  Where the
 elements are assembled a chunk at a time, the route of a mesh that does not fit the
 card whole, a matrix that goes to the single-precision library is accumulated in single
 precision (``HIPPYMFEM_SINGLE_ACCUMULATE``, on): the accumulator, the largest
@@ -624,9 +655,10 @@ Blackwell) needs 0.3 ms plus 5.3 ns per state dof for a CG iteration with a Boom
 V-cycle.  On several cards every iteration adds 23 to 31 halo exchanges, one per
 product with a level matrix or an interpolation matrix, and without a GPU-aware MPI
 each of them goes through the host: 1 to 2 ms per iteration at up to 1.1 million dofs
-per card, 2.5 to 5 ms at 2.1 million.  So at 32\ :sup:`3` four L40S are 1.35 times
-faster than one and at 64\ :sup:`3` 2.4 times, while at 128\ :sup:`3` four are twice as
-fast as two, and sixteen Blackwell cards at 256\ :sup:`3` 2.2 times as fast as eight.
+per card, 2.5 to 5 ms at 2.1 million.  So at 32\ :sup:`3` four Blackwell slices are
+hardly faster than one (1.47 against 1.55 s for two Newton steps) and at 64\ :sup:`3`
+four L40S 2.2 times, while at 128\ :sup:`3` four L40S are twice as fast as two, and
+sixteen Blackwell cards at 256\ :sup:`3` 2.1 times as fast as eight.
 
 Three settings matter on several cards.  Their defaults are the ones to use:
 
@@ -671,7 +703,7 @@ How large a problem fits
 A Newton step holds about 2 kB of device memory per unknown (state, parameter and
 adjoint together): the assembled blocks and the AMG hierarchies.  That puts
 128\ :sup:`3` (36 M unknowns) on four 45 GB L40S at 20 GiB per card, on two of them at
-31 GiB, or on one 80 GB H100 at 59 GiB; a Newton-CG run to its tolerance peaked there at
+34 GiB, or on one 80 GB H100 at 58 GiB; a Newton-CG run to its tolerance peaked there at
 64.1 GiB in double precision (253.8 s) and at 58.4 GiB with single-precision element
 matrices and solves (197.7 s), both with ``release_linearization_on_move``.  At
 400\ :sup:`3` a 48 GB slice holds 37 GiB.  What decides whether a given run fits:
@@ -681,14 +713,14 @@ ceiling, not a reservation: the pool grows as the element kernels need it, and t
 batches are sized from the room left under the ceiling, so a lower share means smaller
 chunks and a smaller pool, at some cost in time.  Set
 ``HIPPYMFEM_GPU_MEM_FRACTION=0.20`` when a run is short of card memory: at
-128\ :sup:`3` on four L40S it saves 1.9 GiB per card for 13 % more time.
+128\ :sup:`3` on four L40S it saves 2.8 GiB per card for 14 % more time.
 ``XLA_PYTHON_CLIENT_ALLOCATOR=platform`` is not a substitute: it reports no budget to
 size the chunks from, and its card peak was higher.
 
 **Matrix-free linearization points.**  ``setLinearizationPoint(x, matrix_free=True)``
 leaves ``C``, ``W_um`` and ``W_mm`` unassembled and computes their products at every
-Hessian application instead: 0.6 GiB per card for 4 % more time in the same run.  With
-the lower share as well it is 2.7 GiB for 64 %, so it is for a run that still does not
+Hessian application instead: 1.5 GiB per card for 8 % more time in the same run.  With
+the lower share as well it is 3.2 GiB for 50 %, so it is for a run that still does not
 fit.
 
 **What the problem class keeps.**  Three settings of
@@ -823,11 +855,11 @@ pointwise variance and the traces.
 =======================================  ===========================  ====================  ====================  =====================
 Laplace stage                            32\ :sup:`3`, host, 4 ranks  32\ :sup:`3`, 1 L40S  64\ :sup:`3`, 4 L40S  128\ :sup:`3`, 4 L40S
 =======================================  ===========================  ====================  ====================  =====================
-eigensolver (140 Hessian applies)        199.1 s                      10.1 s                28.4 s                174.5 s
-one posterior sample                     165 ms                       24 ms                 46 ms                 274 ms
-pointwise variance, randomized, r = 64   4.6 s                        1.6 s                 4.4 s                 15.3 s
-pointwise variance, Monte Carlo, n = 64  --                           1.2 s                 2.3 s                 14.0 s
-traces, r = 64                           5.8 s                        1.9 s                 4.9 s                 17.1 s
+eigensolver (140 Hessian applies)        199.1 s                      9.2 s                 25.1 s                147.3 s
+one posterior sample                     165 ms                       24 ms                 46 ms                 285 ms
+pointwise variance, randomized, r = 64   4.6 s                        1.7 s                 4.5 s                 14.2 s
+pointwise variance, Monte Carlo, n = 64  --                           1.2 s                 2.4 s                 14.6 s
+traces, r = 64                           5.8 s                        1.9 s                 4.9 s                 16.2 s
 =======================================  ===========================  ====================  ====================  =====================
 
 The random stream is a vectorized Philox generator, bit-identical to numpy's and on the
@@ -836,7 +868,8 @@ card when the kernels are, which is what makes a sample tens of milliseconds.  T
 the ``"MonteCarlo"`` method (one solve per sample) is unbiased.  The incremental and
 prior solves can run at 1e-8 for these stages: the eigenvalues move by 6e-6 at most and
 the eigensolver is 1.4x faster.  At 128\ :sup:`3` the whole workflow, MAP included,
-runs in 14.4 minutes on four L40S (two on each of two nodes, as above).
+runs in 10.4 minutes on four L40S (two on each of two nodes, as above), and in 8.3 minutes
+with the incremental solves of the MAP point stopped at 1e-6 (:ref:`gpu-recommended`).
 
 **Several GPUs: an ensemble instead of a domain decomposition.**  Every one of these
 stages is a set of independent solves (140 Hessian applications in the eigensolver, one
@@ -860,13 +893,13 @@ slices of RTX PRO 6000 Blackwell cards, incremental solves to 1e-8:
 ==========================================  ========  ===================  ===========
 after the MAP point                         1 slice   8, domain decomp.    8, ensemble
 ==========================================  ========  ===================  ===========
-eigensolver (k = 50, p = 20)                62.0 s    21.2 s               9.9 s
-64 posterior samples                        5.7 s     2.7 s                0.9 s
-pointwise variance, Monte Carlo, n = 64     4.2 s     2.2 s                0.8 s
-all stages                                  83.5 s    37.2 s               17.9 s
+eigensolver (k = 50, p = 20)                52.6 s    22.0 s               8.6 s
+64 posterior samples                        5.7 s     3.1 s                0.9 s
+pointwise variance, Monte Carlo, n = 64     4.0 s     2.6 s                0.7 s
+all stages                                  73.3 s    40.8 s               16.4 s
 ==========================================  ========  ===================  ===========
 
-The eigenvalues of the ensemble agree with those of one slice to 2e-6.  What an
+The eigenvalues of the ensemble agree with those of one slice to 2e-8.  What an
 ensemble does not speed up: the orthogonalizations, which are sequential in the columns
 and which every rank repeats, and the MAP point, whose CG iterations depend on one
 another.  Every rank also has to set the problem up and hold it, so the mesh has to fit
@@ -908,11 +941,11 @@ benchmark above:
 ===========================================  ======  ======  ======
 two Newton-CG steps                          MI210   H100    L40S
 ===========================================  ======  ======  ======
-:math:`64^{3}`, one GPU                      11.2 s  6.1 s   13.6 s
-:math:`128^{3}`, four GPUs                   23.6 s  --      29.1 s
+:math:`64^{3}`, one GPU                      9.2 s   4.7 s   10.9 s
+:math:`128^{3}`, four GPUs                   19.6 s  --      23.4 s
 ===========================================  ======  ======  ======
 
-The answers are the NVIDIA ones: the same cost functional to nine digits and the same CG
+The answers are the NVIDIA ones: the same cost functional to seven digits and the same CG
 counts at every size.  ``run_tests.sh 1 2`` with the HIP build passes every suite,
 ``test_gpu`` and ``test_device`` included.  The recycling pool for hypre's memory is for
 CUDA builds only.

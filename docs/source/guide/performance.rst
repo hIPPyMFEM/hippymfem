@@ -109,8 +109,8 @@ elements per rank   CPU       GPU       speedup
 ==================  ========  ========  =========
 
 With hypre on the device the picture is strong scaling across cards: two Newton-CG
-steps at 64\ :sup:`3` P2 hexahedra (2.1 million state dofs) take 13.6 s on one L40S,
-9.6 s on two and 5.7 s on four.  :doc:`gpu` has the tables, against host ranks and
+steps at 64\ :sup:`3` P2 hexahedra (2.1 million state dofs) take 10.9 s on one L40S
+and 4.9 s on four.  :doc:`gpu` has the tables, against host ranks and
 against hIPPYlibx.
 
 What a linearization point assembles
