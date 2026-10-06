@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="docs/images/geothermal_turn_dark.webp" alt="An animation of the geothermal application: heat flowing through the rock of a reservoir, a forward solve at 1.08 billion state unknowns, and beside it the conductivity of the rock inferred from temperatures logged in 60 boreholes: the MAP estimate, posterior samples and the posterior standard deviation" width="900">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/geothermal_turn_dark.webp">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/geothermal_turn_light.webp">
+    <img src="docs/images/geothermal_turn_light.webp" alt="An animation of the geothermal application: heat flowing through the rock of a reservoir, a forward solve at 1.08 billion state unknowns, and beside it the conductivity of the rock inferred from temperatures logged in 60 boreholes: the MAP estimate, posterior samples and the posterior standard deviation" width="900">
+  </picture>
 </p>
 
 <h1 align="center">hIPPyMFEM</h1>
