@@ -222,6 +222,45 @@ def test_nonlinear_forward():
           "(||r||=%.2e in %d iters)" % (r.norm("l2"), pde.fwd_iterations))
     check("solution is positive and bounded", 0.0 < u.max() < 10.0, "(max %.4f)" % u.max())
 
+    # The residual has a floor of round-off, and a tolerance may lie under it: here it
+    # is zero.  A solve started at the solution then ends by its Newton correction (it
+    # ran to max_iter and raised), with the state where it was.
+    saved = dict(pde.newton_parameters)
+    pde.newton_parameters.update(rel_tolerance=0.0, abs_tolerance=0.0)
+    u1 = u.copy()
+    try:
+        pde.solveFwd(u1, [u1, m, None])
+        moved = u1.copy().axpy(-1.0, u).norm("linf") / u.norm("linf")
+        ok = pde.fwd_iterations <= 3 and moved < 1e-10
+        detail = "(%d iterations, the state moved by %.1e)" % (pde.fwd_iterations, moved)
+    except RuntimeError as exc:
+        ok, detail = False, "(%s)" % exc
+    check("a tolerance under the residual's floor: the solve ends by its correction", ok, detail)
+
+    # A solve whose line search finds no step that lowers the residual, with a
+    # correction that is not negligible, fails at once (it failed at max_iter): here
+    # every correction is turned round.
+    solver = pde._get_solver("solver")
+    forwards = solver.solve
+
+    def backwards(x, b):
+        forwards(x, b)
+        x.scale(-1.0)
+
+    solver.solve = backwards
+    u3 = pde.generate_state()
+    said = ""
+    try:
+        pde.solveFwd(u3, [u3, m, None])
+    except RuntimeError as exc:
+        said = str(exc)
+    finally:
+        del solver.solve
+        pde.newton_parameters.update(saved)
+    check("a solve that its line search cannot advance fails at once",
+          "stalled" in said and pde.fwd_iterations == 1,
+          "(after %d of %d iterations: %s)" % (pde.fwd_iterations, saved["max_iter"], said[:60]))
+
     # a mislabeled linear problem must be reported, not silently mis-solved
     pde2 = PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
                                  is_fwd_linear=True)

@@ -232,6 +232,15 @@
   run needs, `benchmarks/README.md` maps each published table to its script,
   `docs/source/guide/configuration.rst` lists every setting, and the profiling scripts of
   finished investigations are gone from `benchmarks/` and `tools/`.
+- A nonlinear forward solve ends by its Newton correction as well as by its residual
+  (`newton_parameters["step_tolerance"]`, 1e-12 of the state). The residual has a floor of
+  round-off that grows with the mesh, 4.8e-15 at 16^3 and 1.2e-14 at 256^3 in the
+  geothermal application, and with a tolerance under it a solve ran to `max_iter` and
+  raised although its state had all its digits: 30 iterations with up to twelve step
+  lengths each, for every trial of a line search of Newton-CG, about twelve minutes at
+  256^3 before that search gave up. And a solve whose own line search finds no step that
+  lowers the residual, with a correction that is not negligible, raises at once and no
+  longer at `max_iter`.
 - `tools/build_pymfem_hip.sh` builds where ROCm and MPI come from modules. It took ROCm
   from `/opt/rocm` and the MPI include directories from OpenMPI's wrapper; it now reads
   `ROCM_PATH`, takes the include directories from an MPICH wrapper too and hands them to

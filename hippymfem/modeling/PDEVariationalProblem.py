@@ -294,10 +294,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self.solver = self.solver_adj = None
         self.solver_fwd_inc = self.solver_adj_inc = None
 
-        #: Newton controls for a nonlinear forward solve
+        #: Newton controls for a nonlinear forward solve.  It ends when the residual is
+        #: below ``max(rel_tolerance * ||r_0||, abs_tolerance)``, or when the Newton
+        #: correction is below ``step_tolerance`` of the state (:meth:`solveFwd`; with
+        #: ``0`` the residual alone decides).
         self.newton_parameters = {
             "rel_tolerance": 1e-10,
             "abs_tolerance": 1e-14,
+            "step_tolerance": 1e-12,
             "max_iter": 25,
             "line_search": True,
             "max_backtrack": 12,
@@ -744,6 +748,17 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
 
         A linear residual converges in one step; the declaration
         ``is_fwd_linear`` only stops the loop early, it does not change the step.
+
+        A nonlinear solve ends when its residual is below the tolerance, and also when
+        the Newton correction is below ``newton_parameters["step_tolerance"]`` of the
+        state.  The residual has a floor of round-off that grows with the mesh, and a
+        tolerance may lie under it: 1e-14 against 1.2e-14 at 135 million unknowns,
+        where a solve that a line search had warm-started ran to ``max_iter`` and
+        raised with a state that had all its digits.  The correction measures the
+        error of the state it corrects, whatever the size of the residual.  A solve
+        whose own line search finds no step that lowers the residual, with a correction
+        that is not negligible, raises at once and does not repeat that search
+        ``max_iter`` times.
         """
         self.n_calls["forward"] += 1
         m = x[PARAMETER]
@@ -792,18 +807,30 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             r.scale(-1.0)
             solver.solve(du, r)
             alpha = 1.0
-            if prm["line_search"] and not self.is_fwd_linear:
-                alpha, rnew, r = self._backtrack(u, du, m, p, r.norm("l2"))
+            searched = prm["line_search"] and not self.is_fwd_linear
+            if searched:
+                rprev = r.norm("l2")
+                alpha, rnew, r = self._backtrack(u, du, m, p, rprev)
             else:
                 u.axpy(1.0, du)
                 r = self._residual([u, m, p], ADJOINT, ess=self.bc0.ess)
                 rnew = r.norm("l2")
             self.fwd_iterations = it + 1
+            step = None
+            if not self.is_fwd_linear:
+                size = u.norm("linf")
+                step = du.norm("linf") / size if size > 0.0 else float("inf")
             if prm["print_level"] >= 0 and self.comm.rank == 0:
-                print("  fwd Newton %2d: ||r|| = %.6e  alpha = %.3g"
-                      % (it + 1, rnew, alpha), flush=True)
-            if rnew < tol:
+                print("  fwd Newton %2d: ||r|| = %.6e  alpha = %.3g%s"
+                      % (it + 1, rnew, alpha, "" if step is None else "  step = %.1e" % step),
+                      flush=True)
+            if rnew < tol or (step is not None and step <= prm["step_tolerance"]):
                 break
+            if searched and rnew >= rprev:
+                raise RuntimeError(
+                    "forward Newton solve stalled: no step lowers ||r|| = %.3e "
+                    "(tolerance %.3e) and the correction is %.1e of the state, at "
+                    "iteration %d" % (rnew, tol, step, it + 1))
         else:
             if maxit and not self.is_fwd_linear:
                 raise RuntimeError(
