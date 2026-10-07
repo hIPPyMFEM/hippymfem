@@ -191,11 +191,12 @@ def check_partition(files, tol=1e-12):
         print("%-40s %6d %12.2e %12.2e %12.2e %12.2e %12.2e / %.2e"
               % (os.path.basename(f), cur["ranks"], row["xyz"], row["data"], row["mtrue"], row["mmap"], row["std_post"], row["d"]))
         # The random streams are partition independent, the Krylov solves are not: the
-        # prior sample (an A-solve at 1e-8) and the data agree to that tolerance, the MAP
-        # (Newton-CG on top) to about 1e-5, and the truncated eigen-decomposition and the
-        # posterior std it gives only to the eigensolver's own accuracy (0.1 at k = 20,
-        # 16^3, where more than k eigenvalues are above one).  The pass criterion is the
-        # stream and the solves; the rest is reported.
+        # truth is a function of the point and agrees to the last bit, the data (a forward
+        # solve) to that solve's tolerance, the MAP (Newton-CG on top) to about 1e-5, and
+        # the truncated eigen-decomposition and the posterior std it gives only to the
+        # eigensolver's own accuracy (0.1 at k = 20, 16^3, where more than k eigenvalues
+        # are above one).  The pass criterion is the stream and the solves; the rest is
+        # reported.
         row["ok"] = bool(all(np.isnan(row[k]) or row[k] <= tol for k in ("xyz", "data", "mtrue")) and
                          (np.isnan(row["mmap"]) or row["mmap"] <= 1e3 * tol))
         out["rows"].append(row)
