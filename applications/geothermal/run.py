@@ -80,9 +80,9 @@ def main():
     ap.add_argument("--newton-max", type=int, default=30)
     ap.add_argument("--newton-tol", type=float, default=1e-6)
     ap.add_argument("--cg-max", type=int, default=200,
-                    help="most CG iterations of a Newton step.  The data grow with the mesh (one sample per element "
-                         "layer), and so do the iterations the Eisenstat-Walker tolerance asks for: up to 103 at 128^3 "
-                         "and 100 at 256^3.  A cap under that makes the last Newton steps converge linearly")
+                    help="most CG iterations of a Newton step.  The Eisenstat-Walker tolerance asks for up to 68 in "
+                         "the last steps, on every mesh (and for 100 with four times the observations): a cap under "
+                         "what it asks for makes those steps converge linearly")
     ap.add_argument("--inc-tol", type=float, default=1e-6,
                     help="relative tolerance of the incremental solves of a Hessian action.  The CG of a Newton step "
                          "keeps its residuals orthogonal, so 1e-6 gives the Newton and CG iterations of 1e-8")
@@ -130,7 +130,7 @@ def main():
                                                     solver.termination_reasons[solver.reason], c_tot, c_mis, c_reg, err_m, err_pr))
     # the anomaly is what the data can see: the error inside the target box, and the
     # correlation of MAP and truth there and everywhere (the global L2 error is dominated
-    # by the prior sample's fine structure, which 60 boreholes were never going to resolve)
+    # by the truth between the boreholes, which 60 logs were never going to resolve)
     xyz = G.Vm.coordinates()
     cc, rr = ANOMALY["centre"], 1.5 * ANOMALY["radius"]
     box = (np.abs(xyz[:, 0] - cc[0]) < rr) & (np.abs(xyz[:, 1] - cc[1]) < rr) & (np.abs(xyz[:, 2] - cc[2]) < 0.6 * rr)

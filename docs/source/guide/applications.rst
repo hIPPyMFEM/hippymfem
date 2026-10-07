@@ -37,11 +37,13 @@ residual density, in full:
    def bdr_varf(u, m, p, x, n):                     # bottom face: heat enters from below
        return -Q_BASAL * p.val
 
-The data are temperature logs from 60 boreholes to 2.8 km depth (one sample per element
-layer) at 0.5 K noise; the prior is a BiLaplacian with a 2 km horizontal and 0.5 km
-vertical correlation length and a marginal standard deviation of 0.5 in log k; the
-synthetic truth is a prior sample plus a buried conductive body (log k + 1, radius 1 km,
-2.3 km deep).
+The data are temperature logs from 60 boreholes to 2.8 km depth, a sample every 62.5 m
+(2 700 in all, whatever the mesh), at 0.5 K noise; the prior is a BiLaplacian with a 2 km
+horizontal and 0.5 km vertical correlation length and a marginal standard deviation of
+0.5 in log k; the synthetic truth is a random field with the prior's spectrum, without
+its shortest waves, plus a buried conductive body (log k + 1, radius 1 km, 2.3 km deep),
+both functions of the point.  Neither the data nor the truth depend on the mesh, so a
+finer mesh solves the same inverse problem more accurately.
 
 Two things about the solvers follow from the physics.  ``dR/du`` carries
 ``k'(u) du grad u . grad p`` and is not symmetric, so the forward and incremental solves
@@ -77,23 +79,27 @@ against the exact one, and the agreement of runs on 1, 2 and 4 ranks.
 What it gives
 -------------
 
-At :math:`32^{3}` on one L40S (274 625 state dofs, 1 320 observations):
+At :math:`64^{3}` on one AMD MI250X (2 146 689 state dofs, 2 700 observations), with
+``--gauss-newton --k 600``:
 
 ====================================  ================================================
 stage                                 result
 ====================================  ================================================
-build (truth, data, one forward)      18 s
-MAP                                   236 s, 24 Newton iterations, 790 CG iterations
-Laplace (blocks + eigensolver, k=50)  18 s
-posterior sample                      26 ms
-recovery in the body's box            correlation 0.82 (0.72 over the domain)
-truth within 2 posterior std          96.5 % of dofs
-QoI: mean target temperature          truth 85.1 K, MAP 85.2 K; std 0.45 K linearized,
-                                      0.46 K over 32 samples through the forward solve
+build (truth, data, one forward)      82 s
+MAP                                   213 s, 16 Newton iterations, 363 CG iterations
+Laplace (eigensolver, 600 pairs)      393 s; 506 eigenvalues above one
+posterior sample                      0.29 s
+recovery in the body's box            correlation 0.96 (0.83 over the domain)
+QoI: mean target temperature          truth 71.60 K, MAP 71.58 K; std 0.08 K linearized,
+                                      0.19 K over 32 samples through the forward solve
 ====================================  ================================================
 
-At :math:`64^{3}` on four L40S (2 146 689 state dofs, 2 700 observations) the MAP takes
-506 s and the Laplace approximation with k = 200 another 147 s.  The body is recovered
+The data and the truth are the same on every mesh, so a finer mesh repeats the inversion:
+at :math:`128^{3}` on four MI250X and at :math:`256^{3}` on 32 (135 million state dofs)
+the MAP takes 16 and 17 Newton iterations with 358 and 359 CG iterations, in 554 s and
+649 s, and the eigensolver finds 491 and 483 eigenvalues above one among 566, in 992 s
+and 1 171 s; the largest eigenvalue is 1.008e6, 1.009e6 and 1.010e6 on the three meshes
+and the target temperature at the MAP 71.58, 71.57 and 71.59 K.  The body is recovered
 where the logs reach it, and the posterior standard deviation falls from the prior's
 0.5 to 0.2 along the logs and returns to the prior below them.
 

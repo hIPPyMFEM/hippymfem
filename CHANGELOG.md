@@ -258,7 +258,7 @@
   longer at `max_iter`.
 - The geothermal application stops the incremental solves of its Hessian actions at 1e-6
   and lets a Newton step take up to 200 CG iterations (`--inc-tol`, `--cg-max`; they were
-  1e-8 and 50). Its data grow with the mesh, one sample per element layer in every
+  1e-8 and 50). Its data then grew with the mesh, one sample per element layer in every
   borehole, and the CG of a Newton step with them: at 256^3 the cap of 50 ended 24 of 35
   steps before the Eisenstat-Walker tolerance was met, and the gradient came down by 0.7 a
   step. With the new values the same MAP point takes 18 steps and 552 CG iterations
@@ -267,6 +267,21 @@
   to 5e-11 and the 50 eigenvalues to 1.5e-5. The tolerance alone keeps the iterations and
   takes a fifth off each. The same 660 observations on 16^3 and on 24^3 take 250 and 251 CG
   iterations: it is the data that the cap has to follow, not the mesh.
+- The data and the synthetic truth of the geothermal application no longer depend on the
+  mesh. The boreholes had one temperature sample per element layer, 660 observations at
+  16^3 and 10 740 at 256^3 with the same noise, and the truth away from the anomaly was a
+  prior sample drawn on the mesh: a finer mesh solved another inverse problem, a more
+  informative one on another rock (the largest eigenvalue of the prior-preconditioned
+  misfit Hessian was 16.7 times larger with the 256^3 data than with the 16^3 data, on one
+  mesh). Every borehole is now logged every 62.5 m, 45 samples and 2 700 observations in
+  all, and the truth is a function of the point, 1 024 plane waves with the prior's
+  spectrum and none shorter than 0.4 km (`model.background_truth`). On Frontier 64^3 on
+  one MI250X, 128^3 on four and 256^3 on 32 take 16, 16 and 17 Newton steps with 363, 358
+  and 359 CG iterations (213, 554 and 649 s); their largest eigenvalues are 1.008e6,
+  1.009e6 and 1.010e6, about 500 are above one on each (506 of the 600 computed, 491 and
+  483 of 566, in 393, 992 and 1 171 s), and the target temperature at the MAP is 71.58,
+  71.57 and 71.59 K. The application's README and the guide hold these records, and
+  `docs/images/geothermal_posterior.png` is the 128^3 run.
 - `tools/build_pymfem_hip.sh` builds where ROCm and MPI come from modules. It took ROCm
   from `/opt/rocm` and the MPI include directories from OpenMPI's wrapper; it now reads
   `ROCM_PATH`, takes the include directories from an MPICH wrapper too and hands them to

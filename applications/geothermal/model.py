@@ -18,9 +18,14 @@ The residual density is therefore code, not a form:
 
 with a basal heat flux as a boundary density on the bottom face and the surface
 temperature as a Dirichlet condition on the top face.
+
+The synthetic truth and the data do not depend on the mesh: the truth is a function of the
+point (:func:`background_truth` plus the anomaly), and every borehole is logged at the same
+45 depths.  A finer mesh then solves the same inverse problem more accurately.
 """
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 import mfem.par as mfem
 
@@ -61,6 +66,16 @@ PRIOR = {"gamma": 0.3, "delta": 4.8, "theta_z": 0.25, "robin_bc": True}
 ANOMALY = {"centre": (0.62, 0.48, 0.42), "radius": 0.12, "amplitude": 1.0}
 #: bottom of the boreholes in unit coordinates (2.8 km): deep exploration wells
 BOREHOLE_BOTTOM = 0.3
+#: one temperature sample every 62.5 m down a borehole, 45 in all, whatever the mesh.  (The
+# logs used to be sampled once per element layer.  The data then grew with the mesh, 660
+# observations at 16^3 and 10,740 at 256^3 with the same noise, and with them the
+# eigenvalues of the prior-preconditioned misfit Hessian and the CG iterations of a Newton
+# step: a finer mesh solved another inverse problem.)
+LOG_SPACING = 1.0 / 64.0
+#: the synthetic truth away from the anomaly: 1024 plane waves with the prior's spectrum,
+# none shorter than 2 pi / cutoff correlation lengths (1.6 km horizontally and 0.4 km
+# vertically, six nodes of the 64^3 parameter mesh), of standard deviation 0.5 as the prior
+TRUTH = {"modes": 1024, "cutoff": 8.0, "std": 0.5}
 
 
 def conductivity_tables(n_nodes=16, T_max=300.0):
@@ -70,6 +85,44 @@ def conductivity_tables(n_nodes=16, T_max=300.0):
     for _, k0, a, b in LITHOLOGIES:
         tabs.append(k0 / (0.99 + T * (a - b / k0)) / K_REF)
     return T, np.array(tabs)
+
+
+def background_truth(seed=1):
+    """The truth away from the anomaly, a function of the points ``(n, 3)``.
+
+    A stationary random field as a sum of plane waves, ``std sqrt(2/M) sum_j cos(w_j . x +
+    phi_j)``: the wave vectors are drawn from the spectral density of the prior,
+    ``(delta + gamma w . Theta w)^-2``, which is a Cauchy law in three dimensions once the
+    axes are scaled, and those above ``cutoff`` inverse correlation lengths are dropped;
+    the phases are uniform.  It has the prior's correlation lengths and marginal variance,
+    without the short waves of a prior sample, which every mesh would render differently:
+    a sample drawn on the mesh was another rock on every mesh.
+    """
+    rng = np.random.default_rng(seed)
+    M, cutoff = TRUTH["modes"], TRUTH["cutoff"]
+    w = np.empty((0, 3))
+    while w.shape[0] < M:
+        t = rng.standard_normal((4 * M, 3)) / np.abs(rng.standard_normal((4 * M, 1)))
+        w = np.concatenate([w, t[np.linalg.norm(t, axis=1) < cutoff]])
+    kappa = np.sqrt(PRIOR["delta"] / PRIOR["gamma"])
+    w = kappa * w[:M] / np.sqrt(np.array([1.0, 1.0, PRIOR["theta_z"]]))
+    phi = rng.uniform(0.0, 2.0 * np.pi, M)
+    amplitude = TRUTH["std"] * np.sqrt(2.0 / M)
+    wt, phase = jnp.asarray(w.T), jnp.asarray(phi)
+    waves = jax.jit(lambda Xc: amplitude * jnp.sum(jnp.cos(Xc @ wt + phase), axis=1))
+    size = 16384                                             # points at a time: 134 MB of cosines
+
+    def field(X):
+        X = np.atleast_2d(np.asarray(X, dtype=np.float64))
+        out = np.empty(X.shape[0])
+        for a in range(0, X.shape[0], size):
+            Xc = np.zeros((size, 3))                         # one shape, one compilation
+            m = min(size, X.shape[0] - a)
+            Xc[:m] = X[a:a + m]
+            out[a:a + m] = np.asarray(waves(jnp.asarray(Xc)))[:m]
+        return out
+
+    return field
 
 
 def lithology_index(x):
@@ -152,21 +205,19 @@ class Geothermal:
             sol = getattr(self.prior, name, None)
             if sol is not None and hasattr(sol, "parameters"):
                 sol.parameters["rel_tolerance"] = 1e-8
-        # the synthetic truth: a prior sample plus a buried high-conductivity body
-        hm.parRandom.set_seed(seed)
-        noise = self.prior.noise_vector()
-        self.prior.sample_noise(1.0, noise)
-        self.mtrue = self.Vm.vector()
-        self.prior.sample(noise, self.mtrue)
+        # the synthetic truth: a field with the prior's spectrum plus a buried
+        # high-conductivity body, both functions of the point
+        self.mtrue = self.Vm.project(background_truth(seed))
         c, r, a = ANOMALY["centre"], ANOMALY["radius"], ANOMALY["amplitude"]
         bump = self.Vm.project(lambda z: a * np.exp(-0.5 * (((z[0] - c[0]) ** 2 + (z[1] - c[1]) ** 2) / r ** 2
                                                             + ((z[2] - c[2]) / (0.6 * r)) ** 2)))
         self.mtrue.axpy(1.0, bump)
-        # boreholes: vertical logs from the surface to BOREHOLE_BOTTOM, one sample per element layer
+        # boreholes: vertical logs from the surface to BOREHOLE_BOTTOM, a sample every LOG_SPACING
         rng = np.random.default_rng(seed + 10)
         xy = rng.uniform(0.12, 0.88, (nboreholes, 2))
-        nz = int(round((1.0 - BOREHOLE_BOTTOM) * n))
-        zs = 1.0 - (np.arange(nz) + 0.5) / n
+        nz = int(round((1.0 - BOREHOLE_BOTTOM) / LOG_SPACING))
+        zs = 1.0 - (np.arange(nz) + 0.5) * LOG_SPACING
+        self.nboreholes = nboreholes
         self.targets = np.array([[x, y, z] for x, y in xy for z in zs])
         self.B = hm.assemblePointwiseObservation(self.Vu, self.targets)
         utrue = self.pde.generate_state()
@@ -183,7 +234,7 @@ class Geothermal:
 
     def summary(self):
         return {"n": self.n, "state_dofs": int(self.Vu.GlobalTrueVSize()), "param_dofs": int(self.Vm.GlobalTrueVSize()),
-                "observations": int(self.targets.shape[0]), "boreholes": int(self.targets.shape[0] // max(1, int(round((1.0 - BOREHOLE_BOTTOM) * self.n)))),
+                "observations": int(self.targets.shape[0]), "boreholes": int(self.nboreholes),
                 "noise_kelvin": self.noise_std * T_SCALE, "u_true_max_kelvin": float(self.utrue.norm("linf")) * T_SCALE,
                 "forward_newton_iterations": int(getattr(self.pde, "fwd_iterations", -1)),
                 "prior": dict(PRIOR), "anomaly": dict(ANOMALY), "lithologies": [l[0] for l in LITHOLOGIES]}
