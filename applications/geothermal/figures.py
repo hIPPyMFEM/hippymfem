@@ -11,8 +11,10 @@
 Writes ``<out>_slices.png`` (truth, MAP, posterior std on a horizontal slice through the
 anomaly and a vertical section through it, with the boreholes), ``<out>_spectrum.png``
 (the generalized eigenvalues), ``<out>_qoi.png`` (the sampled QoI against the linearized
-Gaussian) and ``<out>_profile.png`` (prior and posterior std and the MAP error along the
-vertical line through the anomaly).
+Gaussian), ``<out>_profile.png`` (prior and posterior std and the MAP error along the
+vertical line through the anomaly) and ``<out>_block.png`` (truth, MAP and posterior std
+on the block of rock with a quarter cut away through the anomaly, and the boreholes: the
+picture of the application's README).
 """
 
 import argparse
@@ -35,11 +37,107 @@ def on_grid(xyz, vals, n):
     return out
 
 
+def block(ax, F, n, norm, cmap, ic, jc, km, kmz, zexag):
+    """Draw the field ``F[i, j, k]`` (``k = 0`` at the base) on the block with the front
+    right quarter cut away down to the base, the cut faces passing through ``(ic, jc)``.
+    Coordinates in km, z up.  A mesh finer than 128^3 is drawn at every other vertex or so."""
+    step = max(1, int(np.ceil(n / 128.0)))
+    span = lambda a, b: np.unique(np.append(np.arange(a, b + 1, step), b))
+    xs = np.linspace(0.0, km, n + 1)
+    ys = np.linspace(0.0, km, n + 1)
+    zs = np.linspace(-kmz, 0.0, n + 1) * zexag
+
+    def face(X, Y, Z, V):
+        ax.plot_surface(X, Y, Z, facecolors=cmap(norm(V)), rstride=1, cstride=1, shade=False,
+                        linewidth=0, antialiased=False)
+
+    # outer faces seen from the viewer's side (+x and -y), then the two cut faces, then the top
+    I, K = np.meshgrid(span(0, ic), span(0, n), indexing="ij")
+    face(xs[I], np.zeros_like(xs[I]), zs[K], F[I, 0, K])                       # front,   y = 0,  x < xc
+    J, K = np.meshgrid(span(jc, n), span(0, n), indexing="ij")
+    face(np.full(J.shape, km), ys[J], zs[K], F[n, J, K])                       # right,   x = L,  y > yc
+    J, K = np.meshgrid(span(0, jc), span(0, n), indexing="ij")
+    face(np.full(J.shape, xs[ic]), ys[J], zs[K], F[ic, J, K])                  # cut,     x = xc, y < yc
+    I, K = np.meshgrid(span(ic, n), span(0, n), indexing="ij")
+    face(xs[I], np.full(I.shape, ys[jc]), zs[K], F[I, jc, K])                  # cut,     y = yc, x > xc
+    I, J = np.meshgrid(span(0, ic), span(0, n), indexing="ij")
+    face(xs[I], ys[J], np.zeros(I.shape), F[I, J, n])                          # top,     x < xc
+    I, J = np.meshgrid(span(ic, n), span(jc, n), indexing="ij")
+    face(xs[I], ys[J], np.zeros(I.shape), F[I, J, n])                          # top,     x > xc, y > yc
+    # the block's visible edges
+    xc, yc, zb = xs[ic], ys[jc], -kmz * zexag
+    edges = [((0, 0, 0), (xc, 0, 0)), ((xc, 0, 0), (xc, yc, 0)), ((xc, yc, 0), (km, yc, 0)), ((km, yc, 0), (km, km, 0)),
+             ((0, 0, 0), (0, km, 0)), ((0, km, 0), (km, km, 0)),
+             ((0, 0, 0), (0, 0, zb)), ((0, 0, zb), (xc, 0, zb)), ((xc, 0, 0), (xc, 0, zb)), ((xc, 0, zb), (xc, yc, zb)),
+             ((xc, yc, 0), (xc, yc, zb)), ((xc, yc, zb), (km, yc, zb)), ((km, yc, 0), (km, yc, zb)),
+             ((km, yc, zb), (km, km, zb)), ((km, km, 0), (km, km, zb))]
+    for a, b in edges:
+        ax.plot(*zip(a, b), color="#333333", lw=1.2, zorder=10)
+    return xc, yc
+
+
+def block_figure(fields, targets, n, out, vmax, std_max, zexag=1.3):
+    """Truth, MAP and posterior std on the cut block, with the boreholes."""
+    import matplotlib.pyplot as plt
+    from matplotlib import cm, colors
+    from mpl_toolkits.mplot3d import proj3d
+
+    c = ANOMALY["centre"]
+    ic, jc = int(round(c[0] * n)), int(round(c[1] * n))
+    km, kmz = L_HORIZ / 1000.0, H_DEPTH / 1000.0
+    wells = np.unique(np.round(targets[:, :2], 9), axis=0) * km
+    depth = (1.0 - targets[:, 2].min()) * kmz
+    logk = colors.Normalize(-vmax, vmax)             # truth and MAP on one scale, so they compare
+    panels = (("mtrue", "RdBu_r", logk, "true parameter"), ("mmap", "RdBu_r", logk, "MAP estimate"),
+              ("std_post", "viridis", colors.Normalize(0.0, std_max), "posterior std"))
+    with plt.rc_context({"font.family": "sans-serif", "font.sans-serif": ["Lato", "DejaVu Sans"]}):
+        fig = plt.figure(figsize=(15.0, 5.6))
+        axes = []
+        for p, (key, cmap_name, norm, title) in enumerate(panels):
+            ax = fig.add_axes([-0.075 + 0.333 * p, 0.145, 0.48, 0.80], projection="3d")
+            axes.append(ax)
+            ax.set_proj_type("ortho")
+            ax.computed_zorder = False
+            xc, yc = block(ax, fields[key], n, norm, plt.get_cmap(cmap_name), ic, jc, km, kmz, zexag)
+            # the wellheads in every panel; under the posterior std, which they explain, every
+            # borehole straight down to its deepest log, drawn through the rock
+            if key == "std_post":
+                for wx, wy in wells:
+                    ax.plot([wx, wx], [wy, wy], [0.0, -depth * zexag], color="#111111", lw=1.0, alpha=0.55, zorder=13)
+            ax.scatter(wells[:, 0], wells[:, 1], np.zeros(len(wells)), s=13, color="#111111", depthshade=False, zorder=14)
+            ax.view_init(elev=24, azim=-52)
+            ax.set_box_aspect((km, km, kmz * zexag), zoom=1.22)
+            ax.set_axis_off()
+            fig.text(0.165 + 0.333 * p, 0.985, title, fontsize=23, color="#0d294d", fontweight="bold", ha="center", va="top")
+        # the colour bars just under the lowest corner of the blocks, wherever the view puts it
+        fig.canvas.draw()
+        zb = -kmz * zexag
+        base = np.array([(0.0, 0.0, zb), (xc, 0.0, zb), (xc, yc, zb), (km, yc, zb), (km, km, zb)])
+        low = 1.0
+        for ax in axes:
+            X, Y, _ = proj3d.proj_transform(base[:, 0], base[:, 1], base[:, 2], ax.M)
+            low = min(low, fig.transFigure.inverted().transform(ax.transData.transform(np.column_stack([X, Y])))[:, 1].min())
+        for box, norm, cmap_name, label in (([0.07, low - 0.095, 0.52, 0.04], logk, "RdBu_r", "log conductivity"),
+                                            ([0.715, low - 0.095, 0.25, 0.04], panels[2][2], "viridis",
+                                             "posterior std (%d boreholes to %.1f km)" % (len(wells), depth))):
+            cb = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(cmap_name)), cax=fig.add_axes(box),
+                              orientation="horizontal")
+            cb.set_label(label, fontsize=17)
+            cb.ax.tick_params(labelsize=15)
+        fig.savefig(out + "_block.png", dpi=200, bbox_inches="tight", pad_inches=0.06)
+        plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("dump")
     ap.add_argument("--json", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--vmax", type=float, default=1.8, help="the block's colours span -vmax to vmax in log conductivity")
+    ap.add_argument("--std-max", type=float, default=0.7, help="... and 0 to this in its posterior std")
+    ap.add_argument("--fields", default=None,
+                    help="the file of movie_data.py fields: the block's posterior std from it, which has the noise "
+                         "of 800 Monte Carlo samples where the dump's has that of 64")
     args = ap.parse_args()
     import matplotlib
     matplotlib.use("Agg")
@@ -133,7 +231,11 @@ def main():
     ax.set_title("vertical line through the anomaly, %d^3" % n, fontsize=10)
     fig.savefig(out + "_profile.png", dpi=150)
     plt.close(fig)
-    print("wrote %s_{slices,spectrum,qoi,profile}.png" % out)
+
+    if args.fields:
+        fields["std_post"] = np.load(args.fields)["std_post"].reshape((n + 1,) * 3).T       # [i, j, k] from x fastest
+    block_figure(fields, targets, n, out, args.vmax, args.std_max)
+    print("wrote %s_{slices,spectrum,qoi,profile,block}.png" % out)
     return 0
 
 

@@ -66,8 +66,75 @@ From the repository's root:
 Rank 0 writes a JSON record of every timing and number, and with `--dump` the truth,
 the MAP, the prior and posterior std on the P1 grid, the eigenvalues, the borehole
 coordinates, the data and the sampled QoI values.  `figures.py` turns a dump into the
-slice, spectrum, QoI and profile figures.  Without a GPU, drop the two variables and
-the launcher wrapper: `--n 16` takes seven minutes on one host core.
+slice, spectrum, QoI, profile and block figures (below).  Without a GPU, drop the two
+variables and the launcher wrapper: `--n 16` takes seven minutes on one host core.
+
+## The pictures and the animation (`figures.py`, `movie_data.py`, `movie.py`)
+
+They start from the dump of a run (`run.py --dump`), and none of them repeats its MAP
+solve.  The pictures need nothing else:
+
+    python -m applications.geothermal.figures results/geothermal_n128.npz \
+        --json results/geothermal_n128.json --out results/figures/geothermal_n128
+
+`<out>_block.png` is the picture at the top of this page: the truth, the MAP estimate and
+the posterior standard deviation on the block with a quarter cut away through the buried
+body.  The animation needs nothing else either:
+
+    python -m applications.geothermal.movie results/geothermal_n128.npz --out results/animations
+
+draws the block four times while the camera swings around it: the true rock, the MAP
+estimate, the truth minus the MAP, and the posterior standard deviation.  It writes an
+MP4, an animated WebP for a web page and one frame as a PNG, for a light page and for a
+dark one.
+
+The animation at the top of the repository's README also shows the heat flowing through
+the true rock and the posterior in motion.  Those need the true temperature and samples
+of the posterior, which a dump does not hold.  `movie_data.py` makes them from the dump,
+with the launcher and the environment of the run:
+
+    mpirun -n 4 tools/mpirun_pinned.sh python -m applications.geothermal.movie_data fields \
+        --dump results/geothermal_n128.npz --gauss-newton --out results/fields_n128.npz
+    python -m applications.geothermal.movie results/fields_n128.npz --out results/animations
+
+It rebuilds the problem, checks that its truth and its data are the dump's, takes the
+MAP point from the dump and computes the eigenpairs there as `run.py` does (give
+`--gauss-newton` if the run had it; this is the time of the run's Laplace stage, and it
+prints how far its eigenvalues are from the dump's: 3e-14 at 12³ on as many ranks as
+the run).  Then it draws 12
+pairs of samples of the prior and of the posterior from the same noise, and takes the
+posterior standard deviation from 800 Monte Carlo samples of the prior's variance
+(`--var-samples`), where the dump's has the noise of 64 (`figures.py --fields
+results/fields_n128.npz` puts that one on the block).
+
+The large picture can show the temperature of a forward solve on a finer mesh.  The truth
+is a function of the point, so a finer mesh holds the same rock:
+
+    mpirun -n 64 tools/mpirun_pinned.sh python -m applications.geothermal.movie_data forward \
+        --n 512 --onto 128 --out results/forward_n512.npz
+    python -m applications.geothermal.movie results/fields_n128.npz --temperature results/forward_n512.npz \
+        --name geothermal_turn --reveal 0.7 1.3 --turn 2 \
+        --hardware "<the forward solve's GPUs and time>" "<the inversion's>" \
+        --say "Heat flows up through the rock of a geothermal reservoir." "<three more sentences>" \
+        --out results/animations
+
+This is the film of the repository's README: an opening in which the quarter that is
+cut away fades (`--reveal`), the camera once around the block in two loops (`--turn 2`),
+a third line under the pictures for what the solves ran on (`--hardware`), and sentences
+written under the pictures one after another (`--say`), 22 seconds in all.  Its WebP
+(900 pixels wide, 12.5 frames a second) is what `docs/images/geothermal_turn_light.webp`
+and `geothermal_turn_dark.webp` are.
+
+`movie.py` needs neither MFEM nor JAX, so it also runs on another machine than the
+solves: NumPy, Matplotlib, Pillow and PyVista (`pip install pyvista`), and for the MP4 an
+ffmpeg on the path or `pip install imageio-ffmpeg`.  PyVista draws off screen.  On a node
+with neither a display nor a GPU that VTK can draw on, the wheel `vtk-osmesa` in the
+place of `vtk` draws in software (`pip uninstall vtk`, then `pip install
+--extra-index-url https://wheels.vtk.org vtk-osmesa`): with it a frame at 128³ takes
+0.7 s on a 64-core node, the README's film about seven minutes for each of the two pages.  The
+text is set in Lato where that is installed (`HIPPYMFEM_FONT_DIR` names a folder with
+`Lato-Regular.ttf` and `Lato-Bold.ttf`) and in DejaVu Sans, which Matplotlib carries,
+elsewhere.
 
 ## The checks (`validate.py`)
 
