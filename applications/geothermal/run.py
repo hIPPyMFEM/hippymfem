@@ -79,8 +79,13 @@ def main():
                          "second-order blocks (W_uu, W_um, W_mm), which is what lets 128^3 fit four 45 GB cards")
     ap.add_argument("--newton-max", type=int, default=30)
     ap.add_argument("--newton-tol", type=float, default=1e-6)
-    ap.add_argument("--cg-max", type=int, default=50)
-    ap.add_argument("--inc-tol", type=float, default=1e-8)
+    ap.add_argument("--cg-max", type=int, default=200,
+                    help="most CG iterations of a Newton step.  The data grow with the mesh (one sample per element "
+                         "layer), and so do the iterations the Eisenstat-Walker tolerance asks for: up to 103 at 128^3 "
+                         "and 100 at 256^3.  A cap under that makes the last Newton steps converge linearly")
+    ap.add_argument("--inc-tol", type=float, default=1e-6,
+                    help="relative tolerance of the incremental solves of a Hessian action.  The CG of a Newton step "
+                         "keeps its residuals orthogonal, so 1e-6 gives the Newton and CG iterations of 1e-8")
     ap.add_argument("--device", default=("cuda" if hm.config.hypre_device else "cpu"),
                     help="MFEM device; the default follows HIPPYMFEM_HYPRE_DEVICE")
     ap.add_argument("--out", default=None)

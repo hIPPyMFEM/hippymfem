@@ -256,6 +256,17 @@
   256^3 before that search gave up. And a solve whose own line search finds no step that
   lowers the residual, with a correction that is not negligible, raises at once and no
   longer at `max_iter`.
+- The geothermal application stops the incremental solves of its Hessian actions at 1e-6
+  and lets a Newton step take up to 200 CG iterations (`--inc-tol`, `--cg-max`; they were
+  1e-8 and 50). Its data grow with the mesh, one sample per element layer in every
+  borehole, and the CG of a Newton step with them: at 256^3 the cap of 50 ended 24 of 35
+  steps before the Eisenstat-Walker tolerance was met, and the gradient came down by 0.7 a
+  step. With the new values the same MAP point takes 18 steps and 552 CG iterations
+  instead of 35 and 1302, 851 s instead of 2190 s on 32 MI250X (at 128^3 on 8 of them 361 s
+  instead of 747 s), and the whole run 36 minutes instead of 59; the cost functional agrees
+  to 5e-11 and the 50 eigenvalues to 1.5e-5. The tolerance alone keeps the iterations and
+  takes a fifth off each. The same 660 observations on 16^3 and on 24^3 take 250 and 251 CG
+  iterations: it is the data that the cap has to follow, not the mesh.
 - `tools/build_pymfem_hip.sh` builds where ROCm and MPI come from modules. It took ROCm
   from `/opt/rocm` and the MPI include directories from OpenMPI's wrapper; it now reads
   `ROCM_PATH`, takes the include directories from an MPICH wrapper too and hands them to
