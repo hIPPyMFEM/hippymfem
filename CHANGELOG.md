@@ -4,6 +4,24 @@
 
 ### Added
 
+- **The geothermal application draws its pictures and its animation** from the dump of a
+  run, without repeating the MAP solve (`applications/geothermal/README.md`).
+  `figures.py` also writes `<out>_block.png`, the truth, the MAP estimate and the
+  posterior standard deviation on the block with a quarter cut away, which is the
+  picture of the application's README.  `movie.py` draws the animation of the
+  repository's README with PyVista: an MP4, an animated WebP and a still, for a light and
+  for a dark page, with an opening (`--reveal`), the camera's swing or a full turn
+  (`--turn`), and lines and sentences under the pictures (`--hardware`, `--say`).  From a
+  dump alone it shows the true rock, the MAP estimate, the truth minus the MAP and the
+  posterior standard deviation.  `movie_data.py fields` adds what the README's animation
+  shows beyond a dump, the heat flowing through the true rock and samples of the
+  posterior: it rebuilds the problem, takes the MAP point from the dump and computes the
+  eigenpairs there as `run.py` does (at 12^3, on as many ranks as the run, its
+  eigenvalues are the dump's to 3e-14).  `movie_data.py forward` solves the
+  forward problem alone on a finer mesh and keeps its temperature on the inversion's
+  grid, for the large picture.  `movie.py` needs neither MFEM nor JAX; it was run with
+  PyVista 0.46 on a GPU and with PyVista 0.49 and the software renderer of `vtk-osmesa`
+  9.3 on a node without one, and it takes ffmpeg from the path or from `imageio-ffmpeg`.
 - **Single precision** in three places, none of which changes the state, the gradient or
   the MAP point (`docs/source/guide/gpu.rst`, "Single precision").
   `HIPPYMFEM_PRECISION=mixed` computes the element matrices in single precision, corrects
