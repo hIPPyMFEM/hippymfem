@@ -74,7 +74,13 @@ body, at the MAP with its linearized posterior standard deviation
 :math:`\sqrt{g^{\top} \Gamma_{\mathrm{post}} g}` and over posterior samples pushed through the
 nonlinear forward solve.  ``validate.py`` holds the application's own checks:
 finite-difference slopes, the forward Newton convergence, the Monte Carlo variance
-against the exact one, and the agreement of runs on 1, 2 and 4 ranks.
+against the exact one, the mesh against the lattice it has to be, and the agreement of
+runs on 1, 2 and 4 ranks.
+
+The mesh is built in parallel (``model.cube_mesh``): every rank builds a coarse mesh,
+takes its own box of it and cuts the elements of that box, so no rank holds the whole
+mesh.  At :math:`512^{3}` on 256 ranks that takes a rank 4 s and 0.4 GB, where the whole
+mesh on every rank would take 79 GB; ``--coarse`` sets the coarse mesh.
 
 What it gives
 -------------

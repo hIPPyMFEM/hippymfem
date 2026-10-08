@@ -8,10 +8,12 @@
     python -m applications.geothermal.validate fd        --n 16   # FD slopes, Hessian symmetry
     python -m applications.geothermal.validate forward   --n 32   # Newton convergence of the forward solve
     python -m applications.geothermal.validate variance  --n 16   # MC and sample variance against the exact one
+    python -m applications.geothermal.validate mesh      --n 64   # the mesh the ranks build in parallel is the lattice
     python -m applications.geothermal.validate partition a.npz b.npz ...   # dumps of run.py at different rank counts
 
 The first three build the model (mesh, truth, data) exactly as ``run.py`` does and run
-under MPI; ``partition`` is a serial numpy comparison of ``run.py --dump`` files.
+under MPI; ``mesh`` builds the mesh and its two spaces only, so it runs on host ranks at any
+size; ``partition`` is a serial numpy comparison of ``run.py --dump`` files.
 """
 
 import argparse
@@ -36,7 +38,7 @@ def check_fd(args, comm):
     from hippymfem.modeling.variables import PARAMETER
     from applications.geothermal.model import Geothermal
 
-    G = Geothermal(args.n, comm, order=args.order)
+    G = Geothermal(args.n, comm, order=args.order, coarse=args.coarse)
     model = G.model
     # The reduced Hessian is symmetric only to the accuracy of the incremental solves
     # (GMRES, 1e-10 in the model: measured asymmetry 4.2e-10 at 16^3), so they are
@@ -76,7 +78,7 @@ def check_forward(args, comm):
     from hippymfem.modeling.variables import ADJOINT
     from applications.geothermal.model import Geothermal, T_SCALE
 
-    G = Geothermal(args.n, comm, order=args.order)
+    G = Geothermal(args.n, comm, order=args.order, coarse=args.coarse)
     pde = G.pde
     pde.newton_parameters["print_level"] = 0 if comm.rank == 0 else -1
     u = pde.generate_state()
@@ -103,7 +105,7 @@ def check_variance(args, comm):
     from hippymfem.modeling.variables import PARAMETER
     from applications.geothermal.model import Geothermal
 
-    G = Geothermal(args.n, comm, order=args.order)
+    G = Geothermal(args.n, comm, order=args.order, coarse=args.coarse)
     model, prior = G.model, G.prior
     # a Laplace approximation at the truth (the MAP is not needed for the estimator check)
     x = model.generate_vector()
@@ -160,6 +162,91 @@ def check_variance(args, comm):
             "var_prior_mean": mean(ex_pr.array), "var_post_mean": mean(ex.array), "ok": bool(ok)}
 
 
+def check_mesh(args, comm):
+    """The mesh of ``model.cube_mesh`` against the lattice it has to be, by sums over the
+    ranks, so that the check costs a rank its own part and holds at 512^3 as at 12^3."""
+    import mfem.par as mfem
+    import hippymfem as hm
+    from mpi4py import MPI
+    from applications.geothermal.model import cube_mesh
+
+    def peak_gb():
+        with open("/proc/self/status") as f:
+            return next(int(line.split()[1]) for line in f if line.startswith("VmHWM")) / 2.0 ** 20
+
+    def total(v):
+        return comm.allreduce(int(v), op=MPI.SUM)
+
+    n = args.n
+    before = comm.allreduce(peak_gb(), op=MPI.MAX)
+    comm.Barrier()
+    t0 = time.perf_counter()
+    pmesh, coarse, grid = cube_mesh(n, comm, args.coarse)
+    comm.Barrier()
+    t_mesh = time.perf_counter() - t0
+    after = comm.allreduce(peak_gb(), op=MPI.MAX)
+    Vm, Vu = hm.FunctionSpace.H1(pmesh, 1), hm.FunctionSpace.H1(pmesh, args.order)
+    comm.Barrier()
+    t_spaces = time.perf_counter() - t0 - t_mesh
+
+    ne = pmesh.GetNE()
+    sizes = comm.allgather(ne)
+    vol = np.array([pmesh.GetElementVolume(e) for e in range(ne)]) * n ** 3
+    vmin = comm.allreduce(float(vol.min()) if ne else 1.0, op=MPI.MIN)
+    vmax = comm.allreduce(float(vol.max()) if ne else 1.0, op=MPI.MAX)
+
+    # The dofs of a space are the points of a lattice, each one once: their number, that every
+    # one is on the lattice, and the sums of the lattice numbers and of their squares.  The
+    # sums are taken modulo 2^64, which unsigned integers do exactly.
+    def lattice(space, m):
+        K = space.coordinates() * m
+        key = np.rint(K).astype(np.int64)
+        off = comm.allreduce(float(np.abs(K - key).max()) if key.size else 0.0, op=MPI.MAX)
+        lin = ((key[:, 0] * (m + 1) + key[:, 1]) * (m + 1) + key[:, 2]).astype(np.uint64)
+        inside = comm.allreduce(int(key.size == 0 or (key.min() >= 0 and key.max() <= m)), op=MPI.MIN) == 1
+        N, mod = (m + 1) ** 3, 2 ** 64
+        s1 = total(np.sum(lin, dtype=np.uint64)) % mod
+        s2 = total(np.sum(lin * lin, dtype=np.uint64)) % mod
+        once = (total(lin.size) == N and inside and s1 == (N * (N - 1) // 2) % mod
+                and s2 == ((N - 1) * N * (2 * N - 1) // 6) % mod)
+        return int(space.GlobalTrueVSize()), N, off, bool(once)
+
+    dofs_m, want_m, off_m, once_m = lattice(Vm, n)
+    dofs_u, want_u, off_u, once_u = lattice(Vu, n * args.order)
+
+    # boundary attributes of MakeCartesian3D: 1 bottom (z = 0), 2 y = 0, 3 x = 1, 4 y = 1,
+    # 5 x = 0, 6 top (z = 1); the model puts its flux on 1 and its Dirichlet condition on 6
+    face = {1: (2, 0.0), 2: (1, 0.0), 3: (0, 1.0), 4: (1, 1.0), 5: (0, 0.0), 6: (2, 1.0)}
+    count, misplaced = np.zeros(7, np.int64), 0
+    for i in range(pmesh.GetNBE()):
+        a = int(pmesh.GetBdrAttribute(i))
+        count[a if a in face else 0] += 1
+        if a in face:
+            axis, value = face[a]
+            misplaced += any(abs(pmesh.GetVertexArray(int(v))[axis] - value) > 1e-12 for v in pmesh.GetBdrElementVertices(i))
+    count = np.array([total(c) for c in count])
+    misplaced = total(misplaced)
+
+    elements = sum(sizes)
+    ok = (elements == n ** 3 and min(sizes) > 0 and abs(vmin - 1.0) < 1e-9 and abs(vmax - 1.0) < 1e-9
+          and dofs_m == want_m and dofs_u == want_u and once_m and once_u and max(off_m, off_u) < 1e-9
+          and count[0] == 0 and bool(np.all(count[1:] == n * n)) and misplaced == 0)
+    _say(comm, "mesh %d^3 on %d ranks, %s: %d elements, %d to %d a rank (the largest %.3f of the mean); "
+         "element volumes %.12f to %.12f of 1/n^3; %d and %d dofs (%s, %s), off the lattice by %.1e; "
+         "boundary faces per attribute %s, misplaced %d; mesh %.1f s, spaces %.1f s, peak host memory of a rank "
+         "%.2f GB (%.2f before the mesh): %s"
+         % (n, comm.size, "the whole mesh on every rank" if coarse == n else
+            "%d^3 on every rank in %s, cut by %d" % (coarse, "%d x %d x %d equal boxes" % grid if grid else "parts of METIS",
+                                                     n // coarse), elements, min(sizes), max(sizes),
+            max(sizes) * comm.size / max(elements, 1), vmin, vmax, dofs_m, dofs_u,
+            "each lattice point once" if once_m else "NOT the lattice", "each lattice point once" if once_u else "NOT the lattice",
+            max(off_m, off_u), count[1:].tolist(), misplaced, t_mesh, t_spaces, after, before, "OK" if ok else "FAILED"))
+    return {"check": "mesh", "n": n, "coarse": int(coarse), "grid": list(grid) if grid else None,
+            "elements": int(elements), "elements_min": int(min(sizes)),
+            "elements_max": int(max(sizes)), "param_dofs": dofs_m, "state_dofs": dofs_u, "t_mesh": t_mesh,
+            "t_spaces": t_spaces, "peak_gb": after, "peak_before_gb": before, "ok": bool(ok)}
+
+
 def check_partition(files, tol=1e-12):
     """Compare ``run.py --dump`` files: truth, data, MAP, posterior std, eigenvalues."""
     ref = None
@@ -207,10 +294,11 @@ def check_partition(files, tol=1e-12):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("check", choices=["fd", "forward", "variance", "partition"])
+    ap.add_argument("check", choices=["fd", "forward", "variance", "mesh", "partition"])
     ap.add_argument("files", nargs="*")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--order", type=int, default=2)
+    ap.add_argument("--coarse", type=int, default=None, help="the mesh every rank builds and partitions (run.py --coarse)")
     ap.add_argument("--k", type=int, default=20)
     ap.add_argument("--p", type=int, default=10)
     ap.add_argument("--samples", type=int, default=600)
@@ -229,7 +317,7 @@ def main():
         comm = MPI.COMM_WORLD
         rank = comm.rank
         hm.configure_device(args.device, comm, quiet=(rank != 0))
-        rec = {"fd": check_fd, "forward": check_forward, "variance": check_variance}[args.check](args, comm)
+        rec = {"fd": check_fd, "forward": check_forward, "variance": check_variance, "mesh": check_mesh}[args.check](args, comm)
         rec["ranks"] = comm.size
         rec["device"] = args.device
     if args.out and rank == 0:

@@ -39,6 +39,13 @@ interest) on GPUs.
   symmetric, so the forward and incremental solves use GMRES with BoomerAMG, and the
   adjoint applies the true transpose with the forward operator's AMG hierarchy
   (`symmetric_jacobian=False, transpose_free_adjoint=True`).
+- **Mesh.** `n`³ hexahedra of the unit cube, built in parallel (`cube_mesh`): every rank
+  builds a coarse mesh that keeps 512 elements a rank, takes its own box of it (the ranks
+  as a grid of equal boxes, 4 x 8 x 8 on 256; METIS when they make no grid) and cuts its
+  elements into up to 8³.  The lattice and the boundary attributes are those of
+  `MakeCartesian3D`.  At 256³ on 32 ranks that takes a rank 0.6 s and 0.3 GB; the whole
+  mesh built and partitioned on every rank (`--coarse 256`) takes 42 s and 10 GB, and at
+  512³ it would take 79 GB, which the eight ranks of a node do not have.
 
 ## The workflow (`run.py`)
 
@@ -141,6 +148,7 @@ elsewhere.
     python -m applications.geothermal.validate fd       --n 16    # FD slopes 1 +- 0.05, Hessian symmetric to 1e-10
     python -m applications.geothermal.validate forward  --n 32    # <= 6 Newton iterations to 1e-9
     python -m applications.geothermal.validate variance --n 16    # MC and sample variance vs the exact posterior variance
+    python -m applications.geothermal.validate mesh     --n 64    # the mesh the ranks build is the lattice, each point once
     python -m applications.geothermal.validate partition a.npz b.npz c.npz   # dumps at 1, 2, 4 ranks agree
 
 Each check prints its verdict.
