@@ -4,6 +4,24 @@
 
 ### Added
 
+- **The geothermal application builds its mesh in parallel** (`model.cube_mesh`,
+  `run.py --coarse`).  Every rank used to build and partition the whole mesh: 635 bytes
+  an element while METIS partitions it, which is 42 s and 10 GB a rank at 256^3 on 32
+  ranks and would be 79 GB a rank at 512^3, where the eight ranks of a Frontier node have
+  512 GB between them.  Now every rank builds a coarse mesh that keeps 512 elements a
+  rank, takes its own box of it (the ranks as a grid of equal boxes, 4 x 8 x 8 on 256;
+  METIS when they make no grid) and cuts its elements into up to 8^3 with
+  `ParMesh.MakeRefined`: 0.6 s and 0.3 GB a rank at 256^3, 4 s at 512^3 on 256 ranks.
+  The vertices are the same lattice to the last bit and the boundary attributes the same
+  faces; `validate.py mesh` checks it on any number of ranks, by sums (each lattice point
+  once, the volume of every element, the faces of each attribute).  At 12^3 the dumps on
+  1, 2 and 4 ranks agree with that of the whole mesh (the data to 7e-16, the MAP point to
+  1e-7).  At 256^3 on 32 MI250X every rank holds 524 288 elements, the build takes 160 s
+  instead of 207 s, and the MAP the same 17 Newton and 359 CG iterations in 643 s instead
+  of 649 s; with METIS on the coarse mesh the largest part was 2.9 % above the mean and
+  the MAP took 659 s.  With it the application ran at 512^3 on 256 MI250X, 1.08 billion
+  state unknowns, in 59 minutes end to end.  `--coarse N`, with `N` the size of the mesh,
+  builds the whole mesh on every rank as before.
 - **The geothermal application draws its pictures and its animation** from the dump of a
   run, without repeating the MAP solve (`applications/geothermal/README.md`).
   `figures.py` also writes `<out>_block.png`, the truth, the MAP estimate and the

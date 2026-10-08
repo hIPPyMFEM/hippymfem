@@ -76,6 +76,67 @@ LOG_SPACING = 1.0 / 64.0
 # none shorter than 2 pi / cutoff correlation lengths (1.6 km horizontally and 0.4 km
 # vertically, six nodes of the 64^3 parameter mesh), of standard deviation 0.5 as the prior
 TRUTH = {"modes": 1024, "cutoff": 8.0, "std": 0.5}
+#: the mesh is built in parallel: every rank builds and partitions a coarse mesh and cuts the
+# elements of its own part.  The coarse mesh keeps 512 elements a rank, so that the partition
+# has parts to shape and to balance, and its elements are cut into at most 8^3 (the cutting
+# builds one finite element collection of that order: 0.06 s at 8, 24 s at 16).
+MESH = {"per_rank": 512, "max_factor": 8}
+
+
+def coarse_size(n, ranks):
+    """The elements per side of the mesh that :func:`cube_mesh` builds on every rank: the
+    smallest ``n / f``, ``f`` a divisor of ``n`` up to 8, that leaves 512 elements a rank
+    (``n`` itself, the whole mesh, when no divisor does)."""
+    for f in range(MESH["max_factor"], 1, -1):
+        if n % f == 0 and (n // f) ** 3 >= MESH["per_rank"] * ranks:
+            return n // f
+    return n
+
+
+def rank_grid(ranks, n0):
+    """The ranks as a grid of equal boxes of the ``n0^3`` coarse mesh: the most cubic grid of
+    ``ranks`` boxes, when its sides divide ``n0`` and differ by no more than a factor two;
+    ``None`` when the ranks make no such grid."""
+    grid = min(((a, b, ranks // (a * b)) for a in range(1, ranks + 1) if ranks % a == 0
+                for b in range(a, ranks // a + 1) if (ranks // a) % b == 0 and b <= ranks // (a * b)),
+               key=lambda g: g[2] / g[0])
+    return grid if grid[2] <= 2 * grid[0] and all(n0 % g == 0 for g in grid) else None
+
+
+def cube_mesh(n, comm, coarse=None):
+    """The ``n^3`` hexahedral mesh of the unit cube, each rank building its own part.
+
+    ``ParMesh(comm, Mesh.MakeCartesian3D(n, n, n))`` builds and partitions the whole mesh on
+    every rank: 635 bytes an element while METIS partitions it, which is 10 GB and 42 s a rank
+    at 256^3 and would be 79 GB at 512^3, where the eight ranks of a node have 512 GB between
+    them.  Here every rank builds and partitions a mesh of ``coarse^3`` elements and cuts the
+    elements of its part into ``(n / coarse)^3`` (``ParMesh.MakeRefined``): 0.3 GB and 0.7 s
+    a rank at 256^3 on 32 ranks.  The vertices are the same lattice to the last bit and the
+    boundary attributes the same faces.
+
+    The parts are unions of coarse elements.  METIS leaves the largest of them 3 % above the
+    mean (0.1 % on the whole mesh), and the slowest card sets the pace, so the coarse mesh is
+    cut into equal boxes when the ranks make a grid (:func:`rank_grid`: 4 x 8 x 8 on 256
+    ranks) and by METIS when they do not.
+
+    ``coarse`` defaults to :func:`coarse_size`; ``coarse = n`` is the whole mesh on every
+    rank, partitioned by METIS.  Returns the mesh, ``coarse`` and the grid of the ranks
+    (``None`` for METIS).
+    """
+    n0 = coarse_size(n, comm.size) if coarse is None else int(coarse)
+    if n0 < 1 or n % n0 or n // n0 > MESH["max_factor"]:
+        raise ValueError("the coarse mesh of a %d^3 mesh has n / f elements a side, f a divisor of n up to %d: not %d"
+                         % (n, MESH["max_factor"], n0))
+    serial = mfem.Mesh.MakeCartesian3D(n0, n0, n0, mfem.Element.HEXAHEDRON)
+    grid = rank_grid(comm.size, n0) if n0 < n else None
+    if grid is None:
+        pmesh = mfem.ParMesh(comm, serial)
+    else:
+        nxyz = mfem.intArray(list(grid))
+        pmesh = mfem.ParMesh(comm, serial, serial.CartesianPartitioning(nxyz.GetData()))
+    if n0 < n:
+        pmesh = mfem.ParMesh.MakeRefined(pmesh, n // n0, mfem.BasisType.ClosedUniform)
+    return pmesh, n0, grid
 
 
 def conductivity_tables(n_nodes=16, T_max=300.0):
@@ -166,10 +227,10 @@ class Geothermal:
     """Everything the workflow needs, built once."""
 
     def __init__(self, n, comm, order=2, nboreholes=60, noise_kelvin=0.5, seed=1,
-                 quadrature_degree=None):
+                 quadrature_degree=None, coarse=None):
         self.comm = comm
         self.n = n
-        self.pmesh = mfem.ParMesh(comm, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
+        self.pmesh, self.coarse, self.grid = cube_mesh(n, comm, coarse)
         self.Vu = hm.FunctionSpace.H1(self.pmesh, order)
         self.Vm = hm.FunctionSpace.H1(self.pmesh, 1)
         self.Vh = [self.Vu, self.Vm, self.Vu]
@@ -233,7 +294,8 @@ class Geothermal:
         self.model = hm.Model(self.pde, self.prior, self.misfit)
 
     def summary(self):
-        return {"n": self.n, "state_dofs": int(self.Vu.GlobalTrueVSize()), "param_dofs": int(self.Vm.GlobalTrueVSize()),
+        return {"n": self.n, "mesh_coarse": int(self.coarse), "mesh_grid": list(self.grid) if self.grid else None,
+                "state_dofs": int(self.Vu.GlobalTrueVSize()), "param_dofs": int(self.Vm.GlobalTrueVSize()),
                 "observations": int(self.targets.shape[0]), "boreholes": int(self.nboreholes),
                 "noise_kelvin": self.noise_std * T_SCALE, "u_true_max_kelvin": float(self.utrue.norm("linf")) * T_SCALE,
                 "forward_newton_iterations": int(getattr(self.pde, "fwd_iterations", -1)),

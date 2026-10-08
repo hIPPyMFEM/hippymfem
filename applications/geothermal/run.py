@@ -66,6 +66,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--order", type=int, default=2)
+    ap.add_argument("--coarse", type=int, default=None,
+                    help="every rank builds and partitions a mesh of this many elements a side and cuts the elements "
+                         "of its part (model.cube_mesh).  The default keeps 512 coarse elements a rank and cuts them "
+                         "into at most 8^3; --coarse N, with N the value of --n, builds the whole mesh on every rank")
     ap.add_argument("--boreholes", type=int, default=60)
     ap.add_argument("--noise-kelvin", type=float, default=0.5)
     ap.add_argument("--k", type=int, default=50)
@@ -95,13 +99,16 @@ def main():
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
     t_build, G = timed(lambda: Geothermal(args.n, COMM, order=args.order, nboreholes=args.boreholes,
-                                          noise_kelvin=args.noise_kelvin))
+                                          noise_kelvin=args.noise_kelvin, coarse=args.coarse))
     info = G.summary()
     say("geothermal %d^3: %d state dofs, %d parameter dofs, %d observations in %d boreholes, noise %.2f K, "
         "T_max(true) %.0f K, forward Newton its %d, %d ranks, kernels on %s, MFEM on %s, built in %.1f s"
         % (args.n, info["state_dofs"], info["param_dofs"], info["observations"], info["boreholes"],
            info["noise_kelvin"], info["u_true_max_kelvin"], info["forward_newton_iterations"], COMM.size,
            kernel_mod.device(), args.device, t_build))
+    say("  mesh: " + ("the whole of it built and partitioned on every rank" if G.coarse == args.n else
+                      "%d^3 built on every rank and partitioned %s, the elements of a part cut into %d^3"
+                      % (G.coarse, "into %d x %d x %d equal boxes" % G.grid if G.grid else "by METIS", args.n // G.coarse)))
     model, prior, pde = G.model, G.prior, G.pde
     for attr in ("solver_fwd_inc", "solver_adj_inc"):
         getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol
