@@ -521,10 +521,13 @@ def test_taylor_under_posterior():
     # tolerance, and that inexactness lands in the B inner products (1e-14 on one rank,
     # 1e-4 on two).  Handing the eigensolver the precision in the covariance's place gives
     # a residual of order 1 and an orthogonality error of 2, so both still separate it.
+    # With the solves in a single-precision hypre an action is exact to about 1e-5, and so
+    # is the residual: 7e-11 in double precision and 1.9e-6 with them on eight ranks of an
+    # MI250X node (below 1e-6 on one and two).
     resid, bortho, diag = check_g(tay.H, post.Hlr, Uq, dq)
     scale = max(float(np.abs(dq).max()), 1e-300)
     check("posterior-preconditioned eigenpairs solve H u = d Hlr u",
-          resid.max() / scale < 1e-6 and bortho < 1e-2
+          resid.max() / scale < action_tolerance(1e-6, single=1e-5) and bortho < 1e-2
           and diag < action_tolerance(1e-8, single=1e-5),
           "(residual %.2e, Hlr-orthogonality %.2e, diagonalization %.2e)"
           % (resid.max() / scale, bortho, diag))

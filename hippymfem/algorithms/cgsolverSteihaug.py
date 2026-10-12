@@ -236,6 +236,17 @@ class CGSolverSteihaug:
         self.reasonid = 0
         betanom = 0.0
 
+        # With MFEM on a device the vectors of the iteration are handed to it here.  A
+        # vector's arithmetic runs where the vector was last used (ParVector.hypre):
+        # the iterate would never get to the device, and the residual only through a
+        # preconditioner that passes it to MFEM as it is (a Krylov solve does; a
+        # ChebyshevSolver copies it).  A vector that stays on the host has every
+        # operand copied back from the device for each update and each inner product:
+        # 2 to 7 ms apiece at 1.8 million unknowns on an MI250X, with a long tail over
+        # the ranks of a large run (26 ms a CG iteration on one GPU, 87 ms on 4096).
+        for v in (x, b, self.r, self.z, self.d, self.Ad, self.Bx):
+            getattr(v, "hypre", None)
+
         if self.parameters["zero_initial_guess"]:
             self.r.zero()
             self.r.axpy(1.0, b)

@@ -103,7 +103,7 @@ def rank_grid(ranks, n0):
     return grid if grid[2] <= 2 * grid[0] and all(n0 % g == 0 for g in grid) else None
 
 
-def cube_mesh(n, comm, coarse=None):
+def cube_mesh(n, comm, coarse=None, levels=0):
     """The ``n^3`` hexahedral mesh of the unit cube, each rank building its own part.
 
     ``ParMesh(comm, Mesh.MakeCartesian3D(n, n, n))`` builds and partitions the whole mesh on
@@ -122,9 +122,31 @@ def cube_mesh(n, comm, coarse=None):
     ``coarse`` defaults to :func:`coarse_size`; ``coarse = n`` is the whole mesh on every
     rank, partitioned by METIS.  Returns the mesh, ``coarse`` and the grid of the ranks
     (``None`` for METIS).
+
+    ``levels``: cut the elements in two a side that many times at the end instead of all
+    at once, and keep the meshes in between for the library
+    (``hippymfem.fem.ptransfer.set_coarser_meshes``: the meshes of a p-multigrid's
+    geometric levels, the solver parameter ``pmg_h``).  The same vertices, elements and
+    parts in another order; ``n / coarse`` must be a multiple of ``2 ** levels``.  Or the
+    cuts themselves, from the first to the last: ``(5, 3, 2, 2, 2)`` cuts a coarse element
+    in five a side, then in three, then three times in two, and keeps the five meshes
+    before each cut; ``coarse`` then defaults to ``n`` over their product (120: one
+    element a rank at 120^3 elements a rank, so that the coarsest mesh has a
+    vertex a rank and no rank has more neighbours on it than on the mesh itself).
     """
+    cuts = None
+    if not isinstance(levels, (int, np.integer)):
+        cuts = [int(f) for f in levels]
+        if any(f < 2 or f > MESH["max_factor"] for f in cuts):
+            raise ValueError("the cuts of a mesh are 2 to %d a side each: not %s" % (MESH["max_factor"], cuts))
+        levels = len(cuts)
+    product = int(np.prod(cuts)) if cuts else 1
+    if cuts and coarse is None:
+        if n % product:
+            raise ValueError("the cuts %s make %d of a coarse element's side: not a divisor of %d" % (cuts, product, n))
+        coarse = n // product
     n0 = coarse_size(n, comm.size) if coarse is None else int(coarse)
-    if n0 < 1 or n % n0 or n // n0 > MESH["max_factor"]:
+    if n0 < 1 or n % n0 or (n // n0 > MESH["max_factor"] and not cuts):
         raise ValueError("the coarse mesh of a %d^3 mesh has n / f elements a side, f a divisor of n up to %d: not %d"
                          % (n, MESH["max_factor"], n0))
     serial = mfem.Mesh.MakeCartesian3D(n0, n0, n0, mfem.Element.HEXAHEDRON)
@@ -134,8 +156,24 @@ def cube_mesh(n, comm, coarse=None):
     else:
         nxyz = mfem.intArray(list(grid))
         pmesh = mfem.ParMesh(comm, serial, serial.CartesianPartitioning(nxyz.GetData()))
-    if n0 < n:
-        pmesh = mfem.ParMesh.MakeRefined(pmesh, n // n0, mfem.BasisType.ClosedUniform)
+    levels = int(levels or 0)
+    if cuts is None:
+        cuts = [2] * max(levels, 0)
+        product = 2 ** max(levels, 0)
+    if (n // n0) % product or (n // n0) // product > MESH["max_factor"]:
+        raise ValueError("the cuts %s make %d of a coarse element's side, and the %d^3 mesh has %d: not a multiple of "
+                         "it by 1 to %d" % (cuts, product, n, n // n0, MESH["max_factor"]))
+    first = (n // n0) // product
+    if first > 1:
+        pmesh = mfem.ParMesh.MakeRefined(pmesh, first, mfem.BasisType.ClosedUniform)
+    coarser = []
+    for f in cuts:
+        coarser.insert(0, pmesh)
+        pmesh = mfem.ParMesh.MakeRefined(pmesh, f, mfem.BasisType.ClosedUniform)
+    if coarser:
+        from hippymfem.fem.ptransfer import set_coarser_meshes
+
+        set_coarser_meshes(pmesh, coarser)
     return pmesh, n0, grid
 
 

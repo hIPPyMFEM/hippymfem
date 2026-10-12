@@ -30,7 +30,7 @@ import numpy as np
 from mpi4py import MPI
 
 from ..common.keepalive import KeepAlive
-from ..common.parvector import ParVector
+from ..common.parvector import ParVector, allreduce as _reduce
 from ..fem.assemble import assemble_matrix, assemble_scalar, assemble_vector
 from ..fem.bcs import as_bcset, zero_essential
 from ..fem.elementbatch import default_quadrature_degree, get_batches
@@ -320,6 +320,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self._symmetry_probes = None
         #: work vector of :meth:`solveIncremental`
         self._inc_rhs = None
+        #: the interpolation of a p-multigrid for the Jacobian's solves, once built
+        #: (``False``: the state space allows none; see :meth:`_p_transfer`)
+        self._ptransfer = None
 
     # ------------------------------------------------------------------ shapes
     def generate_state(self):
@@ -473,7 +476,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         values to the host on the way (:func:`~hippymfem.fem.csrassemble.add_boundary_entries`)."""
         from ..fem.kernel import any_nonzero
 
-        return bool(self.comm.allreduce(int(not any_nonzero(bmats)), op=MPI.MIN))
+        return bool(_reduce(self.comm, int(not any_nonzero(bmats)), MPI.MIN))
 
     def _boundary_arrays(self, i, j, bmats):
         """``(test_tables, trial_tables, element_matrices)`` of block ``(i, j)``'s
@@ -527,6 +530,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 from ..fem.tdofassemble import single_target
 
                 with single_target():
+                    T = self._element_products()
+                    if T is not None:
+                        return self._jacobian_with_products(xx, consistent, T)
                     return self._block(ADJOINT, STATE, xx, **kw)
             return self._block(ADJOINT, STATE, xx, **kw)
 
@@ -564,9 +570,131 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             At = _transpose_operator(A)
         else:
             At = A.Transpose()
+        if _is_single(A):
+            A.transfer = self._p_transfer()
         self._jac_cache = (None if self.is_fwd_linear else u.copy(), m.copy(),
                            A, At)
         return A, At
+
+    def _element_products(self):
+        """The interpolation of :meth:`_p_transfer` where the products of the p-multigrid
+        can be made from the Jacobian's element matrices, or ``None``: a scalar state on a
+        domain term alone (the boundary and facet terms add their entries by other
+        routes), and :data:`~hippymfem.algorithms.singlesolve.PMG_ELEMENT_PRODUCTS`."""
+        from ..algorithms import singlesolve
+
+        if (not singlesolve.PMG_ELEMENT_PRODUCTS or self.bdr_kernel is not None
+                or self.facet_kernel is not None or self.Vh[STATE].vdim != 1):
+            return None
+        T = self._p_transfer()
+        return T if T is not None and T.local is not None and T.coarse is not None else None
+
+    def _jacobian_with_products(self, x, consistent, T):
+        """The Jacobian in the single-precision hypre with the two products of a
+        p-multigrid, ``P^T A P`` and ``A P``, from the same pass: the element matrices
+        ``P_e^T A_e P_e`` and ``A_e P_e`` scattered into the patterns of the linear
+        elements, with the essential dofs eliminated as in the Jacobian (the identity on
+        those of the coarse matrix).  They are the matrices that hypre's products of the
+        assembled ones give, without a product; the Jacobian comes back with them in
+        ``products`` (``"C"`` and, with ``PMG_KEEP_AP``, ``"Q"``).  Called inside
+        ``single_target``."""
+        import jax.numpy as jnp
+
+        from ..algorithms import singlesolve
+        from ..fem.csrassemble import finish_block, plan_block, scatter_derived
+
+        loc = self._locals(x) + self._aux_locals()
+        Vu, V1, groups = self.Vh[STATE], T.coarse, self.batches.groups
+        ess, ess1 = self.bc0.ess_tdof, T.coarse_ess
+        plans = {"A": plan_block(self.Vh[ADJOINT], Vu, groups, test_ess=ess, diag_policy="one"),
+                 "C": plan_block(V1, V1, groups, test_ess=ess1, diag_policy="one")}
+        if singlesolve.PMG_KEEP_AP:
+            plans["Q"] = plan_block(Vu, V1, groups, test_ess=ess, trial_ess=ess1,
+                                    diag_policy="zero")
+        for k in plans:
+            # (the defect of the row sums is for the matrix the iteration multiplies by)
+            plans[k].row_sums = k == "A"
+        if not all(p.tpat is not None and p.fold for p in plans.values()):
+            # (a matrix of the single-precision hypre is made on the folded true-dof route)
+            return self._block(ADJOINT, STATE, x, test_ess=ess, diag_policy="one",
+                               consistent=consistent)
+        local = [jnp.asarray(l) for l in T.local]
+
+        def derive(g, arr):
+            q = jnp.einsum("nik,kj->nij", arr, local[g].astype(arr.dtype))
+            out = {"A": arr, "C": jnp.einsum("ki,nkj->nij", local[g].astype(arr.dtype), q)}
+            if "Q" in plans:
+                out["Q"] = q
+            return out
+
+        finite = _FiniteFlag()
+        chunks = finite.wrap(lambda: self.kernel.element_matrix_chunks(
+            ADJOINT, STATE, loc, consistent=consistent))
+        accs = scatter_derived(plans, chunks(), derive)
+        finite.check(self.comm, "block (%d, %d)" % (ADJOINT, STATE))
+        A = finish_block(plans["A"], accs.pop("A"))
+        A.products = {k: finish_block(plans[k], accs[k]) for k in sorted(accs)}
+        return A
+
+    def _p_transfer(self):
+        """The interpolation of a p-multigrid for the Jacobian's solves in the
+        single-precision hypre (:class:`~hippymfem.algorithms.singlesolve.PMGEngine`), or
+        ``None``.
+
+        Asked for by the forward solver's parameter ``pmg`` (``HIPPYMFEM_PMG=1``) and
+        built at the first Jacobian, from the linear elements of the mesh to the state
+        space with this problem's essential dofs: a linear space among the problem's own
+        (the parameter's, often) serves, otherwise one is made.  Where the state space
+        allows none (:func:`hippymfem.fem.ptransfer.why_not`: linear elements already,
+        another family, a nonconforming mesh), or the library lacks a call, the solves
+        keep BoomerAMG, with a warning.
+        """
+        prm = getattr(self._get_solver("solver"), "parameters", None)
+        if prm is None or "pmg" not in prm or not int(prm["pmg"]):
+            return None
+        if self._ptransfer is None:
+            from ..algorithms import singlesolve
+            from ..fem import ptransfer
+            from ..fem.spaces import FunctionSpace
+
+            V = self.Vh[STATE]
+            lib = singlesolve.library()
+            why = ptransfer.why_not(V) or (lib.no_pmg if lib is not None else singlesolve.why_not())
+            if why:
+                import warnings
+
+                warnings.warn("pmg: no p-multigrid for the Jacobian's solves (%s); they keep "
+                              "BoomerAMG" % why, RuntimeWarning, stacklevel=2)
+                self._ptransfer = False
+            else:
+                coarse = next((s for s in self.Vh + self.aux_spaces
+                               if s is not V and not ptransfer.why_not(V, s)), None)
+                if coarse is None:
+                    coarse = FunctionSpace.H1(self.mesh, 1, V.vdim)
+                self._ptransfer = singlesolve.PTransfer(ptransfer.interpolation(
+                    V, coarse, self.batches.groups, self.bc0.ess_tdof))
+                # under the linear elements: the meshes that the mesh was refined from,
+                # where the solver asks for them and the mesh has them (``pmg_h``)
+                levels = int(prm["pmg_h"] or 0) if "pmg_h" in prm else 0
+                meshes = ptransfer.coarser_meshes(coarse.mesh)[:max(levels, 0)]
+                if levels > 0 and not meshes and self.comm.rank == 0:
+                    import warnings
+
+                    warnings.warn("pmg_h: the mesh knows no mesh it was refined from "
+                                  "(fem.ptransfer.set_coarser_meshes); the linear elements keep BoomerAMG",
+                                  RuntimeWarning, stacklevel=2)
+                space, ess, chain = coarse, self._ptransfer.coarse_ess, []
+                # (a matrix that the hierarchy gathers at once needs no mesh under it)
+                gathered = singlesolve.gather_threshold(prm)
+                for mesh in meshes:
+                    if gathered and int(space.fes.GlobalTrueVSize()) <= gathered:
+                        break
+                    below = FunctionSpace.H1(mesh, 1, space.vdim)
+                    blocks = ptransfer.refinement(space, below, ess)
+                    chain.append(singlesolve.PTransfer(blocks))
+                    space, ess = below, blocks.coarse_ess
+                self._ptransfer.h = chain
+        return self._ptransfer or None
 
     #: Whether this problem's solves may run in a single-precision hypre when one is
     #: named (``HIPPYMFEM_HYPRE_SINGLE``, :mod:`hippymfem.algorithms.singlesolve`).
@@ -661,6 +789,17 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: up in a pass.  A refinement that converges ends at its goal (about 1e-11 for a
     #: tolerance of 1e-12) in two or three passes.
     REFINE_STALL = (1e3, 1e-8)
+    #: What a *forward* solve does where single precision cannot carry it (a refinement
+    #: that stalls, or whose solver gives up): ``"double"`` solves it again with the
+    #: Jacobian in double precision, as above; ``"raise"`` raises the ``RuntimeError``,
+    #: which a line search takes for a failed trial and answers by backtracking.  The
+    #: second is for a run whose card has no room for a double-precision Jacobian and
+    #: its hierarchy beside the single-precision ones, which the first holds at once
+    #: (with 1.7 million quadratic hexahedra a rank on a 64 GiB card, 36 GiB beside 12:
+    #: such a trial ended the run, out of device memory); a forward solve outside a line
+    #: search then fails where it would have been solved.  An adjoint solve is solved
+    #: in double precision either way: it is at a point the line search accepted.
+    SINGLE_GIVE_UP = "double"
 
     def _probe_symmetry(self, A, tol=None):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -988,6 +1127,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         if gave_up or (point is not None and self._refine_measured
                        and rn > max(factor * goal,
                                     max(worst, 100.0 * _kernel.residual_floor()) * r0)):
+            if self.SINGLE_GIVE_UP == "raise" and what == "forward":
+                # (on every rank: the solver's verdict and the norms are those of all)
+                raise RuntimeError(
+                    "single precision cannot carry this forward solve (%s), and "
+                    "SINGLE_GIVE_UP is \"raise\"" % (gave_up or "the refinement stopped at "
+                                                     "%.1e of its first residual" % (rn / r0)))
             _warn_stall(what, rn / r0, goal / r0,
                         self.symmetric_jacobian == "auto" and bool(self._symmetric_verdict),
                         gave_up)
@@ -1145,7 +1290,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # elimination already folded in.
             return False
         local = self.kernel.will_chunk(weight=self.kernel.nslots)
-        return bool(self.comm.allreduce(int(local), op=MPI.MAX))
+        return bool(_reduce(self.comm, int(local), MPI.MAX))
 
     def _blocks_streamed(self, need, loc, ess):
         """The blocks of a linearization point from one streamed pass."""
@@ -1182,6 +1327,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             r = self._inc_rhs = rhs.duplicate()
         r.assign(rhs)
         self.bc0.zero(r)
+        # (with MFEM before it is zeroed: a vector that has not been there yet is
+        # zeroed on the host, 27 ms at 14 million unknowns, and uploaded by the solve)
+        getattr(out, "hypre", None)
         out.zero()
         self.n_calls["incremental_adjoint" if is_adj else "incremental_forward"] += 1
         solver = self._get_solver("solver_adj_inc" if is_adj else "solver_fwd_inc")
@@ -1401,7 +1549,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             local = sum(float(np.dot(np.asarray(v, dtype=float).reshape(-1),
                                      np.where(g.shared, 0.5, 1.0)))
                         for g, v in zip(self.facet_batches.groups, vals))
-            total += self.comm.allreduce(local, op=MPI.SUM)
+            total += _reduce(self.comm, float(local), MPI.SUM)
         return total
 
 
@@ -1423,7 +1571,7 @@ class _FiniteFlag:
         return gen
 
     def check(self, comm, what):
-        if not comm.allreduce(int(self.ok), op=MPI.MIN):
+        if not _reduce(comm, int(self.ok), MPI.MIN):
             raise RuntimeError(
                 "%s produced non-finite element values; the residual density "
                 "overflowed at this point (a line search should reject it)" % what)
@@ -1444,7 +1592,7 @@ def require_finite_arrays(arrays, comm, what):
     from ..fem.kernel import all_finite
 
     ok = all_finite(arrays)
-    if not comm.allreduce(int(ok), op=MPI.MIN):
+    if not _reduce(comm, int(ok), MPI.MIN):
         raise RuntimeError(
             "%s produced non-finite element values; the residual density "
             "overflowed at this point (a line search should reject it)" % what
@@ -1470,7 +1618,7 @@ def require_finite(v, what):
         ok = math.isfinite(v.hypre.Norml2())
     else:
         ok = bool(np.isfinite(v._host_read()).all())
-    if not v.comm.allreduce(int(ok), op=MPI.MIN):
+    if not _reduce(v.comm, int(ok), MPI.MIN):
         raise RuntimeError(
             "%s contains non-finite values; the step that produced it is too "
             "large for this problem (a line search should reject it)" % what
@@ -1501,12 +1649,15 @@ def _warn_stall(what, rel, goal, kept, gave_up=""):
 
 
 def _same(a, b):
-    """True when two vectors are bitwise equal (one global reduction)."""
+    """True when two vectors are equal (one global reduction).  The Euclidean norm of
+    the difference, which is reduced where the vectors are (the maximum norm reads
+    the host): zero for equal vectors, not zero and not a number otherwise, down to
+    differences of 1e-162, whose squares are no longer numbers of their own."""
     if a is None or b is None:
         return a is b
     if a.local_size != b.local_size:
         return False
-    return a.copy().axpy(-1.0, b).norm("linf") == 0.0
+    return a.copy().axpy(-1.0, b).norm("l2") == 0.0
 
 
 def _matrix_free_slots(matrix_free):

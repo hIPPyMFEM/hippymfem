@@ -157,7 +157,7 @@ class BlockPlan:
 
     __slots__ = ("test_space", "trial_space", "pattern", "same", "test_ess",
                  "trial_ess", "diag_policy", "fold", "kill", "Pt", "Pr", "escapes",
-                 "tpat", "target", "zero", "device")
+                 "tpat", "target", "zero", "device", "row_sums")
 
 
 def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
@@ -168,6 +168,10 @@ def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
     p = BlockPlan()
     p.test_space, p.trial_space = test_space, trial_space
     p.test_ess, p.trial_ess, p.diag_policy = test_ess, trial_ess, diag_policy
+    # (a square block in the single-precision hypre keeps the defect of its row sums
+    # where tdofassemble.SINGLE_ROW_SUMS asks; a caller that plans a block for which it
+    # is of no use says so here)
+    p.row_sums = test_space.fes is trial_space.fes
     p.pattern = get_pattern(test_space, trial_space, groups)
     p.same = test_space.fes is trial_space.fes
     p.fold = _foldable(test_space, trial_space, test_ess, trial_ess, diag_policy,
@@ -227,7 +231,10 @@ def finish_block(p, acc):
         # (a complete matrix may be asked for in the single-precision hypre)
         from .tdofassemble import single_requested
 
-        A = p.tpat.finish(acc, diagonal, single=bool(p.fold and single_requested()))
+        from . import tdofassemble as td
+
+        A = p.tpat.finish(acc, diagonal, single=bool(p.fold and single_requested()),
+                          row_sums=bool(td.SINGLE_ROW_SUMS and p.row_sums))
         if p.fold:
             return A
     else:
@@ -253,11 +260,12 @@ def finish_block(p, acc):
 def _accumulator_dtype(p, host):
     """Single precision for the accumulator of a block that is finished on the device
     as a matrix of the single-precision hypre (``tdofassemble.SINGLE_ACCUMULATE``),
-    ``None`` (double precision) for every other block."""
+    ``None`` (double precision) for every other block, and for one that is to keep the
+    defect of its row sums (``tdofassemble.SINGLE_ROW_SUMS``)."""
     from . import tdofassemble as td
 
     if (not host and p.tpat is not None and p.fold and td.single_requested()
-            and td.SINGLE_ACCUMULATE):
+            and td.SINGLE_ACCUMULATE and not (td.SINGLE_ROW_SUMS and p.row_sums)):
         return np.float32
     return None
 
@@ -273,6 +281,26 @@ def scatter_many(plans, chunks):
     """
     state = {k: p.target.fused_begin() for k, p in plans.items()}
     for g, a, bnd, mats in chunks:
+        for k, p in plans.items():
+            acc, maps = state[k]
+            state[k] = (p.target.fused_add(acc, maps, g, a, bnd, mats[k]), maps)
+    return {k: p.target.fused_end(state[k][0], p.zero, host=not p.device)
+            for k, p in plans.items()}
+
+
+def scatter_derived(plans, chunks, derive):
+    """One pass over the chunks of one block, into the targets of several plans.
+
+    ``chunks`` yields ``(group, start, stop, array)`` and ``derive(group, array)`` gives
+    ``{key: array}`` for the keys of ``plans``: the block itself and what follows from its
+    element matrices (the products of a p-multigrid with the interpolation of an element,
+    ``PDEVariationalProblem._jacobian_with_products``).  Each accumulator has the precision
+    its matrix will have.  Returns ``{key: accumulator}`` for :func:`finish_block`.
+    """
+    state = {k: p.target.fused_begin(_accumulator_dtype(p, not p.device))
+             for k, p in plans.items()}
+    for g, a, bnd, arr in chunks:
+        mats = derive(g, arr)
         for k, p in plans.items():
             acc, maps = state[k]
             state[k] = (p.target.fused_add(acc, maps, g, a, bnd, mats[k]), maps)

@@ -32,7 +32,7 @@ import warnings
 import numpy as np
 
 __all__ = ["available", "why_not", "jax_address", "copy_from_jax", "copy_from_host",
-           "copy_to_jax", "host_to_jax", "pin", "unpin", "address", "synchronize",
+           "copy_to_jax", "copy_to_host", "host_to_jax", "pin", "unpin", "address", "synchronize",
            "set_device_bridge"]
 
 #: ``"auto"`` (use the bridge when :func:`available`), ``"0"`` (never), or ``"1"``
@@ -243,6 +243,16 @@ def copy_from_host(dst, array):
     """Copy a contiguous numpy array to the device address ``dst``."""
     array = np.ascontiguousarray(array)
     _copy(int(dst), array.ctypes.data, array.nbytes, _H2D)
+
+
+def copy_to_host(array, src):
+    """Fill the contiguous host ``array`` from the device address ``src``; returns when it
+    is filled.  Into memory registered with :func:`pin` that is one transfer at the rate of
+    the bus, where ``numpy.asarray`` of a JAX array goes through a buffer of JAX's own."""
+    if array.nbytes:
+        _copy(int(array.ctypes.data), int(src), array.nbytes, _D2H)
+        synchronize()
+    return array
 
 
 def copy_to_jax(src, count, dtype=np.float64):

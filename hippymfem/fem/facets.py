@@ -661,21 +661,21 @@ def _facet_ldof_matrix(pattern, values, test, trial):
     interior face integrators.
     """
     from .prolongation import _ldof_offset
-    from ..common.parvector import _HYPRE_INT
+    from ..common.parvector import _HYPRE_BIGINT
     from ..common.linalg import own
 
     roff, rglob = _ldof_offset(test)
     same = trial.fes is test.fes
     coff, cglob = (roff, rglob) if same else _ldof_offset(trial)
     I = np.ascontiguousarray(pattern.indptr, dtype=np.int32)
-    J = np.ascontiguousarray(pattern.indices, dtype=_HYPRE_INT)
+    J = np.ascontiguousarray(pattern.indices, dtype=_HYPRE_BIGINT)
     D = np.ascontiguousarray(values, dtype=np.float64)
-    rows = np.array([roff, roff + pattern.nrow], dtype=_HYPRE_INT)
+    rows = np.array([roff, roff + pattern.nrow], dtype=_HYPRE_BIGINT)
     # One partition array for a square block, as hypre wants it: it compares the two
     # pointers to decide whether to bring each row's diagonal entry to the front.
     args = ([I, J, D, rows] if same else
             [I, J, D, rows, np.array([coff, coff + trial.fes.GetVSize()],
-                                     dtype=_HYPRE_INT)])
+                                     dtype=_HYPRE_BIGINT)])
     A = mfem.HypreParMatrix(test.comm, pattern.nrow, rglob, cglob, args)
     A.CopyRowStarts()
     A.CopyColStarts()

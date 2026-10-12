@@ -128,8 +128,14 @@ for completeness:
                                             host; 0 maps the whole batch at once
 ``ad_working_set``          16              doubles per tangent and quadrature point the
                                             chunk planner assumes
+``ad_vector_tangents``      8               tangents a chunk of an element vector (a
+                                            residual, a gradient) is planned for; 0 plans
+                                            it as a matrix, with one for every dof
 ``geometry_stream``         0.25            share of the device budget above which element
                                             geometry stays on the host and is streamed
+``affine_geometry``         off             keep the inverse Jacobians once an element
+                                            where every element of a group is mapped
+                                            affinely (the element arrays change at round-off)
 ``geometry_slice``          0               elements per slice when the quadrature geometry
                                             is built here; a positive value forces that path
 ``fused_keep``              on              keep a large assembly accumulator between
@@ -139,6 +145,10 @@ for completeness:
                                             numba is importable and the pattern has
                                             ``pattern_builder_min`` (2\ :sup:`24`) entries;
                                             ``numba`` always, ``sort`` never
+``pattern_lean``            on              the index tables of a large pattern from the
+                                            dof tables and row by row, no map kept twice:
+                                            half the host memory of a rank
+                                            (:ref:`gpu-memory`)
 ``pattern_sort``            ``auto``        where the sort route sorts: ``host`` or
                                             ``device`` (from ``pattern_sort_min``,
                                             2\ :sup:`22` keys, in chunks of
@@ -152,11 +162,27 @@ for completeness:
                                             solvers; -1 keeps MFEM's
 ``amg_max_levels``          -1              default BoomerAMG level cap; -1 keeps hypre's
 ``pc_reuse``                0               reuse a solver's AMG hierarchy across operators
+``pmg``                     0               a p-multigrid in the single-precision solves of
+                                            new solvers, for spaces of order two or more
+``pmg_h``                   0               under the linear elements of a p-multigrid, a
+                                            V-cycle over up to this many of the meshes that
+                                            the mesh was refined from (:ref:`gpu-pmg-h`)
+``pmg_h_host``              0               with hypre on a device, the levels of those meshes
+                                            of at most this many rows a rank live in host
+                                            memory, with everything under them, where the
+                                            gathered last matrix has no more rows than that
+                                            in all (:ref:`gpu-pmg-h`)
+``prior_h``                 0               the multigrid cycles of a prior's Hessian
+                                            preconditioner go over up to this many of the
+                                            meshes that its mesh was refined from, in the
+                                            single-precision hypre, where the mesh was last
+                                            cut in two (:ref:`gpu-pmg-h`)
 ==========================  ==============  ================================================
 
-Six switches of the device assembly and of the single-precision solves are read from the
+Some switches of the device assembly and of the single-precision solves are read from the
 environment alone, when their module is imported.  Each is on unless set to ``0``, except
-the BoomerAMG options, which are a string and empty by default:
+those that name a choice and the BoomerAMG options, which are a string and empty by
+default:
 
 ==================================  ======================================================
 variable                            what it decides
@@ -167,9 +193,35 @@ variable                            what it decides
 ``HIPPYMFEM_PINNED_STREAM``         streamed element geometry goes to the card from
                                     pinned host memory instead of through JAX's copy
                                     (:ref:`gpu-memory`)
+``HIPPYMFEM_DEVICE_EXCHANGE``       how an assembly hands over the rows that other ranks
+                                    own where matrices are finished on the device:
+                                    ``neighbors`` (a message a neighbour, a device
+                                    accumulator's from page-locked buffers the pattern
+                                    keeps) or ``alltoallv`` (one collective on fresh host
+                                    arrays, as wherever matrices are finished on the host)
 ``HIPPYMFEM_SINGLE_ACCUMULATE``     a matrix for the single-precision hypre is
                                     accumulated in single precision; ``0`` accumulates
                                     in double and rounds once
+``HIPPYMFEM_SINGLE_ROW_SUMS``       the Jacobian of the single-precision hypre keeps
+                                    what the rounding of its values took from each
+                                    row's sum, and its solver adds that in every
+                                    product (:ref:`single-precision`)
+``HIPPYMFEM_PMG_KEEP_AP``           a p-multigrid keeps the product of the matrix and
+                                    its interpolation for the second residual of a
+                                    cycle; ``0`` computes that residual with the matrix
+``HIPPYMFEM_PMG_ELEMENT_PRODUCTS``  the two products of a p-multigrid come from the
+                                    Jacobian's element matrices, in the pass that
+                                    assembles it; ``0`` leaves them to hypre
+``HIPPYMFEM_PMG_H_SMOOTH``          the relaxation on a geometric level of a p-multigrid
+                                    whose next mesh is three or more times coarser a
+                                    side: ``chebyshev`` (a polynomial of as many steps)
+                                    or ``sweep`` (the one sweep of the other levels)
+``HIPPYMFEM_PMG_TIMERS``            a probe's clock on the correction from one of a
+                                    p-multigrid's coarser meshes down (the index of the
+                                    level), with the device at rest around each
+``HIPPYMFEM_PMG_TRACE``             the first and the middle rank say where a
+                                    p-multigrid with levels in host memory is, in its
+                                    set-up and its first cycles
 ``HIPPYMFEM_SINGLE_SHARE_COLUMNS``  single-precision matrices of one pattern share one
                                     copy of its column indices on the device
 ``HIPPYMFEM_SINGLE_POOL``           the single-precision hypre allocates device memory

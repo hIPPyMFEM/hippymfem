@@ -27,7 +27,24 @@ parameter                    effect
                              :class:`~hippymfem.common.parvector.ParVector`
 ``robin_bc``                 the boundary term above
 ``solver_type``              ``"lu"`` or ``"krylov"`` for the internal solves
+``lumped_mass``              the mass matrix :math:`M` by the rule at the
+                             vertices: diagonal (below)
 ===========================  ===============================================
+
+**A lumped mass.**  Every product with :math:`R`, which the cost, the gradient and each
+Hessian action take, solves a system with the mass matrix; with the consistent one that
+is some seventy CG iterations, 50 to 80 ms on a GPU at two million parameter unknowns,
+as much as a solve with :math:`R` itself.  ``lumped_mass=True`` integrates the mass
+matrix by the rule at the vertices of an element, which makes it diagonal (on affine
+elements the sums of the rows of the consistent one): the lumped mass of the SPDE
+approach to Matern fields (Lindgren, Rue and Lindstrom, 2011).  The square root for
+sampling is by the same rule, so samples have the covariance :math:`R^{-1}` of that
+precision exactly.  It is another discretization of the same prior, with another
+matrix :math:`R`, which is why it is not the default; it is for a parameter space of
+first order on a mesh of one kind of element.  On the MI250X cards of Frontier, with the
+Newton benchmark at 1.8 million parameter unknowns a GPU, the operations of two
+Newton-CG steps took 18.3 s instead of 19.4 s on one GPU and 23.9 s instead of 24.9 s on
+64.
 
 Use :func:`~hippymfem.modeling.prior.BiLaplacianComputeCoefficients` to go the other
 way, from a desired pointwise standard deviation and correlation length to

@@ -134,6 +134,31 @@ If MFEM itself was built with MUMPS, SuperLU_dist or STRUMPACK, those are reacha
 through ``assemble_native_matrix`` and MFEM's own solver classes;
 ``hm.mfem_config()`` says which are present.
 
+A solve that only preconditions
+-------------------------------
+
+A Krylov solve stopped at a tolerance is a different map for every right-hand side.
+Where a solve is the preconditioner of another iteration, that iteration either needs
+it far more accurate than its own tolerance or needs one fixed linear map of any
+accuracy.  :class:`~hippymfem.algorithms.linSolvers.ChebyshevSolver` is the second: it
+takes a :class:`~hippymfem.algorithms.linSolvers.KrylovSolver` whose operator is set
+and applies its preconditioner (a multigrid cycle) ``degree`` times, each from the
+iterate before it, with the coefficients of the Chebyshev iteration on the interval of
+the cycle's eigenvalues, which it estimates once.  The result is symmetric and positive
+definite where the cycle is, and within ``error_bound`` of the solve in the energy norm
+(1.6 % with four cycles and 0.14 % with six for a cycle with which CG takes 22
+iterations to 1e-13).  The prior's precision solver made of two of them is the
+preconditioner that ``ReducedSpaceNewtonCG`` takes with ``cg_preconditioner_cycles``
+(:doc:`optimization`).
+
+.. code-block:: python
+
+   ks = hm.KrylovSolver(comm, "cg", "amg")
+   ks.set_operator(A)
+   fast = hm.ChebyshevSolver(ks, degree=5)
+   fast.solve(x, b)                  # five cycles
+   print(fast.interval, fast.error_bound)
+
 Choosing
 --------
 
@@ -141,6 +166,7 @@ Choosing
 situation                                  solver
 =========================================  ==================================
 large problem, well-conditioned operator   ``KrylovSolver(comm, "cg", "amg")``
+the same, as a preconditioner only         ``ChebyshevSolver(krylov, degree)``
 exact Hessian or spectrum needed           ``LUSolver`` up to ~4e5 unknowns
 exact and larger                           ``PETScLUSolver`` with MUMPS
 mass-matrix-like operator, cheap            ``LumpedMassSolver``

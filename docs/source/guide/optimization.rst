@@ -97,6 +97,30 @@ more than a thousandth of the CG's own tolerance, and it leaves the solves as th
 without ``cg_reorthogonalize`` and in the trust-region method; ``0`` leaves them as
 they are everywhere.
 
+**Or they are a fixed polynomial of multigrid cycles** (``cg_preconditioner_cycles``,
+off by default).  What the argument above asks of a preconditioner is that it be one
+linear map, and a Krylov solve is one only in the limit of its tolerance.  ``k`` steps
+of the Chebyshev iteration on the eigenvalues of the cycle times the operator are one
+by construction: ``k`` cycles, each from the iterate before it, with coefficients that
+do not depend on the right-hand side
+(:class:`~hippymfem.algorithms.linSolvers.ChebyshevSolver`), symmetric and positive
+definite where the cycle is, with an error of at most
+:math:`1/T_k((\lambda_{\max}+\lambda_{\min})/(\lambda_{\max}-\lambda_{\min}))` of the
+solution in the energy norm.  The interval is estimated once, from twelve CG iterations
+on a vector of random signs.  For the prior of the Newton benchmark on 64 GPUs (480\ :sup:`3`
+elements; eigenvalues of the cycle in [0.48, 1.05]) the bound is 1.4 % with three cycles,
+0.3 % with four and 0.05 % with five, where the solve to 1e-6 takes eleven iterations.
+How many to take is a measurement and not that bound: the first Newton steps are CG
+stopped after a few iterations, and such an iterate moves with the preconditioner.
+After two steps of that benchmark (eight CG iterations in every case) the cost
+functional was the one of the Krylov solves to 4e-4 with five cycles, where two runs
+with the Krylov solves differ by 2e-4; it was 1.3 % from it with four and 4 % with
+three, with a gradient norm half as large again.  With five the prior's part of a CG
+iteration took 0.07 s instead of 0.16 s there.
+It replaces the solves only where they precondition: a sample of the prior and the
+gradient's norm take the prior's own solver, as before, and a prior solved by a
+factorization has nothing to replace.
+
 **The Hessian actions may lose accuracy as the CG converges**
 (``cg_hessian_relaxation``, off by default).  The error of a product enters the
 residual in proportion to the step it multiplies, and the steps shrink with the

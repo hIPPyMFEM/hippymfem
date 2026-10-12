@@ -616,7 +616,7 @@ def test_newton_cg_reorthogonalized():
             inc_its[0] += int(self.iterations)
             return n
 
-    def run(reorth, inc_tol=None, prec_tol=0.0, relax=0.0):
+    def run(reorth, inc_tol=None, prec_tol=0.0, relax=0.0, cycles=0):
         inc_its[0] = 0
         if inc_tol is not None:
             for a in ("solver_fwd_inc", "solver_adj_inc"):
@@ -635,6 +635,7 @@ def test_newton_cg_reorthogonalized():
         params["cg_reorthogonalize"] = reorth
         params["cg_preconditioner_tolerance"] = prec_tol
         params["cg_hessian_relaxation"] = relax
+        params["cg_preconditioner_cycles"] = cycles
         solver = hm.ReducedSpaceNewtonCG(model, params)
         x = solver.solve([None, model.prior.mean.copy(), None])
         return solver, x[PARAMETER].copy()
@@ -675,6 +676,21 @@ def test_newton_cg_reorthogonalized():
           "(%d Newton and %d CG iterations, %d and %d with the solves at %.0e; MAP differs by %.1e%s)"
           % (pcl.it, pcl.total_cg_iter, reo.it, reo.total_cg_iter, own, e_pcl,
              "" if krylov else "; a factorization here, nothing loosened"))
+    # each of the prior's solves a fixed polynomial of multigrid cycles where they
+    # precondition the CG (cg_preconditioner_cycles): one linear map, so no tolerance,
+    # and a preconditioner whose spectrum is the exact one's to a few per cent with
+    # five cycles.  The same MAP point, in about the count.
+    if krylov:
+        chb, m_chb = run(True, cycles=5)
+        e_chb = m_chb.copy().axpy(-1.0, m_plain).norm("l2") / scale
+        cheb = model.prior.getHessianPreconditioner(cycles=5)
+        check("the prior's solves as five multigrid cycles each leave the MAP point and about the count",
+              chb.converged and e_chb < 1e-5 and cheb is not model.prior.Rsolver
+              and chb.it <= reo.it + 1
+              and chb.total_cg_iter <= 1.15 * reo.total_cg_iter + 3,
+              "(%d Newton and %d CG iterations, %d and %d with Krylov solves; MAP differs by %.1e; "
+              "bound of one solve %.1e)"
+              % (chb.it, chb.total_cg_iter, reo.it, reo.total_cg_iter, e_chb, cheb.Asolver.error_bound))
     # Hessian actions less accurate as the CG converges: the incremental solves stop at
     # 1e-2 of the CG's tolerance times |r_0| / |r_k| where that is looser than their own
     # 1e-5.  The same MAP point in about as many Hessian actions, with fewer iterations

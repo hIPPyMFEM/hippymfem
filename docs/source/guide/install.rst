@@ -75,7 +75,7 @@ loaded next to it in the same process; :ref:`single-precision` in the GPU guide 
 what that gives.  ``tools/build_hypre_single.sh`` configures the same hypre source again
 with the options of PyMFEM's build of it (compilers and flags, MPI, CUDA architecture,
 hypre's own options) and single precision, so it needs ``cmake`` and the compiler, MPI
-and CUDA toolkit of that build:
+and CUDA toolkit of that build (for an AMD build, see below):
 
 .. code-block:: bash
 
@@ -87,8 +87,14 @@ The first argument is a PyMFEM source tree in which PyMFEM's build compiled hypr
 CMake: the script reads ``external/hypre/src/cmbuild/CMakeCache.txt`` there.
 ``tools/build_pymfem_cuda.sh`` keeps that tree under its prefix (``<prefix>/PyMFEM``).
 ``tools/install_pymfem_parallel.sh`` builds in a temporary directory and removes it, so
-for a host build PyMFEM has to be built from a checkout that is kept.  The HIP build of
-``tools/build_pymfem_hip.sh`` configures its hypre without CMake and is not supported.
+for a host build PyMFEM has to be built from a checkout that is kept.  For the HIP build
+of ``tools/build_pymfem_hip.sh``, whose hypre is configured with autotools, the first
+argument is that script's prefix: ``tools/build_hypre_single.sh <prefix> <directory>``
+copies ``<prefix>/src/hypre`` with the patches it was built with, configures the copy with
+the options that the installed build recorded and ``--enable-single``, and builds it (eight
+minutes with sixteen jobs on a login node of Frontier, the device kernels being the slow
+part).  The index widths are those of the stack, so a stack built with ``HYPRE_MIXEDINT=1``
+gets a single-precision library with 64-bit global indices.
 ``MODULES="gcc/12.3.0 openmpi/4.1.8"`` makes the script load the modules itself, and
 ``JOBS`` (default 12) sets the parallel build, which takes about three minutes with
 twelve for a CUDA build and half a minute for a host build.  The script stops if the new library links another MPI than the installed one,
@@ -96,9 +102,11 @@ since it would not load next to it.  Into the output directory it writes
 ``libHYPRE_single.so``; ``libHYPRE_single.json``, the offsets of the few fields of
 hypre's structures that the library reads, taken from this build's own headers (keep it
 next to the ``.so``); and the build itself (``build/``, ``initial_cache.cmake``,
-``hypre_offsets``, ``configure.log``, ``build.log``).
+``hypre_offsets``, ``configure.log``, ``build.log``; for an AMD stack the copy of the
+source, ``hypre/``).
 It has been built and used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell
-cards and with a host build.
+cards, with the HIP build for MI250X cards (hypre 3.2.0, ROCm 7.2.0, with 32-bit and with
+64-bit global indices) and with a host build.
 
 Set the variable before ``import hippymfem``, or set ``hm.config.hypre_single`` before
 the problem is built.  To see whether the library loads, run in the environment of the

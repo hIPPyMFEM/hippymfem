@@ -24,6 +24,7 @@ Run with ``mpirun -n N python -m hippymfem.test.test_solvers``.
 """
 
 import json
+import math
 import os
 
 import numpy as np
@@ -468,6 +469,283 @@ def test_hypre_pool_logic():
     short.trim()
 
 
+def test_boomeramg_options():
+    """BoomerAMG settings beyond those of MFEM's class, through hypre's own handle of the
+    preconditioner (``mfemconfig.set_boomeramg_options``, a solver's ``amg_options``)."""
+    import ctypes
+
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("BoomerAMG options through hypre's handle")
+    opts = mc.parse_boomeramg_options(" relax_wt=1.8, pmax=6 ; theta=0.5,")
+    check("a list of settings is read by name, each with its type",
+          opts == {"relax_wt": 1.8, "pmax": 6, "theta": 0.5} and type(opts["pmax"]) is int
+          and mc.parse_boomeramg_options("") == {} and mc.parse_boomeramg_options(None) == {})
+    said = ""
+    try:
+        mc.parse_boomeramg_options("pmax=6,pmaxx=6")
+    except ValueError as e:
+        said = str(e)
+    check("an unknown name is refused, with the names that exist",
+          "'pmaxx'" in said and "relax_wt" in said)
+
+    A, b, V = make_operator(n=24)
+    pc = mfem.HypreBoomerAMG(A)
+    pc.SetPrintLevel(0)
+    H = mc._hypre_library()
+    if H is None or mc.boomeramg_handle(pc) is None:
+        raised = False
+        try:
+            mc.set_boomeramg_options(pc, {"pmax": 6})
+        except RuntimeError:
+            raised = True
+        check("without hypre's handle the options are refused with an explanation (skipped: "
+              "this MFEM library does not export it)", raised)
+        return
+
+    def read(pc, name, kind, *more):
+        out, fn = kind(), getattr(H, name)
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(kind)] + [ctypes.c_int] * len(more)
+        fn(ctypes.c_void_p(mc.boomeramg_handle(pc)), ctypes.byref(out), *more)
+        return out.value
+
+    mc.set_boomeramg_options(pc, {"levels": 7, "theta": 0.5, "pmax": 6, "trunc": 0.125,
+                                  "coarse_size": 40, "coarse_relax": 7})
+    got = (read(pc, "HYPRE_BoomerAMGGetMaxLevels", ctypes.c_int),
+           read(pc, "HYPRE_BoomerAMGGetStrongThreshold", ctypes.c_double),
+           read(pc, "HYPRE_BoomerAMGGetPMaxElmts", ctypes.c_int),
+           read(pc, "HYPRE_BoomerAMGGetTruncFactor", ctypes.c_double),
+           read(pc, "HYPRE_BoomerAMGGetMaxCoarseSize", ctypes.c_int),
+           read(pc, "HYPRE_BoomerAMGGetCycleRelaxType", ctypes.c_int, 3))
+    check("the values arrive in hypre, integers and reals alike",
+          got == (7, 0.5, 6, 0.125, 40, 7), "(%s)" % ", ".join("%g" % v for v in got))
+    said = ""
+    try:
+        mc.set_boomeramg_options(pc, {"levels": 0})
+    except ValueError as e:
+        said = str(e)
+    check("a value hypre refuses raises by the name of the setting, and leaves no error behind",
+          "levels=0" in said and H.HYPRE_GetError() == 0
+          and read(pc, "HYPRE_BoomerAMGGetMaxLevels", ctypes.c_int) == 7)
+    del pc
+
+    def solver(extra):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-12
+        ks.parameters["amg_options"] = extra
+        ks.set_operator(A)
+        return ks
+
+    x0, x1 = V.vector(), V.vector()
+    its0 = solver("").solve(x0, b)
+    ks = solver("pmax=6,theta=0.3")
+    arrived = (read(ks._pc, "HYPRE_BoomerAMGGetPMaxElmts", ctypes.c_int),
+               read(ks._pc, "HYPRE_BoomerAMGGetStrongThreshold", ctypes.c_double))
+    its1 = ks.solve(x1, b)
+    res = residual(A, x1, b)
+    e = x1.axpy(-1.0, x0).norm("l2") / x0.norm("l2")
+    check("a solver's amg_options reach its preconditioner, and its solve agrees with the "
+          "default one", arrived == (6, 0.3) and res < 1e-10 and e < 1e-9,
+          "(residual %.1e, difference %.1e, %d and %d iterations)" % (res, e, its1, its0))
+    raised = False
+    try:
+        solver("pmaxx=6")
+    except ValueError:
+        raised = True
+    check("and a mistyped one stops the solver's setup", raised)
+
+    # A hierarchy ended at a level of a few rows, which one process finishes, gathered
+    # (seq_threshold).  hypre's own code does it on the host; with hypre on a device it
+    # needs tools/hypre-3.2.0-seqdevice.patch, and without it the setting is refused
+    # with the reason, since hypre would fault in the set-up.  (On one rank hypre drops
+    # the setting, and the solve is the default one.)
+    device = bool(mc._DEVICE)
+    if device and not mc.seq_on_device(H):
+        raised = False
+        try:
+            solver("seq_threshold=200")
+        except RuntimeError:
+            raised = True
+        check("seq_threshold is refused by a device hypre without the patch (this one)", raised)
+        return
+    for extra, who in (("seq_threshold=200", "the first rank"),
+                       ("seq_threshold=200,redundant=1", "every rank")):
+        ks = solver(extra)
+        arrived = read(ks._pc, "HYPRE_BoomerAMGGetSeqThreshold", ctypes.c_int)
+        x2 = V.vector()
+        its2 = ks.solve(x2, b)
+        res = residual(A, x2, b)
+        e = x2.axpy(-1.0, x0).norm("l2") / x0.norm("l2")
+        check("seq_threshold ends the hierarchy at a level of that many rows and %s "
+              "finishes it: the solve agrees with the default one" % who,
+              arrived == 200 and res < 1e-10 and e < 1e-9 and its2 <= its0 + 3,
+              "(residual %.1e, difference %.1e, %d iterations against %d%s)"
+              % (res, e, its2, its0, ", on a device" if device else ""))
+    # the whole matrix under the threshold (the gathered level is the matrix itself), and
+    # a second operator through the same solver, which gathers again
+    ks = solver("seq_threshold=%d" % (A.GetGlobalNumRows() + 1))
+    x3 = V.vector()
+    its3 = ks.solve(x3, b)
+    e3 = x3.axpy(-1.0, x0).norm("l2") / x0.norm("l2")
+    A2, b2, V2 = make_operator(n=16)
+    ks.set_operator(A2)
+    x4 = V2.vector()
+    its4 = ks.solve(x4, b2)
+    res4 = residual(A2, x4, b2)
+    check("with a threshold above the matrix one process solves all of it, and a second "
+          "operator of the same solver is gathered in its turn",
+          e3 < 1e-9 and res4 < 1e-10, "(difference %.1e in %d iterations; residual %.1e in %d)"
+          % (e3, its3, res4, its4))
+
+
+def test_chebyshev_solver():
+    """A fixed polynomial of multigrid cycles in place of a Krylov solve
+    (``ChebyshevSolver``): its error against the exact solve is within its bound, and it
+    is one linear map, symmetric and positive definite, which a Krylov solve stopped at
+    a tolerance is not.  The prior hands out its precision solver made of two of them as
+    the preconditioner of the Hessian."""
+    if RANK == 0:
+        print("a fixed polynomial of multigrid cycles in place of a Krylov solve")
+    A, b, V = make_operator(n=24)
+    ks = hp.KrylovSolver(COMM, "cg", "amg")
+    ks.parameters["rel_tolerance"] = 1e-13
+    ks.set_operator(A)
+    x0 = V.vector()
+    its0 = ks.solve(x0, b)
+
+    def energy(v):
+        w = ParVector(COMM, A.Height())
+        A.Mult(v.hypre, w.hypre)
+        return math.sqrt(max(w.inner(v), 0.0))
+
+    said, worst = [], 0.0
+    for degree in (1, 2, 4, 6):
+        ch = hp.ChebyshevSolver(ks, degree)
+        x = V.vector()
+        n = ch.solve(x, b)
+        err = energy(x.copy().axpy(-1.0, x0)) / energy(x0)
+        bound = ch.error_bound
+        said.append("%d: %.1e (bound %.1e)" % (degree, err, bound))
+        worst = max(worst, err / bound)
+        ok = n == degree and err <= 1.05 * bound + 1e-12
+        if not ok:
+            worst = float("inf")
+    lo, hi = ch.interval
+    check("the error of the polynomial is within its bound at every degree",
+          worst <= 1.05 and 0.0 < lo < hi,
+          "(%s; the cycle's eigenvalues in [%.3f, %.3f], Ritz values %.3f and %.3f; CG to 1e-13 "
+          "takes %d iterations)" % ("; ".join(said), lo, hi, ch.ritz[0], ch.ritz[1], its0))
+    # one linear map, symmetric and positive definite
+    hp.parRandom.set_seed(77)
+    u, v = V.vector(), V.vector()
+    hp.parRandom.normal(1.0, u)
+    hp.parRandom.normal(1.0, v)
+    ch = hp.ChebyshevSolver(ks, 4)
+    su, sv, sw = V.vector(), V.vector(), V.vector()
+    ch.solve(su, u)
+    ch.solve(sv, v)
+    w = u.copy().scale(0.3).axpy(-1.7, v)
+    ch.solve(sw, w)
+    lin = sw.copy().axpy(-0.3, su).axpy(1.7, sv).norm("l2") / sw.norm("l2")
+    a, c = v.inner(su), u.inner(sv)
+    sym = abs(a - c) / max(abs(a), abs(c))
+    check("it is one linear map, symmetric and positive definite",
+          lin < 1e-10 and sym < 1e-10 and u.inner(su) > 0.0 and v.inner(sv) > 0.0,
+          "(S(0.3 u - 1.7 v) off by %.1e, <v, S u> and <u, S v> by %.1e)" % (lin, sym))
+    # the cycles applied from the iterate (BoomerAMG) and the recurrence with a residual
+    # updated by a product (any other preconditioner) are one polynomial
+    xa, xb = V.vector(), V.vector()
+    ch.solve(xa, b)
+    kept, ks.precond_type = ks.precond_type, "another"
+    try:
+        ch.solve(xb, b)
+    finally:
+        ks.precond_type = kept
+    two = xb.axpy(-1.0, xa).norm("l2") / xa.norm("l2")
+    check("cycles from the iterate and a residual updated by products give the same solve",
+          two < 1e-11, "(difference %.1e)" % two)
+    # refused where there is nothing to make it of
+    raised = False
+    try:
+        hp.ChebyshevSolver(hp.KrylovSolver(COMM, "cg", "amg"), 4)
+    except ValueError:
+        raised = True
+    check("and it is refused for a solver without an operator", raised)
+    # the prior's precision solver of two such polynomials, as the Hessian's preconditioner
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(24, 24, mfem.Element.QUADRILATERAL))
+    Vm = hp.FunctionSpace.H1(pm, 1)
+    prior = hp.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True)
+    g, r_exact, r_cheb = Vm.vector(), Vm.vector(), Vm.vector()
+    hp.parRandom.set_seed(78)
+    hp.parRandom.normal(1.0, g)
+    prior.Rsolver.solve(r_exact, g)
+    pc = prior.getHessianPreconditioner(cycles=5)
+    pc.solve(r_cheb, g)
+    krylov = isinstance(prior.Asolver, hp.KrylovSolver)
+    if krylov:
+        bound = pc.Asolver.error_bound
+        diff = r_cheb.copy().axpy(-1.0, r_exact).norm("l2") / r_exact.norm("l2")
+        # (the two bounds are in the energy norm of each solve; an order of magnitude is
+        # asked of the Euclidean norm of their composition)
+        check("the prior's precision solver with five cycles a solve is the exact one to the bound",
+              pc is not prior.Rsolver and pc is prior.getHessianPreconditioner(cycles=5)
+              and diff < 20.0 * bound and g.inner(r_cheb) > 0.0,
+              "(difference %.1e, bound of one solve %.1e)" % (diff, bound))
+    else:
+        check("a prior solved by a factorization hands out its own solver", pc is prior.Rsolver)
+
+
+def test_index_widths():
+    """hypre's two integer types (``parvector._HYPRE_INT`` and ``_HYPRE_BIGINT``): arrays of
+    global indices reach MFEM in the wider one, and a matrix goes from scipy to hypre and
+    back with either pair of widths (one width, or the two of a hypre built
+    ``--enable-mixedint``)."""
+    import scipy.sparse as sp
+
+    from hippymfem.common import parvector as pv
+    from hippymfem.common.linalg import hypre_to_scipy, scipy_to_hypre
+
+    if RANK == 0:
+        print("hypre's local and global index types")
+    narrow, wide = 8 * np.dtype(pv._HYPRE_INT).itemsize, 8 * np.dtype(pv._HYPRE_BIGINT).itemsize
+    check("the two types are the build's", narrow == 8 * mfem.sizeof_HYPRE_Int()
+          and wide == 8 * mfem.sizeof_HYPRE_BigInt(),
+          "(HYPRE_Int %d bits, HYPRE_BigInt %d bits)" % (narrow, wide))
+    vals = [3, 5, 2 ** 31 - 1] + ([2 ** 40 + 7] if wide == 64 else [])
+    arr = pv.bigint_array(vals)
+    back = [int(v) for v in pv.bigint_view(arr.GetData(), len(vals))]
+    check("global indices go to an MFEM array and back, up to the type's range", back == vals,
+          "(%s)" % back[-1])
+
+    # this rank's rows with global columns: a square matrix, and a rectangular one with
+    # its own column partition
+    nloc = 3 + RANK
+    counts = COMM.allgather(nloc)
+    off, N = int(sum(counts[:RANK])), int(sum(counts))
+    rows = np.repeat(np.arange(nloc), 3)
+    cols = np.concatenate([[(off + i) % N, (off + i + 1) % N, (off + i + N // 2) % N]
+                           for i in range(nloc)])
+    data = 1.0 + np.arange(rows.size) + 10.0 * RANK
+    S = sp.csr_matrix((data, (rows, cols)), shape=(nloc, N))
+    S.sum_duplicates()
+    A = scipy_to_hypre(S)
+    T = hypre_to_scipy(A)
+    err = abs(T - S).max() if T.shape == S.shape else np.inf
+    check("a square matrix goes from scipy to hypre and back", err == 0.0
+          and int(A.GetGlobalNumRows()) == N and int(A.GetGlobalNumCols()) == N, "(%g)" % err)
+    mloc = 2
+    M = mloc * NP
+    R = sp.csr_matrix((data, (rows, cols % M)), shape=(nloc, M))
+    R.sum_duplicates()
+    B = scipy_to_hypre(R, col_starts=[mloc * RANK, mloc * (RANK + 1)])
+    T = hypre_to_scipy(B)
+    err = abs(T - R).max() if T.shape == R.shape else np.inf
+    check("and a rectangular one with its column partition", err == 0.0
+          and int(B.GetGlobalNumCols()) == M and B.Width() == mloc, "(%g)" % err)
+
+
 def test_lumped_mass():
     """The lumped mass solver: its diagonal against MFEM's linear form of the constant one."""
     if RANK == 0:
@@ -576,6 +854,9 @@ def main():
     test_guards()
     test_inverse_problem()
     test_hypre_pool_logic()
+    test_boomeramg_options()
+    test_chebyshev_solver()
+    test_index_widths()
     test_single_precision_solves()
     test_lumped_mass()
     test_transpose_solver()

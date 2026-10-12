@@ -59,7 +59,33 @@ def device_vectors():
     :data:`DEVICE_VECTORS`): MFEM configured on a GPU and the setting not ``"0"``."""
     return DEVICE_VECTORS != "0" and device_active()
 
+#: hypre's two integer types as numpy's.  ``HYPRE_Int`` counts and indexes within a rank
+#: (row pointers, the columns of a diagonal or an off-diagonal block); ``HYPRE_BigInt``
+#: indexes a whole space (global columns, the partitions, a block's column map).  They
+#: are one width except with a hypre built ``--enable-mixedint``, which a GPU build
+#: needs for a space of more than 2 147 483 647 unknowns: 32 and 64 bits.
 _HYPRE_INT = np.int32 if mfem.sizeof_HYPRE_Int() == 4 else np.int64
+_HYPRE_BIGINT = np.int32 if mfem.sizeof_HYPRE_BigInt() == 4 else np.int64
+
+
+def bigint_array(values):
+    """An MFEM array of ``HYPRE_BigInt`` holding ``values`` (at least one entry), for the
+    constructors that take ``HYPRE_BigInt *`` and have no numpy typemap: its
+    ``GetData()`` is that pointer.  Filled by index: an array made from a list can hand
+    back a pointer into storage that does not outlive the call."""
+    values = [int(v) for v in values]
+    arr = (mfem.intArray if _HYPRE_BIGINT is np.int32 else mfem.int64Array)(max(len(values), 1))
+    for k, v in enumerate(values):
+        arr[k] = v
+    return arr
+
+
+def bigint_view(pointer, n):
+    """The ``n`` entries behind a ``HYPRE_BigInt *`` that MFEM returned, as numpy's."""
+    # (PyMFEM's typemap for a pointer with its size, one argument, is for int alone)
+    arr = (mfem.intArray((pointer, int(n))) if _HYPRE_BIGINT is np.int32
+           else mfem.int64Array(pointer, int(n), False))
+    return np.array(arr.GetDataArray(), dtype=np.int64)
 
 
 def partition(comm, local_size):
@@ -68,10 +94,33 @@ def partition(comm, local_size):
     ``offsets`` has ``comm.size + 1`` entries; ``offsets[r]`` is the global
     index of rank ``r``'s first entry.
     """
-    counts = comm.allgather(int(local_size))
+    # (MPI's own collective on a buffer: mpi4py's ``allgather`` pickles every rank's
+    # number and unpickles them one by one, milliseconds on thousands of ranks)
+    counts = np.empty(comm.size, dtype=np.int64)
+    comm.Allgather(np.array([int(local_size)], dtype=np.int64), counts)
     offs = np.zeros(comm.size + 1, dtype=np.int64)
     np.cumsum(counts, out=offs[1:])
     return offs, int(offs[-1])
+
+
+def allreduce(comm, value, op=MPI.SUM):
+    """One number reduced over ``comm`` by MPI's own collective: a float, or an integer
+    (a count, a flag) where ``value`` is one.
+
+    ``comm.allreduce`` of mpi4py does the same through pickled point-to-point messages,
+    up a tree of the ranks and down again: two dozen hops one after the other on 4096
+    ranks, where the library's collective is a fraction of that.  Every inner product
+    and norm of a Newton-CG iteration ends in one.
+    """
+    if isinstance(value, (bool, int, np.integer)):
+        buf = np.array([int(value)], dtype=np.int64)
+        out = np.empty(1, dtype=np.int64)
+        comm.Allreduce(buf, out, op=op)
+        return int(out[0])
+    buf = np.array([float(value)], dtype=np.float64)
+    out = np.empty(1, dtype=np.float64)
+    comm.Allreduce(buf, out, op=op)
+    return float(out[0])
 
 
 def allreduce_extreme(comm, loc, op):
@@ -108,20 +157,43 @@ class Layout:
     between ranks, so one rank could hit the cache and skip the ``allgather`` while
     another misses and performs it.  The ranks would then desynchronize, and a
     *later*, unrelated collective would receive the wrong message.  Constructing a
-    layout always communicates; only reuse is free.
+    layout from a local size always communicates; only reuse is free.
+
+    :meth:`of_range` makes one without a message, from what a matrix or a space already
+    knows of this rank's range.  Its :attr:`offsets` of every rank are then gathered at
+    their first read, which has to be a read on every rank (the gather of a whole
+    vector, which is one collective anyway).
     """
 
-    __slots__ = ("comm", "local_size", "offsets", "global_size", "col_starts")
+    __slots__ = ("comm", "local_size", "_offsets", "global_size", "col_starts")
 
     def __init__(self, comm, local_size):
         self.comm = comm
         self.local_size = int(local_size)
-        self.offsets, self.global_size = partition(comm, self.local_size)
+        self._offsets, self.global_size = partition(comm, self.local_size)
         rank = comm.rank
         self.col_starts = np.array(
-            [self.offsets[rank], self.offsets[rank + 1], self.global_size],
-            dtype=_HYPRE_INT,
+            [self._offsets[rank], self._offsets[rank + 1], self.global_size],
+            dtype=_HYPRE_BIGINT,
         )
+
+    @classmethod
+    def of_range(cls, comm, first, last, global_size):
+        """The layout of a vector whose entries on this rank are the global indices
+        ``first`` to ``last - 1`` of ``global_size``, as the caller knows them on every
+        rank (the rows of a matrix, the true dofs of a space): no message."""
+        self = cls.__new__(cls)
+        self.comm, self.local_size = comm, int(last) - int(first)
+        self._offsets, self.global_size = None, int(global_size)
+        self.col_starts = np.array([int(first), int(last), int(global_size)], dtype=_HYPRE_BIGINT)
+        return self
+
+    @property
+    def offsets(self):
+        """The first global index of every rank, and the global size at the end."""
+        if self._offsets is None:
+            self._offsets, _ = partition(self.comm, self.local_size)
+        return self._offsets
 
 
 class ParVector(KeepAlive):
@@ -151,7 +223,6 @@ class ParVector(KeepAlive):
             raise ValueError("layout has local size %d, array has %d"
                              % (layout.local_size, array.shape[0]))
         self._layout = layout
-        self._offsets = layout.offsets
         self._global_size = layout.global_size
         self._col_starts = layout.col_starts
         # hypre does not own this array; both it and the partitioning must be
@@ -260,13 +331,12 @@ class ParVector(KeepAlive):
     @property
     def offsets(self):
         """Global offsets array, ``comm.size + 1`` entries."""
-        return self._offsets
+        return self._layout.offsets
 
     @property
     def owner_range(self):
         """``(first, last)`` global indices owned by this rank."""
-        r = self.comm.rank
-        return int(self._offsets[r]), int(self._offsets[r + 1])
+        return int(self._col_starts[0]), int(self._col_starts[1])
 
     @property
     def local_size(self):
@@ -397,7 +467,7 @@ class ParVector(KeepAlive):
             loc = float(self._hv * y._hv)
         else:
             loc = float(np.dot(self._host_read(), y._host_read()))
-        return self.comm.allreduce(loc, op=MPI.SUM)
+        return allreduce(self.comm, loc, MPI.SUM)
 
     dot = inner
 
@@ -410,11 +480,11 @@ class ParVector(KeepAlive):
             return allreduce_extreme(self.comm, loc, MPI.MAX)
         if norm_type in ("l1", 1, "NORM_1"):
             loc = float(np.abs(self._host_read()).sum())
-            return self.comm.allreduce(loc, op=MPI.SUM)
+            return allreduce(self.comm, loc, MPI.SUM)
         raise ValueError("unknown norm type %r" % (norm_type,))
 
     def sum(self):
-        return self.comm.allreduce(float(self._host_read().sum()), op=MPI.SUM)
+        return allreduce(self.comm, float(self._host_read().sum()), MPI.SUM)
 
     def max(self):
         loc = float(self._host_read().max()) if self.local_size else -np.inf

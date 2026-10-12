@@ -43,6 +43,7 @@ results can be compared across rank counts.
 
 import math
 import numbers
+import os
 
 import numpy as np
 from mpi4py import MPI
@@ -57,7 +58,19 @@ from ..fem.assemble import assemble_native_matrix, mass_functional
 from ..fem.elementbatch import get_batches
 from ..fem.spaces import as_space
 from ..algorithms.multivector import MultiVector
-from ..algorithms.linSolvers import KrylovSolver, LUSolver
+from ..algorithms.linSolvers import ChebyshevSolver, CycleOf, KrylovSolver, LUSolver
+
+#: ``prior_h()``: how many of the meshes that a prior's mesh was refined from
+#: (:func:`hippymfem.fem.ptransfer.set_coarser_meshes`) the multigrid cycles of its elliptic
+#: operator go over where they precondition the Hessian (``getHessianPreconditioner(cycles=...)``):
+#: a V-cycle over those meshes in the single-precision library
+#: (:class:`~hippymfem.algorithms.singlesolve.HCycle`, with its small levels in host memory
+#: where ``HIPPYMFEM_PMG_H_HOST`` says so) in place of a cycle of BoomerAMG on the operator,
+#: and the polynomial of cycles wholly in that library.  0, the default: BoomerAMG.  A
+#: prior's own ``h_levels`` overrides it.  ``HIPPYMFEM_PRIOR_H``, read when the
+#: preconditioner is asked for.
+def prior_h():
+    return int(os.environ.get("HIPPYMFEM_PRIOR_H", "0") or 0)
 from ..common.operators import MatrixOperator, Operator2Solver
 from ..algorithms.randomizedEigensolver import doublePass, doublePassG
 from ..common.linalg import estimate_diagonal_inv2
@@ -248,9 +261,10 @@ class QuadratureSqrtPrecision(Operator):
                 )
                 c += 1
             if self.grad_coeff is not None:
+                # (g.Jinv is once an element where the group is affine)
                 contrib += self.grad_coeff * np.einsum(
                     "qik,eqkd,eq,eqdv->evi",
-                    t.G, g.Jinv, sq, xi[:, :, c:c + self.sdim, :], optimize=True
+                    t.G, g.full_Jinv(), sq, xi[:, :, c:c + self.sdim, :], optimize=True
                 )
             flat = (contrib.reshape(g.ne, self.vdim * t.nd) * t.signs).reshape(-1)
             local += np.bincount(t.edofs.reshape(-1), weights=flat,
@@ -274,7 +288,7 @@ class QuadratureSqrtPrecision(Operator):
                 c += 1
             if self.grad_coeff is not None:
                 xi[:, :, c:c + self.sdim, :] = self.grad_coeff * np.einsum(
-                    "qik,eqkd,eq,evi->eqdv", t.G, g.Jinv, sq, ve, optimize=True
+                    "qik,eqkd,eq,evi->eqdv", t.G, g.full_Jinv(), sq, ve, optimize=True
                 )
             noise_out.array[off:off + n] = xi.reshape(-1)
         return noise_out
@@ -425,7 +439,7 @@ class _Prior(KeepAlive):
     def sample_noise(self, sigma=1.0, out=None, rng=None):
         raise NotImplementedError
 
-    def getHessianPreconditioner(self, tolerance=None):
+    def getHessianPreconditioner(self, tolerance=None, cycles=None):
         """The solver that preconditions the Hessian: ``Rsolver``.
 
         With ``tolerance``, the same solver with its Krylov solves stopped at that
@@ -435,7 +449,36 @@ class _Prior(KeepAlive):
         that iteration stops at (``ReducedSpaceNewtonCG``, ``cg_preconditioner_tolerance``).
         A solver without Krylov solves (a factorization) is returned as it is, and the
         solver returned for a tolerance is the same object at every call.
+
+        With ``cycles``, the precision solver with each of its Krylov solves replaced
+        by a fixed polynomial of that many multigrid cycles
+        (:class:`~hippymfem.algorithms.linSolvers.ChebyshevSolver`): one linear map,
+        symmetric and positive definite, that needs no tolerance.  It is there for a
+        prior whose precision is two solves around a mass matrix
+        (:class:`SqrtPrecisionPDE_Prior` with Krylov solvers); for any other the
+        tolerance decides, as above.
         """
+        if cycles:
+            pc = self.__dict__.get("_hessian_cheb")
+            inner = getattr(self.Rsolver, "Asolver", None)
+            levels = getattr(self, "h_levels", None)
+            levels = int(prior_h() if levels is None else levels or 0)
+            if (pc is None or pc.base is not self.Rsolver or pc.inner is not inner
+                    or pc.Asolver.degree != int(cycles) or pc.h_levels != levels):
+                pc = None
+                if isinstance(self.Rsolver, _BilaplacianRsolver) and ChebyshevSolver.fits(inner):
+                    # the cycle of the polynomial: BoomerAMG on the operator, or a V-cycle
+                    # over the meshes that the mesh was refined from (PRIOR_H)
+                    geometric = self._geometric_cycle(inner, levels) if levels > 0 else None
+                    pc = _BilaplacianRsolver(
+                        ChebyshevSolver(CycleOf(geometric, inner) if geometric is not None else inner,
+                                        int(cycles)),
+                        self.Rsolver.M, self.comm)
+                    pc.base, pc.inner, pc.h_levels, pc.geometric = self.Rsolver, inner, levels, geometric
+                    pc.Asolver.setup()
+                self.__dict__["_hessian_cheb"] = pc
+            if pc is not None:
+                return pc
         if not tolerance:
             return self.Rsolver
         pc = self.__dict__.get("_hessian_pc")
@@ -447,6 +490,66 @@ class _Prior(KeepAlive):
             pc = self.__dict__["_hessian_pc"] = _Loosened(self.Rsolver, inner)
         pc.tolerance = float(tolerance)
         return pc
+
+    def _geometric_cycle(self, inner, levels):
+        """A :class:`~hippymfem.algorithms.singlesolve.HCycle` of the operator of the
+        elliptic solver ``inner`` over up to ``levels`` of the meshes that the mesh was
+        refined from, or ``None`` (with a warning) where there is no such cycle: no
+        single-precision hypre, a mesh that knows no coarser one, a space that is not one
+        of linear elements, a mesh whose last cut was by three or more a side (the cycle
+        then relaxes on the finest matrix by a polynomial of as many steps, and BoomerAMG's
+        is the cheaper one).  The levels end at the first matrix that the solver's
+        ``seq_threshold`` gathers anyway."""
+        import warnings
+
+        from ..algorithms import singlesolve as ss
+        from ..fem import ptransfer
+        from ..fem.spaces import FunctionSpace
+
+        lib, why = ss.library(), ""
+        meshes = ptransfer.coarser_meshes(self.Vh.mesh)[:max(int(levels), 0)]
+        if lib is None or lib.no_pmg:
+            why = "no single-precision hypre for it (%s)" % (
+                (lib.no_pmg if lib is not None else ss.why_not()) or "HIPPYMFEM_HYPRE_SINGLE is not set")
+        elif not meshes:
+            why = "the mesh knows no mesh it was refined from (fem.ptransfer.set_coarser_meshes)"
+        elif getattr(inner, "precond_type", None) != "amg":
+            why = "the prior's solver is not preconditioned by BoomerAMG"
+        elif not self.Vh.fec.Name().startswith("H1_") or int(self.Vh.order) != 1 or int(self.Vh.vdim) != 1:
+            why = "the parameter space is not one of linear nodal elements with one component"
+        else:
+            gathered = ss.gather_threshold(inner.parameters)
+            chain, space = [], self.Vh
+            try:
+                for mesh in meshes:
+                    if gathered and int(space.fes.GlobalTrueVSize()) <= gathered:
+                        break
+                    below = FunctionSpace.H1(mesh, 1)
+                    chain.append(ss.PTransfer(ptransfer.refinement(space, below, None), lib))
+                    space = below
+                cut = int(getattr(chain[0], "cut", None) or 2) if chain else 2
+                if cut > 2:
+                    # (the cycle relaxes on the finest matrix by a polynomial of as many
+                    # steps: measured dearer than BoomerAMG's cycle, 0.061 against 0.047 s
+                    # for the preconditioner of one CG iteration after a cut by three)
+                    for tr in chain:
+                        tr.destroy()
+                    chain, why = None, ("the mesh was last cut by %d a side, where a cycle over the meshes "
+                                        "costs more than one of BoomerAMG" % cut)
+                if chain:
+                    blocks = ss.matrix_blocks(inner.A, self.comm)
+                    S = ss.SingleParMatrix.from_pattern(blocks, blocks.values, lib)
+                    blocks.values = None
+                    cycle = ss.HCycle(S, chain, inner.parameters)
+                    cycle.blocks = blocks          # (the matrix borrows its column indices)
+                    return cycle
+                why = why or "its matrix is gathered as it is"
+            except NotImplementedError as e:
+                why = str(e)
+        if self.comm.rank == 0:
+            warnings.warn("HIPPYMFEM_PRIOR_H: no cycle over coarser meshes for the prior (%s); it keeps "
+                          "BoomerAMG" % why, RuntimeWarning, stacklevel=3)
+        return None
 
     def cost(self, m):
         r""":math:`\tfrac12 (m - \bar m)^{\!\top} R (m - \bar m)`."""
@@ -595,14 +698,43 @@ class SqrtPrecisionPDE_Prior(_Prior):
     mean : ParVector, optional
     solver_type : {"krylov", "lu"}
         ``"lu"`` is serial only (see :mod:`hippymfem.algorithms.linSolvers`).
+    lumped_mass : bool
+        The mass matrix :math:`M` of :math:`R = \mathcal{A} M^{-1} \mathcal{A}` by the
+        rule at the vertices of an element, which makes it diagonal: the sum of each
+        row of the consistent one where the elements are affine, the lumped mass of
+        the SPDE approach to Matern fields (Lindgren, Rue and Lindstrom, 2011).  A
+        product with :math:`R`, which the cost, the gradient and every Hessian action
+        take, then solves with a diagonal matrix instead of running some seventy CG
+        iterations on the consistent one, and the square root that samples are drawn
+        with is by the same rule, so the samples have the covariance
+        :math:`R^{-1}` of this precision exactly.  It is another discretization of
+        the same prior, not the same matrix: off by default.  For a parameter space
+        of first order on a mesh of one kind of element.
     """
 
     def __init__(self, Vh, domain_integrators, bdr_integrators=(), mean=None,
                  rel_tol=1e-12, max_iter=1000, solver_type="krylov",
-                 quadrature_degree=None, systems_dim=None):
+                 quadrature_degree=None, systems_dim=None, lumped_mass=False):
         self.Vh = as_space(Vh)
         self.comm = self.Vh.comm
         mass = mfem.VectorMassIntegrator() if self.Vh.vdim > 1 else mfem.MassIntegrator()
+        self.lumped_mass = bool(lumped_mass)
+        if self.lumped_mass:
+            from ..fem.elementbatch import VERTEX_RULE, integration_rule
+
+            mesh = self.Vh.mesh
+            kinds = self.comm.allreduce(int(mesh.GetNumGeometries(mesh.Dimension())), op=MPI.MAX)
+            if int(self.Vh.order) != 1 or kinds != 1:
+                # (the same on every rank)
+                raise ValueError("lumped_mass is for a parameter space of first order on a mesh "
+                                 "of one kind of element (order %d, %d kinds here)"
+                                 % (int(self.Vh.order), kinds))
+            geom = self.comm.allreduce(int(mesh.GetElementGeometry(0)) if mesh.GetNE() else -1,
+                                       op=MPI.MAX)
+            rule = integration_rule(geom, VERTEX_RULE)
+            mass.SetIntRule(rule)
+            self.keep(rule)
+            quadrature_degree = VERTEX_RULE
         self.M = assemble_native_matrix(self.Vh, [mass])
         self.A = assemble_native_matrix(self.Vh, list(domain_integrators),
                                         list(bdr_integrators))
@@ -728,14 +860,17 @@ def _make_prior_solvers(comm, M, A, solver_type, rel_tol, max_iter,
 # ---------------------------------------------------------------- constructors
 def BiLaplacianPrior(Vh, gamma, delta, Theta=None, mean=None, rel_tol=1e-12,
                      max_iter=1000, robin_bc=False, solver_type="krylov",
-                     quadrature_degree=None):
+                     quadrature_degree=None, lumped_mass=False):
     r"""Matern-class prior with :math:`\mathcal{A} = \gamma\,\mathrm{div}(\Theta\nabla)
     + \delta`.
 
     ``Theta`` may be ``None`` (isotropic), a scalar, a numpy array (a constant
     tensor), or an ``mfem.MatrixCoefficient``.  ``robin_bc=True`` adds
     :math:`\sqrt{\gamma\delta}/1.42` on the boundary, which reduces the
-    boundary-layer artefact in the pointwise variance.
+    boundary-layer artefact in the pointwise variance.  ``lumped_mass=True`` takes the
+    diagonal mass matrix of the rule at the vertices for the :math:`M` of
+    :math:`R = \mathcal{A} M^{-1} \mathcal{A}` (:class:`SqrtPrecisionPDE_Prior`), with
+    which a product with :math:`R` needs no iteration.
     """
     Vh = as_space(Vh)
     gamma = float(gamma)
@@ -761,7 +896,7 @@ def BiLaplacianPrior(Vh, gamma, delta, Theta=None, mean=None, rel_tol=1e-12,
         bdr.append(mfem.MassIntegrator(mfem.ConstantCoefficient(beta)))
     prior = SqrtPrecisionPDE_Prior(
         Vh, [diff, mass], bdr, mean, rel_tol, max_iter, solver_type,
-        quadrature_degree,
+        quadrature_degree, lumped_mass=lumped_mass,
     )
     prior.keep(*keep)
     prior.gamma, prior.delta, prior.robin_bc = gamma, delta, robin_bc

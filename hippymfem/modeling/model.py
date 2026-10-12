@@ -230,15 +230,20 @@ class Model(ReducedMap):
     def applyR(self, dm, out):
         return self.prior.R.mult(dm, out)
 
-    def Rsolver(self, tolerance=None):
+    def Rsolver(self, tolerance=None, cycles=None):
         """The solver of the prior's precision.  With ``tolerance``, as the
         preconditioner of a Krylov iteration: its solves stopped at that relative
-        tolerance (``prior.getHessianPreconditioner``)."""
-        if tolerance:
+        tolerance; with ``cycles``, each of them a fixed polynomial of that many
+        multigrid cycles (``prior.getHessianPreconditioner``)."""
+        if tolerance or cycles:
             get = getattr(self.prior, "getHessianPreconditioner", None)
             if get is not None:
                 try:
-                    return get(tolerance)
+                    return get(tolerance, cycles=cycles) if cycles else get(tolerance)
                 except TypeError:          # a prior written before the argument existed
-                    pass
+                    if cycles and tolerance:
+                        try:
+                            return get(tolerance)
+                        except TypeError:
+                            pass
         return self.prior.Rsolver

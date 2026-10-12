@@ -4,6 +4,308 @@
 
 ### Added
 
+- **The small geometric levels of a p-multigrid in host memory beside the device** (the
+  solvers' parameter `pmg_h_host`, `HIPPYMFEM_PMG_H_HOST`, in rows a rank, with `pmg_h`;
+  `singlesolve.PMGEngine._levels`, `_enter_host`, `_HostGathered`, `_Library.to_host`,
+  `PTransfer.host`).  A level of a few thousand rows a rank costs a device almost nothing
+  to compute and all of its latency: a kernel launch for every operation and, around each
+  exchange between ranks, a copy from the card and one back.  On 512 MI250X GCDs of
+  Frontier the two coarsest meshes of the cycle and the gathered matrix under them (3460
+  and 135 rows a rank, 729 rows) took 3.1 ms of an iteration's 35 ms and held 20 of its 38
+  exchanges; on 64 GCDs the one such mesh took 1.4 ms.  The meshes of at most `pmg_h_host`
+  rows a rank, and what is under them, now can live in host memory: their matrices are
+  the same Galerkin products (the first copied from the device at every set-up, the
+  others made there), their relaxation the same, and a cycle hands the restricted
+  residual to the host at the first such level and takes the correction back.  There the
+  same levels take 1.6 to 1.7 ms on 512 GCDs.  It pays for these levels where it did not
+  for the last levels of an algebraic hierarchy (11 October): a geometric level has the
+  26 neighbours of the mesh at every size.  A last matrix that the solver's
+  `seq_threshold` gathers is gathered in host memory by the library itself and solved by
+  a BoomerAMG of one process on every rank; hypre's own code for that in host memory
+  leaves the ranks without a row of the gathered level in another collective than the
+  others, and a matrix of 729 rows on 512 ranks stopped in its first cycle.  A gathered
+  matrix has no exchange to save, and every rank solves the whole of it on one core, so
+  the setting bounds it too: where it has more rows than `pmg_h_host` in all, the levels
+  above it stay on the device with it (15 625 rows: an iteration 1.0 to 1.4 ms longer in
+  host memory; 729 rows: 1.1 to 1.2 ms shorter; 4913 rows: 0.6 to 0.7 ms shorter), and
+  the last matrix alone is never moved.  With `HIPPYMFEM_PMG_H_HOST=5000`, 960^3 on 512
+  GCDs: 17.7 s for the operations of two Newton-CG steps where every level on the device
+  takes 18.3 s, with the same iterations.  With it and the prior's cycles of the next
+  entry, in one job on 1 to 4096 GCDs (the eighth series): 17.0, 17.7, 17.7 and 19.0 s
+  on 8, 64, 512 and 4096 GCDs where the series of the entry below takes 17.0, 17.8, 18.3
+  and 19.4 s; **1920^3 on 4096 GCDs, 120 billion unknowns: 1.9 % less time, 89.4 % of
+  one node (87.6 %)**, and 81 % of that job's single GCD, which was itself 2.6 % slower
+  than the one before it (79 % against that one; 77.5 % before).  An iteration is 1.2 ms
+  shorter where the gathered matrix has 729 rows (128 and 512 GCDs) and 0.6 to 0.7 ms
+  where it has 4913 (1024 to 4096; the solve of that matrix takes 0.42 ms in host memory
+  and 0.47 ms on the device, so the difference is elsewhere, and not yet found).  In that
+  configuration 2048^3 elements ran on 4096 GCDs (128^3 a GCD, 146 billion unknowns):
+  two Newton-CG steps in 15.2 s, the operations in 23.0 s, 82 % of one GCD and 88 % of
+  one node at that load.  Off by default.
+- **A prior's multigrid cycles over the meshes, in the single-precision library** (a
+  prior's `h_levels`, `prior_h`, `HIPPYMFEM_PRIOR_H`; `singlesolve.HCycle` and
+  `matrix_blocks`, `linSolvers.CycleOf`, `prior._geometric_cycle`).  Where a fixed
+  polynomial of multigrid cycles stands for each of the prior's elliptic solves in the
+  CG's preconditioner (`cg_preconditioner_cycles`), the cycles can be V-cycles over the
+  meshes that the mesh was refined from, in the single-precision hypre, in place of
+  BoomerAMG's on the operator in double precision.  The operator is copied there once,
+  its Galerkin products are made once, since it stays, and the whole polynomial runs in
+  that library: a solve converts two vectors.  The rounding, 1e-7 of the result, is far
+  below the polynomial's own error.  On MI250X GCDs the preconditioner of one CG
+  iteration takes 0.035 s in place of 0.052 s on one node, 0.054 s in place of 0.071 s
+  on 512 GCDs and 0.076 s in place of 0.089 s on 4096 (the cycle's eigenvalues lie in
+  [0.60, 1.05] where BoomerAMG's lie in [0.54, 1.05]).  For linear nodal elements with
+  one component on a mesh that was last cut in two a side; after a cut by three the
+  cycle relaxes on the finest matrix by a polynomial of three steps and costs more than
+  BoomerAMG's (0.061 to 0.079 s against 0.047 to 0.063 s), so such a prior, and one on a
+  mesh that knows no coarser mesh, keeps BoomerAMG, with a warning.  Off by default.
+- **Each rank's side of its card in the benchmark's table** (`bench_newton_device.py
+  --rank-table`): JAX's allocator, the card's memory in use, hypre's pool with the
+  seconds it spent in the driver, and the driver's seconds inside each stage, beside the
+  rank's times.  Twice in two days every assembly of a Jacobian in a run waited half a
+  second for one rank; in the run whose ranks were recorded that rank took 1.2 s where
+  the others took 0.7 s, with its every other time and the kernels timed on its card
+  unremarkable, and not in the next run on the same nodes.  The table is for reading the
+  next one.
+- **Geometric levels under the linear elements of a p-multigrid** (the solvers' parameter
+  `pmg_h`, `HIPPYMFEM_PMG_H`, with `pmg`; `fem.ptransfer.refinement`, `set_coarser_meshes`,
+  `coarser_meshes`; `singlesolve.PMGEngine` with `transfer.h`, `HIPPYMFEM_PMG_H_SMOOTH`;
+  `applications.geothermal.model.cube_mesh(levels=...)`, `bench_newton_device.py
+  --h-levels`).  BoomerAMG on the linear elements' matrix coarsens it, builds
+  interpolations and forms their products at every set-up, and what it builds has 100 to
+  170 entries a row from its second level on and one level more for every eight times the
+  ranks, each with its exchanges whatever its size.  A mesh that was made by cutting
+  coarser meshes (`ParMesh.MakeRefined`) has a hierarchy that needs none of it.  Told the
+  meshes, the library corrects from the linear elements by a V-cycle over up to `pmg_h` of
+  them: the interpolation between the linear elements of two meshes from MFEM's own on
+  local dofs, with the essential dofs taken out as in the interpolation of the
+  p-multigrid; the Galerkin products level by level at every set-up, by hypre's products
+  with `A P` kept; the fine level's relaxation on each mesh, or as many steps of a
+  Chebyshev polynomial as the next mesh is times coarser a side where that is three or
+  more (one sweep around a cut by five took the Jacobian's solves from 6 to 9 iterations);
+  BoomerAMG on the last product alone.  Every level has the 27 entries a row of linear
+  hexahedra and the neighbours of the mesh, and the levels end at the first matrix that
+  `seq_threshold` gathers.  `cube_mesh(n, comm, levels=(5, 3, 2, 2, 2))` builds the
+  benchmark's mesh from one element a rank by those cuts and keeps the meshes between.
+  On the MI250X GCDs of Frontier, 120^3 elements a GCD, in the configuration of the sixth
+  series (below) with these levels, in one job on 1 to 4096 GCDs: a set-up of 0.07 s on
+  one GCD, 0.12 to 0.13 s on 8 to 512 and 0.16 s on 4096 (0.16 s, 0.28 to 0.35 s and
+  0.38 s); a forward linearized solve of 4.1 iterations on 4096 GCDs where there were 7.0,
+  in the same 0.17 s from one node on (0.18 to 0.25 s), while the adjoint ones keep their
+  7 iterations; and the operations of two Newton-CG steps in 15.0, 17.0, 17.8, 18.3 and
+  19.4 s on 1, 8, 64, 512 and 4096 GCDs where they took 15.4, 18.1, 18.9, 19.9 and 20.9 s.
+  **On 4096 GCDs (1920^3, 120 billion unknowns): 77.5 % of one GCD and 87.6 % of one node
+  instead of 73.7 and 86.7 %, 91.6 % from 64 GCDs instead of 90.4 %**; on 512 GCDs 82 and
+  93 % instead of 77.5 and 91 %.  The levels are the same on any number of ranks (the
+  gathered matrix has 729 rows on 512 GCDs and 4913 on 4096).  What still grows with the
+  ranks is the time of an iteration (24 ms for one more on one GCD, 32 ms on 4096: the
+  cycle has 38 products with an exchange between ranks, 20 of them on its two coarsest
+  meshes), the wait of an assembly for the slowest card, and the prior's preconditioner,
+  whose cycles are BoomerAMG's.  With 128^3 elements a GCD, seven cuts in two: 18.4, 20.4
+  and 21.5 s on 1, 8 and 64 GCDs instead of 19.0, 21.6 and 23.2 s, and 22.5 s on 512
+  (1024^3, 18.3 billion unknowns: 82 % of one GCD, 91 % of one node).
+  For linear elements on a conforming mesh that MFEM refines in parallel (hexahedra and
+  quadrilaterals in MFEM 4.9); a mesh that knows no coarser one keeps BoomerAMG on the
+  linear elements, with a warning.  Off by default.
+- **Every rank's own times after a benchmark** (`bench_newton_device.py --rank-table`):
+  the stages of the steps on every rank, its waits at the collectives, and two kernels
+  that each rank runs alone on its card, gathered into `OUT.ranks.json` with their spread
+  in the record.  The times a benchmark prints are rank 0's, and a rank that is done
+  waits at the next collective for the slowest one.  On 512 MI250X GCDs of Frontier the
+  element pass of a rank varies with a standard deviation of 1.2 % (9 ms of 0.74 s), the
+  slowest rank is 65 ms behind the fastest at the collective after the Jacobian's pass,
+  and the cards' own kernels are within 3 to 5 % of their medians.  It is not slow nodes:
+  the same benchmark on the eight nodes ranked fastest, on the eight slowest and on eight
+  around the median took 18.97, 18.89 and 18.95 s.  It is the cards, in their longest
+  pass: on 4096 GCDs the two GCDs of an MI250X are slow or fast together (correlation
+  0.69; four fifths of the variance between ranks is between cards), 4 % of the cards
+  are more than 2 % behind the median and the slowest 5 %, and an assembly waits 65 ms
+  for it; a card's time in that pass does not follow the two kernels timed before the run.
+- **The last levels of a hierarchy gathered, with hypre on a device** (`seq_threshold`
+  and `redundant` among the BoomerAMG options of `HIPPYMFEM_AMG`, `HIPPYMFEM_SINGLE_AMG`
+  and a solver's `amg_options`; `tools/hypre-3.2.0-seqdevice.patch`, `HYPRE_SEQ_DEVICE=1
+  tools/build_pymfem_hip.sh`; `mfemconfig.seq_on_device`, `mfemconfig.seq_solvers`).
+  `seq_threshold=n` ends a hierarchy at its first level of at most `n` rows in all, and
+  one process finishes that level, gathered.  On hundreds of ranks the last levels are a
+  few rows a rank that talk to many ranks, at four exchanges a cycle each: on 512 MI250X
+  GCDs of Frontier an iteration of CG with a linear-element hierarchy takes 7.1 ms
+  instead of 8.8 ms with `seq_threshold=30000`, and a solve of the prior 0.088 s instead
+  of 0.101 s, in the same iterations.  hypre's own code for this reads device memory
+  through host pointers and faults; the patch reads the level from a host copy, gathers
+  it, and sets a hierarchy of one process up on the device.  The first rank that holds
+  rows of the level solves it and sends the solution to the others, or, with
+  `redundant=1`, every such rank solves it and keeps its own rows.  A first version did
+  only the second, and was wrong: hypre's device coarsening draws its random numbers from
+  one generator a process, which stands wherever earlier hierarchies left it, so each
+  rank had another hierarchy of the same matrix, the ranks' solutions differed by 3 to
+  41 %, and the pieces did not fit together (CG took 78 iterations for 7 on a smooth
+  right-hand side, or stalled, where a random right-hand side showed nothing).  Now the
+  generator is set back before each rank's set-up and the solvers are compared on one
+  right-hand side; where they differ the first rank solves.  `test_device` checks that a
+  cycle with a gathered level is symmetric to rounding and solves for a smooth solution
+  in the default cycle's iterations.  A library without the patch, or with its first
+  version, is refused the option on a device with the reason.  Gathering a larger level
+  does not pay (83 000 rows: the same cycle and 0.2 to 0.6 s more a set-up, since every
+  rank receives the level's matrix).  Not a default.
+- **A fixed polynomial of multigrid cycles in place of the prior's solves, where they
+  precondition the CG of a Newton step** (`ChebyshevSolver`, `cg_preconditioner_cycles`
+  of `ReducedSpaceNewtonCG`, `prior.getHessianPreconditioner(cycles=k)`,
+  `model.Rsolver(cycles=k)`, `--cg-prec-cycles` of `bench_newton_device.py`).  The
+  preconditioner of that CG is the prior's covariance, two solves with the prior's
+  operator, which were Krylov solves stopped at 1e-6: ten to thirteen iterations each,
+  0.09 s a CG iteration on one MI250X GCD and 0.26 s on 4096, the largest loss to the
+  size that the Newton benchmark had left.  `ChebyshevSolver(krylov, k)` applies the
+  solver's multigrid cycle `k` times, each from the iterate before it (so that the
+  residual is formed inside the cycle and no product is made beside it), with the
+  coefficients of the Chebyshev iteration on the interval of the cycle's eigenvalues,
+  which it estimates once from twelve CG iterations: one linear map, symmetric and
+  positive definite, within `1 / T_k(...)` of the solve (`error_bound`), where a Krylov
+  solve stopped at a tolerance is another map for every right-hand side.  With five
+  cycles the cost functional after two Newton steps at 480^3 on 64 GCDs is the one of
+  the Krylov solves to 4e-4 (two such runs differ by 2e-4) and the prior's part of a CG
+  iteration takes 0.07 s instead of 0.16 s; with four cycles the functional is 1.3 % off
+  and with three 4 %, so the count is to be measured and not read off the bound.  Off by
+  default (`cg_preconditioner_cycles = 0`).
+- **BoomerAMG options that MFEM's class does not have, and the Newton benchmark on 1 to
+  512 GPUs of Frontier** (`HIPPYMFEM_AMG`, the solvers' `amg_options`,
+  `mfemconfig.set_boomeramg_options`).  PyMFEM passes on the settings that
+  `mfem.HypreBoomerAMG` has a method for.  The class converts to hypre's own handle of
+  the preconditioner, a shared MFEM library exports that conversion, and through the
+  handle hypre's C interface takes every option, by the names of `HIPPYMFEM_SINGLE_AMG`
+  and eight more (`mfemconfig.BOOMERAMG_SETTERS`); an MFEM library without the symbol
+  gets an error that says so.  The benchmark of the README's "How it scales"
+  (`bench_newton_device.py`, two Newton-CG steps) ran on OLCF Frontier with one 64^3
+  block of elements on each MI250X GCD, from 64^3 on one to 512^3 on 512 (2.29 billion
+  unknowns, 64 nodes): 8.6 s on one and 14.3 s on 512 with MFEM's settings.
+  `HIPPYMFEM_AMG=relax_wt=1.8,pmax=6` (l1-Jacobi with a weight, which stays positive
+  definite for any weight below two, and six interpolation entries a row) keeps an
+  incremental solve at 17 iterations from one GCD to 512, where MFEM's settings take 26
+  to 31: 7.3 s and 10.8 s.  With a parameter three times as large it took 22 iterations
+  at 64^3 against 32, where plain Jacobi (`HIPPYMFEM_AMG_RELAX=7`) stopped after 10.  The
+  two steps are not the same work at every size (3 to 11 forward solves, 6 to 12 CG
+  iterations); with every size charged for the operations of the 64^3 run at its own cost
+  of each, 512 GCDs keep 48 % of one GCD's rate with MFEM's settings and 54 % with these
+  (71 and 76 % of one node's), and 256 GCDs with two blocks each 61 and 66 %.  What is
+  lost is in the BoomerAMG hierarchy: it gains a level with every eightfold size, and a
+  level below the third costs 0.4 to 0.6 ms a cycle on several GCDs whatever its size,
+  against a few hundredths on one, where it has no exchange (4.6 ms of a cycle of 12.8 ms
+  at 512^3, 0.9 of 7.3 ms at 64^3); the element kernels take the same time at every size.
+  Not the default.
+- **Spaces of more than 2 147 483 647 unknowns** (`HYPRE_MIXEDINT=1
+  tools/build_pymfem_hip.sh`, `parvector._HYPRE_BIGINT`).  hypre numbers the unknowns of a
+  space with `HYPRE_BigInt`, 32 bits wide as PyMFEM and the HIP script build it, and MFEM
+  stops at the first space whose dofs, summed over the ranks, pass that range: 640^3 quadratic
+  hexahedra.  The script now builds hypre `--enable-mixedint` on request (64-bit indices of a
+  space, 32-bit ones within a rank) and has SWIG write PyMFEM's wrappers again from the
+  headers of that build (with `-DHYPRE_MIXEDINT`: SWIG reads `HYPRE_utilities.h`, where the
+  types are chosen, and not the `HYPRE_config.h` it includes, and wrappers written without
+  it compile and convert a global size as an `int`).  The library had one integer type for a
+  rank's indices and a space's (`_HYPRE_INT`); global columns, partitions and column maps now
+  take `_HYPRE_BIGINT`, the arrays that MFEM wants as `HYPRE_BigInt *` come from
+  `parvector.bigint_array`, `scipy_to_hypre` builds its matrix itself where the widths differ
+  (PyMFEM's helper sizes every array as `HYPRE_Int`), and `hypre_to_scipy` refuses a matrix
+  of more columns than MFEM's `SparseMatrix` can index.  Every suite passes on a build of
+  either kind (`test_solvers` has the two widths and the round trip), and at the sizes both
+  can run (1 to 256 MI250X GCDs with four 64^3 blocks each) the two gave the same cost
+  functional to seven digits, the same Newton and CG counts and times within 1.3 %.
+  The Newton benchmark with four 64^3 blocks of elements a GCD then ran on Frontier at 816^3
+  on 512 MI250X GCDs (4.35 billion state unknowns) and at 1024^3 on 1024 (8.6 billion, 18.3
+  billion with the adjoint and the parameter): two Newton-CG steps in 33.0 s with
+  `HIPPYMFEM_AMG=relax_wt=1.8,pmax=6` and the patched staging, 34.8 s with hypre's own
+  staging, 44.3 s with the library's settings (35 iterations a linearized solve instead of
+  19).  Charged for the same operations, 128 nodes keep 90 % of the rate of one node and
+  76 % of one GCD's (81 and 65 % with the library's settings).
+  With the two hypre patches and the index tables of the next entries, 120^3 elements a GCD
+  (14 million state unknowns, the most that the eight ranks of a node hold) ran from one GCD
+  to 1920^3 on 4096, 512 nodes: 56.7 billion state unknowns, 7.1 billion of the parameter,
+  itself past the 32-bit range, and 120.4 billion in all.  Two Newton-CG steps took 66.0 s
+  (4 forward and 2 adjoint solves, 8 CG iterations), a forward solve 9.1 s with a BoomerAMG
+  setup of 2.7 s, and a linearized solve 20 iterations where one GCD takes 17.  Charged for
+  the same operations, 512 nodes keep 88 % of the rate of one node and 76 % of one GCD's.
+- **The index tables of an assembly in half the host memory** (`fem.pattern.LEAN`,
+  `HIPPYMFEM_PATTERN_LEAN`, on).  A rank held 12.5 GB of host memory for every 262 144
+  quadratic hexahedra, two thirds of it index tables: 50 GiB at the peak of their builds
+  for a million elements, so that the eight ranks of a node with 512 GB could not take
+  more.  The graph of a block and the slot of every element-matrix entry now come from the
+  two dof tables of its element group (`patternbuild.build_tables`: the flat row and column
+  of every entry, 16 bytes each, are not formed); the true-dof graph is laid out one row at
+  a time from the rank's own row and the entries that arrived for it
+  (`patternbuild.tdof_graph`: the global row and column of every nonzero, their sorted
+  copies and the permutations between them are not formed, and the slot of a nonzero is
+  kept in 32 bits below two billion); the compact scatter map is made in slabs; and a map
+  with one entry per element-matrix entry is given up when what is made from it exists, the
+  ldof pattern's once its true-dof target has its own and the target's once the compact map
+  is made (`ScatterPattern.release_slot`; a map given up is made again when asked for).
+  Every array is the same (`test_assembly` compares them on 1 to 8 ranks, with the maps
+  given up and made again), and two Newton-CG steps give the same cost functional and
+  counts.  With a million elements a rank the peak is 28 GiB instead of 50 and the tables
+  13 GiB instead of 30; the Jacobian's pattern is built in 11 s instead of 15 s and its
+  true-dof layout in 5 s instead of 14 s.  1.7 million elements a rank (120^3) take 41 to
+  43 GiB, on one GCD as on 4096.  `HIPPYMFEM_PATTERN_LEAN=0` builds and keeps the tables as
+  before.
+- **`tools/hypre-3.2.0-staging.patch`** (`HYPRE_PINNED_STAGING=1
+  tools/build_pymfem_hip.sh`): for the hypre of the HIP build, the page-locked staging
+  buffers of the 2.32.0 patch and a staged exchange that starts before the product with
+  the local block instead of after it, so that the copy to the host and the sends overlap
+  with that kernel.  An iteration at 128^3 on 8 MI250X GCDs takes 9.9 ms instead of
+  11.2 ms (10.7 with the buffers alone, 10.6 with the early start alone), and the two
+  steps at 512^3 on 512 take 10.0 s instead of 10.8 s: 59 % of one GCD's rate, 77 % of
+  one node's, and 71 % with two blocks a GCD on 256.  `HYPRE_STAGE_PINNED=0` and
+  `HYPRE_STAGE_EARLY=0` in the environment of a run switch either off.  The suites pass
+  with the patched library preloaded.
+- **`tools/hypre-3.2.0-spgemm.patch`** (`HYPRE_SORTED_SPGEMM=1 tools/build_pymfem_hip.sh`):
+  the sparse products of a BoomerAMG setup on AMD cards without their sorts.  hypre hands
+  rocSPARSE both operands of a product with their rows in ascending order, and gets there
+  by copying each operand and sorting the copy, with a permutation and a second copy of the
+  values beside it, before every product.  Most operands of a setup are sorted as they come
+  (a transpose, the result of the product before), and the fine matrix is sorted but for
+  the diagonal entry that hypre keeps first in each row.  The patch checks the rows of an
+  operand in one pass and takes a sorted one as it is, writes the sorted copy of a matrix
+  with only its first entries out of place in one pass (a warp a row; a first attempt with
+  a thread a row was slower than rocSPARSE's sort), writes the matrix that joins a diagonal
+  block with its off-processor one in order in the first place, and sorts the rows a rank
+  receives before it stacks them under its own.  Any other matrix is copied and sorted as
+  before.  It saves those copies and sorts and the memory they took: in two Newton-CG steps
+  with 8.6 million state unknowns a GCD the hypre of one rank took 163 to 311 GiB from the
+  driver and now takes 91 to 165 GiB.  A setup at that size takes 0.81 s instead of 1.53 s
+  on one GCD and 1.04 to 1.17 s instead of 2.31 to 2.52 s on two to eight; a forward solve
+  4.49 s instead of 5.37 s and 5.12 s instead of 6.45 s; hypre's device memory peaks at
+  13 GiB instead of 23 on one GCD and at 15 instead of 31 on several; the cost functional
+  is the same to nine digits and the CG counts are the same.  The series with four 64^3
+  blocks a GCD, 102^3 on one GCD to 1024^3 on 1024, takes 6 to 15 % less time with it as
+  measured (two steps at 1024^3 in 30.2 s instead of 33.0 s) and 9.5 to 14 % less charged
+  for the same operations at every size; 1024 GCDs then keep 78 % of one GCD's rate instead
+  of 76 %, and 88 % of one node's instead of 90 %, since a setup lost 0.7 s on one GCD and
+  1.1 to 1.4 s on any more, on one node as on 128.  With hypre at half its memory that load
+  no longer needs JAX held to a fifth of the card and the linearization released: with the
+  library's own share the operations charged take 27 s on one GCD and 32 s on eight, where
+  they took 44 and 51 s.  `HYPRE_SPGEMM_SKIP_SORT=0` in the environment of a run has hypre
+  copy and sort every operand again (`1` leaves out the one-pass copy and the ordered join,
+  `2` the join).  Every suite passes on a build with it.
+- **hypre's device memory pool on AMD cards** (`hipMalloc`; worth 0 to 2 % of two Newton
+  steps on up to 32 MI250X.  `HyprePool` now counts the driver's time and bytes,
+  `driver_seconds` and `driver_bytes`, and the card's least free memory, `min_free`, and
+  the Newton benchmark records them for each stage: the driver's time is nearly all in
+  giving blocks back, half of it the wait for kernels still running, and a pool of 24 GiB
+  that keeps the large blocks takes it from 0.26 to 0.10 s a forward solve and the solve
+  from 4.36 to 4.28 s), the MPI library's own answer about device memory on a HIP build
+  (`MPIX_Query_hip_support`), and `HIPPYMFEM_GPU_AWARE_MPI=0|1`, which sets hypre's
+  GPU-aware exchange whatever the library was built with.  `=solve` (experimental) turns it
+  on only inside Krylov solves on a hierarchy that is set up, since a setup's exchanges
+  each cost Cray MPICH a registration.  With Cray MPICH 9.1.0 it takes 10 to 20 % off an
+  iteration and deadlocks or faults every time at 320^3 on 128 and at 400^3 on 256 GCDs, so
+  nothing above uses it.
+- **Benchmarks.**  `bench_newton_device.py --coarse`, `--amg`, `--prior-amg`, and in its
+  record the calls and the seconds of every solver and stage of the two steps, which is
+  what the charging above reads; `--single-refine-goal` and `--single-give-up`; the
+  precision of a run, whether
+  its solves were in the single-precision hypre, JAX's share of the card and what its
+  allocator held at the most; and the norms of the state, the adjoint, the gradient and
+  one reduced-Hessian action at the prior mean, which two runs of a problem agree on
+  whatever their precision (the cost functional after two steps is not such a number: a
+  line search that backtracks takes another path for a direction that differs in a late
+  digit).  `bench_scaling.py --coarse`, `--m-scale`, `--amg`, and `--profile-vcycle`, a
+  V-cycle on hierarchies cut at 1, 2, ... levels.
 - **The geothermal application builds its mesh in parallel** (`model.cube_mesh`,
   `run.py --coarse`).  Every rank used to build and partition the whole mesh: 635 bytes
   an element while METIS partitions it, which is 42 s and 10 GB a rank at 256^3 on 32
@@ -40,6 +342,205 @@
   grid, for the large picture.  `movie.py` needs neither MFEM nor JAX; it was run with
   PyVista 0.46 on a GPU and with PyVista 0.49 and the software renderer of `vtk-osmesa`
   9.3 on a node without one, and it takes ffmpeg from the path or from `imageio-ffmpeg`.
+- **The geometry of an affine element group once an element** (`HIPPYMFEM_AFFINE_GEOMETRY=1`,
+  `hm.config.affine_geometry`, `fem.elementbatch.AFFINE_GEOMETRY`; off by default).  A
+  kernel reads the inverse Jacobians at every quadrature point, 4.6 kB an element with 64
+  points, and a group too large to keep them on the card streams them to it with every
+  chunk of every pass: with 1.7 million quadratic hexahedra on an MI250X that stream was
+  four fifths of a residual (0.46 s, 0.09 s with the geometry on the card), and the eight
+  ranks of a node, streaming at once, were 5 to 33 % slower in their element passes than a
+  rank alone.  Where every element of a group is mapped affinely (straight simplices,
+  parallelepipeds) the inverse Jacobian is one an element: `ElementGroup` keeps it as
+  `(ne, 1, dim, sdim)` (the mean over the points, which agree to 1e-12; `group.affine`,
+  `group.full_Jinv()`), the evaluators apply the one matrix, and an affine group keeps on
+  the card what is small (the inverse Jacobians and the weights, 1.0 GB there instead of
+  11.5 GB) and leaves the coordinates on the host for the kernels that read them
+  (`GroupKernel._kept_on_device`).  On eight MI250X in double precision two Newton-CG
+  steps of the benchmark take 59.8 s instead of 72.2 s and a rank holds 34.5 GiB of host
+  memory instead of 41.9 GiB; in the mixed mode, with the freed card given to JAX
+  (`HIPPYMFEM_GPU_MEM_FRACTION=0.45`), their operations take 34.4 s on eight GCDs and
+  29.2 s on one, where the series to 4096 GCDs of the same morning took 73.6 and 62.9 s.
+  Eight 64^3 blocks a GCD then run on a node in 39 s for two steps with 11 GiB of a card
+  left.  The element arrays change at round-off (the state's norm in the twelfth digit),
+  which is why it is opt-in; every suite passes with it on (`test_kernels` compares the
+  two forms by either route to the second derivatives and in the mixed precision, and
+  that a curved group keeps a Jacobian a point).
+- **The single-precision solves on AMD cards, and with 64-bit global indices**
+  (`algorithms.singlesolve`, `tools/build_hypre_single.sh <prefix of build_pymfem_hip.sh>
+  <directory>`).  The library refused a single-precision hypre on a HIP build, its build
+  script knew PyMFEM's CMake build of hypre only, and its matrices had 32-bit global
+  indices.  The script now also takes the prefix of the HIP stack: it copies that stack's
+  hypre source, patches and all, configures the copy with the options the installed build
+  recorded and `--enable-single`, and links it `-Bsymbolic` under a soname of its own.
+  `singlesolve` reads the width of `HYPRE_BigInt` from the offsets file and passes global
+  sizes, partitions and column maps in it (a library with 32-bit global indices refuses a
+  matrix of more than 2 147 483 647 rows), sets the host policy in a GPU build that runs
+  under MFEM on the host, and gives a hierarchy the solver's `amg_options`
+  (`HIPPYMFEM_AMG`) before `HIPPYMFEM_SINGLE_AMG`, by one table of names
+  (`mfemconfig.BOOMERAMG_SETTERS`).  Every suite passes with the library named on HIP
+  stacks of both index widths, on eight ranks too, which two checks had to learn: the
+  chunk that `single_case` forces is now smaller than a rank's elements (125 of them on
+  eight ranks did not split at 128), and the eigen-residual of `test_uq`'s
+  posterior-preconditioned pairs has the tolerance of an action under single-precision
+  solves (1.9e-6 on eight ranks, 7e-11 in double precision).  On the MI250X of Frontier at 120^3
+  quadratic hexahedra a GCD (14 million state unknowns, incremental solves to 1e-5 in both
+  precisions): an iteration of a linearized solve 47 ms instead of 61 ms on eight GCDs, a
+  BoomerAMG setup 1.7 s instead of 2.4 s, 16.6 GiB of a card free at its fullest instead
+  of 7.3 GiB; the state, the adjoint and the gradient within 4e-10 of double precision.
+  A refined forward or adjoint solve takes two more residuals from the element kernels, so
+  with the same settings two Newton-CG steps take as long as in double precision; with the
+  freed memory given to JAX (`HIPPYMFEM_GPU_MEM_FRACTION=0.35`) their operations take
+  49.7 s on eight GCDs instead of 62.0 s and 43.7 s on one instead of 54.4 s (45.8 s on
+  eight with `HIPPYMFEM_AD_WORKING_SET=8`, the size of the matrices' tangents in that mode,
+  which the chunk planner does not assume by itself).  Eight 64^3
+  blocks a GCD, which a node does not hold in double precision, fit: 256^3 on eight GCDs
+  (287 million unknowns) in 57 s for two steps.  The library is to be named together with
+  `HIPPYMFEM_PRECISION=mixed`: from double-precision element matrices the Jacobian is not
+  corrected on the constants, and the cost functional after two steps at 102^3 was 1.6 %
+  off where the mixed mode was 3e-4 off.  In the mixed mode with the compact geometry of
+  an affine mesh (the entry above) the benchmark's operations take half the time of the
+  double-precision series at every size from 1 to 512 GCDs (41.1 s instead of 80.9 s at
+  960^3, 15.1 billion unknowns), with a lower ratio to one GCD, 71 % instead of 79 %:
+  both series lose the same 6.7 s from one node to 64, in the solver.
+- **A p-multigrid in the Jacobian's single-precision solves** (`HIPPYMFEM_PMG=1`, the
+  solvers' parameter `pmg`, `hm.config.pmg`; `algorithms.singlesolve.PMGEngine` and
+  `PTransfer`, `fem.ptransfer.interpolation`; off by default).  BoomerAMG on the matrix of
+  quadratic elements coarsens it, builds an interpolation for it and forms the Galerkin
+  product: a third of a forward solve at a new parameter.  The linear elements of the same
+  mesh are a coarse space that needs none of that: their interpolation `P` to the state
+  space follows from the two spaces, `P^T A P` is the matrix of the same form on them (an
+  eighth of the rows, a twentieth of the entries; the identity on the essential dofs), and
+  BoomerAMG is set up on it.  An application relaxes on the Jacobian as the finest level
+  of BoomerAMG would (l1-Jacobi with the weight `relax_wt`, Jacobi with `relax=7`), takes
+  one V-cycle of that hierarchy on the restricted residual, and relaxes again; the steps
+  are calls of the library from Python inside hypre's PCG.  The product `A P`, which the
+  Galerkin product passes through, is kept (`singlesolve.PMG_KEEP_AP`,
+  `HIPPYMFEM_PMG_KEEP_AP=0` to give its 2 bytes a matrix entry back): the residual after
+  the coarse correction is `t - (A P) e`, a product with a quarter of the matrix's entries
+  in place of the third product with the matrix that an iteration would make.  On the
+  MI250X of Frontier at 14 million state unknowns a GCD: the same six or seven iterations
+  to 1e-5 as BoomerAMG at every parameter of two Newton-CG steps, each 31 ms instead of
+  43 ms on one GCD and 34 instead of 48 ms on eight (40 and 44 ms without the kept
+  product); a set-up of 0.39 s instead of 1.18 s and of 0.67 s instead of 1.60 s; the two
+  steps' operations in 21.8 s instead of 29.4 s on one GCD and 26.3 s instead of 34.4 s
+  on eight, with the state, the adjoint and the gradient at the prior mean within 6e-11
+  and 2.3 GiB less of a card held by hypre.  To 512 GCDs (960^3, 15.1 billion unknowns),
+  measured before the product was kept, the operations took 15 to 19 % less time at every
+  size, 35.1 s instead of 41.1 s there, with the ratio to one GCD where it was (69 %; 72 %
+  with BoomerAMG on the matrix).  `interpolation` is for the
+  nodal H1 spaces of order two or more on a conforming mesh, hexahedra, tetrahedra,
+  quadrilaterals and triangles (`single_case` checks that it carries a linear function to
+  itself for orders two and three, that the coarse matrix is the Jacobian of the form on
+  the linear elements, and that the forward solve and Newton-CG give the state and the
+  MAP point of double precision); a problem whose state space allows none keeps
+  BoomerAMG, with a warning.  The hierarchy's settings are in one function for both
+  engines (`singlesolve._boomeramg`).  Tried beside it and not kept: the hierarchy of a
+  linearization point as the preconditioner of the trial points of its line search,
+  which failed at every one of fourteen (the parameter moves by 1 to 54 in the maximum
+  norm; 200 iterations, or a preconditioner that is no longer positive definite).
+- **The products of a p-multigrid from the Jacobian's element matrices**
+  (`singlesolve.PMG_ELEMENT_PRODUCTS`, on; `HIPPYMFEM_PMG_ELEMENT_PRODUCTS=0`;
+  `PDEVariationalProblem._jacobian_with_products`, `fem.csrassemble.scatter_derived`).
+  `A P` and `P^T A P` are sums over the elements of `A_e P_e` and `P_e^T A_e P_e`, with
+  the interpolation `P_e` of one element (27 by 8 for a quadratic hexahedron).  For a
+  scalar state on a domain term the pass that assembles the Jacobian scatters the three
+  matrices, each into its own pattern, with the essential dofs eliminated alike, and the
+  engine takes the two products with the matrix instead of asking hypre for them.  They
+  are the matrices hypre's products give (`single_case` compares the two engines and the
+  products on a vector).  On the MI250X of Frontier at 14 million state unknowns a GCD an
+  assembly takes 0.10 s more on one GCD and 0.16 s more on eight, a set-up 0.18 s
+  instead of 0.39 s and 0.29 s instead of 0.68 s (0.42 s on 4096 GCDs, where hypre's
+  products made it 0.80 s), and two Newton-CG steps 3 to 4 % less.
+- **The sums of the rows of a single-precision Jacobian** (`HIPPYMFEM_SINGLE_ROW_SUMS=1`,
+  `fem.tdofassemble.SINGLE_ROW_SUMS`, off by default;
+  `algorithms.singlesolve.RowDefect`, `_Library.pcg`).  The element matrices of the mixed
+  precision are exact on the constants, but the matrix of the single-precision library
+  rounds every entry to 24 bits and the sum of a row is off again, by about 3e-8 of its
+  diagonal.  On a mesh of like elements with a constant coefficient every like row is
+  rounded alike, the matrix has a term of order zero with one sign over the domain, and a
+  solve with it is off, relative to a smooth solution, by the rounding unit times the
+  square of the number of nodes across the domain: about 7e-3 at 240^3 second-order
+  hexahedra, and of order one half at 1920^3.  The refined solves remove it at a price
+  that grows with the mesh (3 passes up to 240^3, 4.3 on average at 1920^3 on 4096 GCDs
+  of Frontier), the incremental solves of a Hessian action keep it, and two Newton-CG
+  steps from a constant prior mean ended at 0.5 to 1.7 times the cost that double
+  precision reaches.  With the switch on the Jacobian is accumulated in double precision,
+  what the rounding takes from each row's sum is kept as a vector of the library (the
+  rounding residuals put in the matrix, multiplied by ones, and the values written
+  after), and hypre's PCG is built on its table of functions for a parallel matrix with
+  the product replaced by one that adds that vector times the argument.  Measured: the
+  residual after a refinement's second pass at the prior mean from 2.1e-9 of the first to
+  1e-10 at 240^3 (to the solver's own limit; a sample of the prior was there already);
+  three passes at every size to 1920^3, and the cost of double precision after two steps
+  to within about 2 % at every size (579.22 against 579.35 at 1920^3, 120 billion unknowns,
+  where the run without it had 972).  It costs 0.1 s an assembly at 14 million unknowns
+  a card: the accumulator in double precision for the duration of the assembly, two
+  passes over it and one product.  `bench_newton_device.py` records the switch, the
+  passes of its two stage solves (`stage_passes`), the route of the element Hessians and
+  whether the p-multigrid's products came from the element matrices.
+  On an MI250X a conversion to single precision and back inside one compiled program is
+  taken for the identity (`x - x.astype(float32).astype(float64)` is zero there): the
+  rounding residual is computed in two programs.
+- **A matrix of the single-precision library from a double-precision device
+  accumulator is rounded a piece at a time** (`singlesolve._put_single`, `PIECE`), where
+  one expression copied the accumulator and its rounded values whole, and its range is
+  checked a piece at a time (`_all_single`).
+- **A prior with a lumped mass matrix** (`BiLaplacianPrior(lumped_mass=True)`,
+  `SqrtPrecisionPDE_Prior`; `fem.elementbatch.VERTEX_RULE`, `integration_rule`; off by
+  default).  `R = A M^-1 A` solves with the mass matrix at every product, which the
+  cost, the gradient and each Hessian action take: 61 to 70 CG iterations with the
+  consistent mass of first-order hexahedra, 50 to 80 ms on an MI250X at 1.8 million
+  parameter unknowns, as much as a solve with `R` to 1e-9.  With the option the mass
+  matrix is integrated by the rule at the vertices of an element, which makes it diagonal
+  (the sums of the rows of the consistent one on affine elements: the lumped mass of the
+  SPDE approach of Lindgren, Rue and Lindstrom), its solve is one iteration, and the
+  square root that samples are drawn with is by the same rule, so that `R^-1` is their
+  covariance exactly.  Another discretization of the same prior, with another matrix
+  `R`; for a parameter space of first order on a mesh of one kind of element
+  (`test_modeling.test_lumped_mass_prior`, hexahedra and tetrahedra, on one, two and
+  eight ranks).  `bench_newton_device.py --prior-lumped-mass`: the operations of two
+  Newton-CG steps on Frontier in 18.3 s instead of 19.4 s on one MI250X, 22.2 s instead
+  of 22.5 s on eight, 23.9 s instead of 24.9 s on 64 and 25.7 s instead of 26.5 s on 512
+  (960^3 elements, the two run side by side).
+- **The rows of other ranks leave a device assembly by messages to the neighbours**
+  (`fem.tdofassemble.DEVICE_EXCHANGE`, `HIPPYMFEM_DEVICE_EXCHANGE`: `neighbors`, the
+  default, or `alltoallv`; `TrueDofPattern._exchange_messages`,
+  `devicebridge.copy_to_host`).  The entries an assembly computes for rows that another
+  rank owns went from the device through a slice and a fresh host array into one
+  `Alltoallv` in double precision, and back through a fresh array.  They now go from the
+  accumulator's own memory into a page-locked buffer that the pattern keeps, to each
+  owner in a message of its own, and back from a second kept buffer, in the
+  accumulator's precision.  On 64 MI250X of Frontier with 14 million quadratic-hexahedron
+  unknowns a rank (66 MB to send for the Jacobian) the exchange of the Jacobian and of
+  the two products of its p-multigrid takes 18 ms instead of 166 ms an assembly, and the
+  operations of two Newton-CG steps 24.9 s instead of 26.4 s (22.5 instead of 23.1 s on
+  eight; the same on one).  On 4096 MI250X (1920^3 elements, 120.4 billion unknowns) they
+  take 29.2 s instead of 31.2 s, a forward solve at a new parameter 2.75 s instead of
+  3.17 s, and the two steps 23.6 s: 66 % of the rate of one MI250X and 77 % of that of
+  one node, where the series before it kept 62 and 74 %.  The ranks of a pattern agree
+  on the way when it is made (`TrueDofPattern.messages`: messages where every rank
+  finishes its matrices on the device, the collective otherwise, as on the host), and
+  both ways are open to a host and to a device accumulator: in an assembly over
+  elements that some ranks do not have, such as a boundary's, those ranks hold host
+  accumulators beside the others' device ones.  A message carries its sender's
+  precision, which the receiver reads from its length
+  (`test_device.test_exchange_routes_agree`, `test_exchange_of_mixed_accumulators`).
+- **The true-dof maps of a space are kept** (`fem.tdofassemble._tdof_maps`): every pattern
+  of a problem asked for those of the same two or three spaces again, on a device by one
+  SWIG call a dof, ten seconds for fourteen million dofs.
+- **A forward solve that single precision cannot carry may raise instead of going to
+  double precision** (`PDEVariationalProblem.SINGLE_GIVE_UP = "raise"`; `"double"`, the
+  default, is the behaviour so far; `bench_newton_device.py --single-give-up`).  The
+  fallback assembles the Jacobian in double precision and builds its hierarchy beside the
+  single-precision ones, three times their size on the card, and a problem sized for the
+  mixed mode may not have that room: with 1.7 million quadratic hexahedra a rank on a
+  64 GiB MI250X (600^3 on 128 GCDs) a trial point of a line search at which the
+  single-precision solver gave up ended the run out of device memory.  With `"raise"`
+  the forward solve raises a `RuntimeError`, on every rank, which the line searches take
+  for a failed trial and answer by backtracking; the same run then finished with one
+  trial refused.  An adjoint solve is at a point the line search accepted and goes to
+  double precision either way.  `single_case` (in `test_solvers` and `test_device`)
+  checks both ways out on a preconditioner made indefinite.
 - **Single precision** in three places, none of which changes the state, the gradient or
   the MAP point (`docs/source/guide/gpu.rst`, "Single precision").
   `HIPPYMFEM_PRECISION=mixed` computes the element matrices in single precision, corrects
@@ -140,6 +641,69 @@
 
 ### Changed
 
+- **The reductions and gathers of the Newton steps are MPI's own** (`parvector.allreduce`,
+  `Layout.of_range`, `ParVector.offsets`; `singlesolve._Library.check` and `agree`;
+  `linSolvers`, `PDEVariationalProblem`, `fem.assemble`).  mpi4py's `allreduce` and
+  `allgather` pickle what they send, a tree of messages up and down and one object a
+  rank: 79 µs a reduction and 289 µs a gather on 512 ranks where MPI's own on a buffer
+  take 34 and 65 µs.  Two Newton-CG steps made some 450 of them: every inner product and
+  norm of a `ParVector`, the check after every call of the single-precision library that
+  each rank's succeeded, an agreement on a failure at every single-precision solve, and a
+  gather of every rank's size for each vector made without a layout.  They are now
+  reductions on buffers; a vector made for a matrix takes its layout from the matrix's
+  row range without a message (the offsets of all ranks are gathered when something
+  reads them); and an agreement reduces one flag and gathers the messages only when a
+  rank has failed.  On 4096 ranks a pickled gather takes 1.64 ms where MPI's own takes
+  0.13 ms, and the pickled calls of two steps came to 0.11 s.
+- **The vectors of a Newton step stay on the device** (`CGSolverSteihaug._solve`,
+  `ChebyshevSolver.solve`, `PDEVariationalProblem.solveIncremental`).  A `ParVector`'s
+  arithmetic runs where the vector was last used: on the device once it has been handed
+  to MFEM or hypre, on the host until then, where every operand that is current on the
+  device is first copied back.  The CG of a Newton step never handed its iterate to
+  MFEM, and its residual only through the preconditioner; the polynomial preconditioner
+  of the entry above copied that residual instead of passing it on, so with it every
+  update and inner product of the reorthogonalization ran on the host (42 inner
+  products at 2.5 ms and 42 updates at 2.2 ms in two steps on eight MI250X GCDs, where
+  the same on the device take 0.1 ms; `tools/trace_vectors.py`, run around a script,
+  lists every vector operation of the Newton steps by where it ran and who called it).
+  Host arithmetic has a long tail over the ranks of a large run: what the CG did besides
+  the Hessian and the preconditioner was 26 ms an iteration on one GCD and 87 ms on
+  4096.  The CG now hands its six vectors to MFEM when it starts, the polynomial its
+  right-hand side, and the incremental solve its output before it is zeroed (27 ms for a
+  host vector of 14 million unknowns, and an upload); two parameter vectors are compared
+  by the Euclidean norm of their difference, which is reduced on the device.  Nothing
+  changes without a device.  With the polynomial's cycles applied from the iterate, the
+  charged operations of the Newton benchmark went from 16.7, 19.6, 20.4 and 21.6 s to
+  16.0, 18.9, 19.9 and 20.9 s on 1, 8, 64 and 512 GCDs, with the same cost functional.
+- **One cycle and one product less in every single-precision solve with the p-multigrid**
+  (`PMGEngine`, `RowDefect.zero_guess`).  hypre's PCG applies the preconditioner to the
+  right-hand side, for the norm that it stops on, then forms the residual of its guess
+  with a product, then applies the preconditioner to that residual.  An engine's guess
+  is zero, so the residual is the right-hand side and the second application repeats the
+  first: 15 ms for the cycle and 9 ms for the product at 14 million unknowns on an
+  MI250X, of a solve of 230 ms, in each of the 32 solves that two Newton-CG steps charge.
+  The engine now keeps the first cycle's result for the second, and the product that a
+  matrix with its row sums kept brings to the PCG returns at once for a zero guess.  The
+  iterates are the same to the last bit.  The benchmark's operations: 15.2, 18.2, 18.9
+  and 19.8 s on 1, 8, 64 and 512 GCDs.  The series in that tree, with the gathered
+  levels and the polynomial preconditioner of the two entries above: 15.4 s on one GCD
+  and **20.9 s on 4096, at 1920^3 elements and 120.4 billion unknowns, where two
+  Newton-CG steps take 16.4 s** (24.6 s and 19.8 s in the series before those two
+  entries, 84.4 s and 66.0 s in double precision): 74 % of the rate of one GCD and 87 %
+  of that of one node (68 and 82 % before; 76 and 88 % in double precision), with 5.5 s
+  lost between one GCD and 4096 where there were 7.9 s, and 20.3 s in double precision.
+- **Element vectors run in larger chunks** (`fem.kernel.AD_VECTOR_TANGENTS`,
+  `HIPPYMFEM_AD_VECTOR_TANGENTS`, 8).  The planner sized every chunk for the element
+  matrices, which carry a tangent for every dof of every variable: 508 kB an element with
+  quadratic hexahedra.  A residual or a gradient is one reverse sweep and was measured at
+  16 kB an element, so with the card shared with hypre it ran in hundreds of launches of
+  1.5 ms each.  A vector is now planned for eight tangents (a margin of four on that
+  measurement, never more than the matrices' plan, and with the same retry when an
+  estimate is too small).  With 1.7 million quadratic hexahedra on an MI250X and a quarter
+  of the card for JAX a residual takes 0.47 s instead of 0.70 s and a gradient 0.56 s
+  instead of 1.02 s, and the operations of two Newton-CG steps 5 to 7 % less, in double
+  precision and in the mixed mode alike; the results are those of the smaller chunks to
+  round-off.  `0` plans a vector as a matrix, as before.
 - **The measurements quoted in the README and in the GPU guide are those of 5 October 2026**,
   taken with the library as it is now (hypre's own PCG, the orthogonalized CG of a Newton
   step, the compact scatter map). Two Newton-CG steps of the benchmark take 10.9 s at 64^3
@@ -341,6 +905,21 @@
 
 ### Fixed
 
+- **`set_hessian_mode` also drops the consistent blocks of the mixed precision**
+  (`fem.kernel`): a Jacobian compiled by one route kept that route when the mode was
+  changed afterwards, since the block that is exact on the constants is cached under a key
+  of its own.
+- **The column indices that single-precision matrices share are freed once, whatever the
+  order of the finalizers** (`singlesolve._SharedColumns`).  Every matrix of a pattern in
+  the single-precision hypre borrows the pattern's one copy of its column indices and
+  takes the pointers out of its blocks before hypre destroys it.  At the end of a process,
+  or of a reference cycle, Python finalizes a group of objects in no particular order:
+  where the shared copy went first, it freed the arrays, and hypre freed them again with
+  a matrix that still had their pointers.  `test_gpu` with the library named ended that
+  way on two and on eight ranks of a HIP build, after its last check ("double free or
+  corruption", "corrupted size vs. prev_size while consolidating").  A matrix now says
+  when it takes the arrays and when it has let go of them, and they are freed when
+  nothing refers to the shared copy *and* no matrix holds them.
 - **A single-precision solve that hypre's PCG abandons is no longer taken for converged.**
   A solve counted as converged when it had used fewer than `max_iter` iterations. With a
   preconditioner that is not positive definite hypre's PCG stops after two or three

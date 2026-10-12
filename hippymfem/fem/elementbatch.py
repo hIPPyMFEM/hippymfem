@@ -43,6 +43,31 @@ from .spaces import as_space
 KEEP_GEOMETRIC_FACTORS = os.environ.get(
     "HIPPYMFEM_KEEP_GEOMETRIC_FACTORS", "0").lower() in ("1", "yes", "true", "on")
 
+#: Keep the inverse Jacobians of a group once an element instead of once a quadrature
+#: point where every element of the group is mapped affinely (straight simplices,
+#: parallelepipeds: any uniformly refined box).  ``Jinv`` then has the shape
+#: ``(ne, 1, dim, sdim)`` and the kernels apply the one matrix at every point
+#: (:func:`hippymfem.fem.kernel._eval_field`).  With 64 points that is 72 bytes an
+#: element instead of 4.6 kB: 0.12 GB instead of 8 GB for 1.7 million hexahedra, on the
+#: host and in every pass of an element kernel.  A group of that size streams its
+#: geometry to the card with every chunk (``kernel.GEOMETRY_STREAM_FRACTION``), and the
+#: stream was four fifths of a residual; of an affine group the inverse Jacobians and
+#: the weights then stay on the card and only the coordinates are left on the host, for
+#: the kernels that read them (:meth:`hippymfem.fem.kernel.GroupKernel._kept_on_device`).
+#: On eight MI250X with 1.7 million quadratic hexahedra each, in double precision, a
+#: residual takes 0.10 s instead of 0.49 s and two Newton-CG steps of the README's
+#: benchmark 59.8 s instead of 72.2 s; a rank holds 34.5 GiB of host memory instead of
+#: 41.9 GiB.  The inverse Jacobian kept is the mean over the points, which differ in
+#: their last digits where the map is affine, so the element arrays change at
+#: round-off: that is why it is not the default.  Set ``HIPPYMFEM_AFFINE_GEOMETRY=1``
+#: (for the batches built afterwards).
+AFFINE_GEOMETRY = os.environ.get(
+    "HIPPYMFEM_AFFINE_GEOMETRY", "0").lower() in ("1", "yes", "true", "on")
+
+#: How far the inverse Jacobians of an element may differ between its quadrature
+#: points, relative to their largest entry, for its map to count as affine.
+AFFINE_TOL = 1e-12
+
 #: MFEM sizes the vectors of ``GetGeometricFactors`` with an ``int``: the Jacobians
 #: are ``nq * sdim * dim * NE``, which passes 2^31 at four million hexahedra and 64
 #: quadrature points, and the kernel then reads out of bounds (an illegal memory
@@ -56,6 +81,41 @@ _MFEM_VECTOR_LIMIT = 2 ** 31 - 1
 #: 128 MB of Jacobians; a positive value pins it and also *forces* this path, which
 #: is how the two routes are compared.  Set ``HIPPYMFEM_GEOMETRY_SLICE``.
 GEOMETRY_SLICE = int(os.environ.get("HIPPYMFEM_GEOMETRY_SLICE", "0") or 0)
+
+
+#: A quadrature degree that stands for the rule at the vertices of an element, with equal
+#: weights (:func:`integration_rule`): the rule that makes the mass matrix of first-order
+#: elements diagonal, the sum of each row of the consistent one on an affine element (a
+#: prior's ``lumped_mass``).
+VERTEX_RULE = -1
+
+_REFERENCE_VOLUME = {"SEGMENT": 1.0, "TRIANGLE": 0.5, "SQUARE": 1.0,
+                     "TETRAHEDRON": 1.0 / 6.0, "CUBE": 1.0, "PRISM": 0.5}
+_VERTEX_RULES = {}
+
+
+def integration_rule(geom, degree):
+    """MFEM's rule of ``degree`` on the geometry ``geom``, or for :data:`VERTEX_RULE` the
+    rule at its vertices (one object a geometry, kept for the life of the process: MFEM
+    keys what it caches for a rule on the rule's address)."""
+    degree = int(degree)
+    if degree != VERTEX_RULE:
+        return mfem.IntRules.Get(geom, degree)
+    ir = _VERTEX_RULES.get(int(geom))
+    if ir is None:
+        volume = next((v for name, v in _REFERENCE_VOLUME.items()
+                       if int(getattr(mfem.Geometry, name)) == int(geom)), None)
+        if volume is None:
+            raise NotImplementedError("no vertex rule for the element geometry %d" % int(geom))
+        vertices = mfem.Geometries.GetVertices(geom)
+        n = vertices.GetNPoints()
+        ir = mfem.IntegrationRule(n)
+        for k in range(n):
+            src, dst = vertices.IntPoint(k), ir.IntPoint(k)
+            dst.x, dst.y, dst.z = src.x, src.y, src.z
+            dst.weight = volume / n
+        _VERTEX_RULES[int(geom)] = ir
+    return ir
 
 
 def default_quadrature_degree(spaces, extra=2):
@@ -84,8 +144,11 @@ class ElementGroup(KeepAlive):
     wdet : ndarray, shape (ne, nq)
         ``w_q * |det J|``.
     Jinv : ndarray, shape (ne, nq, dim, sdim)
+        ``(ne, 1, dim, sdim)`` where :attr:`affine` is set (:data:`AFFINE_GEOMETRY`).
     X : ndarray, shape (ne, nq, sdim)
         Physical coordinates of the quadrature points.
+    affine : bool
+        Whether ``Jinv`` is kept once an element: every element's map is affine.
     """
 
     def __init__(self, mesh, geom, elems, quadrature_degree, batched=None,
@@ -95,7 +158,7 @@ class ElementGroup(KeepAlive):
         self.elems = np.asarray(elems, dtype=np.int64)
         self.dim = mesh.Dimension()
         self.sdim = mesh.SpaceDimension()
-        self.ir = mfem.IntRules.Get(geom, int(quadrature_degree))
+        self.ir = integration_rule(geom, quadrature_degree)
         self.keep(mesh, self.ir)
         self.nq = self.ir.GetNPoints()
         self.ne = int(self.elems.size)
@@ -110,7 +173,34 @@ class ElementGroup(KeepAlive):
         # function this path needs is built collectively on a ParMesh, while the
         # element count that motivates it is rank-local.
         self.sliced = sliced
+        self.affine = False
         self._build_geometry()
+
+    def _compact_affine(self):
+        """Keep ``Jinv`` once an element where every element's map is affine
+        (:data:`AFFINE_GEOMETRY`): the mean over its quadrature points, which agree
+        to :data:`AFFINE_TOL` there.  A rank decides for its own elements."""
+        self.affine = False
+        J = self.Jinv
+        if not AFFINE_GEOMETRY or self.nq < 2 or not self.ne or J.shape[1] != self.nq:
+            return
+        out = np.empty((self.ne, 1) + J.shape[2:])
+        m = max(1, (1 << 24) // max(J[0].size, 1))          # 128 MB of them at a time
+        for a in range(0, self.ne, m):
+            z = J[a:a + m]
+            mean = z.mean(axis=1, keepdims=True)
+            off = np.abs(z - mean).max(axis=(1, 2, 3))
+            if (off > AFFINE_TOL * np.abs(mean).max(axis=(1, 2, 3))).any():
+                return
+            out[a:a + m] = mean
+        self.Jinv, self.affine = out, True
+
+    def full_Jinv(self):
+        """``Jinv`` at every quadrature point, ``(ne, nq, dim, sdim)``: the array
+        itself, or a read-only view of the compact one that repeats it."""
+        if self.Jinv.shape[1] == self.nq:
+            return self.Jinv
+        return np.broadcast_to(self.Jinv, (self.ne, self.nq) + self.Jinv.shape[2:])
 
     def _build_geometry(self):
         mesh, nq, dim, sdim = self.mesh, self.nq, self.dim, self.sdim
@@ -123,6 +213,7 @@ class ElementGroup(KeepAlive):
                 nq * sdim * dim * int(mesh.GetNE()) > _MFEM_VECTOR_LIMIT)
         if sliced:
             self._geometry_sliced()
+            self._compact_affine()
             return
         if batched:
             gf = mesh.GetGeometricFactors(
@@ -163,6 +254,7 @@ class ElementGroup(KeepAlive):
             self.Jinv = np.ascontiguousarray(np.linalg.pinv(J))
         self.detJ = det
         self.wdet = np.ascontiguousarray(self.w[None, :] * np.abs(det))
+        self._compact_affine()
 
     def _geometry_sliced(self, slice_ne=None):
         """``Jinv``, ``detJ``, ``X`` and ``wdet`` from the mesh nodes, in slices.
@@ -478,7 +570,7 @@ class MeshBatches(KeepAlive):
         ne = int(mesh.GetNE())
         worst = 0
         for g in geoms:
-            nq = mfem.IntRules.Get(g, self.quadrature_degree).GetNPoints()
+            nq = integration_rule(g, self.quadrature_degree).GetNPoints()
             worst = max(worst, nq * sdim * dim * ne)
         local = bool(GEOMETRY_SLICE) or worst > _MFEM_VECTOR_LIMIT
         return self.comm.allreduce(int(local), op=MPI.MAX) > 0

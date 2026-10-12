@@ -448,6 +448,325 @@ def test_parmat_block_route():
           "(rel %.2e)" % cg_err)
 
 
+def test_exchange_routes_agree():
+    """The rows of other ranks arrive the same by messages and by the collective.
+
+    The entries a rank computes for rows that another owns leave its accumulator and
+    arrive in the owner's either by one message to each neighbour, a device
+    accumulator's through page-locked buffers a pattern keeps
+    (``HIPPYMFEM_DEVICE_EXCHANGE=neighbors``, the default where matrices are finished
+    on the device), or through fresh host arrays and one ``Alltoallv``.  Either way
+    the same numbers are added at the same places, so the matrices must agree to the
+    last bit of a product; and with more than one rank the first way must be the one
+    taken, on every rank, by the agreement the ranks made when the pattern was built.
+    """
+    if RANK == 0:
+        print("the exchange with the neighbours agrees with the collective one")
+    from hippymfem.fem import tdofassemble as td
+
+    pm, Vh, b, K, bc = problem()
+    csr.set_parmat_mode("tdof")
+    SEEDS = (5, 17)
+    taken = {"messages": 0, "agreed": []}
+    inner = td.TrueDofPattern._exchange_messages
+
+    def counted(self, acc):
+        taken["messages"] += 1
+        taken["agreed"].append(bool(self.messages))
+        return inner(self, acc)
+
+    def products(A):
+        out = []
+        for p in range(2):
+            v = hp.ParVector(COMM, A.Width())
+            hp.parRandom.set_seed(211 + p)
+            hp.parRandom.normal(1.0, v)
+            y = hp.ParVector(COMM, A.Height())
+            A.Mult(v.hypre, y.hypre)
+            out.append(y)
+        return out
+
+    def run(mode):
+        was, td.DEVICE_EXCHANGE = td.DEVICE_EXCHANGE, mode
+        csr.clear_pattern_cache()          # (a pattern keeps what its ranks agreed on)
+        try:
+            # two assemblies of one pattern: the second goes through the kept buffers
+            return [y for seed in SEEDS for y in products(matrix(pm, Vh, b, K, bc, seed))]
+        finally:
+            td.DEVICE_EXCHANGE = was
+            csr.clear_pattern_cache()
+            csr.set_parmat_mode("auto")
+
+    td.TrueDofPattern._exchange_messages = counted
+    try:
+        got = run("neighbors")
+        calls = taken["messages"]
+        ref = run("alltoallv")
+    finally:
+        td.TrueDofPattern._exchange_messages = inner
+
+    def apart(x, y):
+        d = x.copy()
+        d.axpy(-1.0, y)
+        return d.norm("linf")
+
+    scale = max(max(r.norm("linf") for r in ref), 1e-300)
+    err = max(apart(r, g) for r, g in zip(ref, got)) / scale
+    check("the two exchanges give the same matrices", err < 1e-14, "(rel %.2e)" % err)
+    check("the assemblies differ from each other", apart(ref[0], ref[2]) > 1e-8 * scale)
+    if COMM.size > 1:
+        every = COMM.allreduce(calls, op=MPI.MIN)
+        check("every rank took the messages, by agreement, and none the collective's turn",
+              every == len(SEEDS) and all(taken["agreed"]) and taken["messages"] == calls,
+              "(%d exchanges a rank)" % every)
+    else:
+        check("one rank has nothing to exchange", calls == 0)
+
+
+def test_exchange_of_mixed_accumulators():
+    """The messages carry whatever accumulator a rank has, and every rank reads them.
+
+    In one assembly the ranks need not hold accumulators of one kind: a rank without
+    elements has a host one, of double precision, beside device ones that may be of
+    single.  So each rank sends its own precision, a receiver learns it from the
+    length of the message, and host and device accumulators take the same turns.
+    Checked on the accumulators themselves, filled with small integers so that every
+    sum is exact in either precision: all on the device in double and in single
+    precision, all on the host, and each mixture of two of these by the parity of the
+    rank, against one ``Alltoallv`` of the same numbers.
+    """
+    if RANK == 0:
+        print("the exchange by messages with accumulators of several kinds")
+    import jax.numpy as jnp
+
+    from hippymfem.fem.kernel import _put
+
+    if COMM.size == 1:
+        check("one rank has nothing to exchange (skipped)", True)
+        return
+    pm, Vh, b, K, bc = problem()
+    csr.set_parmat_mode("tdof")
+    csr.clear_pattern_cache()
+    try:
+        tp = csr.plan_block(Vh[0], Vh[0], b.groups).tpat
+        if tp is None or not tp.messages:
+            check("the pattern's ranks agreed on messages", False,
+                  "(no true-dof pattern)" if tp is None else "(they took the collective)")
+            return
+        nt, ns, nr = int(tp.nnz_t), int(tp.nsend), int(tp.nrecv)
+        start = np.zeros(nt + ns)
+        start[:nt] = np.arange(nt) % 7
+        start[nt:] = 1 + (np.arange(ns) + 3 * RANK) % 251
+        rbuf = np.empty(nr)
+        COMM.Alltoallv([np.ascontiguousarray(start[nt:]), tp.scnt, tp.sdsp, MPI.DOUBLE],
+                       [rbuf, tp.rcnt, tp.rdsp, MPI.DOUBLE])
+        ref = start[:nt] + np.bincount(tp.slot_recv, weights=rbuf, minlength=nt)
+        some = COMM.allreduce(nr, op=MPI.SUM)
+
+        def make(kind):
+            if kind == "host":
+                return start.copy()
+            return _put(start.astype(np.float32 if kind == "single" else np.float64))
+
+        bad = []
+        cases = [(k, k) for k in ("double", "single", "host")]
+        cases += [("double", "single"), ("single", "host"), ("host", "double")]
+        for even, odd in cases:
+            kind = odd if RANK % 2 else even
+            # twice: the second exchange finds the buffers as the first one left them
+            for turn in range(2):
+                acc = make(kind)
+                out = tp._exchange_messages(acc)
+                want = np.float64 if kind != "single" else np.float32
+                same = (isinstance(out, np.ndarray) == (kind == "host")
+                        and np.dtype(out.dtype) == np.dtype(want)
+                        and np.array_equal(np.asarray(out, dtype=np.float64)[:nt], ref))
+                if not COMM.allreduce(bool(same), op=MPI.LAND):
+                    bad.append("%s/%s (turn %d)" % (even, odd, turn))
+                del acc, out
+        check("each kind and each mixture of two gives the collective's sums, exactly",
+              not bad and some > 0,
+              "(%d entries exchanged; %d cases)" % (some, len(cases))
+              if not bad else "wrong: " + ", ".join(bad))
+    finally:
+        csr.clear_pattern_cache()
+        csr.set_parmat_mode("auto")
+
+
+def test_gathered_coarse_solve():
+    """The last levels of a device hierarchy gathered and finished by one process.
+
+    ``seq_threshold=n`` (a solver's ``amg_options``) ends a BoomerAMG hierarchy at its
+    first level of at most ``n`` rows and gathers that level on the ranks that hold rows
+    of it; the first of them solves it on its card and sends the solution to the others
+    (with ``redundant=1`` each solves it whole and keeps its own rows).  hypre's own code
+    for this takes device memory for host memory; ``tools/hypre-3.2.0-seqdevice.patch``
+    has the device's.  With a library that has it, CG with such a hierarchy must give the
+    solution of the default one in about its iterations, with the gathered level
+    somewhere in the hierarchy and with the matrix itself gathered; a library without
+    it must refuse the setting, since the set-up would fault.
+    """
+    if RANK == 0:
+        print("the last levels of a hierarchy gathered on one process, on a device")
+    from hippymfem.common import mfemconfig as mc
+
+    pm, Vh, b, K, bc = problem()
+    A = matrix(pm, Vh, b, K, bc, 7)
+    rhs = hp.ParVector(COMM, A.Height())
+    hp.parRandom.set_seed(31)
+    hp.parRandom.normal(1.0, rhs)
+
+    def solve(extra):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-10
+        ks.parameters["max_iter"] = 300
+        ks.parameters["amg_options"] = extra
+        ks.set_operator(A)
+        x = hp.ParVector(COMM, A.Height())
+        its = ks.solve(x, rhs)
+        return x, int(its)
+
+    x0, its0 = solve("")
+    if not mc.seq_on_device(mc._hypre_library()):
+        raised = False
+        try:
+            solve("seq_threshold=300")
+        except RuntimeError:
+            raised = True
+        check("seq_threshold is refused by a device hypre without the patch (this one)", raised)
+        return
+
+    def apart(x):
+        d = x.copy()
+        d.axpy(-1.0, x0)
+        return d.norm("l2") / max(x0.norm("l2"), 1e-300)
+
+    n = int(A.GetGlobalNumRows())
+    x1, its1 = solve("seq_threshold=300")
+    x1r, its1r = solve("seq_threshold=300,redundant=1")
+    x2, its2 = solve("seq_threshold=%d" % (n + 1))
+    e1, e1r, e2 = apart(x1), apart(x1r), apart(x2)
+    check("a hierarchy ended at a level of 300 rows, which the first rank solves, gives the "
+          "default one's solution", e1 < 1e-7 and its1 <= its0 + 3,
+          "(difference %.1e, %d iterations against %d, %d rows)" % (e1, its1, its0, n))
+    check("and so does one that every rank solves (redundant=1)",
+          e1r < 1e-7 and its1r <= its0 + 3, "(difference %.1e, %d iterations)" % (e1r, its1r))
+    check("and so does the matrix itself gathered", e2 < 1e-7 and its2 <= its0 + 3,
+          "(difference %.1e, %d iterations)" % (e2, its2))
+
+    # The gathered solve has to be one linear map.  Where every rank solves the whole
+    # system and keeps its own rows, it is one only if the ranks' solvers are the same;
+    # hypre's coarsening on a device draws random numbers from a generator that stands
+    # wherever the process's earlier hierarchies left it, so the first version of the
+    # patch gave every rank a hierarchy of its own, and corrections that did not fit at
+    # the seams between the ranks: a cycle that is not symmetric, with which CG took ten
+    # times its iterations on a smooth right-hand side or stalled.  A cycle of a larger
+    # matrix, gathered at its first coarse level: as symmetric as the default cycle, and
+    # CG on a smooth solution in the default one's iterations.
+    pm2, Vh2, b2, K2, bc2 = problem(10)
+    A2 = matrix(pm2, Vh2, b2, K2, bc2, 7)
+    n2 = int(A2.GetGlobalNumRows())
+    u, v, w = (hp.ParVector(COMM, A2.Height()) for _ in range(3))
+    hp.parRandom.set_seed(32)
+    hp.parRandom.normal(1.0, u)
+    hp.parRandom.normal(1.0, v)
+    w.array[:] = 1.0
+    smooth = hp.ParVector(COMM, A2.Height())
+    A2.Mult(w.hypre, smooth.hypre)
+
+    def cycle(extra):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-10
+        ks.parameters["max_iter"] = 300
+        ks.parameters["amg_options"] = extra
+        ks.set_operator(A2)
+        cu, cv = hp.ParVector(COMM, A2.Height()), hp.ParVector(COMM, A2.Height())
+        ks._pc.Mult(u.hypre, cu.hypre)
+        ks._pc.Mult(v.hypre, cv.hypre)
+        a, b_ = v.inner(cu), u.inner(cv)
+        x = hp.ParVector(COMM, A2.Height())
+        its = int(ks.solve(x, smooth))
+        err = x.axpy(-1.0, w).norm("l2") / w.norm("l2")
+        return (abs(a - b_) / max(abs(a), abs(b_), 1e-300), its, err,
+                mc.seq_solvers(ks._pc, COMM))
+
+    s0, i0, _, _ = cycle("")
+    for label, extra in (("the first rank solves", "seq_threshold=%d" % (n2 // 3)),
+                         ("every rank is asked to solve",
+                          "seq_threshold=%d,redundant=1" % (n2 // 3))):
+        s1, i1, err, who = cycle(extra)
+        asked = "all" if "redundant" in extra else "first"
+        check("a cycle with its first coarse level gathered (%s) is one symmetric map" % label,
+              s1 < max(1e-9, 100.0 * s0) and i1 <= i0 + 2 and err < 1e-7
+              and (COMM.size == 1 or who in ("first", asked)),
+              "(asymmetry %.1e against %.1e of the default cycle; a smooth solution in %d "
+              "iterations against %d, error %.1e; %d rows; solved by: %s)"
+              % (s1, s0, i1, i0, err, n2, who))
+
+
+def test_chebyshev_on_device():
+    """A fixed polynomial of multigrid cycles in place of a Krylov solve
+    (``ChebyshevSolver``), with hypre and the vectors on the device: within its bound
+    of the exact solve, and one symmetric linear map."""
+    if RANK == 0:
+        print("a fixed polynomial of multigrid cycles in place of a Krylov solve, on a device")
+    pm, Vh, b, K, bc = problem(10)
+    A = matrix(pm, Vh, b, K, bc, 7)
+    ks = hp.KrylovSolver(COMM, "cg", "amg")
+    ks.parameters["rel_tolerance"] = 1e-13
+    ks.parameters["max_iter"] = 300
+    ks.set_operator(A)
+    u, v, x0, su, sv, w = (hp.ParVector(COMM, A.Height()) for _ in range(6))
+    hp.parRandom.set_seed(41)
+    hp.parRandom.normal(1.0, u)
+    hp.parRandom.normal(1.0, v)
+    ks.solve(x0, u)
+    ch = hp.ChebyshevSolver(ks, 5)
+    ch.solve(su, u)
+    ch.solve(sv, v)
+    d = su.copy().axpy(-1.0, x0)
+    A.Mult(d.hypre, w.hypre)
+    num = max(w.inner(d), 0.0) ** 0.5
+    A.Mult(x0.hypre, w.hypre)
+    err = num / max(w.inner(x0), 1e-300) ** 0.5
+    a, c = v.inner(su), u.inner(sv)
+    sym = abs(a - c) / max(abs(a), abs(c), 1e-300)
+    check("five cycles are within the bound of the exact solve, and one symmetric map",
+          err <= 1.05 * ch.error_bound + 1e-12 and sym < 1e-10 and u.inner(su) > 0.0,
+          "(error %.1e in the energy norm, bound %.1e; <v, S u> and <u, S v> differ by %.1e; "
+          "the cycle's eigenvalues in [%.3f, %.3f])"
+          % (err, ch.error_bound, sym, ch.interval[0], ch.interval[1]))
+    # the cycles applied from the iterate against the recurrence with products, with a
+    # gathered level in the hierarchy too (seq_threshold, where the library has it): a
+    # cycle from an iterate that is not zero has to be the same map there
+    def two_ways(solver):
+        ch2 = hp.ChebyshevSolver(solver, 5)
+        ya, yb = hp.ParVector(COMM, A.Height()), hp.ParVector(COMM, A.Height())
+        ch2.solve(ya, u)
+        kept, solver.precond_type = solver.precond_type, "another"
+        try:
+            ch2.solve(yb, u)
+        finally:
+            solver.precond_type = kept
+        return yb.axpy(-1.0, ya).norm("l2") / ya.norm("l2")
+
+    from hippymfem.common import mfemconfig as mc
+
+    said = "%.1e" % two_ways(ks)
+    worst = float(said)
+    if COMM.size > 1 and mc.seq_on_device(mc._hypre_library()):
+        kg = hp.KrylovSolver(COMM, "cg", "amg")
+        kg.parameters["rel_tolerance"] = 1e-13
+        kg.parameters["max_iter"] = 300
+        kg.parameters["amg_options"] = "seq_threshold=%d,redundant=1" % (int(A.GetGlobalNumRows()) // 3)
+        kg.set_operator(A)
+        t = two_ways(kg)
+        worst = max(worst, t)
+        said += ", with a gathered level %.1e" % t
+    check("cycles from the iterate and a residual updated by products give the same solve",
+          worst < 1e-11, "(difference %s)" % said)
+
+
 def test_empty_boundary_rank():
     """A boundary pattern some ranks have no element of, built with the block
     constructor on the device: no deadlock resolving the device, no shared
@@ -629,9 +948,6 @@ def test_hypre_pool():
     from the pool, never more held than allowed, nothing held after a trim."""
     from hippymfem.common import mfemconfig as cfg
 
-    if mfem_gpu_backend() != "cuda":
-        check("hypre device pool (NVIDIA builds only)", True, "(skipped)")
-        return
     pm, Vh, b, K, bc = problem(6)
     A = matrix(pm, Vh, b, K, bc, seed=22)
     ref = amg_cg(A, iters=30)
@@ -642,7 +958,17 @@ def test_hypre_pool():
     check("pool installed", pool is not None and pool.installed)
     if pool is None:
         return
+    # the peak is the pool's since it was installed: what the default pool held during the
+    # setups of the tests before this one, with its limit for a setup, is not held here
+    pool.peak_cached = pool.cached
+    asked, spent, blocks = pool.driver_bytes, pool.driver_seconds, pool.driver_allocs
     first = amg_cg(A, iters=30)             # a setup, its hierarchy freed on return
+    check("the pool counts what it asks of the driver",
+          pool.driver_bytes > asked and pool.driver_seconds > spent
+          and pool.peak_footprint >= pool.peak_in_use > 0,
+          "(%.2f MiB in %d blocks, %.2f ms)" % ((pool.driver_bytes - asked) / 2 ** 20,
+                                               pool.driver_allocs - blocks,
+                                               1e3 * (pool.driver_seconds - spent)))
     served = pool.from_pool
     second = amg_cg(A, iters=30)            # the same setup again, from the pool
     ok = (abs(first - ref) <= 1e-12 * abs(ref)) and (abs(second - ref) <= 1e-12 * abs(ref))
@@ -653,8 +979,10 @@ def test_hypre_pool():
     check("the pool holds no more than it may", pool.peak_cached <= 32 * 2 ** 20,
           "(peak %.1f MiB)" % (pool.peak_cached / 2 ** 20))
     gc.collect()
+    held, trims = pool.cached, pool.trims
     pool.trim()
     check("nothing held after a trim", pool.cached == 0)
+    check("a trim that returned memory is counted", pool.trims == trims + (1 if held else 0))
     third = amg_cg(A, iters=30)
     check("the same solve after a trim", abs(third - ref) <= 1e-12 * abs(ref))
     if had:
@@ -673,9 +1001,6 @@ def test_hypre_pool_setup_scope():
     keep between setups."""
     from hippymfem.common import mfemconfig as cfg
 
-    if mfem_gpu_backend() != "cuda":
-        check("hypre device pool (NVIDIA builds only)", True, "(skipped)")
-        return
     pool = cfg.HYPRE_POOL
     if pool is None or not pool.installed or not pool.scoped:
         check("the default pool is the one with a limit of its own during a setup", True,
@@ -930,10 +1255,13 @@ def test_streamed_geometry_pinned():
             gk._dev.clear()
 
     out, moved = {}, {}
+    # a chunk smaller than the elements of any rank, or nothing is streamed there (on 8
+    # ranks this mesh leaves a rank 27 elements, and a chunk of 37 was the whole of it)
+    chunk = min(37, max(2, COMM.allreduce(pm.GetNE(), op=MPI.MIN) // 2))
     try:
         for label, frac, pinned in (("cached", 0.0, True), ("by JAX", 1e-12, False),
                                     ("pinned", 1e-12, True)):
-            reset(37, frac, pinned)
+            reset(chunk, frac, pinned)
             before = bridge.stats()[1]
             out[label] = ([np.asarray(a) for a in K.element_matrices(ADJOINT, STATE, loc)]
                           + [np.asarray(a) for a in K.element_vectors(ADJOINT, loc)])
@@ -967,6 +1295,10 @@ if __name__ == "__main__":
     test_operator_reset()
     test_routes_agree_on_device()
     test_parmat_block_route()
+    test_exchange_routes_agree()
+    test_exchange_of_mixed_accumulators()
+    test_gathered_coarse_solve()
+    test_chebyshev_on_device()
     test_empty_boundary_rank()
     test_boundary_block_on_device()
     test_coordinates_on_device()

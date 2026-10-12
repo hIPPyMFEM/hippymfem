@@ -4,11 +4,17 @@
 # problem, its BoomerAMG hierarchy and the CG solves with it then live in this library.
 #
 #   tools/build_hypre_single.sh <PyMFEM source tree> <output directory>
+#   tools/build_hypre_single.sh <prefix of tools/build_pymfem_hip.sh> <output directory>
 #
 # The options are those of the installed build (its CMakeCache.txt under
 # external/hypre/src/cmbuild) with HYPRE_ENABLE_SINGLE=ON, so the library is for the
-# same GPU architecture, the same MPI and the same CUDA.  Two things make it usable
-# next to the double-precision library, which defines the same symbols:
+# same GPU architecture, the same MPI and the same CUDA.  For an AMD (HIP) stack, whose
+# hypre is configured with autotools, they are the options that its config.status
+# recorded with --enable-single, in a copy of its source tree with the patches it was
+# built with (the build is in the source, and that tree stays as it is): the same index
+# widths, so 64-bit global indices where the stack has them (HYPRE_MIXEDINT=1).  Two
+# things make it usable next to the double-precision library, which defines the same
+# symbols:
 #
 #   * it is linked with -Bsymbolic, so that its own calls stay inside it, and it is
 #     loaded with RTLD_LOCAL (ctypes' default) and reached through its handle only;
@@ -20,12 +26,11 @@
 # Load the compiler and MPI modules of the PyMFEM build first (MODULES="gcc/12.3.0
 # openmpi/4.1.8" loads them here): a library linked against another MPI does not load
 # next to the installed one.  About three minutes with twelve jobs (JOBS).  Built and
-# used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell cards and with a host
-# build.  Not for a HIP build: the hypre of tools/build_pymfem_hip.sh is configured with
-# autotools (no cmbuild/CMakeCache.txt here), and the library refuses a single-precision
-# hypre when MFEM runs on an AMD GPU (hippymfem.algorithms.singlesolve.unsupported).
+# used with CUDA builds for H100, L40S and RTX PRO 6000 Blackwell cards, with a host
+# build, and with the HIP build of tools/build_pymfem_hip.sh for MI250X cards (hypre
+# 3.2.0, ROCm 7.2.0).
 set -eo pipefail
-PYMFEM=${1:?PyMFEM source tree}
+PYMFEM=${1:?PyMFEM source tree, or the prefix of tools/build_pymfem_hip.sh}
 NEW=${2:?output directory}
 TOOLS=$(cd "$(dirname "$0")" && pwd)
 if [ -n "${MODULES:-}" ]; then
@@ -33,10 +38,54 @@ if [ -n "${MODULES:-}" ]; then
   module load $MODULES > /dev/null 2>&1
 fi
 set -u
+mkdir -p "$NEW"
+NEW=$(cd "$NEW" && pwd)
+
+# ------------------------------------------------- an autotools build (the HIP stack)
+if [ ! -f "$PYMFEM/external/hypre/src/cmbuild/CMakeCache.txt" ] && [ -x "$PYMFEM/src/hypre/src/config.status" ]; then
+  OLD=$PYMFEM/src/hypre
+  rm -rf "$NEW/hypre"
+  mkdir -p "$NEW/hypre"
+  (cd "$OLD" && tar cf - --exclude='*.o' --exclude='*.obj' --exclude='*.so' --exclude='*.a' .) | (cd "$NEW/hypre" && tar xf -)
+  cd "$NEW/hypre/src"
+  # the options of the installed build, as its configure was given them
+  eval "set -- $(./config.status --config)"
+  ./configure "$@" --enable-single --prefix="$NEW/install" LDFLAGS=-Wl,-Bsymbolic > "$NEW/configure.log" 2>&1 \
+      || { tail -20 "$NEW/configure.log"; exit 1; }
+  grep -q "define HYPRE_SINGLE 1" HYPRE_config.h || { echo "HYPRE_SINGLE did not reach HYPRE_config.h"; exit 1; }
+  # (the sources that the compiler of the installed build could not take at -O2)
+  grep ': CUFLAGS += ' "$OLD/src/config/Makefile.config" >> config/Makefile.config || true
+  make clean > /dev/null 2>&1 || true
+  n=0
+  until make -j "${JOBS:-12}" > "$NEW/build.log" 2>&1; do
+    bad=$(grep -o '[A-Za-z0-9_]*\.obj\] Error' "$NEW/build.log" | sed 's/\] Error//' | sort -u | tr '\n' ' ')
+    n=$((n + 1))
+    [ -n "$bad" ] && [ "$n" -le 8 ] || { tail -30 "$NEW/build.log"; exit 1; }
+    echo "  the compiler failed at -O2, building at -Os: $bad"
+    echo "$bad: CUFLAGS += -Os" >> config/Makefile.config
+  done
+  # the library linked once more under its own soname (the last step of the build, in lib/):
+  # two libraries of one soname in a process are told apart by path only
+  rm -f lib/libHYPRE*
+  make -C lib SONAME=libHYPRE_single.so >> "$NEW/build.log" 2>&1 || { tail -30 "$NEW/build.log"; exit 1; }
+  want=$(ldd "$PYMFEM/hypre/lib/libHYPRE.so" | awk '/libmpi/ {print $1}')
+  got=$(ldd lib/libHYPRE_single.so | awk '/libmpi/ {print $1}')
+  [ "$want" = "$got" ] || { echo "linked against $got, the installed library against $want: load the modules of the stack"; exit 1; }
+  cp lib/libHYPRE_single.so "$NEW/libHYPRE_single.so"
+  MPICC=$(./config.status --config | tr ' ' '\n' | sed -n "s/^'\{0,1\}CC=//p" | tr -d "'")
+  "${MPICC:-mpicc}" -I. -Iutilities -Iseq_mv -Iparcsr_mv -Imultivector -Iseq_block_mv \
+      ${ROCM_PATH:+-I"$ROCM_PATH/include"} -D__HIP_PLATFORM_AMD__ "$TOOLS/hypre_offsets.c" -o "$NEW/hypre_offsets"
+  "$NEW/hypre_offsets" > "$NEW/libHYPRE_single.json"
+  grep -q '"sizeof_real": 4' "$NEW/libHYPRE_single.json" || { echo "the offsets program did not see a single-precision build"; exit 1; }
+  echo "built $NEW/libHYPRE_single.so ($got) and libHYPRE_single.json"
+  echo "use it with  HIPPYMFEM_HYPRE_SINGLE=$NEW/libHYPRE_single.so"
+  exit 0
+fi
+
+# ------------------------------------------------- a CMake build (PyMFEM's own)
 SRC=$PYMFEM/external/hypre/src
 OLD=$SRC/cmbuild
-[ -f "$OLD/CMakeCache.txt" ] || { echo "no hypre build under $OLD"; exit 1; }
-mkdir -p "$NEW"
+[ -f "$OLD/CMakeCache.txt" ] || { echo "no hypre build under $OLD, and no $PYMFEM/src/hypre/src/config.status"; exit 1; }
 INIT=$NEW/initial_cache.cmake
 : > "$INIT"
 while IFS= read -r line; do

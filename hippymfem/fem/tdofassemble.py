@@ -15,7 +15,9 @@ So the pattern is re-targeted at true-dof numbering, once, and every assembly th
 * scatters the entries whose *row* this rank owns straight into the true-dof CSR,
   the same reduction as the ldof scatter with a different slot map;
 * scatters the entries whose row belongs to another rank into a send buffer that is
-  contiguous per destination, and exchanges it with one ``Alltoallv`` of values;
+  contiguous per destination, and exchanges it with one ``Alltoallv`` of values (or,
+  where matrices are finished on a device, by a message to each neighbour:
+  :data:`DEVICE_EXCHANGE`);
 * adds what arrived through a slot map fixed once;
 * builds the ``HypreParMatrix`` from hypre's diagonal and off-diagonal blocks, which
   the slot layout makes two contiguous views of the accumulator.
@@ -46,7 +48,7 @@ import mfem.par as mfem
 
 from ..common.identitycache import IdentityCache
 from ..common.linalg import own
-from ..common.parvector import _HYPRE_INT
+from ..common.parvector import _HYPRE_BIGINT, bigint_array, bigint_view
 from ..config import env_choice
 from . import pattern as _pattern, patternbuild
 from .devsort import unique_inverse
@@ -74,6 +76,48 @@ _SINGLE_TARGET = [False]
 #: ``HIPPYMFEM_SINGLE_ACCUMULATE=0`` accumulates in double precision and rounds once.
 SINGLE_ACCUMULATE = os.environ.get("HIPPYMFEM_SINGLE_ACCUMULATE", "1").lower() not in (
     "0", "no", "false", "off")
+
+#: How the entries of rows that other ranks own leave an accumulator and those that other
+#: ranks computed for this one's rows arrive (:meth:`TrueDofPattern.finish`), where
+#: matrices are finished on the device (:func:`device_finish`).  ``"neighbors"``: sent to
+#: each owner in a message of its own and received likewise (nonblocking), in the
+#: accumulator's own precision; a device accumulator's entries go from the card into a
+#: page-locked buffer that the pattern keeps, and what arrives goes back from a second
+#: one.  ``"alltoallv"``: through fresh host arrays and one collective, in double
+#: precision, as before 11 October 2026 and as wherever matrices are finished on the
+#: host.  Which of the two a pattern takes is agreed by its ranks when it is made
+#: (``TrueDofPattern.messages``): in one assembly a rank without elements finishes on
+#: the host and one with elements on its card, and they must talk alike.  On 64 MI250X
+#: of Frontier with 14 million quadratic-hexahedron unknowns a rank (66 MB to send) the
+#: collective took 93 ms and the copy from the device 35 ms of a Jacobian's assembly;
+#: ``HIPPYMFEM_DEVICE_EXCHANGE``.
+DEVICE_EXCHANGE = os.environ.get("HIPPYMFEM_DEVICE_EXCHANGE", "neighbors").strip().lower()
+if DEVICE_EXCHANGE not in ("neighbors", "alltoallv"):
+    raise ValueError("HIPPYMFEM_DEVICE_EXCHANGE must be neighbors or alltoallv, not %r"
+                     % (DEVICE_EXCHANGE,))
+
+#: the tag of those messages
+_EXCHANGE_TAG = 7741
+
+
+def _unpin_buffers(addresses):
+    from ..common import devicebridge as bridge
+
+    for addr in addresses:
+        try:
+            bridge.unpin(addr)
+        except Exception:                                        # noqa: BLE001
+            pass
+
+
+#: Whether a Jacobian of the single-precision hypre keeps what the rounding of its values
+#: takes from the sum of each row, for its solver to add in every product
+#: (:class:`~hippymfem.algorithms.singlesolve.RowDefect`, which says what it is for).  The
+#: values are then accumulated in double precision whatever :data:`SINGLE_ACCUMULATE` says,
+#: since the defect is the difference between those and their rounded copies: an
+#: accumulator twice as large for the duration of the assembly.  ``HIPPYMFEM_SINGLE_ROW_SUMS=1``.
+SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "0").lower() in (
+    "1", "yes", "true", "on")
 
 
 @contextlib.contextmanager
@@ -192,150 +236,168 @@ class TrueDofPattern:
         self.ntd = self.t1 - self.t0
         starts = np.array(comm.allgather(self.t0) + [self.gnr], dtype=np.int64)
 
-        I = np.asarray(pattern.indptr, dtype=np.int64)
-        J = np.asarray(pattern.indices, dtype=np.int64)
-        rows_l = np.repeat(np.arange(nld_t, dtype=np.int64), np.diff(I))
-        rg, cg, mine = gt_t[rows_l], gt_r[J], owned[rows_l]
-        del rows_l, I, J
-
-        # Ghost entries, grouped by the rank that owns their row.  The order fixed
-        # here is the order the send buffer is filled in on every assembly.
-        gidx = np.flatnonzero(~mine)
-        dest = np.searchsorted(starts, rg[gidx], side="right") - 1
-        o = np.argsort(dest, kind="stable")
-        gidx, dest = gidx[o], dest[o]
-        del o
-        scnt = np.bincount(dest, minlength=size).astype(np.int64)
-        rcnt = np.empty(size, dtype=np.int64)
-        comm.Alltoall([scnt, MPI.INT64_T], [rcnt, MPI.INT64_T])
-        sdsp = np.concatenate([[0], np.cumsum(scnt)[:-1]]).astype(np.int64)
-        rdsp = np.concatenate([[0], np.cumsum(rcnt)[:-1]]).astype(np.int64)
-        nsend, nrecv = int(scnt.sum()), int(rcnt.sum())
-        r_rg = np.empty(nrecv, dtype=np.int64)
-        r_cg = np.empty(nrecv, dtype=np.int64)
-        comm.Alltoallv([np.ascontiguousarray(rg[gidx]), scnt, sdsp, MPI.INT64_T],
-                       [r_rg, rcnt, rdsp, MPI.INT64_T])
-        comm.Alltoallv([np.ascontiguousarray(cg[gidx]), scnt, sdsp, MPI.INT64_T],
-                       [r_cg, rcnt, rdsp, MPI.INT64_T])
-
-        # The true-dof graph: this rank's rows, global columns, from its own entries
-        # and the ones that arrived.  One key per entry orders by row then column.
-        n_own = int(mine.sum())
-        t0 = time.perf_counter()
-        rowstart = None
-        if patternbuild.wanted(n_own + nrecv):
-            # Without a sort: an own row's entries are already distinct (the ldof ->
-            # true-dof map is injective on this rank), so duplicates come only from
-            # rows other ranks sent, and grouping by row then ordering each short row
-            # (patternbuild) gives np.unique's pairs and inverse exactly.
-            rowstart, ucol, inv = patternbuild.unique_inverse_rows(
-                np.concatenate([rg[mine] - self.t0, r_rg - self.t0]),
-                np.concatenate([cg[mine], r_cg]), self.ntd, self.gnc)
-            del rg, cg, r_rg, r_cg
-            nnz_t = int(ucol.size)
-            urow = np.repeat(np.arange(self.ntd, dtype=np.int64), np.diff(rowstart))
-            ucol = ucol.astype(np.int64, copy=False)
-        else:
-            keys = np.concatenate([
-                (rg[mine] - self.t0) * np.int64(self.gnc) + cg[mine],
-                (r_rg - self.t0) * np.int64(self.gnc) + r_cg])
-            del rg, cg, r_rg, r_cg
-            # np.unique on the host, whose inverse uses a stable (merge) sort: the keys
-            # arrive grouped by row, where merge sort is several times faster than
-            # introsort.  With the kernels on a GPU the sort runs on the device in chunks.
-            uniq, inv = unique_inverse(keys)
-            del keys
-            nnz_t = int(uniq.size)
-            urow = uniq // np.int64(self.gnc)
-            ucol = uniq % np.int64(self.gnc)
-            del uniq
-        if _pattern.PATTERN_TIMING:
-            _pattern._say_phase("true-dof unique", time.perf_counter() - t0, n_own + nrecv)
-        # Slot layout.  hypre keeps a parallel matrix as two CSR blocks (the columns
-        # this rank owns, and the rest), so the slots are block-major: every
-        # diagonal-block entry first, row by row, then every off-diagonal one.  Both
-        # blocks are then contiguous views of one accumulator, which MFEM's block
-        # constructor aliases without a copy on the host.  Within a row of the
-        # diagonal block the diagonal entry leads: hypre reorders a square matrix to
-        # that order and writes the permutation back, but leaves alone a matrix that
-        # already has it.
-        in_diag = (ucol >= self.c0) & (ucol < self.c1)
-        lead = np.zeros(nnz_t, dtype=bool)
-        if self.c1 - self.c0 == self.ntd:            # a locally square diagonal block
-            lead = in_diag & (ucol - self.c0 == urow)
-        # Block, row, lead, column order without a sort: ``urow``/``ucol`` are already
-        # sorted by row and column, so the only moves are the off-diagonal entries to
-        # the second block and the diagonal to the front of its row, which
-        # ``_slot_order`` makes in linear passes (a four-key lexsort costs about half
-        # the pattern build).
-        t0 = time.perf_counter()
-        if patternbuild.wanted(nnz_t):
-            if rowstart is None:
-                rowstart = np.zeros(self.ntd + 1, dtype=np.int64)
-                np.cumsum(np.bincount(urow, minlength=self.ntd), out=rowstart[1:])
-            newslot = patternbuild.block_slots(urow, rowstart, in_diag, lead, self.ntd)
-        else:
-            newslot = _slot_order(urow, ucol, in_diag, lead, self.ntd)
-        del rowstart
-        if _pattern.PATTERN_TIMING:
-            _pattern._say_phase("true-dof slot order", time.perf_counter() - t0, nnz_t)
-        nnz_diag = int(in_diag.sum())
-        r2 = np.empty(nnz_t, dtype=np.int64); r2[newslot] = urow
-        c2 = np.empty(nnz_t, dtype=np.int64); c2[newslot] = ucol
-        del in_diag, lead
-        cmap = np.unique(c2[nnz_diag:])
-        self.n_offd = int(cmap.size)
-        # Which constructor, agreed by all ranks.  The copying 9-argument constructor
-        # and the diag/offd one communicate differently (one allreduces the global
-        # nonzero count, the other builds its comm package first), so ranks choosing
-        # by their *own* ``n_offd`` would deadlock inside MFEM.  The copy route is
-        # taken only when no rank has an off-diagonal column.
-        self.all_local = not bool(comm.allreduce(int(self.n_offd), op=MPI.MAX))
-        # The copying constructor (``_finish_copy``) takes the graph as one row-major
-        # CSR with global columns, which ``urow``/``ucol`` already are, with
-        # ``newslot`` giving each entry's slot.  These arrays are kept only where that
-        # constructor is the route now (the host with no off-diagonal column anywhere,
-        # or a device with ``HIPPYMFEM_PARMAT_DEVICE=copy``), and otherwise rebuilt
-        # from the two blocks on first use: ``J_t`` alone can be a gigabyte per rank,
-        # and the block constructor never reads it.
+        # Row by row and without an array of the size of the graph beside what is kept
+        # (pattern.LEAN), except where the row-major arrays of the copying constructor
+        # are the route in force and are made here (one rank on the host, or a device
+        # with ``HIPPYMFEM_PARMAT_DEVICE=copy``).  The arrays are the same either way.
         from ..common.parvector import device_active
 
-        if self.all_local or (device_active() and DEVICE_PARMAT != "block"):
-            indptr = np.zeros(self.ntd + 1, dtype=np.int64)
-            np.cumsum(np.bincount(urow, minlength=self.ntd), out=indptr[1:])
-            self._rm = (indptr.astype(np.int32),
-                        np.ascontiguousarray(ucol).astype(_HYPRE_INT, copy=False),
-                        None if np.array_equal(newslot, np.arange(nnz_t)) else
-                        newslot.astype(np.int32 if nnz_t < 2 ** 31 else np.int64))
-            del indptr
+        lean = (_pattern.LEAN and patternbuild.wanted(int(pattern.nnz))
+                and not (size == 1 and not device_finish())
+                and not (device_active() and DEVICE_PARMAT != "block")
+                and int(np.count_nonzero(owned)) == self.ntd)
+        if lean:
+            tslot, nnz_t, nsend, nrecv, scnt, sdsp, rcnt, rdsp = self._graph_lean(
+                pattern, comm, starts, gt_t, gt_r, owned)
         else:
-            self._rm = None
-        del urow, ucol
-        self.I_diag = np.zeros(self.ntd + 1, dtype=np.int32)
-        np.cumsum(np.bincount(r2[:nnz_diag], minlength=self.ntd), out=self.I_diag[1:])
-        self.J_diag = np.ascontiguousarray(c2[:nnz_diag] - self.c0).astype(np.int32)
-        self.I_offd = np.zeros(self.ntd + 1, dtype=np.int32)
-        np.cumsum(np.bincount(r2[nnz_diag:], minlength=self.ntd), out=self.I_offd[1:])
-        self.J_offd = np.ascontiguousarray(np.searchsorted(cmap, c2[nnz_diag:])).astype(np.int32)
-        self.nnz_diag = nnz_diag
-        del r2, c2
-        # Pointers MFEM's block constructor wants, built by index: an intArray made
-        # from a list or an array can hand back a pointer into storage that does not
-        # outlive the call, and the matrix built on it would be wrong.
-        self.ia_rows = mfem.intArray(2); self.ia_rows[0] = self.t0; self.ia_rows[1] = self.t1
-        self.ia_cols = mfem.intArray(2); self.ia_cols[0] = self.c0; self.ia_cols[1] = self.c1
-        self.ia_cmap = mfem.intArray(max(self.n_offd, 1))
-        for k in range(self.n_offd):
-            self.ia_cmap[k] = int(cmap[k])
-        self.cmap = cmap.astype(np.int64)
+            I = np.asarray(pattern.indptr, dtype=np.int64)
+            J = np.asarray(pattern.indices, dtype=np.int64)
+            rows_l = np.repeat(np.arange(nld_t, dtype=np.int64), np.diff(I))
+            rg, cg, mine = gt_t[rows_l], gt_r[J], owned[rows_l]
+            del rows_l, I, J
 
-        # ldof CSR slot -> target: a true-dof slot for an own row, a send-buffer
-        # position (past the true-dof slots) for a ghost row.
-        tslot = np.empty(pattern.nnz, dtype=np.int64)
-        tslot[np.flatnonzero(mine)] = newslot[inv[:n_own]]
-        tslot[gidx] = nnz_t + np.arange(nsend, dtype=np.int64)
-        self.slot_recv = np.ascontiguousarray(newslot[inv[n_own:]])
-        del inv, gidx, mine, newslot
+            # Ghost entries, grouped by the rank that owns their row.  The order fixed
+            # here is the order the send buffer is filled in on every assembly.
+            gidx = np.flatnonzero(~mine)
+            dest = np.searchsorted(starts, rg[gidx], side="right") - 1
+            o = np.argsort(dest, kind="stable")
+            gidx, dest = gidx[o], dest[o]
+            del o
+            scnt = np.bincount(dest, minlength=size).astype(np.int64)
+            rcnt = np.empty(size, dtype=np.int64)
+            comm.Alltoall([scnt, MPI.INT64_T], [rcnt, MPI.INT64_T])
+            sdsp = np.concatenate([[0], np.cumsum(scnt)[:-1]]).astype(np.int64)
+            rdsp = np.concatenate([[0], np.cumsum(rcnt)[:-1]]).astype(np.int64)
+            nsend, nrecv = int(scnt.sum()), int(rcnt.sum())
+            r_rg = np.empty(nrecv, dtype=np.int64)
+            r_cg = np.empty(nrecv, dtype=np.int64)
+            comm.Alltoallv([np.ascontiguousarray(rg[gidx]), scnt, sdsp, MPI.INT64_T],
+                           [r_rg, rcnt, rdsp, MPI.INT64_T])
+            comm.Alltoallv([np.ascontiguousarray(cg[gidx]), scnt, sdsp, MPI.INT64_T],
+                           [r_cg, rcnt, rdsp, MPI.INT64_T])
+
+            # The true-dof graph: this rank's rows, global columns, from its own entries
+            # and the ones that arrived.  One key per entry orders by row then column.
+            n_own = int(mine.sum())
+            t0 = time.perf_counter()
+            rowstart = None
+            if patternbuild.wanted(n_own + nrecv):
+                # Without a sort: an own row's entries are already distinct (the ldof ->
+                # true-dof map is injective on this rank), so duplicates come only from
+                # rows other ranks sent, and grouping by row then ordering each short row
+                # (patternbuild) gives np.unique's pairs and inverse exactly.
+                rowstart, ucol, inv = patternbuild.unique_inverse_rows(
+                    np.concatenate([rg[mine] - self.t0, r_rg - self.t0]),
+                    np.concatenate([cg[mine], r_cg]), self.ntd, self.gnc)
+                del rg, cg, r_rg, r_cg
+                nnz_t = int(ucol.size)
+                urow = np.repeat(np.arange(self.ntd, dtype=np.int64), np.diff(rowstart))
+                ucol = ucol.astype(np.int64, copy=False)
+            else:
+                keys = np.concatenate([
+                    (rg[mine] - self.t0) * np.int64(self.gnc) + cg[mine],
+                    (r_rg - self.t0) * np.int64(self.gnc) + r_cg])
+                del rg, cg, r_rg, r_cg
+                # np.unique on the host, whose inverse uses a stable (merge) sort: the keys
+                # arrive grouped by row, where merge sort is several times faster than
+                # introsort.  With the kernels on a GPU the sort runs on the device in chunks.
+                uniq, inv = unique_inverse(keys)
+                del keys
+                nnz_t = int(uniq.size)
+                urow = uniq // np.int64(self.gnc)
+                ucol = uniq % np.int64(self.gnc)
+                del uniq
+            if _pattern.PATTERN_TIMING:
+                _pattern._say_phase("true-dof unique", time.perf_counter() - t0, n_own + nrecv)
+            # Slot layout.  hypre keeps a parallel matrix as two CSR blocks (the columns
+            # this rank owns, and the rest), so the slots are block-major: every
+            # diagonal-block entry first, row by row, then every off-diagonal one.  Both
+            # blocks are then contiguous views of one accumulator, which MFEM's block
+            # constructor aliases without a copy on the host.  Within a row of the
+            # diagonal block the diagonal entry leads: hypre reorders a square matrix to
+            # that order and writes the permutation back, but leaves alone a matrix that
+            # already has it.
+            in_diag = (ucol >= self.c0) & (ucol < self.c1)
+            lead = np.zeros(nnz_t, dtype=bool)
+            if self.c1 - self.c0 == self.ntd:            # a locally square diagonal block
+                lead = in_diag & (ucol - self.c0 == urow)
+            # Block, row, lead, column order without a sort: ``urow``/``ucol`` are already
+            # sorted by row and column, so the only moves are the off-diagonal entries to
+            # the second block and the diagonal to the front of its row, which
+            # ``_slot_order`` makes in linear passes (a four-key lexsort costs about half
+            # the pattern build).
+            t0 = time.perf_counter()
+            if patternbuild.wanted(nnz_t):
+                if rowstart is None:
+                    rowstart = np.zeros(self.ntd + 1, dtype=np.int64)
+                    np.cumsum(np.bincount(urow, minlength=self.ntd), out=rowstart[1:])
+                newslot = patternbuild.block_slots(urow, rowstart, in_diag, lead, self.ntd)
+            else:
+                newslot = _slot_order(urow, ucol, in_diag, lead, self.ntd)
+            del rowstart
+            if _pattern.PATTERN_TIMING:
+                _pattern._say_phase("true-dof slot order", time.perf_counter() - t0, nnz_t)
+            nnz_diag = int(in_diag.sum())
+            r2 = np.empty(nnz_t, dtype=np.int64); r2[newslot] = urow
+            c2 = np.empty(nnz_t, dtype=np.int64); c2[newslot] = ucol
+            del in_diag, lead
+            cmap = np.unique(c2[nnz_diag:])
+            self.n_offd = int(cmap.size)
+            # Which constructor, agreed by all ranks.  The copying 9-argument constructor
+            # and the diag/offd one communicate differently (one allreduces the global
+            # nonzero count, the other builds its comm package first), so ranks choosing
+            # by their *own* ``n_offd`` would deadlock inside MFEM.  The copy route is
+            # taken only when no rank has an off-diagonal column.
+            self.all_local = not bool(comm.allreduce(int(self.n_offd), op=MPI.MAX))
+            # The copying constructor (``_finish_copy``) takes the graph as one row-major
+            # CSR with global columns, which ``urow``/``ucol`` already are, with
+            # ``newslot`` giving each entry's slot.  These arrays are kept only where that
+            # constructor is the route now (the host with no off-diagonal column anywhere,
+            # or a device with ``HIPPYMFEM_PARMAT_DEVICE=copy``), and otherwise rebuilt
+            # from the two blocks on first use: ``J_t`` alone can be a gigabyte per rank,
+            # and the block constructor never reads it.
+            from ..common.parvector import device_active
+
+            if self.all_local or (device_active() and DEVICE_PARMAT != "block"):
+                indptr = np.zeros(self.ntd + 1, dtype=np.int64)
+                np.cumsum(np.bincount(urow, minlength=self.ntd), out=indptr[1:])
+                self._rm = (indptr.astype(np.int32),
+                            np.ascontiguousarray(ucol).astype(_HYPRE_BIGINT, copy=False),
+                            None if np.array_equal(newslot, np.arange(nnz_t)) else
+                            newslot.astype(np.int32 if nnz_t < 2 ** 31 else np.int64))
+                del indptr
+            else:
+                self._rm = None
+            del urow, ucol
+            self.I_diag = np.zeros(self.ntd + 1, dtype=np.int32)
+            np.cumsum(np.bincount(r2[:nnz_diag], minlength=self.ntd), out=self.I_diag[1:])
+            self.J_diag = np.ascontiguousarray(c2[:nnz_diag] - self.c0).astype(np.int32)
+            self.I_offd = np.zeros(self.ntd + 1, dtype=np.int32)
+            np.cumsum(np.bincount(r2[nnz_diag:], minlength=self.ntd), out=self.I_offd[1:])
+            self.J_offd = np.ascontiguousarray(np.searchsorted(cmap, c2[nnz_diag:])).astype(np.int32)
+            self.nnz_diag = nnz_diag
+            del r2, c2
+            # Pointers MFEM's block constructor wants (HYPRE_BigInt *), built by index: an
+            # array made from a list or a numpy array can hand back a pointer into storage
+            # that does not outlive the call, and the matrix built on it would be wrong.
+            self.ia_rows = bigint_array([self.t0, self.t1])
+            self.ia_cols = bigint_array([self.c0, self.c1])
+            self.ia_cmap = bigint_array(cmap)
+            self.cmap = cmap.astype(np.int64)
+
+            # ldof CSR slot -> target: a true-dof slot for an own row, a send-buffer
+            # position (past the true-dof slots) for a ghost row.
+            tslot = np.empty(pattern.nnz, dtype=np.int64)
+            tslot[np.flatnonzero(mine)] = newslot[inv[:n_own]]
+            tslot[gidx] = nnz_t + np.arange(nsend, dtype=np.int64)
+            self.slot_recv = np.ascontiguousarray(newslot[inv[n_own:]])
+            del inv, gidx, mine, newslot
+        if _pattern.LEAN:
+            # as wide as the slots need, whichever route made it (int32 below two billion
+            # slots: this is one integer per nonzero that the pattern keeps)
+            want = np.int32 if nnz_t + nsend <= np.iinfo(np.int32).max else np.int64
+            if tslot.dtype != want:
+                tslot = tslot.astype(want)
         self.tslot = tslot
         self.nnz_t, self.nsend, self.nrecv = nnz_t, nsend, nrecv
         # Whether *any* rank exchanges, agreed by all of them: skipping the
@@ -343,10 +405,16 @@ class TrueDofPattern:
         # collective behind a rank-local condition (a rank without boundary elements
         # would skip it and the others would wait in it forever).
         self.exchange = bool(comm.allreduce(nsend + nrecv, op=MPI.MAX))
+        # How they exchange is one decision of all the ranks as well, and it is taken
+        # here, where every rank is: in :meth:`finish` a rank without elements has a host
+        # accumulator and its neighbours device ones, and a rank that waited in the
+        # collective for neighbours that were sending it messages would wait for ever.
+        self.messages = self.exchange and bool(comm.allreduce(
+            int(DEVICE_EXCHANGE == "neighbors" and device_finish()), op=MPI.MIN))
         self.scnt, self.sdsp, self.rcnt, self.rdsp = scnt, sdsp, rcnt, rdsp
         self.comm, self.same = comm, same
-        self.rows_t = np.array([self.t0, self.t1], dtype=_HYPRE_INT)
-        self.cols_t = np.array([self.c0, self.c1], dtype=_HYPRE_INT)
+        self.rows_t = np.array([self.t0, self.t1], dtype=_HYPRE_BIGINT)
+        self.cols_t = np.array([self.c0, self.c1], dtype=_HYPRE_BIGINT)
         self._kill = IdentityCache()
         self._diag = IdentityCache()
         self._dev_J = {}                   # device copies of J (pattern.DEVICE_PATTERN)
@@ -357,6 +425,15 @@ class TrueDofPattern:
         width = nnz_t + nsend
         idx_t = np.int32 if width <= np.iinfo(np.int32).max else np.intp
         tp.slot = tslot[pattern.slot].astype(idx_t, copy=False)
+        tp._slot_again = None
+        if _pattern.LEAN:
+            # The ldof pattern's own map has done what this route needs of it, and the
+            # target's can be made from it again (ScatterPattern.release_slot).
+            def again(tslot=tslot, pattern=pattern, idx_t=idx_t):
+                return tslot[pattern.slot].astype(idx_t, copy=False)
+
+            tp._slot_again = again
+            pattern.release_slot()
         tp.nnz = width
         tp.nrow, tp.ncol = self.ntd, self.gnc
         tp.indptr, tp.indices = self.I_diag, self.J_diag   # the diagonal block's
@@ -366,6 +443,88 @@ class TrueDofPattern:
         tp._pad = None
         tp.maxc = None
         self.target = tp
+
+    def _graph_lean(self, pattern, comm, starts, gt_t, gt_r, owned):
+        """The graph of ``__init__`` without its whole-graph arrays (pattern.LEAN).
+
+        The entries of rows other ranks own are found from those rows alone and
+        exchanged as before; the true-dof rows are then laid out one at a time
+        (:func:`~hippymfem.fem.patternbuild.tdof_graph`), each from its own ldof row and
+        the entries that arrived for it.  Sets the same attributes and returns
+        ``(tslot, nnz_t, nsend, nrecv, scnt, sdsp, rcnt, rdsp)``; ``tslot`` is as wide as
+        the slots need (int32 below two billion), where the other route keeps int64.
+        """
+        size = comm.size
+        I = np.asarray(pattern.indptr, dtype=np.int64)
+        J = pattern.indices
+        nnz = int(pattern.nnz)
+
+        # Ghost entries, grouped by the rank that owns their row, in the order of
+        # ``__init__``: ascending ldof slot, then a stable sort by destination.
+        grow = np.flatnonzero(~owned)
+        cnt = I[grow + 1] - I[grow]
+        nsend = int(cnt.sum())
+        gidx = (np.repeat(I[grow] - (np.cumsum(cnt) - cnt), cnt)
+                + np.arange(nsend, dtype=np.int64))
+        rg = np.repeat(gt_t[grow], cnt)
+        cg = gt_r[J[gidx]]
+        del grow, cnt
+        dest = np.searchsorted(starts, rg, side="right") - 1
+        o = np.argsort(dest, kind="stable")
+        gidx, dest, rg, cg = gidx[o], dest[o], rg[o], cg[o]
+        del o
+        scnt = np.bincount(dest, minlength=size).astype(np.int64)
+        rcnt = np.empty(size, dtype=np.int64)
+        comm.Alltoall([scnt, MPI.INT64_T], [rcnt, MPI.INT64_T])
+        sdsp = np.concatenate([[0], np.cumsum(scnt)[:-1]]).astype(np.int64)
+        rdsp = np.concatenate([[0], np.cumsum(rcnt)[:-1]]).astype(np.int64)
+        nrecv = int(rcnt.sum())
+        r_rg = np.empty(nrecv, dtype=np.int64)
+        r_cg = np.empty(nrecv, dtype=np.int64)
+        comm.Alltoallv([np.ascontiguousarray(rg), scnt, sdsp, MPI.INT64_T],
+                       [r_rg, rcnt, rdsp, MPI.INT64_T])
+        comm.Alltoallv([np.ascontiguousarray(cg), scnt, sdsp, MPI.INT64_T],
+                       [r_cg, rcnt, rdsp, MPI.INT64_T])
+        del rg, cg, dest
+
+        # the ldof row that is each true-dof row of this rank
+        own_rows = np.flatnonzero(owned)
+        ldof_of_row = np.empty(self.ntd, dtype=np.int64)
+        ldof_of_row[gt_t[own_rows] - self.t0] = own_rows
+        del own_rows
+        t0 = time.perf_counter()
+        # (the slots are bounded by the entries until the nonzeros are known)
+        wide = np.int32 if nnz + nrecv <= np.iinfo(np.int32).max else np.int64
+        ndiag, noff, tslot, slot_recv, J_diag, offd_cols = patternbuild.tdof_graph(
+            ldof_of_row, I, J, np.ascontiguousarray(gt_r, dtype=np.int64),
+            r_rg - self.t0, r_cg, self.c0, self.c1, self.c1 - self.c0 == self.ntd, nnz,
+            wide)
+        del ldof_of_row, r_rg, r_cg
+        nnz_diag = int(J_diag.size)
+        nnz_t = nnz_diag + int(offd_cols.size)
+        if _pattern.PATTERN_TIMING:
+            _pattern._say_phase("true-dof rows (%d thr)" % patternbuild.threads(),
+                                time.perf_counter() - t0, nnz - nsend + nrecv)
+        cmap = np.unique(offd_cols)
+        self.n_offd = int(cmap.size)
+        # (collective, and in the place the other route has it)
+        self.all_local = not bool(comm.allreduce(int(self.n_offd), op=MPI.MAX))
+        self._rm = None                          # made from the blocks if ever asked for
+        self.I_diag = np.zeros(self.ntd + 1, dtype=np.int32)
+        np.cumsum(ndiag, out=self.I_diag[1:])
+        self.J_diag = J_diag
+        self.I_offd = np.zeros(self.ntd + 1, dtype=np.int32)
+        np.cumsum(noff, out=self.I_offd[1:])
+        self.J_offd = np.ascontiguousarray(np.searchsorted(cmap, offd_cols)).astype(np.int32)
+        self.nnz_diag = nnz_diag
+        del ndiag, noff, offd_cols
+        self.ia_rows = bigint_array([self.t0, self.t1])
+        self.ia_cols = bigint_array([self.c0, self.c1])
+        self.ia_cmap = bigint_array(cmap)
+        self.cmap = cmap.astype(np.int64)
+        tslot[gidx] = nnz_t + np.arange(nsend, dtype=np.int64)
+        self.slot_recv = slot_recv
+        return tslot, nnz_t, nsend, nrecv, scnt, sdsp, rcnt, rdsp
 
     def kill(self, ldof_kill):
         """Target slots of a set of ldof CSR slots, for the folded elimination.
@@ -430,7 +589,7 @@ class TrueDofPattern:
             got = self._dev_J[key] = _put(self.J_diag if block == "diag" else self.J_offd)
         return got
 
-    def finish(self, acc, diagonal=None, single=False):
+    def finish(self, acc, diagonal=None, single=False, row_sums=False):
         """Exchange the send buffer of a scattered accumulator and build the matrix.
 
         ``diagonal`` is ``(slots, value)``, the slots from :meth:`diagonal_slots`; it
@@ -450,18 +609,21 @@ class TrueDofPattern:
 
         With ``single`` the matrix is made in the single-precision hypre instead
         (:class:`~hippymfem.algorithms.singlesolve.SingleParMatrix`), from the same
-        values: no double-precision matrix exists at any time.
+        values: no double-precision matrix exists at any time.  ``row_sums`` asks that
+        matrix to keep the defect of its row sums (:data:`SINGLE_ROW_SUMS`).
         """
         if not isinstance(acc, np.ndarray):
             if device_finish():
                 if single:
-                    return self._finish_single(self._device_values(acc, diagonal))
+                    return self._finish_single(self._device_values(acc, diagonal), row_sums)
                 return self._finish_device(acc, diagonal)
             dev, acc = acc, host_writable(acc)
             self.target.give_back(dev)
             del dev
         acc = host_writable(acc)
-        if self.exchange:                  # collective decision, see __init__
+        if self.messages:                  # collective decisions, both: see __init__
+            acc = self._exchange_messages(acc)
+        elif self.exchange:
             rbuf = np.empty(self.nrecv, dtype=np.float64)
             self.comm.Alltoallv(
                 [np.ascontiguousarray(acc[self.nnz_t:], dtype=np.float64),
@@ -474,7 +636,7 @@ class TrueDofPattern:
             slots, value = diagonal
             acc[slots] = value
         if single:
-            return self._finish_single(acc)
+            return self._finish_single(acc, row_sums)
         from ..common.parvector import device_active
 
         if device_active() and DEVICE_PARMAT == "block":
@@ -555,7 +717,9 @@ class TrueDofPattern:
         from .pattern import _device_set, _fused_add
 
         tp = self.target
-        if self.exchange:                  # collective decision, see __init__
+        if self.messages:                  # collective decisions, both: see __init__
+            acc = self._exchange_messages(acc)
+        elif self.exchange:
             sbuf = (np.ascontiguousarray(np.asarray(acc[self.nnz_t:]), dtype=np.float64)
                     if self.nsend else np.zeros(0, dtype=np.float64))
             rbuf = np.empty(self.nrecv, dtype=np.float64)
@@ -569,12 +733,108 @@ class TrueDofPattern:
                 acc = _device_set(acc, tp._device_zero(slots), float(value))
         return acc
 
-    def _finish_single(self, acc):
+    def _exchange_buffers(self):
+        """The two buffers of :meth:`_exchange_messages`, eight bytes an entry so that
+        either precision fits, with the ranks to send to and to receive from: the
+        pattern's, made when first needed and page-locked where the runtime allows."""
+        buf = self.__dict__.get("_xbuf")
+        if buf is None:
+            import weakref
+
+            from ..common import devicebridge as bridge
+
+            sb = np.zeros(max(int(self.nsend), 1), dtype=np.float64)
+            rb = np.zeros(max(int(self.nrecv), 1), dtype=np.float64)
+            pinned = [int(b.ctypes.data) for b in (sb, rb) if bridge.pin(b)]
+            if pinned:
+                # (unregistered before the arrays go, which is when the pattern goes)
+                weakref.finalize(self, _unpin_buffers, pinned)
+            buf = self._xbuf = (sb, rb, [int(r) for r in np.flatnonzero(self.scnt)],
+                                [int(r) for r in np.flatnonzero(self.rcnt)])
+        return buf
+
+    def _exchange_messages(self, acc):
+        """The exchange of :meth:`finish` by messages to and from the ranks this one
+        shares rows with (:data:`DEVICE_EXCHANGE`), for a host or a device accumulator;
+        returns it with what was received added.
+
+        Each rank sends the entries of its own accumulator as they are, in its
+        precision, and learns each neighbour's from the length of what arrives: the
+        ranks of one assembly need not hold accumulators of one kind (a rank without
+        elements has a host one of double precision beside device ones of single).  A
+        device accumulator's entries are copied from the card into the pattern's
+        page-locked buffer and what arrives is copied back from the other one; a host
+        accumulator is sent from where it is."""
+        from ..common import devicebridge as bridge
+        from .pattern import _fused_add
+
+        host = isinstance(acc, np.ndarray)
+        if host and acc.dtype not in (np.float32, np.float64):
+            acc = acc.astype(np.float64)
+        size = int(np.dtype(acc.dtype).itemsize)
+        sb, rb, dests, srcs = self._exchange_buffers()
+        scnt, sdsp, rcnt, rdsp = self.scnt, self.sdsp, self.rcnt, self.rdsp
+        inbox = rb.view(np.uint8)
+        requests = [self.comm.Irecv([inbox[8 * int(rdsp[r]):8 * int(rdsp[r] + rcnt[r])],
+                                     MPI.BYTE], source=r, tag=_EXCHANGE_TAG) for r in srcs]
+        out = None
+        if self.nsend:
+            if host:
+                # (a view: the accumulator is contiguous, and it lives past the wait)
+                out = np.ascontiguousarray(acc[self.nnz_t:]).view(np.uint8)
+            else:
+                out = sb.view(np.uint8)[:size * int(self.nsend)]
+                base, _total = bridge.jax_address(acc)        # (waits for the scatter)
+                bridge.copy_to_host(out, base + int(self.nnz_t) * size)
+        requests += [self.comm.Isend([out[size * int(sdsp[r]):size * int(sdsp[r] + scnt[r])],
+                                      MPI.BYTE], dest=r, tag=_EXCHANGE_TAG) for r in dests]
+        statuses = [MPI.Status() for _ in requests]
+        MPI.Request.Waitall(requests, statuses)
+        if not self.nrecv:
+            return acc
+        got = self._received(rb, srcs, statuses, np.dtype(acc.dtype))
+        if host:
+            acc[:self.nnz_t] += np.bincount(self.slot_recv, weights=got,
+                                            minlength=self.nnz_t)
+            return acc
+        return _fused_add(acc, bridge.host_to_jax(got),
+                          self.target._device_zero(self.slot_recv), None)
+
+    def _received(self, rb, srcs, statuses, dtype):
+        """What the messages of :meth:`_exchange_messages` brought, as the ``nrecv``
+        values of the precision ``dtype`` in the order of ``slot_recv``: a view of the
+        receive buffer.
+
+        Each message lies at the start of its slot of eight bytes an entry, in its
+        sender's precision, which its length tells.  Double-precision values wanted in
+        double precision are in place already.  Anything else is moved or converted to
+        its place, the messages taken in the order of their slots, so that no move
+        reaches a message not yet read."""
+        rcnt, rdsp = self.rcnt, self.rdsp
+        wide, narrow = rb.view(np.float64), rb.view(np.float32)
+        out = wide if dtype.itemsize == 8 else narrow
+        for r, status in zip(srcs, statuses):
+            n, at = int(rcnt[r]), int(rdsp[r])
+            nbytes = int(status.Get_count(MPI.BYTE))
+            if nbytes == 8 * n:
+                if out is not wide:
+                    out[at:at + n] = wide[at:at + n].astype(np.float32)
+            elif nbytes == 4 * n:
+                if out is wide:
+                    out[at:at + n] = narrow[2 * at:2 * at + n].astype(np.float64)
+                elif at:
+                    out[at:at + n] = narrow[2 * at:2 * at + n].copy()
+            else:
+                raise RuntimeError("rank %d sent %d bytes for %d entries of a matrix: "
+                                   "neither single nor double precision" % (r, nbytes, n))
+        return out[:int(self.nrecv)]
+
+    def _finish_single(self, acc, row_sums=False):
         """The matrix in the single-precision hypre, from the values of the two blocks
         (a device or a host accumulator, after the exchange)."""
         from ..algorithms.singlesolve import SingleParMatrix
 
-        S = SingleParMatrix.from_pattern(self, acc)
+        S = SingleParMatrix.from_pattern(self, acc, row_sums=row_sums)
         if not isinstance(acc, np.ndarray):
             self.target.give_back(acc)
         return S
@@ -637,7 +897,7 @@ class TrueDofPattern:
             indptr = np.zeros(ntd + 1, dtype=np.int64)
             np.cumsum(np.bincount(rows, minlength=ntd), out=indptr[1:])
             self._rm = (indptr.astype(np.int32),
-                        np.ascontiguousarray(cols[order]).astype(_HYPRE_INT, copy=False),
+                        np.ascontiguousarray(cols[order]).astype(_HYPRE_BIGINT, copy=False),
                         None if np.array_equal(order, np.arange(nnz_t)) else
                         order.astype(np.int32 if nnz_t < 2 ** 31 else np.int64))
         return self._rm
@@ -686,18 +946,37 @@ def _tdof_maps(fes):
     the rank's first.  A non-boolean ``P`` (which the true-dof route never takes) or
     hypre's memory on a device (where the merged rows cannot be read from the host)
     falls back to one SWIG call per dof.
+
+    Kept for the space while it is not updated: every pattern of a problem asks for the
+    same two or three spaces (and the interpolation of a p-multigrid once more), and on
+    a device a space of fourteen million dofs takes ten seconds of those calls.  The
+    arrays are for reading only.
     """
     from ..common.parvector import device_active
 
+    sequence = int(fes.GetSequence())
+    got = _TDOF_MAPS.get((fes,))
+    if got is not None and got[0] == sequence:
+        return got[1], got[2]
+    gt, lt = _tdof_maps_of(fes, device_active())
+    _TDOF_MAPS.put((fes,), (sequence, gt, lt))
+    return gt, lt
+
+
+_TDOF_MAPS = IdentityCache()
+
+
+def _tdof_maps_of(fes, on_device):
     nld = int(fes.GetVSize())
-    if not device_active() and nld:
+    # (the merged rows have 32-bit columns: not for a space numbered beyond them)
+    if not on_device and nld and int(fes.GlobalTrueVSize()) <= np.iinfo(np.int32).max:
         from ..common.linalg import hypre_to_scipy
 
         P = fes.Dof_TrueDof_Matrix()
         Pl = hypre_to_scipy(P)
         if Pl.shape[0] == nld and np.array_equal(np.diff(Pl.indptr), np.ones(nld, dtype=Pl.indptr.dtype)):
             gt = np.asarray(Pl.indices[Pl.indptr[:-1]], dtype=np.int64)
-            starts = np.asarray(mfem.intArray((P.GetColStarts(), 2)).GetDataArray())
+            starts = bigint_view(P.GetColStarts(), 2)
             c0, c1 = int(starts[0]), int(starts[1])
             lt = np.where((gt >= c0) & (gt < c1), gt - c0, -1)
             return gt, lt
@@ -726,3 +1005,4 @@ def get_tdof_pattern(pattern, test_space, trial_space):
 
 def clear_tdof_cache():
     _TDOF.clear()
+    _TDOF_MAPS.clear()

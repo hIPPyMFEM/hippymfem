@@ -6,6 +6,7 @@
 
 from .multivector import MatMvMult, MatMvTranspmult, MultiVector, MvDSmatMult
 from .linSolvers import (
+    ChebyshevSolver,
     KrylovSolver,
     KrylovSolver_ParameterList,
     auto_solver,
@@ -53,7 +54,8 @@ from .directSolvers import (
 
 __all__ = [
     "MultiVector", "MatMvMult", "MatMvTranspmult", "MvDSmatMult",
-    "KrylovSolver", "LUSolver", "auto_solver", "TransposeSolver", "LumpedMassSolver",
+    "KrylovSolver", "ChebyshevSolver", "LUSolver", "auto_solver", "TransposeSolver",
+    "LumpedMassSolver",
     "KrylovSolver_ParameterList", "make_solver",
     "CGSolverSteihaug", "CGSolverSteihaug_ParameterList",
     "ReducedSpaceNewtonCG", "ReducedSpaceNewtonCG_ParameterList",

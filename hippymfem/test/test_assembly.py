@@ -153,9 +153,12 @@ def test_sortfree_pattern():
         check("sort-free pattern (skipped: numba is not importable)", True)
         return
     saved_mode = pb.MODE
+    saved_lean = (pat.LEAN, pat.LEAN_MIN_ENTRIES, pat._COMPACT_SLAB)
     worst = 0
     worst_t = 0
+    worst_l = 0
     ncase = 0
+    released = 0
     try:
         # "mixed" has two element groups, so it runs the reordering into mesh element
         # order that precedes the build, and runs of two lengths
@@ -165,9 +168,15 @@ def test_sortfree_pattern():
             Vu, Vm = FunctionSpace.H1(pm, pu), FunctionSpace.H1(pm, pmo)
             groups = MeshBatches(pm, 2 * pu + 2, COMM).groups
             for tst, trl in ((Vu, Vu), (Vu, Vm), (Vm, Vm)):
-                got, tdof = {}, {}
-                for mode in ("sort", "numba"):
-                    pb.MODE, pb._USABLE = mode, None
+                got, tdof, lean = {}, {}, {}
+                # "lean" is the build from the dof tables and row by row, with the maps
+                # given up and made again (pattern.LEAN), forced on these small patterns
+                # and with the compact map made in slabs of a few elements
+                for mode in ("sort", "numba", "lean"):
+                    pb.MODE, pb._USABLE = ("numba" if mode == "lean" else mode), None
+                    pat.LEAN = mode == "lean"
+                    pat.LEAN_MIN_ENTRIES, pat._COMPACT_SLAB = (
+                        (0, 1 << 9) if mode == "lean" else saved_lean[1:])
                     pat.clear_pattern_cache()
                     P = pat.get_pattern(tst, trl, groups)
                     got[mode] = (P.nnz, np.asarray(P.indptr).copy(),
@@ -177,6 +186,23 @@ def test_sortfree_pattern():
                     tdof[mode] = ([getattr(T, c) for c in tdof_counts],
                                   [np.asarray(getattr(T, c)).copy() for c in tdof_arrays]
                                   + [None if x is None else np.asarray(x).copy() for x in rm])
+                    if mode == "lean" and P._slot is None:
+                        released += 1
+                    # the maps after the scatter has what it needs of them: the compact
+                    # map, the target's slots (given up by then, when lean) and the ldof
+                    # pattern's, made again
+                    cm = pat._compact_slots(T.target.slot, T.target.shapes, T.target.sizes)
+                    if mode == "lean" and T.target.nnz:
+                        T.target.release_slot()
+                    rmask = np.zeros(P.nrow, dtype=bool)
+                    rmask[::3] = True
+                    cmask = np.zeros(P.ncol, dtype=bool)
+                    cmask[1::4] = True
+                    lean[mode] = ([np.asarray(T.target.slot).copy(), np.asarray(P.slot).copy(),
+                                   P.masked_slots(rmask, cmask).copy(),
+                                   P.masked_slots(None, cmask).copy()]
+                                  + ([None, None] if cm is None else
+                                     [cm[0].copy(), cm[1].copy(), np.array([cm[2]])]))
                 a, b = got["sort"], got["numba"]
                 same = (a[0] == b[0] and all(x.dtype == y.dtype and np.array_equal(x, y)
                                              for x, y in zip(a[1:], b[1:])))
@@ -185,9 +211,25 @@ def test_sortfree_pattern():
                 same_t = (ta[0] == tb[0] and len(ta[1]) == len(tb[1])
                           and same_arrays(ta[1], tb[1]))
                 worst_t = max(worst_t, 0 if same_t else 1)
+                # lean against the route it replaces: every array and its type, but for
+                # ``tslot``, which lean keeps as wide as the slots need and no wider
+                c, tc = got["lean"], tdof["lean"]
+                k = tdof_arrays.index("tslot")
+                same_l = (b[0] == c[0]
+                          and all(x.dtype == y.dtype and np.array_equal(x, y)
+                                  for x, y in zip(b[1:], c[1:]))
+                          and tb[0] == tc[0] and len(tb[1]) == len(tc[1])
+                          and same_arrays(tb[1][:k] + tb[1][k + 1:], tc[1][:k] + tc[1][k + 1:])
+                          and np.array_equal(tb[1][k], tc[1][k])
+                          and tc[1][k].dtype == (np.int32 if tc[0][0] + tc[0][1] < 2 ** 31
+                                                 else np.int64)
+                          and len(lean["numba"]) == len(lean["lean"])
+                          and same_arrays(lean["numba"], lean["lean"]))
+                worst_l = max(worst_l, 0 if same_l else 1)
                 ncase += 1
     finally:
         pb.MODE, pb._USABLE = saved_mode, None
+        pat.LEAN, pat.LEAN_MIN_ENTRIES, pat._COMPACT_SLAB = saved_lean
         pat.clear_pattern_cache()
     worst = COMM.allreduce(worst, op=MPI.MAX)
     check("sort-free pattern identical to the sorted one", worst == 0,
@@ -195,6 +237,12 @@ def test_sortfree_pattern():
     worst_t = COMM.allreduce(worst_t, op=MPI.MAX)
     check("its true-dof pattern identical too", worst_t == 0,
           "(%d space pairs on %d ranks)" % (ncase, COMM.size))
+    worst_l = COMM.allreduce(worst_l, op=MPI.MAX)
+    released = COMM.allreduce(released, op=MPI.SUM)
+    check("the same arrays from the dof tables and row by row, maps given up and made again",
+          worst_l == 0 and released > 0,
+          "(%d space pairs on %d ranks; the ldof map given up %d times)"
+          % (ncase, COMM.size, released))
 
     import os
     old = os.environ.get("OMPI_COMM_WORLD_LOCAL_SIZE")

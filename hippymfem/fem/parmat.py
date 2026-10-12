@@ -10,7 +10,7 @@ import numpy as np
 import mfem.par as mfem
 from ..common.identitycache import IdentityCache
 from ..common.linalg import own, take_ownership
-from ..common.parvector import _HYPRE_INT
+from ..common.parvector import _HYPRE_BIGINT
 from ..config import env_choice
 from .prolongation import _boolean_prolongation, _ldof_offset, _ldof_starts
 from ..common.parvector import device_active
@@ -147,13 +147,14 @@ def local_par_matrix(pattern, data, test_space, trial_space):
         if on_device:
             # This constructor's typemaps want HYPRE_Int row pointers and
             # HYPRE_BigInt columns and partitions, whose widths differ between the
-            # host and device builds; ``hypre_indices`` is sized for the host build.
-            # The casts are no-ops where the widths agree.
+            # host and device builds and within a build of hypre with
+            # --enable-mixedint; ``hypre_indices`` is sized for them.  The casts are
+            # no-ops where the widths agree.
             I = np.ascontiguousarray(I, dtype=np.int32)
-            J = np.ascontiguousarray(J, dtype=_HYPRE_INT)
-            rows = np.ascontiguousarray(rows, dtype=_HYPRE_INT)
+            J = np.ascontiguousarray(J, dtype=_HYPRE_BIGINT)
+            rows = np.ascontiguousarray(rows, dtype=_HYPRE_BIGINT)
             if cols is not None:              # None for a square block, by design
-                cols = np.ascontiguousarray(cols, dtype=_HYPRE_INT)
+                cols = np.ascontiguousarray(cols, dtype=_HYPRE_BIGINT)
         if same:
             # A 4-element list makes PyMFEM pass one pointer for both partitions,
             # which is how MFEM detects "square, same partition" and reorders each

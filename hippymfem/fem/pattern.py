@@ -17,7 +17,7 @@ import warnings
 import numpy as np
 from ..common.identitycache import IdentityCache
 from ..common.keepalive import KeepAlive
-from ..common.parvector import _HYPRE_INT
+from ..common.parvector import _HYPRE_BIGINT, _HYPRE_INT
 from .elementbatch import group_tables
 from .spaces import as_space
 from .parmat import _TRANSPOSE
@@ -81,6 +81,23 @@ COMPACT_PATTERN = os.environ.get("HIPPYMFEM_COMPACT_PATTERN", "1").lower() not i
     "0", "no", "false", "off")
 
 
+#: Build a large pattern without arrays of the size of the element matrices beside what
+#: it keeps, and keep no map twice: the graph of one group of elements comes from its two
+#: dof tables (:func:`~hippymfem.fem.patternbuild.build_tables`), the true-dof graph is
+#: laid out row by row (:func:`~hippymfem.fem.patternbuild.tdof_graph`), the compact map
+#: of :data:`COMPACT_PATTERN` is made in slabs, and a map with one entry per
+#: element-matrix entry (``slot``) is given up once what is made from it exists: the ldof
+#: pattern's when its true-dof target has its own, the target's when the compact map has
+#: been made.  A map given up is made again if something asks for it.  With a million
+#: quadratic hexahedra on a rank the index tables of a Newton step then take 13 GiB of
+#: host memory instead of 30, and their builds 3 GiB more instead of 12.  The arrays are
+#: the same.  ``HIPPYMFEM_PATTERN_LEAN=0`` builds and keeps them as before.
+LEAN = os.environ.get("HIPPYMFEM_PATTERN_LEAN", "1").lower() not in (
+    "0", "false", "no", "off")
+#: A map is given up only where it is worth it: from this many entries.
+LEAN_MIN_ENTRIES = 1 << 24
+
+
 def _compact_slots(slot, shapes, sizes):
     """``(codes, bases, bits)`` for :data:`COMPACT_PATTERN`, or ``None``.
 
@@ -91,34 +108,49 @@ def _compact_slots(slot, shapes, sizes):
     """
     if slot.size == 0:
         return None
+    base_t = np.int32 if slot.dtype.itemsize <= 4 else slot.dtype
+    nrows = sum(int(ne) * int(a) for ne, a, _b in shapes)
     for dtype, bits in ((np.uint8, 7), (np.uint16, 15)):
         limit = (1 << bits) - 1
-        codes, bases, n0, ok = [], [], 0, True
+        # written a slab of elements at a time: the differences below are as wide as the
+        # slots, and for the whole map they would be several times the map itself
+        codes = np.empty(slot.size, dtype=dtype)
+        bases = np.empty((nrows, 2), dtype=base_t)
+        n0, r0, ok = 0, 0, True
         for (ne, a, b), size in zip(shapes, sizes):
-            S = slot[n0:n0 + size].reshape(ne, a, b)
-            n0 += size
             if ne == 0:
-                codes.append(np.zeros(0, dtype=dtype))
-                bases.append(np.zeros((0, 2), dtype=np.int32 if slot.dtype.itemsize <= 4 else slot.dtype))
                 continue
-            lo = S.min(axis=2)
-            off = S - lo[:, :, None]
-            first = off <= limit
-            big = np.iinfo(S.dtype).max
-            hi = np.where(first, big, S).min(axis=2)
-            hi = np.where(hi == big, lo, hi)
-            off2 = S - hi[:, :, None]
-            if not np.all(first | ((off2 >= 0) & (off2 <= limit))):
-                ok = False
+            step = max(1, _COMPACT_SLAB // max(a * b, 1)) if LEAN else ne
+            for e0 in range(0, ne, step):
+                e1 = min(e0 + step, ne)
+                S = slot[n0 + e0 * a * b:n0 + e1 * a * b].reshape(e1 - e0, a, b)
+                lo = S.min(axis=2)
+                off = S - lo[:, :, None]
+                first = off <= limit
+                big = np.iinfo(S.dtype).max
+                hi = np.where(first, big, S).min(axis=2)
+                hi = np.where(hi == big, lo, hi)
+                off2 = S - hi[:, :, None]
+                if not np.all(first | ((off2 >= 0) & (off2 <= limit))):
+                    ok = False
+                    break
+                codes[n0 + e0 * a * b:n0 + e1 * a * b] = np.where(
+                    first, off, off2 + (1 << bits)).astype(dtype).reshape(-1)
+                # (bases as wide as the slots: int32 below two billion nonzeros)
+                bases[r0 + e0 * a:r0 + e1 * a] = np.stack([lo, hi], axis=-1).reshape(-1, 2)
+                del off, off2, first
+            if not ok:
                 break
-            codes.append(np.where(first, off, off2 + (1 << bits)).astype(dtype).reshape(-1))
-            # (bases as wide as the slots: int32 below two billion nonzeros)
-            bases.append(np.stack([lo, hi], axis=-1).reshape(-1, 2)
-                         .astype(np.int32 if S.dtype.itemsize <= 4 else S.dtype))
-            del off, off2, first
+            n0 += size
+            r0 += ne * a
         if ok:
-            return np.concatenate(codes), np.concatenate(bases), bits
+            return codes, bases, bits
+        del codes, bases
     return None
+
+
+#: Element-matrix entries in a slab of :func:`_compact_slots`.
+_COMPACT_SLAB = 1 << 25
 
 
 def _fused_add_coded(acc, flat, code, base, sign, ndt, bits):
@@ -360,6 +392,29 @@ class ScatterPattern(KeepAlive):
         One per element group, in the same order as the element arrays will be.
     """
 
+    @property
+    def slot(self):
+        """The CSR slot of every element-matrix entry.  A map that was given up
+        (:meth:`release_slot`) is made again here, by whatever made it."""
+        got = self._slot
+        if got is None and self._slot_again is not None:
+            got = self._slot = self._slot_again()
+        return got
+
+    @slot.setter
+    def slot(self, value):
+        self._slot = value
+
+    def release_slot(self):
+        """Give the slot map up where it can be made again and is large
+        (:data:`LEAN`): four bytes an element-matrix entry of host memory.  Returns
+        whether it was given up."""
+        if (LEAN and self._slot is not None and self._slot_again is not None
+                and self.nent >= LEAN_MIN_ENTRIES):
+            self._slot = None
+            return True
+        return False
+
     def _diag_first(self):
         """Whether rows lead with their diagonal: on a square local shape, as hypre wants."""
         return self.nrow == self.ncol
@@ -394,16 +449,62 @@ class ScatterPattern(KeepAlive):
         self.shapes = [(int(tt.group.ne), int(tt.nd_total), int(tr.nd_total))
                        for tt, tr in zip(test_tables, trial_tables)]
         self.sizes = [ne * a * b for ne, a, b in self.shapes]
+        #: the element-matrix entries of the pattern (the length of ``slot``)
+        self.nent = int(sum(self.sizes))
+        self.perm = None
+        self._hypre = {}
+        self._masked = IdentityCache()
+        self._dev_zero = IdentityCache()
+        self._fused = {}
+        self._dev = {}
+        self._dev_pad = {}
+        self._pad = None
+        self.maxc = None
+        self._lookup = None
+        self._slot = None
+        self._slot_again = None
+
+        # One group of elements, which is every mesh of one geometry: the graph and the
+        # slots straight from the two dof tables.  The flat row and column of every
+        # entry, which the route below forms, are 16 bytes an entry that only the build
+        # reads (:data:`LEAN`).
+        from . import patternbuild
+
+        if (LEAN and len(test_tables) == 1 and self.nent
+                and patternbuild.wanted(self.nent)
+                and max(self.nrow, self.ncol) <= int(self._KEY_MASK)):
+            tt, tr = test_tables[0], trial_tables[0]
+            self.sign = None
+            if tt.signs.min() < 0 or tr.signs.min() < 0:
+                self.sign = np.ascontiguousarray(np.broadcast_to(
+                    tt.signs[:, :, None] * tr.signs[:, None, :], self.shapes[0]).reshape(-1))
+            tdofs, cdofs = tt.edofs, tr.edofs
+            diag_first = self._diag_first()
+
+            def again(nrow=self.nrow, ncol=self.ncol):
+                return patternbuild.build_tables(tdofs, cdofs, nrow, ncol, diag_first,
+                                                 _HYPRE_INT)[2]
+
+            t0 = time.perf_counter() if PATTERN_TIMING else None
+            self.indptr, self.indices, self.slot, self.nnz = patternbuild.build_tables(
+                tdofs, cdofs, self.nrow, self.ncol, diag_first, _HYPRE_INT)
+            self._slot_again = again
+            if PATTERN_TIMING:
+                _say_phase("from the tables (%d thr)" % patternbuild.threads(),
+                           time.perf_counter() - t0, self.nent)
+            return
 
         rows, cols, signs, elems = [], [], [], []
         any_sign = False
+        several = len(test_tables) > 1
         for tt, tr in zip(test_tables, trial_tables):
             r = tt.edofs[:, :, None]                  # (ne, nd_test, 1)
             c = tr.edofs[:, None, :]                  # (ne, 1, nd_trial)
             shape = (tt.group.ne, tt.nd_total, tr.nd_total)
             rows.append(np.broadcast_to(r, shape).reshape(-1))
             cols.append(np.broadcast_to(c, shape).reshape(-1))
-            elems.append(np.repeat(tt.group.elems, tt.nd_total * tr.nd_total))
+            if several:                               # (read only to order several groups)
+                elems.append(np.repeat(tt.group.elems, tt.nd_total * tr.nd_total))
             if tt.signs.min() < 0 or tr.signs.min() < 0:
                 any_sign = True
                 s = tt.signs[:, :, None] * tr.signs[:, None, :]
@@ -411,7 +512,9 @@ class ScatterPattern(KeepAlive):
             else:
                 signs.append(None)
 
-        if rows:
+        if len(rows) == 1:                      # (the reshape above is a copy already)
+            rows, cols = rows[0], cols[0]
+        elif rows:
             rows = np.concatenate(rows)
             cols = np.concatenate(cols)
         else:                                   # this rank owns no such elements
@@ -426,16 +529,6 @@ class ScatterPattern(KeepAlive):
         # round-off, which is enough to move a long optimizer run, so on a
         # multi-geometry mesh the entries are permuted back into element order.  A
         # single-geometry mesh is already in that order and pays nothing.
-        self.perm = None
-        self._hypre = {}
-        self._masked = IdentityCache()
-        self._dev_zero = IdentityCache()
-        self._fused = {}
-        self._dev = {}
-        self._dev_pad = {}
-        self._pad = None
-        self.maxc = None
-        self._lookup = None
         if len(self.shapes) > 1:
             eidx = np.concatenate(elems)
             perm = np.argsort(eidx, kind="stable")
@@ -610,12 +703,11 @@ class ScatterPattern(KeepAlive):
         if self.nnz == 0:
             kill = np.zeros(0, dtype=np.intp)
         else:
-            cols = np.asarray(self.indices, dtype=np.int64)
             hit = (np.repeat(row_mask, np.diff(self.indptr.astype(np.int64)))
                    if row_mask is not None else np.zeros(self.nnz, dtype=bool))
             if col_mask is not None:
-                hit = hit | col_mask[cols]
-            kill = np.flatnonzero(hit).astype(np.intp)
+                hit |= col_mask[self.indices]
+            kill = np.flatnonzero(hit).astype(np.intp, copy=False)
         return self._masked.put((row_mask, col_mask), kill)
 
     # ------------------------------------------------------------------ hypre
@@ -633,10 +725,10 @@ class ScatterPattern(KeepAlive):
         if got is None:
             I = np.ascontiguousarray(self.indptr, dtype=np.int32)
             J = np.ascontiguousarray(self.indices.astype(np.int64) + coff,
-                                     dtype=_HYPRE_INT)
-            rows = np.array([roff, roff + self.nrow], dtype=_HYPRE_INT)
+                                     dtype=_HYPRE_BIGINT)
+            rows = np.array([roff, roff + self.nrow], dtype=_HYPRE_BIGINT)
             cols = (None if same else
-                    np.array([coff, coff + self.ncol], dtype=_HYPRE_INT))
+                    np.array([coff, coff + self.ncol], dtype=_HYPRE_BIGINT))
             got = self._hypre[key] = (I, J, rows, cols)
         return got
 
@@ -677,9 +769,9 @@ class ScatterPattern(KeepAlive):
             flat = np.concatenate([
                 np.asarray(E, dtype=np.float64).reshape(-1)
                 for E in element_matrices])
-        if flat.size != self.slot.size:
+        if flat.size != self.nent:
             raise ValueError("element arrays hold %d entries, pattern expects %d"
-                             % (flat.size, self.slot.size))
+                             % (flat.size, self.nent))
         if self.perm is not None:
             flat = flat[self.perm]
         if self.sign is not None:
@@ -840,6 +932,8 @@ class ScatterPattern(KeepAlive):
                 got.update(code=code, rows=rows, bits=bits, rbase=rbase,
                            ndt=[int(a) for _, a, _b in self.shapes],
                            ndj=[int(b) for _, _a, b in self.shapes], sign=sign)
+                # (the scatter reads the compact map from here on: see LEAN)
+                self.release_slot()
             else:
                 slot, sign = self.slot, self.sign
                 if on_device:
@@ -862,9 +956,9 @@ class ScatterPattern(KeepAlive):
         else:
             flat = jnp.concatenate([jnp.reshape(E, (-1,))
                                     for E in element_matrices])
-        if flat.size != self.slot.size:
+        if flat.size != self.nent:
             raise ValueError("element arrays hold %d entries, pattern expects %d"
-                             % (flat.size, self.slot.size))
+                             % (flat.size, self.nent))
         if perm is not None:
             flat = flat[perm]
         if sign is not None:
@@ -928,7 +1022,7 @@ class ScatterPattern(KeepAlive):
 
     def __repr__(self):
         return "ScatterPattern(%dx%d, nnz=%d, entries=%d)" % (
-            self.nrow, self.ncol, self.nnz, self.slot.size)
+            self.nrow, self.ncol, self.nnz, self.nent)
 
 
 #: Print how long each phase of a pattern build took, on rank 0.  The build is the

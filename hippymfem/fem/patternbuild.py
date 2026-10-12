@@ -33,6 +33,12 @@ out hypre's diagonal and off-diagonal blocks with one compiled pass over the row
 (:func:`block_slots`); at 128\\ :sup:`3` on two L40S those took 17.0 s and 13.7 s as sorts
 and mask passes, and take 5.7 s and 0.42 s.
 
+Both graphs are built without an array of the size of the element matrices beside their
+results where the entries are those of one group of elements (:func:`build_tables`, from
+the two dof tables) and where the true-dof rows are taken one at a time
+(:func:`tdof_graph`): with a million quadratic hexahedra on a rank the two builds held 29
+and 28 GiB of host memory beyond what they return, and hold under one.
+
 It needs numba, and is used when numba is importable and the pattern is large enough to
 repay the compilation (:data:`MIN_ENTRIES`); otherwise the sort route runs, unchanged.
 """
@@ -194,6 +200,112 @@ def build(rows, cols, nrow, ncol, diag_first, index_type, indptr_type=np.int32):
         slot = slot.astype(idx_t)
     return (indptr.astype(indptr_type, copy=False), indices.astype(index_type, copy=False),
             slot, nnz)
+
+
+def build_tables(tdofs, cdofs, nrow, ncol, diag_first, index_type, indptr_type=np.int32):
+    """:func:`build` for the entries of one group of elements, from its two dof tables.
+
+    ``tdofs`` is ``(ne, nd_test)`` and ``cdofs`` ``(ne, nd_trial)``; entry
+    ``(e, a, b)`` of the group's element matrices, in that order, is row ``tdofs[e, a]``
+    and column ``cdofs[e, b]``.  The arrays are those :func:`build` returns for the flat
+    ``rows`` and ``cols`` of these entries, which are never formed: beside the result
+    this holds one integer per element row, where the flat route holds 16 bytes and a
+    scratch column per entry (12 GB against 0.5 GB for a million quadratic hexahedra).
+    """
+    import numba
+
+    pk = _passes()
+    tdofs = np.ascontiguousarray(tdofs, dtype=np.int64)
+    cdofs = np.ascontiguousarray(cdofs, dtype=np.int64)
+    ne, ndt = tdofs.shape
+    ndr = int(cdofs.shape[1])
+    n = int(ne) * int(ndt) * ndr
+    col_t = np.int32 if ncol <= np.iinfo(np.int32).max else np.int64
+    old = numba.get_num_threads()
+    numba.set_num_threads(min(threads(), numba.config.NUMBA_NUM_THREADS))
+    try:
+        rcount, runs_of_row = pk.group_table(tdofs, int(nrow))
+        maxlen = int(np.max(np.diff(rcount))) * ndr if nrow else 1
+        if maxlen >= (1 << QBITS):
+            raise ValueError("a row holds %d entries, more than the packed per-row key "
+                             "allows (%d)" % (maxlen, (1 << QBITS) - 1))
+        wide = np.int32 if n <= np.iinfo(np.int32).max else np.int64
+        ucount = np.zeros(int(nrow), np.int64)
+        slot = np.empty(n, wide)
+        pk.order_table(cdofs, int(ndt), rcount, runs_of_row, int(nrow), bool(diag_first),
+                       ucount, slot, max(maxlen, 1), 4096)
+        indptr = np.zeros(int(nrow) + 1, np.int64)
+        np.cumsum(ucount, out=indptr[1:])
+        del ucount
+        nnz = int(indptr[-1])
+        indices = np.empty(nnz, col_t)
+        pk.place_table(cdofs, int(ndt), rcount, runs_of_row, indptr, int(nrow), indices, slot)
+    finally:
+        numba.set_num_threads(old)
+    idx_t = np.int32 if nnz <= np.iinfo(np.int32).max else np.intp
+    if slot.dtype != idx_t:
+        slot = slot.astype(idx_t)
+    return (indptr.astype(indptr_type, copy=False), indices.astype(index_type, copy=False),
+            slot, nnz)
+
+
+def tdof_graph(ldof_of_row, indptr, indices, gcol, r_row, r_col, c0, c1, square, nslot,
+               width_type):
+    """The true-dof graph of a rank from its ldof graph, row by row.
+
+    ``ldof_of_row[r]`` is the ldof row that is true-dof row ``r`` on this rank, ``indptr``
+    and ``indices`` the ldof graph, ``gcol`` the global true dof of each ldof column,
+    ``r_row`` and ``r_col`` the entries other ranks sent (local true-dof row, global
+    column), and ``[c0, c1)`` the columns this rank owns.  Returns ``(ndiag, noff, tslot,
+    slot_recv, J_diag, offd_cols)``: the distinct columns of every row inside and outside
+    ``[c0, c1)``, the slot of every ldof entry (``tslot``, of ``nslot`` entries and
+    ``width_type``; entries of rows that are no true-dof row here are left as they are)
+    and of every received one, in the block-major order of
+    :func:`~hippymfem.fem.tdofassemble._slot_order` (the diagonal block row by row, its
+    rows led by their own diagonal where ``square``, then the other block), the diagonal
+    block's columns less ``c0``, and the other block's global columns in slot order.
+    """
+    import numba
+
+    pk = _passes()
+    ntd = int(ldof_of_row.size)
+    r_row = np.ascontiguousarray(r_row, dtype=np.int64)
+    r_col = np.ascontiguousarray(r_col, dtype=np.int64)
+    # the received entries grouped by row, in the order they arrived within a row
+    rorder = np.argsort(r_row, kind="stable").astype(np.int64)
+    rptr = np.zeros(ntd + 1, np.int64)
+    if r_row.size:
+        np.cumsum(np.bincount(r_row, minlength=ntd), out=rptr[1:])
+    rcol = np.ascontiguousarray(r_col[rorder])
+    indptr = np.ascontiguousarray(indptr, dtype=np.int64)
+    own = indptr[ldof_of_row + 1] - indptr[ldof_of_row] if ntd else np.zeros(0, np.int64)
+    maxlen = int(np.max(own + np.diff(rptr))) if ntd else 1
+    if maxlen >= (1 << QBITS):
+        raise ValueError("a true-dof row holds %d entries, more than the packed per-row "
+                         "key allows (%d)" % (maxlen, (1 << QBITS) - 1))
+    del own
+    tslot = np.empty(int(nslot), width_type)
+    slot_recv = np.empty(r_row.size, np.int64)
+    ndiag = np.zeros(ntd, np.int64)
+    noff = np.zeros(ntd, np.int64)
+    old = numba.get_num_threads()
+    numba.set_num_threads(min(threads(), numba.config.NUMBA_NUM_THREADS))
+    try:
+        pk.tdof_count(ldof_of_row, indptr, indices, gcol, rptr, rcol, rorder, int(c0),
+                      int(c1), bool(square), tslot, slot_recv, ndiag, noff, max(maxlen, 1),
+                      4096)
+        dstart = np.zeros(ntd + 1, np.int64)
+        np.cumsum(ndiag, out=dstart[1:])
+        ostart = np.zeros(ntd + 1, np.int64)
+        np.cumsum(noff, out=ostart[1:])
+        nnz_diag = int(dstart[-1])
+        J_diag = np.empty(nnz_diag, np.int32)
+        offd_cols = np.empty(int(ostart[-1]), np.int64)
+        pk.tdof_place(ldof_of_row, indptr, indices, gcol, rptr, rcol, rorder, int(c0),
+                      nnz_diag, dstart, ostart, tslot, slot_recv, J_diag, offd_cols)
+    finally:
+        numba.set_num_threads(old)
+    return ndiag, noff, tslot, slot_recv, J_diag, offd_cols
 
 
 def unique_inverse_rows(rows, cols, nrow, ncol):

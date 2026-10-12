@@ -183,7 +183,8 @@ def set_hessian_mode(mode):
         raise ValueError("hessian mode must be element, quadrature or auto, got %r" % (mode,))
     old, HESSIAN_MODE = HESSIAN_MODE, mode
     for k in _KERNELS:
-        for key in [key for key in k._cache if key and key[0] in ("hs", "h", "hcols")]:
+        # (the consistent block of the mixed precision is built on a slot pass too)
+        for key in [key for key in k._cache if key and key[0] in ("hs", "h", "hcols", "hc")]:
             del k._cache[key]
     return old
 
@@ -379,7 +380,12 @@ def _eval_field(dofs, N, G, Jinv, vdim, nd):
     V = dofs.reshape(vdim, nd)
     val = jnp.einsum("qi,ci->qc", N, V)                 # (nq, vdim)
     gref = jnp.einsum("qik,ci->qck", G, V)              # (nq, vdim, dim)
-    gphys = jnp.einsum("qck,qkd->qcd", gref, Jinv)      # (nq, vdim, sdim)
+    if Jinv.shape[0] == 1 and gref.shape[0] != 1:
+        # an element whose map is affine, with its one inverse Jacobian
+        # (elementbatch.AFFINE_GEOMETRY)
+        gphys = jnp.einsum("qck,kd->qcd", gref, Jinv[0])
+    else:
+        gphys = jnp.einsum("qck,qkd->qcd", gref, Jinv)  # (nq, vdim, sdim)
     if vdim == 1:
         return Field(val[:, 0], gphys[:, 0, :])
     return Field(val, gphys)
@@ -398,6 +404,25 @@ ELEMENT_CHUNK = int(os.environ.get("HIPPYMFEM_ELEMENT_CHUNK", "0") or 0)
 #: leaves margin.  Raising it makes chunks smaller and safer.
 AD_DOUBLES_PER_TANGENT_QP = float(
     os.environ.get("HIPPYMFEM_AD_WORKING_SET", "16"))
+
+#: Tangents that a chunk of an element *vector* (a residual, a gradient) is planned
+#: for.  The plan above is for the element matrices, which carry one tangent for every
+#: dof of every variable; a vector is one reverse sweep, whose working set does not
+#: grow with the dofs.  Measured for the residual of quadratic hexahedra with 64
+#: quadrature points on an MI250X: 16 kB an element (31 doubles a point, two tangents'
+#: worth), where the matrices' plan is 508 kB, so eight leave a margin of four.
+#: With a quarter of that card for JAX and 1.7 million such elements a residual then
+#: runs in chunks of 40 000 to 80 000 elements instead of 5000 to 10 000 and takes 0.47 s
+#: instead of 0.70 s, a gradient 0.56 s instead of 1.02 s (a launch costs 1.5 ms; what
+#: is left is mostly the geometry on its way to the card), and the operations of two
+#: Newton-CG steps 5 to 7 % less.  An estimate that is too small for some form lands
+#: in the retry of :meth:`GroupKernel._chunked`, as one for a matrix does.
+#: ``0`` plans a vector as a matrix.  Set ``HIPPYMFEM_AD_VECTOR_TANGENTS``.
+AD_VECTOR_TANGENTS = float(os.environ.get("HIPPYMFEM_AD_VECTOR_TANGENTS", "8") or 0)
+
+#: The weight of an element vector's pass in :meth:`GroupKernel._chunked`: its plan is
+#: :meth:`GroupKernel._vector_weight` of the matrices', read when the plan is made.
+_VECTOR = -1.0
 
 #: Share of JAX's device budget above which a split batch keeps its per-element
 #: geometry (``Jinv``, ``wdet``, ``X``) on the host and transfers it a chunk at a
@@ -987,7 +1012,8 @@ class GroupKernel:
         sized down from what the allocator asked for and retried, and the size that
         worked is remembered for this device.  ``weight`` scales the planned working
         set (the full element Hessian carries every block at once and keeps its own
-        remembered size).
+        remembered size; an element vector, :data:`_VECTOR`, is planned for the few
+        tangents of :data:`AD_VECTOR_TANGENTS` and keeps its own as well).
 
         JAX reports a launch that runs out of memory at the next synchronization, so a
         split batch is waited for here, inside the retry.  ``overlap`` is for the
@@ -1168,7 +1194,7 @@ class GroupKernel:
             return ne                      # no budget to respect (see :func:`_free_budget`)
         nq = int(np.shape(self.group.wdet)[1]) if np.ndim(self.group.wdet) > 1 else 1
         per_elem = (AD_DOUBLES_PER_TANGENT_QP * max(sum(self.nd), 1) * max(nq, 1) * 8
-                    * max(weight, 1))
+                    * (self._vector_weight() if weight == _VECTOR else max(weight, 1)))
         # A third of what is free, not a half: the budget is what is free when the
         # *first* chunk is planned, and XLA's peak for a chunk exceeds the largest
         # single buffer in it, so a half overshoots.
@@ -1223,16 +1249,50 @@ class GroupKernel:
             tabs = tuple(tuple(_shared_put(t, ("tables", k), a)
                                for k, a in enumerate(t.jax_tables()))
                          for t in self.tables)
-            geo = None if self._stream_geometry(d) else tuple(
-                _shared_put(self.group, n, getattr(self.group, n))
-                for n in self._geo_names)
-            if geo is None and PINNED_STREAM:
-                _pin_geometry(self.group, self._geo_names)
+            # An affine group with its compact geometry (elementbatch.AFFINE_GEOMETRY)
+            # is decided array by array: what is small stays on the device, and what is
+            # not (the coordinates of a large group) is left on the host, from where a
+            # chunk loop takes its slices if the kernel reads them at all.  A group
+            # under the limit as a whole would otherwise put on the device an array
+            # that is two thirds of it and that few kernels read.
+            kept = self._kept_on_device(d)
+            if kept is None:
+                kept = () if self._stream_geometry(d) else self._geo_names
+            # (``None`` for the whole geometry where all of it is streamed, and for
+            # each array that is)
+            geo = tuple(_shared_put(self.group, n, getattr(self.group, n))
+                        if n in kept else None for n in self._geo_names) if kept else None
+            if len(kept) < len(self._geo_names) and PINNED_STREAM:
+                _pin_geometry(self.group, [n for n in self._geo_names if n not in kept])
             ent = self._dev[d] = (tabs, geo)
         tabs, geo = ent
         if geo is None:
             geo = tuple(getattr(self.group, n) for n in self._geo_names)
+        elif any(z is None for z in geo):
+            geo = tuple(getattr(self.group, n) if z is None else z
+                        for n, z in zip(self._geo_names, geo))
         return (tabs, geo)
+
+    def _kept_on_device(self, d):
+        """The geometry arrays of an affine group (``group.affine``) that stay on the
+        device: each that is no more than a third of what a geometry may take before
+        it is streamed (:data:`GEOMETRY_STREAM_FRACTION`).  With 1.7 million quadratic
+        hexahedra and 64 points, and a quarter of a 64 GiB card for JAX, that is the
+        inverse Jacobians (72 bytes an element) and the weights (512), and not the
+        coordinates (1536).  ``None`` where the group is not affine, the device has no
+        budget, nothing is ever streamed or the batch is not split: all or nothing
+        then, as :meth:`_stream_geometry` says."""
+        if not getattr(self.group, "affine", False) or GEOMETRY_STREAM_FRACTION <= 0:
+            return None
+        try:
+            limit = (d.memory_stats() or {}).get("bytes_limit")
+        except Exception:                                        # noqa: BLE001
+            limit = None
+        if not limit or not self.will_chunk():
+            return None                    # (an unsplit kernel would upload at every call)
+        most = GEOMETRY_STREAM_FRACTION * limit / 3.0
+        return tuple(n for n in self._geo_names
+                     if getattr(self.group, n).nbytes <= most)
 
     def _stream_geometry(self, d):
         """Whether to leave this group's geometry on the host for every caller.
@@ -1258,6 +1318,15 @@ class GroupKernel:
         return self.will_chunk()
 
     # ---------------------------------------------------------------- blocks
+    def _vector_weight(self):
+        """The share of the planned working set that a chunk of an element vector is
+        given: :data:`AD_VECTOR_TANGENTS` of the tangents that the element matrices
+        carry, and never more than they do."""
+        total = max(sum(self.nd), 1)
+        if AD_VECTOR_TANGENTS <= 0 or AD_VECTOR_TANGENTS >= total:
+            return 1.0
+        return AD_VECTOR_TANGENTS / total
+
     def grad_block(self, i):
         """Batched ``dR/d(dofs_i)``; returns ``(ne, nd_i)``."""
         key = ("g", i)
@@ -1267,8 +1336,9 @@ class GroupKernel:
             def f(dofs, tabs, geo, params):
                 return jax.grad(lambda z: R(z, tabs, geo, params))(dofs)[i]
 
+            # (planned as a vector, with a remembered chunk size of its own)
             self._cache[key] = self._chunked(
-                _mapped_kernel(f, self._axes()), self._axes())
+                _mapped_kernel(f, self._axes()), self._axes(), weight=_VECTOR)
         return self._cache[key]
 
     def _hess_slot(self, j):
@@ -1368,6 +1438,8 @@ class GroupKernel:
 
             def basis(t):
                 N, G = t
+                if Jinv.shape[0] == 1 and G.shape[0] != 1:      # an affine element
+                    return (N[:, None, :], jnp.einsum("qil,lk->qki", G, Jinv[0]))
                 return (N[:, None, :], jnp.einsum("qil,qlk->qki", G, Jinv))
 
             Pj = basis(tabs[j])

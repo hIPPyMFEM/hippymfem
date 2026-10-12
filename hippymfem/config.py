@@ -180,10 +180,22 @@ _KNOBS = [
           "doubles per tangent and quadrature point the chunk planner assumes (16, with a margin)",
           _module_attr("fem.kernel", "AD_DOUBLES_PER_TANGENT_QP"),
           _module_assign("fem.kernel", "AD_DOUBLES_PER_TANGENT_QP", float)),
+    _Knob("ad_vector_tangents", "HIPPYMFEM_AD_VECTOR_TANGENTS",
+          "tangents a chunk of an element vector (a residual, a gradient) is planned for (8; the "
+          "matrices carry one for every dof); 0 plans a vector as a matrix",
+          _module_attr("fem.kernel", "AD_VECTOR_TANGENTS"),
+          _module_assign("fem.kernel", "AD_VECTOR_TANGENTS", float)),
     _Knob("geometry_stream", "HIPPYMFEM_GEOMETRY_STREAM",
           "share of the device budget above which a group's geometry stays on the host and is streamed",
           _module_attr("fem.kernel", "GEOMETRY_STREAM_FRACTION"),
           _module_assign("fem.kernel", "GEOMETRY_STREAM_FRACTION", float)),
+    _Knob("affine_geometry", "HIPPYMFEM_AFFINE_GEOMETRY",
+          "keep the inverse Jacobians of a group once an element where every element's map is "
+          "affine (a sixty-fourth of the array with 64 points, and what is left of a large "
+          "group's geometry stays on the card); the element arrays change at round-off; for "
+          "the batches built afterwards",
+          _module_attr("fem.elementbatch", "AFFINE_GEOMETRY"),
+          _module_assign("fem.elementbatch", "AFFINE_GEOMETRY", _bool)),
     _Knob("geometry_slice", "HIPPYMFEM_GEOMETRY_SLICE",
           "elements per slice when the quadrature geometry is built here rather than by "
           "MFEM's batched call; a positive value also forces that path",
@@ -210,6 +222,11 @@ _KNOBS = [
           "smallest pattern, in element-matrix entries, the sort-free builder is used for",
           _module_attr("fem.patternbuild", "MIN_ENTRIES"),
           _module_assign("fem.patternbuild", "MIN_ENTRIES", int)),
+    _Knob("pattern_lean", "HIPPYMFEM_PATTERN_LEAN",
+          "build a large pattern's index tables from the dof tables and row by row, and keep "
+          "no map twice: half the host memory of a rank (the maps are the same; one given up "
+          "is made again when asked for)",
+          _module_attr("fem.pattern", "LEAN"), _module_assign("fem.pattern", "LEAN", _bool)),
     _Knob("pattern_threads", "HIPPYMFEM_PATTERN_THREADS",
           "threads for a sort-free pattern build; 0 takes this rank's share of the node",
           _module_attr("fem.patternbuild", "THREADS"),
@@ -259,15 +276,42 @@ _KNOBS = [
     _Knob("hypre_pool_keep", "HIPPYMFEM_HYPRE_POOL_KEEP",
           "megabytes the default hypre pool keeps between BoomerAMG setups (512)",
           _env_only("HIPPYMFEM_HYPRE_POOL_KEEP", "512"), when="import"),
+    _Knob("gpu_aware_mpi", "HIPPYMFEM_GPU_AWARE_MPI",
+          "hypre hands MPI its buffers on the GPU (1), stages them through CPU memory (0), or hands "
+          "them over only inside Krylov solves (solve, experimental); empty: as the library was built",
+          _env_only("HIPPYMFEM_GPU_AWARE_MPI", ""), when="import"),
     _Knob("amg_relax", "HIPPYMFEM_AMG_RELAX",
           "default BoomerAMG relaxation type for new solvers; -1 keeps MFEM's (16 is Chebyshev, SPD only)",
           _env_only("HIPPYMFEM_AMG_RELAX", "-1"), _env_setter("HIPPYMFEM_AMG_RELAX")),
     _Knob("amg_max_levels", "HIPPYMFEM_AMG_MAX_LEVELS",
           "default BoomerAMG level cap for new solvers; -1 keeps hypre's",
           _env_only("HIPPYMFEM_AMG_MAX_LEVELS", "-1"), _env_setter("HIPPYMFEM_AMG_MAX_LEVELS")),
+    _Knob("amg", "HIPPYMFEM_AMG",
+          "further BoomerAMG settings of new solvers by hypre's names, such as relax_wt=1.8,pmax=6 "
+          "(mfemconfig.BOOMERAMG_SETTERS); empty keeps MFEM's",
+          _env_only("HIPPYMFEM_AMG", ""), _env_setter("HIPPYMFEM_AMG")),
     _Knob("pc_reuse", "HIPPYMFEM_PC_REUSE",
           "default for reusing a solver's AMG hierarchy across operators (0: rebuild each time)",
           _env_only("HIPPYMFEM_PC_REUSE", "0"), _env_setter("HIPPYMFEM_PC_REUSE")),
+    _Knob("pmg", "HIPPYMFEM_PMG",
+          "default of new solvers for a p-multigrid in the single-precision solves of a space of "
+          "order two or more (0: BoomerAMG on the matrix itself)",
+          _env_only("HIPPYMFEM_PMG", "0"), _env_setter("HIPPYMFEM_PMG")),
+    _Knob("pmg_h", "HIPPYMFEM_PMG_H",
+          "default of new solvers for the meshes under the linear elements of a p-multigrid: a V-cycle "
+          "over up to this many of the meshes that the mesh was refined from (0: BoomerAMG on the "
+          "linear elements)",
+          _env_only("HIPPYMFEM_PMG_H", "0"), _env_setter("HIPPYMFEM_PMG_H")),
+    _Knob("prior_h", "HIPPYMFEM_PRIOR_H",
+          "default of priors for the meshes that the multigrid cycles of their Hessian preconditioner go "
+          "over, in the single-precision hypre, where the mesh was last cut in two (0: BoomerAMG on the "
+          "prior's operator)",
+          _env_only("HIPPYMFEM_PRIOR_H", "0"), _env_setter("HIPPYMFEM_PRIOR_H")),
+    _Knob("pmg_h_host", "HIPPYMFEM_PMG_H_HOST",
+          "default of new solvers for the levels of those meshes that live in host memory with hypre on "
+          "a device: the ones of at most this many rows a rank, and what is under them, where the "
+          "gathered last matrix has no more rows than that in all (0: none)",
+          _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST")),
 ]
 _BY_NAME = {k.name: k for k in _KNOBS}
 

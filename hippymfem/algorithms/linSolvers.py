@@ -39,7 +39,7 @@ import mfem.par as mfem
 from ..common.keepalive import KeepAlive
 from ..common.linalg import as_matrix, hypre_to_scipy
 from ..common.parameterList import ParameterList
-from ..common.parvector import ParVector
+from ..common.parvector import Layout, ParVector, allreduce as _reduce
 from ..common.operators import init_vector_like
 
 
@@ -82,6 +82,12 @@ def KrylovSolver_ParameterList():
                                "MFEM's default of 1.  More of them coarsen faster, so the "
                                "hierarchy is shorter and cheaper to apply and to set up, at "
                                "the cost of a weaker preconditioner (more CG iterations)"],
+        "amg_options": [os.environ.get("HIPPYMFEM_AMG", ""),
+                        "further BoomerAMG settings, applied after the ones above through "
+                        "hypre's own interface, which has more of them than MFEM's class: a "
+                        "list such as \"relax_wt=1.8,pmax=6\" of the names in "
+                        "mfemconfig.BOOMERAMG_SETTERS (\"print=1\" has hypre print the "
+                        "hierarchy it builds)"],
         "pc_reuse": [_env_default("HIPPYMFEM_PC_REUSE", int, 0),
                      "keep the preconditioner for this many further operators before "
                      "rebuilding it.  A preconditioner changes the iteration count, never "
@@ -91,6 +97,35 @@ def KrylovSolver_ParameterList():
                      "0, the default, rebuilds every time: a hierarchy from an older "
                      "parameter usually costs more iterations than it saves.  Worth it "
                      "for a problem whose Jacobian barely moves"],
+        "pmg": [_env_default("HIPPYMFEM_PMG", int, 0),
+                "in the single-precision hypre, precondition the matrix of a space of order "
+                "two or more by a p-multigrid instead of BoomerAMG on the matrix itself: a "
+                "relaxation on the matrix around one BoomerAMG V-cycle on the Galerkin "
+                "product for the linear elements of the same mesh "
+                "(singlesolve.PMGEngine).  The same iterations for a set-up that is a "
+                "third of BoomerAMG's on quadratic hexahedra (guide, gpu.rst, Single "
+                "precision).  0, the default, keeps BoomerAMG; where no interpolation can "
+                "be built (fem.ptransfer.why_not) it is kept as well"],
+        "pmg_h": [_env_default("HIPPYMFEM_PMG_H", int, 0),
+                  "with pmg, on a mesh that knows the meshes it was refined from "
+                  "(fem.ptransfer.set_coarser_meshes): correct from the linear elements by a "
+                  "V-cycle over up to this many of those meshes, with Galerkin products of the "
+                  "interpolations between them and BoomerAMG on the last one only, in place of "
+                  "BoomerAMG on the linear elements' matrix.  The products keep 27 entries a "
+                  "row and the neighbours of the mesh at every level, where an algebraic "
+                  "coarsening has 100 to 170 entries a row from its second level on and a "
+                  "level more for every eight times the ranks.  0: BoomerAMG on the linear "
+                  "elements"],
+        "pmg_h_host": [_env_default("HIPPYMFEM_PMG_H_HOST", int, 0),
+                       "with pmg_h and hypre on a device: the levels of the coarser meshes whose "
+                       "matrix has at most this many rows a rank live in host memory, with "
+                       "everything under them (singlesolve.PMG_H_HOST).  A level of a few thousand "
+                       "rows a rank costs a device its kernel launches and two copies around each "
+                       "exchange between ranks, whatever its size; on the host it costs "
+                       "microseconds and its exchange is a message.  Not where the last matrix is "
+                       "gathered (seq_threshold) and has more rows than this in all: one core a rank "
+                       "then solves it slower than the device.  0, the default: every level on "
+                       "the device"],
         "amg_strength_threshold": [-1.0, "hypre BoomerAMG strength threshold; -1 keeps "
                                          "MFEM's default of 0.25.  0.5 is the usual advice "
                                          "for 3D problems: sparser interpolation, cheaper "
@@ -255,6 +290,11 @@ class KrylovSolver(_SolverBase):
             theta = float(self.parameters["amg_strength_threshold"])
             if theta >= 0.0:
                 pc.SetStrengthThresh(theta)
+            extra = str(self.parameters["amg_options"] or "")
+            if extra:
+                from ..common import mfemconfig as _mc
+
+                _mc.set_boomeramg_options(pc, _mc.parse_boomeramg_options(extra))
             if self.systems_dim:
                 pc.SetSystemsOptions(int(self.systems_dim))
                 if self.elasticity:
@@ -322,7 +362,7 @@ class KrylovSolver(_SolverBase):
         self._pc = None
         self._held = None
         self.A = A
-        self._template = ParVector(self.comm, A.Height())
+        self._template = ParVector(self.comm, A.Height(), layout=_layout_of(self.comm, A))
         if keep is not None:
             self._pc, self._pc_built_on, self._pc_age = keep
         else:
@@ -354,6 +394,10 @@ class KrylovSolver(_SolverBase):
         # solve is over, a scoped pool recycles the arrays the setup allocates and
         # frees (mfemconfig.set_hypre_pool); it holds nothing afterwards
         self._setup_pending = self._pc is not None
+        #: a hierarchy kept from an older matrix (pc_reuse) is set up already, and so is
+        #: one that another solver handed over after a solve of its own
+        self._setup_due = (self._setup_pending and keep is None
+                           and not getattr(self._pc, "_hm_set_up", False))
         if self._setup_pending:
             from ..common.mfemconfig import hypre_pool_open
 
@@ -381,7 +425,7 @@ class KrylovSolver(_SolverBase):
                     and not self.systems_dim and int(self.parameters["pc_reuse"]) == 0)
 
     def _set_single(self, S, engine=None):
-        from .singlesolve import SingleEngine
+        from .singlesolve import PMGEngine, SingleEngine
 
         if not self.can_solve_single():
             raise ValueError("a single-precision matrix is solved by cg with a plain amg "
@@ -392,9 +436,18 @@ class KrylovSolver(_SolverBase):
         self._fallback = None
         self._native = False
         self.A = S
-        self._template = ParVector(self.comm, S.Height())
-        self._pc = (engine if isinstance(engine, SingleEngine) and engine.matrix is S
-                    else SingleEngine(S, self.parameters))
+        # (the matrix knows its rows on this rank: a layout without a message, where a
+        # vector made from a local size gathers every rank's at each new operator)
+        self._template = ParVector(self.comm, S.Height(), layout=Layout.of_range(
+            self.comm, int(S.row_starts[0]), int(S.row_starts[1]), int(S.global_rows)))
+        if isinstance(engine, SingleEngine) and engine.matrix is S:
+            self._pc = engine
+        else:
+            # a p-multigrid where the solver asks for one and the matrix came with the
+            # interpolation for it (PDEVariationalProblem._p_transfer)
+            transfer = getattr(S, "transfer", None) if int(self.parameters["pmg"]) else None
+            self._pc = (PMGEngine(S, transfer, self.parameters) if transfer is not None
+                        else SingleEngine(S, self.parameters))
         self._pc_built_on = None
         self._pc_age = 0
         self._setup_pending = False
@@ -499,12 +552,28 @@ class KrylovSolver(_SolverBase):
         self._configure(None if solver is self._solver else solver)
         if not self.parameters["nonzero_initial_guess"]:
             x.zero()
-        solver.Mult(b.hypre, x.hypre)
+        from ..common import mfemconfig as _mc
+
+        # a solve on a hierarchy that is set up exchanges through the buffers its
+        # matrices keep: those may go to a GPU-aware MPI (mfemconfig.GPU_AWARE_SOLVES)
+        aware = _mc.GPU_AWARE_SOLVES and not (getattr(self, "_setup_pending", False)
+                                              and getattr(self, "_setup_due", True))
+        if aware:
+            _mc.set_hypre_gpu_aware_mpi(True)
+        try:
+            solver.Mult(b.hypre, x.hypre)
+        finally:
+            if aware:
+                _mc.set_hypre_gpu_aware_mpi(False)
         if getattr(self, "_setup_pending", False):
             from ..common.mfemconfig import hypre_pool_close
 
             self._setup_pending = False
             hypre_pool_close()
+            try:
+                self._pc._hm_set_up = True          # for the solvers this one lends it to
+            except AttributeError:
+                pass
         if native:
             its, norm = mfem.intp(), mfem.doublep()
             solver.GetNumIterations(its)
@@ -533,6 +602,236 @@ class KrylovSolver(_SolverBase):
                    final if final is not None else solver.GetFinalRelNorm())
             )
         return self.iterations
+
+
+def _layout_of(comm, A):
+    """The layout of a vector on the rows of ``A`` without a message, where ``A`` is a
+    parallel matrix that knows its rows on this rank (one of MFEM's); ``None`` otherwise,
+    and the vector then gathers every rank's size for its own."""
+    try:
+        part, n = A.GetRowPartArray(), int(A.GetGlobalNumRows())
+        first, last = int(part[0]), int(part[1])
+    except Exception:                                            # noqa: BLE001
+        return None
+    if last - first != int(A.Height()):
+        return None
+    return Layout.of_range(comm, first, last, n)
+
+
+class ChebyshevSolver(KeepAlive):
+    r"""A fixed polynomial in place of a Krylov solve: :math:`x = q(CA)\,C\,b`.
+
+    ``krylov`` is a :class:`KrylovSolver` whose operator :math:`A` is set, with its
+    preconditioner :math:`C` (a multigrid cycle).  ``degree`` steps of the Chebyshev
+    iteration on the interval of the eigenvalues of :math:`CA` apply :math:`C` that many
+    times (a BoomerAMG cycle from the iterate before it, any other preconditioner to a
+    residual updated with a product of :math:`A`), with coefficients that do not depend
+    on the right-hand side.  The result is one linear map, symmetric and positive definite
+    where :math:`C` is, and its error in the energy norm is at most
+
+    .. math:: 1 / T_{\mathrm{degree}}\Bigl(\frac{\lambda_{\max} + \lambda_{\min}}
+              {\lambda_{\max} - \lambda_{\min}}\Bigr)
+
+    of the solution (:attr:`error_bound`): 1.6 % with four cycles of a multigrid with
+    which CG gains a factor of 0.3 an iteration, where CG needs twelve iterations for
+    six digits.
+
+    That is what a preconditioner has to be.  A Krylov solve stopped at a tolerance is
+    a different map for every right-hand side, so it has to be stopped far below the
+    tolerance of the iteration it preconditions (``ReducedSpaceNewtonCG``,
+    ``cg_preconditioner_tolerance``); a fixed polynomial needs no tolerance, and the
+    iteration it preconditions sees an operator whose spectrum is that of the exact
+    preconditioner moved by at most twice the bound.  It does not replace the solve
+    where the solution itself is wanted (a sample of the prior, a variance).
+
+    The interval is estimated once, at the first solve, from the Lanczos matrix of
+    ``lanczos`` CG iterations on a vector of random signs; the Ritz values lie inside
+    the spectrum, so the interval used is wider (``safety``).  Outside the interval the
+    polynomial's error grows slowly and stays below one up to twice its centre, so an
+    estimate that is somewhat off costs accuracy, not definiteness.
+    """
+
+    def __init__(self, krylov, degree=4, lanczos=12, safety=(0.85, 1.05)):
+        if getattr(krylov, "_single", False) or getattr(krylov, "_pc", None) is None \
+                or getattr(krylov, "A", None) is None:
+            raise ValueError("ChebyshevSolver needs a KrylovSolver with an operator and a "
+                             "preconditioner in double precision")
+        if int(degree) < 1:
+            raise ValueError("degree must be at least 1")
+        self.krylov, self.degree = krylov, int(degree)
+        self.comm = krylov.comm
+        self.lanczos, self.safety = int(lanczos), (float(safety[0]), float(safety[1]))
+        #: the interval of the polynomial, and the Ritz values it came from
+        self.interval = self.ritz = None
+        self.iterations, self.converged = 0, True
+        self._work = None
+        self.keep(krylov)
+
+    @staticmethod
+    def fits(krylov):
+        """Whether ``krylov`` can be replaced: CG with a preconditioner, in double."""
+        return (isinstance(krylov, KrylovSolver) and krylov.method == "cg"
+                and not getattr(krylov, "_single", False)
+                and getattr(krylov, "_pc", None) is not None
+                and getattr(krylov, "A", None) is not None)
+
+    def init_vector(self, v, dim):
+        return self.krylov.init_vector(v, dim)
+
+    @property
+    def error_bound(self):
+        """The bound on the relative error of a solve in the energy norm, for
+        eigenvalues inside :attr:`interval` (``None`` before the first solve)."""
+        if self.interval is None:
+            return None
+        lo, hi = self.interval
+        if hi <= lo:
+            return 0.0
+        s = (hi + lo) / (hi - lo)
+        return 1.0 / math.cosh(self.degree * math.acosh(s))
+
+    def _vectors(self):
+        A = self.krylov.A
+        if self._work is None or self._work[0] is not A:
+            layout = _layout_of(self.comm, A)
+            first = ParVector(self.comm, A.Height(), layout=layout)
+            self._work = (A, first) + tuple(first.duplicate() for _ in range(3))
+            self.interval = None
+        return self._work[1:]
+
+    def setup(self):
+        """Estimate the interval (and let MFEM set the preconditioner up for a direct
+        application, which it does at the first one whatever hypre's PCG did before)."""
+        r, z, d, t = self._vectors()
+        if self.interval is not None:
+            return self
+        from ..common import mfemconfig as _mc
+
+        A, C = self.krylov.A, self.krylov._pc
+        # random signs, from a generator of its own: the stream of parRandom is the
+        # caller's, and a benchmark's samples must not depend on whether this ran
+        rng = np.random.RandomState(8191 + 7919 * self.comm.rank)
+        r._host_write()[:] = rng.randint(0, 2, r.local_size) * 2.0 - 1.0
+        p = d
+        _mc.hypre_pool_open()
+        try:
+            C.Mult(r.hypre, z.hypre)
+        finally:
+            _mc.hypre_pool_close()
+        p.assign(z)
+        rz = r.inner(z)
+        alphas, betas, first = [], [], rz
+        for _ in range(max(2, self.lanczos)):
+            if not (rz > 0.0) or not math.isfinite(rz):
+                break
+            A.Mult(p.hypre, t.hypre)
+            pap = p.inner(t)
+            if not (pap > 0.0) or not math.isfinite(pap):
+                break
+            alpha = rz / pap
+            r.axpy(-alpha, t)
+            C.Mult(r.hypre, z.hypre)
+            new = r.inner(z)
+            alphas.append(alpha)
+            betas.append(new / rz)
+            if new <= 1e-24 * first:
+                break
+            p.axpby(1.0, new / rz, z)
+            rz = new
+        m = len(alphas)
+        if m < 2:
+            raise RuntimeError("ChebyshevSolver: the preconditioned operator is not positive "
+                               "definite on a random vector (no interval to work on)")
+        T = np.zeros((m, m))
+        for j in range(m):
+            T[j, j] = 1.0 / alphas[j] + (betas[j - 1] / alphas[j - 1] if j else 0.0)
+            if j:
+                T[j, j - 1] = T[j - 1, j] = math.sqrt(betas[j - 1]) / alphas[j - 1]
+        ritz = np.linalg.eigvalsh(T)
+        self.ritz = (float(ritz[0]), float(ritz[-1]))
+        self.interval = (self.safety[0] * self.ritz[0], self.safety[1] * self.ritz[1])
+        return self
+
+    def solve(self, x, b):
+        """``x = q(C A) C b``; returns the number of cycles.
+
+        A step of the iteration needs ``C r`` for the residual ``r`` of the current
+        iterate ``y``.  With BoomerAMG a cycle applied from ``y`` (MFEM's
+        ``iterative_mode``) returns ``y + C (b - A y)``, the residual formed inside it
+        by the relaxation that a cycle begins with: the step is the difference, and
+        no product of the operator is made here.  (Applied from zero, a cycle begins
+        with that same product, of a zero vector, since MFEM does not mark the vector
+        as zero for hypre: one product with its exchange more in every cycle.)  Any
+        other preconditioner is applied to a residual that is updated with a product,
+        since not every one of them starts from the vector it is given."""
+        if self.interval is None or self._work is None or self._work[0] is not self.krylov.A:
+            self.setup()
+        r, z, d, t = self._vectors()
+        A, C = self.krylov.A, self.krylov._pc
+        whole = getattr(C, "polynomial", None)
+        if whole is not None:
+            # a cycle that runs the polynomial itself, in its own precision and memory
+            # (singlesolve.HCycle): the same recurrence, two conversions a solve
+            getattr(b, "hypre", None)
+            whole(x.hypre, b.hypre, self.degree, self.interval)
+            self.iterations = self.degree
+            return self.degree
+        lo, hi = self.interval
+        theta, delta = 0.5 * (hi + lo), 0.5 * (hi - lo)
+        # the right-hand side with MFEM, as a Krylov solve takes it: its arithmetic, and
+        # the caller's with it, then runs on the device where MFEM is on one
+        getattr(b, "hypre", None)
+        r.assign(b)
+        C.Mult(r.hypre, z.hypre)
+        d.assign(z)
+        d.scale(1.0 / theta)
+        x.assign(d)
+        if delta > 0.0 and self.degree > 1:
+            sigma = theta / delta
+            rho = 1.0 / sigma
+            from_iterate = self.krylov.precond_type == "amg"
+            was = C.iterative_mode
+            try:
+                for _ in range(1, self.degree):
+                    if from_iterate:
+                        C.iterative_mode = True
+                        z.assign(x)
+                        C.Mult(r.hypre, z.hypre)        # z = x + C (b - A x)
+                        z.axpy(-1.0, x)
+                    else:
+                        A.Mult(d.hypre, t.hypre)
+                        r.axpy(-1.0, t)
+                        C.Mult(r.hypre, z.hypre)
+                    new = 1.0 / (2.0 * sigma - rho)
+                    d.axpby(2.0 * new / delta, new * rho, z)
+                    x.axpy(1.0, d)
+                    rho = new
+            finally:
+                C.iterative_mode = was
+        self.iterations = self.degree
+        return self.degree
+
+
+class CycleOf:
+    """A Krylov solver's operator with another preconditioner than its own, as
+    :class:`ChebyshevSolver` reads a solver: ``cycle`` (``Mult(b, x)`` on MFEM's vectors,
+    from zero) in place of the preconditioner of ``krylov``."""
+
+    _single = False
+    method = "cg"
+    #: (not "amg": the polynomial then applies the cycle to a residual that it updates)
+    precond_type = "cycle"
+
+    def __init__(self, cycle, krylov):
+        self._pc, self.base = cycle, krylov
+        self.comm = krylov.comm
+
+    @property
+    def A(self):
+        return self.base.A
+
+    def init_vector(self, v, dim):
+        return self.base.init_vector(v, dim)
 
 
 class LUSolver(_SolverBase):
@@ -775,4 +1074,4 @@ def _all_finite(v):
     from mpi4py import MPI as _MPI
 
     ok = bool(np.isfinite(v.array).all()) if v.local_size else True
-    return bool(v.comm.allreduce(int(ok), op=_MPI.MIN))
+    return bool(_reduce(v.comm, int(ok), _MPI.MIN))

@@ -88,6 +88,66 @@ def iters(solver):
     return int(getattr(solver, "iterations", 0) or 0)
 
 
+def profile_setup(spec, A, make_pc, b, xw):
+    """BoomerAMG setups of the matrix ``A`` with other settings, each timed with a solve.
+
+    ``spec`` is ``"name:settings;name:settings"``, the settings as for ``--amg`` on top of
+    what ``make_pc`` sets (a solver's own), with ``spgemm=0|1`` for hypre's own sparse
+    product or the vendor's, which stays in force for the sets after it, and ``debug=1``
+    for hypre's printout of the phases of a setup by level.  For each set, twice: a new
+    preconditioner in hypre's PCG, the first solve to 1e-8 (which sets the hierarchy up,
+    with hypre's memory pool open as a solver of the library has it) and a second one; the
+    setup is their difference.  Then ten V-cycles.  Returns ``{name: {"settings", "runs"}}``
+    and prints the faster of the two setups of each set.
+    """
+    import ctypes
+
+    mc = hm.common.mfemconfig
+    H = mc._hypre_library()
+    sprof, sets = {}, []
+    for item in spec.split(";"):                     # (read them all first: a mistyped one stops here)
+        name, _, text = item.partition(":")
+        toks = [t.strip() for t in text.split(",") if t.strip()]
+        sets.append((name.strip(), text, [int(t.split("=")[1]) for t in toks if t.startswith("spgemm=")],
+                     mc.parse_boomeramg_options(",".join(t for t in toks if not t.startswith("spgemm=")),
+                                                "--profile-setup")))
+    for name, text, vendor, opts in sets:
+        for v in vendor:
+            H.HYPRE_SetSpGemmUseVendor(ctypes.c_int(v))
+        runs = []
+        try:
+            for _ in range(2):
+                pc = make_pc(A)
+                mc.set_boomeramg_options(pc, opts)
+                cg = mfem.HyprePCG(A)
+                cg.SetTol(1e-8)
+                cg.SetMaxIter(200)
+                cg.SetPrintLevel(0)
+                cg.SetPreconditioner(pc)
+                xw.zero()
+                mc.hypre_pool_open()
+                t1, _ = timed(lambda: cg.Mult(b.hypre, xw.hypre), xw)
+                mc.hypre_pool_close()
+                xw.zero()
+                t2, _ = timed(lambda: cg.Mult(b.hypre, xw.hypre), xw)
+                its = mfem.intp()
+                cg.GetNumIterations(its)
+                t10, _ = timed(lambda: [pc.Mult(b.hypre, xw.hypre) for _ in range(10)], xw)
+                runs.append({"setup": t1 - t2, "solve": t2, "its": int(its.value()), "cycle": t10 / 10.0,
+                             "finite": bool(np.isfinite(xw.norm("l2")))})
+                del cg, pc
+        except Exception as e:                                           # noqa: BLE001
+            say("  setup %-12s FAILED: %s" % (name, " ".join(str(e).split())[:160]))
+            continue
+        best = min(runs, key=lambda r: r["setup"])
+        sprof[name] = {"settings": text, "runs": runs}
+        say("  setup %-12s %6.3f s (the other %.3f) | solve %.3f s, %d it, %.2f ms/it | V-cycle %.2f ms%s | %s"
+            % (name, best["setup"], max(r["setup"] for r in runs), best["solve"], best["its"],
+               1e3 * best["solve"] / max(best["its"], 1), 1e3 * best["cycle"],
+               "" if all(r["finite"] for r in runs) else " | NOT FINITE", text))
+    return sprof
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--n", type=int, default=64)
@@ -99,6 +159,9 @@ def main():
     ap.add_argument("--amg-max-levels", type=int, default=-1, help="hypre BoomerAMG max levels; -1 = MFEM default (25)")
     ap.add_argument("--amg-agg-levels", type=int, default=-1, help="levels of aggressive coarsening; -1 = MFEM default (1)")
     ap.add_argument("--amg-theta", type=float, default=-1.0, help="strength threshold; -1 = MFEM default (0.25)")
+    ap.add_argument("--amg", default=None,
+                    help="BoomerAMG settings of the problem's solves alone, such as \"relax_wt=1.8,pmax=6\" (the names "
+                         "of mfemconfig.BOOMERAMG_SETTERS); HIPPYMFEM_AMG sets every solver's")
     ap.add_argument("--tag", default="", help="label written into the record")
     ap.add_argument("--cg-tol", type=float, default=1e-12, help="relative tolerance of every Krylov solve")
     ap.add_argument("--both-kernels", action="store_true",
@@ -106,14 +169,41 @@ def main():
                          "matrix-vector kernel (vendor library or hypre's own)")
     ap.add_argument("--cart-part", action="store_true",
                     help="partition the box as a Cartesian grid of ranks instead of with METIS")
+    ap.add_argument("--coarse", type=int, default=None,
+                    help="build the mesh in parallel from a COARSE^3 mesh, in equal boxes when the ranks make "
+                         "a grid (bench_newton_device.py); 0 chooses COARSE")
+    ap.add_argument("--m-scale", type=float, default=0.0,
+                    help="take every operation at this multiple of the synthetic truth instead of the prior "
+                         "mean (0): the coefficient exp(m) is then rough, as at the iterates of an inversion, "
+                         "and 3 is where plain Jacobi relaxation stops being a smoother")
+    ap.add_argument("--profile-vcycle", action="store_true",
+                    help="time a V-cycle of the Jacobian's BoomerAMG with 1, 2, ... levels (what a level adds), "
+                         "with the exchange staged and, where it can be, on the device; and a dot product and a "
+                         "vector update, the rest of a CG iteration")
+    ap.add_argument("--profile-setup", default=None,
+                    help="BoomerAMG setups of the Jacobian with other settings, each timed with a solve "
+                         "to 1e-8 and its V-cycle: 'name:settings;name:settings', the settings as for "
+                         "--amg and on top of the solver's own (debug=1 has hypre print the phases of "
+                         "a setup by level), and spgemm=0|1 for hypre's own sparse product or the "
+                         "vendor's, which stays in force for the sets after it")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
 
     N, ORDER = args.n, args.order
-    serial = mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON)
-    if args.cart_part:
+    t_start = time.perf_counter()
+    serial = None
+    if args.coarse is not None:
+        from applications.geothermal.model import cube_mesh
+
+        pmesh, n0, grid = cube_mesh(N, COMM, coarse=(args.coarse or None))
+        say("  mesh built in parallel from %d^3, %s" % (n0, "equal boxes %s" % (grid,) if grid else "METIS on that mesh"))
+    else:
+        serial = mfem.Mesh.MakeCartesian3D(N, N, N, mfem.Element.HEXAHEDRON)
+    if serial is None:
+        pass
+    elif args.cart_part:
         # the most cubic grid of ranks that divides the rank count (bench_newton_device.py)
         p = COMM.size
         grid = min(((a, b, p // (a * b)) for a in range(1, p + 1) if p % a == 0
@@ -124,6 +214,8 @@ def main():
     else:
         pmesh = mfem.ParMesh(COMM, serial)
     del serial
+    t_mesh = time.perf_counter() - t_start
+    ne = COMM.gather(pmesh.GetNE(), root=0)
     Vu = hm.FunctionSpace.H1(pmesh, ORDER)
     Vm = hm.FunctionSpace.H1(pmesh, 1)
     say("%d^3 hex order %d: %d state dofs, %d parameter dofs, %d ranks, %d elem/rank, kernels on %s (%s)"
@@ -143,6 +235,8 @@ def main():
         amg["amg_agg_levels"] = args.amg_agg_levels
     if args.amg_theta >= 0.0:
         amg["amg_strength_threshold"] = args.amg_theta
+    if args.amg is not None:
+        amg["amg_options"] = args.amg
     # the three solves the records were taken with; the adjoint keeps its default
     pde.set_solvers(hm.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=args.cg_tol,
                     max_iter=2000, attributes=("solver", "solver_fwd_inc", "solver_adj_inc"),
@@ -165,7 +259,15 @@ def main():
     model = hm.Model(pde, prior, hm.DiscreteStateObservation(B, data, nstd ** 2))
 
     x = [model.generate_vector(STATE), prior.mean.copy(), model.generate_vector(ADJOINT)]
-    t_fwd, _ = timed(lambda: model.solveFwd(x[STATE], x), x[STATE])
+    if args.m_scale:
+        x[PARAMETER].axpy(args.m_scale, mtrue)
+        say("  the point is %g times the truth: |m| up to %.2f" % (args.m_scale, x[PARAMETER].norm("linf")))
+    try:
+        t_fwd, _ = timed(lambda: model.solveFwd(x[STATE], x), x[STATE])
+    except RuntimeError as e:
+        # (every rank raises: the solver's verdict is collective)
+        say("  forward solve FAILED: %s" % " ".join(str(e).split())[:200])
+        return 3
     it_fwd = iters(pde.solver)
     t_adj, _ = timed(lambda: model.solveAdj(x[ADJOINT], x), x[ADJOINT])
     it_adj = iters(pde.solver)
@@ -239,6 +341,90 @@ def main():
     say("  incremental solves: fwd %d it (%.2f ms/it), adj %d it (%.2f ms/it)"
         % (it_fwd_inc, 1e3 * op["solveFwdInc"] / max(it_fwd_inc, 1),
            it_adj_inc, 1e3 * op["solveAdjInc"] / max(it_adj_inc, 1)))
+    # ---- one product with the Jacobian, the unit a V-cycle is made of: the diagonal block's
+    # product plus one halo exchange.  With HIPPYMFEM_GPU_AWARE_MPI=solve it is timed both
+    # ways, hypre staging the exchange through CPU memory and handing MPI the device buffers.
+    mc = hm.common.mfemconfig
+    A = getattr(pde.solver_fwd_inc, "A", None) or getattr(pde.solver, "A", None)
+    t_prod = {}
+    if A is not None:
+        for name in (["staged", "aware"] if mc.GPU_AWARE_SOLVES else ["staged"]):
+            if name == "aware":
+                mc.set_hypre_gpu_aware_mpi(True)
+            try:
+                A.Mult(uhat.hypre, rhs_fwd.hypre)
+                rhs_fwd.norm("l2")
+                COMM.Barrier()
+                t0 = time.perf_counter()
+                for _ in range(50):
+                    A.Mult(uhat.hypre, rhs_fwd.hypre)
+                rhs_fwd.norm("l2")
+                COMM.Barrier()
+                t_prod[name] = (time.perf_counter() - t0) / 50.0
+            finally:
+                if name == "aware":
+                    mc.set_hypre_gpu_aware_mpi(False)
+        say("  a product with the Jacobian: %s" % ", ".join("%.3f ms (%s)" % (1e3 * v, k) for k, v in t_prod.items()))
+    # ---- a V-cycle, level by level: hierarchies of 1, 2, ... levels on the Jacobian with the
+    # solver's own settings, each set up once and applied 20 times.  The difference of two
+    # consecutive ones is what a level adds (on that level and on the one above it).  The list
+    # ends two entries after the hierarchy stops growing (its nonzeros are recorded), since
+    # the last levels have a handful of rows and add nothing that the sum can show.
+    vprof = None
+    if args.profile_vcycle and A is not None and getattr(pde.solver, "precond_type", None) == "amg":
+        import ctypes
+
+        H = mc._hypre_library()
+        modes = ["staged", "aware"] if mc.GPU_AWARE_SOLVES else ["staged"]
+        vprof = {"levels": [], "setup": [], "cum_nnz": [], **{m: [] for m in modes}}
+        b, xw = rhs_fwd, model.generate_vector(STATE)
+        last, same = None, 0
+        for L in range(1, 16):
+            pc = pde.solver._make_pc(A)
+            mc.set_boomeramg_options(pc, {"levels": L})
+            h = ctypes.c_void_p(mc.boomeramg_handle(pc))
+            H.HYPRE_BoomerAMGSetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            H.HYPRE_BoomerAMGSetCumNnzAP(h, 1.0)
+            t_first, _ = timed(lambda: pc.Mult(b.hypre, xw.hypre), xw)      # the setup and one cycle
+            nnz = ctypes.c_double(0.0)
+            H.HYPRE_BoomerAMGGetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
+            H.HYPRE_BoomerAMGGetCumNnzAP(h, ctypes.byref(nnz))
+            same = same + 1 if (last is not None and nnz.value <= last) else 0
+            if same > 2:
+                del pc
+                break
+            last = nnz.value
+            cycle = {}
+            for name in modes:
+                if name == "aware":
+                    mc.set_hypre_gpu_aware_mpi(True)
+                try:
+                    pc.Mult(b.hypre, xw.hypre)
+                    t, _ = timed(lambda: [pc.Mult(b.hypre, xw.hypre) for _ in range(20)], xw)
+                    cycle[name] = t / 20.0
+                finally:
+                    if name == "aware":
+                        mc.set_hypre_gpu_aware_mpi(False)
+            vprof["levels"].append(L)
+            vprof["setup"].append(t_first - cycle["staged"])
+            vprof["cum_nnz"].append(nnz.value)
+            for name in modes:
+                vprof[name].append(cycle[name])
+            del pc
+        t, _ = timed(lambda: [b.inner(xw) for _ in range(50)])
+        vprof["t_dot"] = t / 50.0
+        t, _ = timed(lambda: [xw.axpy(1e-300, b) for _ in range(50)], xw)
+        vprof["t_axpy"] = t / 50.0
+        for name in modes:
+            say("  a V-cycle with 1, 2, ... levels (%s): %s ms" % (name, " ".join("%.2f" % (1e3 * v) for v in vprof[name])))
+        say("  its setup: %s s; nonzeros of all levels over the matrix's: %s"
+            % (" ".join("%.3f" % v for v in vprof["setup"]),
+               " ".join("%.3f" % (v / vprof["cum_nnz"][0]) for v in vprof["cum_nnz"])))
+        say("  a dot product %.3f ms, a vector update %.3f ms" % (1e3 * vprof["t_dot"], 1e3 * vprof["t_axpy"]))
+    # ---- the setup of the Jacobian's hierarchy with other settings (profile_setup)
+    sprof = None
+    if args.profile_setup and A is not None and getattr(pde.solver, "precond_type", None) == "amg":
+        sprof = profile_setup(args.profile_setup, A, pde.solver._make_pc, rhs_fwd, model.generate_vector(STATE))
     solves = op["solveFwdInc"] + op["solveAdjInc"]
     say("  the two solves are %.1f %% of the action; the eight products and R are %.1f %%"
         % (100 * solves / t_action, 100 * (t_action - solves) / t_action))
@@ -247,12 +433,18 @@ def main():
            "tdofs": int(Vu.GlobalTrueVSize()), "mdofs": int(Vm.GlobalTrueVSize()),
            "mfem_device": args.device, "amg_relax_type": args.amg_relax_type, "cg_tol": args.cg_tol,
            "amg_max_levels": args.amg_max_levels, "amg_agg_levels": args.amg_agg_levels,
-           "amg_theta": args.amg_theta, "tag": args.tag,
+           "amg_theta": args.amg_theta, "amg": args.amg, "tag": args.tag,
            "hypre_spmv": hm.common.mfemconfig.HYPRE_SPMV, "cart_part": bool(args.cart_part),
+           "coarse": args.coarse, "t_mesh": t_mesh, "elements_per_rank": [int(min(ne)), int(max(ne))] if ne else None,
+           "t_product": t_prod, "vcycle": vprof, "setup_profile": sprof, "gpu_aware_solves": bool(mc.GPU_AWARE_SOLVES),
+           "gpu_aware_mpi": bool(hm.common.mfemconfig.hypre_gpu_aware_mpi()),
+           "hypre_pool": (hm.common.mfemconfig.HYPRE_POOL.stats()
+                          if hm.common.mfemconfig.HYPRE_POOL is not None else None),
            "t_fwd": t_fwd, "it_fwd": it_fwd, "t_adj": t_adj, "it_adj": it_adj, "t_grad": t_grad,
            "t_blocks": t_blocks, "t_blocks_cold": t_blocks_cold,
            "t_action": t_action, "op": op, "it_fwd_inc": it_fwd_inc, "it_adj_inc": it_adj_inc,
-           "repeats": args.repeats}
+           "repeats": args.repeats, "m_scale": args.m_scale, "amg_options": os.environ.get("HIPPYMFEM_AMG", ""),
+           "amg_relax_env": os.environ.get("HIPPYMFEM_AMG_RELAX", "")}
     if args.both_kernels and hm.common.mfemconfig.HYPRE_SPMV is not None:
         # the same Hessian action with hypre's other matrix-vector kernel: a global
         # switch, so the matrices, the hierarchies and the vectors stay as they are

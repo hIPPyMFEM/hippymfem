@@ -35,11 +35,13 @@ The gradient stays exact (its forward and adjoint solves keep their tolerance), 
 MAP point is the same; only the Newton directions come from a Hessian of lower accuracy.
 ``cg_reorthogonalize = False`` gives hIPPYlib's iteration, for a comparison step by step.
 
-Two parameters make the solves inside that CG cheaper.  ``cg_preconditioner_tolerance``
+Three parameters make the solves inside that CG cheaper.  ``cg_preconditioner_tolerance``
 (1e-6 by default) stops the prior's solves where they precondition it; ``0`` leaves
-them at their own tolerance, as hIPPYlib does.  ``cg_hessian_relaxation`` (off by
+them at their own tolerance, as hIPPYlib does.  ``cg_preconditioner_cycles`` (off by
+default) replaces each of those solves by a fixed polynomial of that many multigrid
+cycles, which is a linear map and needs no tolerance.  ``cg_hessian_relaxation`` (off by
 default) lets the incremental solves of a Hessian action lose accuracy as the CG
-converges.  Both are described, with what they save and why they cannot go further,
+converges.  They are described, with what they save and why they cannot go further,
 in the guide (``docs/source/guide/optimization.rst``).
 """
 
@@ -95,6 +97,12 @@ def ReducedSpaceNewtonCG_ParameterList():
                                                "if looser than their own and at most a "
                                                "thousandth of that CG's tolerance; 0: "
                                                "their own"],
+        "cg_preconditioner_cycles": [0, "if positive, each of the prior's solves where they "
+                                        "precondition the CG of a Newton step is a fixed "
+                                        "polynomial of that many multigrid cycles "
+                                        "(ChebyshevSolver): one linear map, which needs "
+                                        "no tolerance; 0: Krylov solves, stopped at "
+                                        "cg_preconditioner_tolerance"],
         "cg_hessian_relaxation": [0.0, "the incremental solves of a Hessian action stop "
                                         "at this times (the CG's tolerance) times |r_0| / "
                                         "|r_k| at CG iteration k, where that is looser "
@@ -166,6 +174,16 @@ class ReducedSpaceNewtonCG:
         p = self.parameters
         tol = float(p["cg_preconditioner_tolerance"] or 0.0) if p["cg_reorthogonalize"] else 0.0
         tol = min(tol, 1e-3 * float(tolcg))
+        # A fixed polynomial of multigrid cycles in place of each of those solves
+        # (cg_preconditioner_cycles): a linear map, so the argument above does not
+        # apply to it, with or without cg_reorthogonalize.  A prior that has no such
+        # preconditioner returns what the tolerance gives.
+        cycles = int(p["cg_preconditioner_cycles"] or 0)
+        if cycles > 0:
+            try:
+                return self.model.Rsolver(tol or None, cycles=cycles)
+            except TypeError:              # a model whose Rsolver takes no such argument
+                pass
         if tol > 0.0:
             try:
                 return self.model.Rsolver(tol)

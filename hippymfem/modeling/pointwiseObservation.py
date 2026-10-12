@@ -29,7 +29,7 @@ import mfem.par as mfem
 
 from ..common.linalg import own
 from ..common.operators import Operator, init_vector_like
-from ..common.parvector import ParVector, _HYPRE_INT, device_vectors
+from ..common.parvector import ParVector, _HYPRE_BIGINT, device_vectors
 from ..fem.spaces import as_space
 
 
@@ -187,10 +187,10 @@ class PointwiseObservation(Operator):
         M.sum_duplicates()
         M.sort_indices()
         I = np.ascontiguousarray(M.indptr, dtype=np.int32)
-        J = np.ascontiguousarray(M.indices, dtype=_HYPRE_INT)
+        J = np.ascontiguousarray(M.indices, dtype=_HYPRE_BIGINT)
         D = np.ascontiguousarray(M.data, dtype=np.float64)
-        rows = np.array([r_off[rank], r_off[rank + 1]], dtype=_HYPRE_INT)
-        cols = np.array([c_off[rank], c_off[rank + 1]], dtype=_HYPRE_INT)
+        rows = np.array([r_off[rank], r_off[rank + 1]], dtype=_HYPRE_BIGINT)
+        cols = np.array([c_off[rank], c_off[rank + 1]], dtype=_HYPRE_BIGINT)
         # the constructor that copies into hypre's own memory, as tdofassemble's does
         Bh = mfem.HypreParMatrix(self.comm, self.n_owned, gnr, gnc, [I, J, D, rows, cols])
         Bh.CopyRowStarts()

@@ -20,7 +20,14 @@
 #         compiler on PATH (OpenMPI, or an MPICH such as Cray's), and CPU_PYMFEM pointing
 #         at a CPU PyMFEM tree of the same MFEM version, whose wrappers are recompiled
 #         here.  PYTHON names the interpreter to build for (python3 by default).
+#         HYPRE_PINNED_STAGING=1 builds hypre with tools/hypre-3.2.0-staging.patch (below).
+#         HYPRE_SORTED_SPGEMM=1 builds hypre with tools/hypre-3.2.0-spgemm.patch (below).
+#         HYPRE_SEQ_DEVICE=1 builds hypre with tools/hypre-3.2.0-seqdevice.patch (below).
+#         HYPRE_MIXEDINT=1 builds hypre with 64-bit global indices (--enable-mixedint), for
+#         spaces of more than 2 147 483 647 unknowns, and has SWIG write the wrappers again
+#         (below); it needs swig on PATH, or SWIG naming it.
 set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
 PREFIX="$1"
 ARCH="${2:-gfx90a}"
 CPU_PYMFEM="${CPU_PYMFEM:-}"
@@ -64,10 +71,54 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # ROCm 7's rocprim headers need C++17 (std::variant); older hypre hard-codes C++14
    # for its HIP sources and --with-cxxstandard does not reach HIPCXXFLAGS
    sed -i 's/HIPCXXFLAGS="-x hip -std=c++14 /HIPCXXFLAGS="-x hip -std=c++17 /' configure
+   # HYPRE_PINNED_STAGING=1: the exchange of shared dofs through page-locked CPU buffers
+   # that are kept, started before the product with the local block instead of after it
+   # (tools/hypre-3.2.0-staging.patch; two Newton-CG steps at 512^3 on 512 MI250X of
+   # Frontier in 10.0 s instead of 10.8 s).  HYPRE_STAGE_PINNED=0 and HYPRE_STAGE_EARLY=0
+   # in the environment of a run switch either part off.
+   if [ "${HYPRE_PINNED_STAGING:-0}" = 1 ] && ! grep -q hm_pin_get parcsr_mv/par_csr_communication.c; then
+     patch -p1 --forward < "$HERE/hypre-3.2.0-staging.patch" > "$LOG/hypre_patch.log" 2>&1 \
+       || { echo "tools/hypre-3.2.0-staging.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch.log" >&2; exit 1; }
+   fi
+   # HYPRE_SORTED_SPGEMM=1: hypre copies and sorts both operands of every sparse product
+   # for rocSPARSE.  With tools/hypre-3.2.0-spgemm.patch an operand whose rows are sorted
+   # already (a transpose, the result of the product before) is used as it is; the sorted
+   # copy of one with only the first entry of each row out of place (the fine matrix,
+   # diagonal first) is written in one pass; the matrix that joins a diagonal block with
+   # its off-processor one is written in order; and the rows a rank receives are sorted
+   # before they are stacked under its own.  A BoomerAMG setup for 8.6 million unknowns of
+   # quadratic elements on an MI250X of Frontier then takes 0.81 s instead of 1.53 s, and
+   # 1.0 to 1.2 s instead of 2.3 to 2.5 s a GCD on 2 to 8 of them, with the same iterates
+   # and half the device memory at its peak (the GPU guide, "Several GPUs").
+   # HYPRE_SPGEMM_SKIP_SORT=0 in the environment of a run has every operand sorted again.
+   if [ "${HYPRE_SORTED_SPGEMM:-0}" = 1 ] && ! grep -q hypre_CSRSpGemmRowsAscend seq_mv/csr_spgemm_device_rocsparse.c; then
+     patch -p1 --forward < "$HERE/hypre-3.2.0-spgemm.patch" > "$LOG/hypre_patch_spgemm.log" 2>&1 \
+       || { echo "tools/hypre-3.2.0-spgemm.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch_spgemm.log" >&2; exit 1; }
+   fi
+   # HYPRE_SEQ_DEVICE=1: BoomerAMG's seq_threshold (a hierarchy ended at a level of a few
+   # thousand rows, which one process finishes, gathered) faults with hypre on a device:
+   # it reads the level through host pointers.  With tools/hypre-3.2.0-seqdevice.patch
+   # the level is read from a host copy and solved on a device: the first rank's, which
+   # sends the solution to the others, or with redundant=1 every rank's, each keeping its
+   # own rows (the patch gives the ranks' coarsenings the same random numbers and compares
+   # the solvers, since corrections of different hierarchies do not fit together).  The
+   # last levels of a hierarchy on hundreds of ranks are a few rows a rank that talk to
+   # many ranks; gathered at 30 000 rows an iteration of CG with a linear-element
+   # hierarchy takes 7.1 ms instead of 8.8 ms on 512 MI250X of Frontier, and a solve of
+   # the prior 0.088 s instead of 0.101 s (the GPU guide, "AMD cards").  Nothing changes
+   # for a solver that does not set seq_threshold.
+   if [ "${HYPRE_SEQ_DEVICE:-0}" = 1 ] && ! grep -q hypre_BoomerAMGSeqOnDevice parcsr_ls/gen_redcs_mat.c; then
+     patch -p1 --forward < "$HERE/hypre-3.2.0-seqdevice.patch" > "$LOG/hypre_patch_seqdevice.log" 2>&1 \
+       || { echo "tools/hypre-3.2.0-seqdevice.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch_seqdevice.log" >&2; exit 1; }
+   fi
    # hypre 3 turns Umpire on for GPU builds; MFEM manages device memory itself.  Its
    # device sources go to hipcc, which is not the MPI wrapper and finds mpi.h only if
    # it is told where (an MPI module that sets CPATH hides this; Cray's does not)
-   ./configure --prefix="$PREFIX/hypre" --with-hip --with-gpu-arch="$ARCH" --enable-shared --without-umpire \
+   # HYPRE_MIXEDINT=1: the unknowns of a space are numbered with 64-bit integers
+   # (HYPRE_BigInt) and those of a rank stay 32-bit (HYPRE_Int).  A GPU build of hypre
+   # has no --enable-bigint: its device kernels and the vendor's take 32-bit local indices.
+   MIXED=""; [ "${HYPRE_MIXEDINT:-0}" = 1 ] && MIXED="--enable-mixedint"
+   ./configure --prefix="$PREFIX/hypre" --with-hip --with-gpu-arch="$ARCH" --enable-shared --without-umpire $MIXED \
        CC="$MPICC" CXX="$MPICXX" HIPCXXFLAGS="$MPIINC" > "$LOG/hypre_configure.log" 2>&1
    make clean > /dev/null 2>&1 || true
    # A compiler that cannot build a device source at -O2 gets that one source at -Os.
@@ -161,6 +212,24 @@ if [ ! -d "$PREFIX/PyMFEM" ]; then
   # the wrapper sources and python modules only: not the external builds or site-packages
   (cd "$CPU_PYMFEM" && tar cf - --exclude=./external --exclude=./lib --exclude=./build \
        --exclude='*.so' --exclude='*.o' .) | (cd "$PREFIX/PyMFEM" && tar xf -)
+fi
+# HYPRE_MIXEDINT=1: the wrappers of the CPU tree were written by SWIG for a hypre with one
+# integer width, so they convert a global size or offset as an int.  SWIG writes them
+# again, from the MFEM headers of the CPU tree (the same interface as the wrappers that are
+# known to compile here) with the hypre headers of this build in front of that tree's.
+if [ "${HYPRE_MIXEDINT:-0}" = 1 ] && [ ! -f "$PREFIX/PyMFEM/.swig_mixedint" ]; then
+  SWIG="${SWIG:-$(command -v swig || true)}"
+  [ -n "$SWIG" ] && [ -x "$SWIG" ] || { echo "HYPRE_MIXEDINT=1 needs swig (pip install swig), or SWIG=<path>" >&2; exit 1; }
+  MPI4PY_INC=$("$PY" -c 'import mpi4py; print(mpi4py.get_include())')
+  echo "  swig: $("$SWIG" -version | grep -i version | head -1)"
+  (cd "$PREFIX/PyMFEM/mfem/_par"
+   # (SWIG reads HYPRE_utilities.h, where the two types are chosen, and not the
+   # HYPRE_config.h that it includes: the choice is named here)
+   ls *_wrap.cxx | sed 's/_wrap\.cxx$//' | xargs -P "$NJ" -I{} "$SWIG" -c++ -python -std=c++17 -fastproxy -olddefs -keyword -DHYPRE_MIXEDINT \
+       -I"$PREFIX/hypre/include" -I"$EXT/par/include" -I"$EXT/par/include/mfem" -I"$CPU_PYMFEM/external/mfem" \
+       -I"$EXT/include" -I"$MPI4PY_INC" {}.i) > "$LOG/swig.log" 2>&1 \
+      || { echo "swig failed: $LOG/swig.log" >&2; exit 1; }
+  touch "$PREFIX/PyMFEM/.swig_mixedint"
 fi
 TPL=$(grep -E "^MFEM_TPLFLAGS" "$PREFIX/mfem/par/share/mfem/config.mk" | cut -d= -f2-)
 "$PY" - "$PREFIX" "$CPU_PYMFEM" "$TPL -D__HIP_PLATFORM_AMD__ -I$ROCM_PATH/include" <<'EOF'

@@ -813,6 +813,26 @@ def test_chunk_plan_per_pass():
               before and K.will_chunk() and grad_n is not None
               and gk._chunk.get((d, 1)) is None,
               "(gradient chunk %s of %d)" % (grad_n, gk.group.ne))
+        # a vector is one reverse sweep and is planned for a few tangents
+        # (AD_VECTOR_TANGENTS), a matrix for one of every dof: an element of a vector
+        # takes that share of the estimate, its chunk is no smaller, and with the knob
+        # at 0 a vector is planned as a matrix
+        n_matrix = gk._plan(gk.group.ne, d, 1, announce=False, remember=False)
+        est_matrix = gk._last_estimate
+        n_vector = gk._plan(gk.group.ne, d, kern._VECTOR, announce=False, remember=False)
+        est_vector = gk._last_estimate
+        tangents, kern.AD_VECTOR_TANGENTS = kern.AD_VECTOR_TANGENTS, 0.0
+        try:
+            n_as_matrix = gk._plan(gk.group.ne, d, kern._VECTOR, announce=False, remember=False)
+        finally:
+            kern.AD_VECTOR_TANGENTS = tangents
+        share = min(1.0, tangents / sum(gk.nd)) if tangents > 0 else 1.0
+        check("a vector's chunk is planned for its few tangents, a matrix's for every dof",
+              grad_n == n_vector >= n_matrix == n_as_matrix
+              and abs(est_vector - share * est_matrix) <= 1e-9 * est_matrix,
+              "(%d elements a chunk of a vector, %d of a matrix; %.0f and %.0f kB an element, "
+              "%d dofs and %g tangents)"
+              % (grad_n, n_matrix, est_vector / 1e3, est_matrix / 1e3, sum(gk.nd), tangents))
 
         A_split = assemble_matrix(Vu, Vu, batches.groups,
                                   K.element_matrices_or_chunks(ADJOINT, STATE, loc), ne)
@@ -963,6 +983,89 @@ def test_sliced_geometry():
           "(straight and curved, worst rel %.1e)" % worst)
 
 
+def test_affine_geometry():
+    """The inverse Jacobians once an element where every element's map is affine
+    (``elementbatch.AFFINE_GEOMETRY``): the same element vectors and matrices, by
+    either route to the second derivatives and in the mixed precision, as with one
+    inverse Jacobian a quadrature point; a curved group keeps them all."""
+    from hippymfem.fem import elementbatch as eb
+    from hippymfem.fem import kernel as kern
+
+    def build(kind, curved=False):
+        pmesh = make_mesh(kind, 4)
+        if curved:
+            pmesh.SetCurvature(2)
+            nodes = pmesh.GetNodes().GetDataArray()
+            nodes[:] = nodes + 0.01 * np.sin(7.0 * nodes)
+        Vu, Vm = FunctionSpace.H1(pmesh, 2), FunctionSpace.H1(pmesh, 1)
+        batches = MeshBatches(pmesh, 6)
+        K = QuadratureKernel(
+            lambda u, m, p, x: jnp.exp(m.val) * inner(u.grad, p.grad) + x[0] * u.val * p.val,
+            [Vu, Vm, Vu], batches)
+        vecs = [Vu.vector(), Vm.vector(), Vu.vector()]
+        hp.parRandom.set_seed(3)
+        for v in vecs:
+            hp.parRandom.normal(1.0, v)
+        loc = [Vu.local_values(vecs[0]), Vm.local_values(vecs[1]), Vu.local_values(vecs[2])]
+        return K, loc, batches
+
+    def arrays(K, loc):
+        out = [np.asarray(a) for a in K.element_vectors(ADJOINT, loc)]
+        out += [np.asarray(a) for a in K.element_vectors(PARAMETER, loc)]
+        for ij in ((ADJOINT, STATE), (ADJOINT, PARAMETER), (PARAMETER, PARAMETER)):
+            out += [np.asarray(a) for a in K.element_matrices(*ij, loc)]
+        return out
+
+    def worst(ref, got):
+        scale = max([float(np.abs(a).max()) for a in ref if a.size] + [1e-300])
+        return max([float(np.abs(a - b).max()) / scale for a, b in zip(ref, got) if a.size] + [0.0])
+
+    saved = (eb.AFFINE_GEOMETRY, kern.HESSIAN_MODE)
+    try:
+        for kind in ("hex", "tet"):
+            eb.AFFINE_GEOMETRY = False
+            K0, loc0, b0 = build(kind)
+            eb.AFFINE_GEOMETRY = True
+            K1, loc1, b1 = build(kind)
+            g0, g1 = b0.groups[0], b1.groups[0]
+            shapes = (not g0.affine and g0.Jinv.shape[1] == g0.nq
+                      and (g1.affine and g1.Jinv.shape[:2] == (g1.ne, 1) or not g1.ne)
+                      and g1.full_Jinv().shape == g0.Jinv.shape
+                      and (not g1.ne or np.abs(g1.full_Jinv() - g0.Jinv).max()
+                           <= 1e-12 * np.abs(g0.Jinv).max()))
+            check("%s: a straight mesh keeps one inverse Jacobian an element" % kind,
+                  COMM.allreduce(bool(shapes), op=MPI.LAND),
+                  "(%s instead of %s)" % (g1.Jinv.shape, g0.Jinv.shape))
+            errs = []
+            for mode in ("element", "quadrature"):
+                kern.set_hessian_mode(mode)
+                errs.append(worst(arrays(K0, loc0), arrays(K1, loc1)))
+            old = kern.set_precision("mixed")
+            try:
+                for K in (K0, K1):
+                    for gk in K.group_kernels:
+                        gk.single_matrices = True
+                e32 = worst([np.asarray(a) for a in K0.element_matrices(ADJOINT, STATE, loc0)],
+                            [np.asarray(a) for a in K1.element_matrices(ADJOINT, STATE, loc1)])
+            finally:
+                kern.set_precision(old)
+            err = COMM.allreduce(max(errs), op=MPI.MAX)
+            e32 = COMM.allreduce(e32, op=MPI.MAX)
+            check("%s: the element vectors and matrices are those of the full geometry" % kind,
+                  err <= 1e-13 and e32 <= 5e-6,
+                  "(rel %.1e by the element route, %.1e by the quadrature route; %.1e with "
+                  "single-precision matrices)" % (errs[0], errs[1], e32))
+        eb.AFFINE_GEOMETRY = True
+        Kc, _loc, bc = build("hex", curved=True)
+        gc = bc.groups[0]
+        check("a curved group keeps an inverse Jacobian a point",
+              COMM.allreduce(bool(not gc.affine and (gc.Jinv.shape[1] == gc.nq or not gc.ne)),
+                             op=MPI.LAND), "(%s)" % (gc.Jinv.shape,))
+    finally:
+        eb.AFFINE_GEOMETRY = saved[0]
+        kern.set_hessian_mode(saved[1])
+
+
 def test_mixed_geometry():
     """A mesh with both triangles and quadrilaterals.
 
@@ -1062,6 +1165,7 @@ if __name__ == "__main__":
     if RANK == 0:
         print("quadrature geometry")
     test_sliced_geometry()
+    test_affine_geometry()
     if RANK == 0:
         print("host chunk planning")
     test_host_chunk_budget()

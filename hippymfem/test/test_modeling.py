@@ -911,6 +911,62 @@ def test_hessian_properties():
     check("ReducedHessian == FDHessian", e < 1e-5, "(%.2e)" % e)
 
 
+def test_lumped_mass_prior():
+    """``BiLaplacianPrior(lumped_mass=True)``: the mass matrix of the rule at the vertices,
+    diagonal, with a square root by the same rule."""
+    if RANK == 0:
+        print("a prior with a lumped mass matrix")
+    for kind, element in (("hexahedra", mfem.Element.HEXAHEDRON), ("tetrahedra", mfem.Element.TETRAHEDRON)):
+        pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(6, 5, 4, element, 1.0, 1.3, 0.7))
+        Vm = hm.FunctionSpace.H1(pmesh, 1)
+        full = hm.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True)
+        lump = hm.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True, lumped_mass=True)
+        ones, a, b = Vm.vector(), Vm.vector(), Vm.vector()
+        ones.set(1.0)
+        full.M.Mult(ones.hypre, a.hypre)
+        lump.M.Mult(ones.hypre, b.hypre)
+        d = b.array.copy()
+        x, y, z = Vm.vector(), Vm.vector(), Vm.vector()
+        hm.parRandom.set_seed(3)
+        hm.parRandom.normal(1.0, x)
+        lump.M.Mult(x.hypre, y.hypre)
+        rows = COMM.allreduce(float(np.abs(a.array - d).max()) if d.size else 0.0, op=MPI.MAX)
+        diag = COMM.allreduce(float(np.abs(y.array - d * x.array).max()) if d.size else 0.0, op=MPI.MAX)
+        scale = COMM.allreduce(float(np.abs(d).max()) if d.size else 0.0, op=MPI.MAX)
+        check("%s: the lumped mass is diagonal, the sums of the consistent one's rows" % kind,
+              rows < 1e-13 * scale and diag < 1e-13 * scale * max(x.norm("linf"), 1.0),
+              "(%.1e and %.1e of the largest entry)" % (rows / scale, diag / scale))
+        lump.R.mult(x, y)
+        its = int(lump.Msolver.iterations)
+        z.zero()
+        lump.Rsolver.solve(z, y)
+        back = z.copy().axpy(-1.0, x).norm("l2") / x.norm("l2")
+        full.R.mult(x, z)
+        its_full = int(full.Msolver.iterations)
+        check("%s: a product with its precision solves with the mass matrix in one iteration, and "
+              "the precision's solver undoes it" % kind,
+              its <= 2 < its_full and back < 1e-9,
+              "(%d iterations, %d with the consistent mass; R^-1 R x against x %.1e)" % (its, its_full, back))
+        n1, n2 = lump.noise_vector(), lump.noise_vector()
+        hm.parRandom.normal(1.0, y)
+        lump.sqrtM.multTranspose(x, n1)
+        lump.sqrtM.multTranspose(y, n2)
+        lump.M.Mult(y.hypre, z.hypre)
+        e = abs(n1.inner(n2) - x.inner(z)) / max(abs(x.inner(z)), 1e-300)
+        noise = lump.noise_vector()
+        lump.sample_noise(1.0, noise)
+        s = Vm.vector()
+        lump.sample(noise, s)
+        check("%s: its square root is by the same rule, and a sample is drawn with it" % kind,
+              e < 1e-12 and math.isfinite(s.norm("l2")) and s.norm("l2") > 0.0, "(%.1e)" % e)
+    refused = ""
+    try:
+        hm.BiLaplacianPrior(hm.FunctionSpace.H1(pmesh, 2), 0.1, 0.5, lumped_mass=True)
+    except ValueError as err:
+        refused = str(err)
+    check("a parameter space of second order is refused", "first order" in refused, "(%s)" % refused[:60])
+
+
 def test_mixed_precision():
     """``HIPPYMFEM_PRECISION=mixed``: element matrices in single precision, and the state,
     the adjoint and the gradient of double precision all the same."""
@@ -955,6 +1011,19 @@ def test_mixed_precision():
                 sums["plain"] = [np.asarray(K) for K in pde.kernel.element_matrices(ADJOINT, STATE, loc)]
                 sums["two-sided"] = [np.asarray(K) for K in pde.kernel.element_matrices(
                     ADJOINT, STATE, loc, consistent="two-sided")]
+        # The same correction on the quadrature route (HIPPYMFEM_HESSIAN=quadrature), at
+        # one point, against the double-precision matrices of that route.
+        quad, old_route = {}, km.HESSIAN_MODE
+        try:
+            km.set_hessian_mode("quadrature")
+            km.set_precision("fp64")
+            quad["fp64"] = [np.asarray(K) for K in pde.kernel.element_matrices(ADJOINT, STATE, loc)]
+            km.set_precision("mixed")
+            for c in ("symmetric", "two-sided"):
+                quad[c] = [np.asarray(K) for K in pde.kernel.element_matrices(
+                    ADJOINT, STATE, loc, consistent=c)]
+        finally:
+            km.set_hessian_mode(old_route)
     finally:
         km.set_precision(old)
         pde.invalidate_jacobian()
@@ -989,6 +1058,21 @@ def test_mixed_precision():
     check("consistent, symmetric: symmetric to the last bit", asym == 0.0, "(%.1e)" % asym)
     check("consistent: the entries are single precision", 1e-10 < entry < 1e-5, "(%.1e)" % entry)
 
+    def qworst(f, *keys):
+        v = [f(*Ks) for Ks in zip(*[quad[k] for k in keys])]
+        return COMM.allreduce(max(v) if v else 0.0, op=MPI.MAX)
+
+    qscale = COMM.allreduce(max([np.abs(K).sum(axis=2).max() for K in quad["fp64"]] or [0.0]), op=MPI.MAX)
+    qsum = max(qworst(lambda K64, K: max(np.abs(K.sum(axis=2) - K64.sum(axis=2)).max(),
+                                         np.abs(K.sum(axis=1) - K64.sum(axis=1)).max()),
+                      "fp64", c) for c in ("symmetric", "two-sided")) / qscale
+    qasym = qworst(lambda K: np.abs(K - np.swapaxes(K, 1, 2)).max(), "symmetric") / qscale
+    qentry = qworst(lambda K64, K: np.abs(K - K64).max(), "fp64", "symmetric") / qscale
+    check("quadrature route, consistent: row and column sums are the double-precision ones",
+          qsum < 1e-13, "(%.1e)" % qsum)
+    check("quadrature route, consistent: symmetric to the last bit, the entries of single precision",
+          qasym == 0.0 and 1e-10 < qentry < 1e-5,
+          "(asymmetry %.1e; from double precision %.1e)" % (qasym, qentry))
 
 if __name__ == "__main__":
     mfem.Hypre.Init()
@@ -1012,6 +1096,7 @@ if __name__ == "__main__":
     test_third_dir()
     test_apply_ij_at()
     test_hessian_properties()
+    test_lumped_mass_prior()
     test_mixed_precision()
     if RANK == 0:
         print("-" * 74)

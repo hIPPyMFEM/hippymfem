@@ -9,7 +9,7 @@ from mpi4py import MPI
 
 import mfem.par as mfem
 
-from .parvector import ParVector, _HYPRE_INT, host_readwrite, host_sync
+from .parvector import ParVector, _HYPRE_BIGINT, _HYPRE_INT, host_readwrite, host_sync
 
 _parcsr = None
 
@@ -51,6 +51,37 @@ def _diag_block(A):
     blk = _scratch("diag")
     A.GetDiag(blk)
     return blk
+
+
+def _offd_block(A):
+    """``A``'s off-diagonal hypre block in a wrapper that is reused, and the global column
+    of each of its columns (a numpy array of 64-bit integers).
+
+    ``HypreParMatrix::GetOffd`` hands the column map back through a reference to a
+    pointer, which PyMFEM cannot pass.  A shared MFEM library exports the method, and it
+    is called here by its symbol.  Scratch, like :func:`_diag_block`.  Raises
+    ``RuntimeError`` where the symbol is not at hand (a static MFEM).
+    """
+    import ctypes
+
+    from . import mfemconfig
+
+    lib = mfemconfig._mfem_library()
+    wide = int(mfem.sizeof_HYPRE_BigInt()) == 8
+    # (HYPRE_BigInt is long long with 64-bit global indices, int without)
+    name = "_ZNK4mfem14HypreParMatrix7GetOffdERNS_12SparseMatrixERP" + ("x" if wide else "i")
+    fn = getattr(lib, name, None) if lib is not None else None
+    if fn is None:
+        raise RuntimeError("MFEM's library does not export HypreParMatrix::GetOffd (%s)" % name)
+    fn.restype, fn.argtypes = None, [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    blk = _scratch("offd")
+    cmap = ctypes.c_void_p()
+    fn(int(A.this), int(blk.this), ctypes.byref(cmap))
+    n = int(blk.Width())
+    if not n or not cmap.value:
+        return blk, np.zeros(0, dtype=np.int64)
+    ctype = ctypes.c_longlong if wide else ctypes.c_int
+    return blk, np.array(np.ctypeslib.as_array((ctype * n).from_address(cmap.value)), dtype=np.int64)
 
 
 def _merged_block(A):
@@ -284,6 +315,11 @@ def hypre_to_scipy(A):
     """
     import scipy.sparse as sp
 
+    if int(A.GetGlobalNumCols()) > np.iinfo(np.int32).max:
+        # (hypre merges with 64-bit columns and MFEM narrows them for its SparseMatrix)
+        raise ValueError("hypre_to_scipy merges the two blocks of a matrix into an MFEM SparseMatrix, "
+                         "whose column indices are 32-bit: not for %d global columns"
+                         % int(A.GetGlobalNumCols()))
     blk = _merged_block(A)
     host_sync(blk)
     n = blk.Height()
@@ -306,11 +342,32 @@ def scipy_to_hypre(csr, comm=None, col_starts=None):
         raise NotImplementedError(
             "PyMFEM's CSR->hypre helper is hard-wired to COMM_WORLD"
         )
-    return _extra().ToHypreParCSR(
-        csr.tocsr(),
-        col_starts=None if col_starts is None else np.asarray(col_starts, dtype=_HYPRE_INT),
-        assert_non_square_no_col_starts=False,
-    )
+    if _HYPRE_BIGINT is _HYPRE_INT:
+        return _extra().ToHypreParCSR(
+            csr.tocsr(),
+            col_starts=None if col_starts is None else np.asarray(col_starts, dtype=_HYPRE_BIGINT),
+            assert_non_square_no_col_starts=False,
+        )
+    # PyMFEM's helper sizes every index array as HYPRE_Int.  With a hypre built
+    # --enable-mixedint the columns and the partitions are HYPRE_BigInt, twice as wide:
+    # the same matrix from the constructor that copies its arrays.
+    world = MPI.COMM_WORLD
+    csr = csr.tocsr()
+    ml, n = csr.shape
+    offs = np.concatenate([[0], np.cumsum(world.allgather(ml))])
+    m, rank = int(offs[-1]), world.rank
+    rows = np.array([offs[rank], offs[rank + 1]], dtype=_HYPRE_BIGINT)
+    cols = (np.minimum(rows, n).astype(_HYPRE_BIGINT) if col_starts is None
+            else np.array(np.asarray(col_starts)[:2], dtype=_HYPRE_BIGINT))
+    I = np.ascontiguousarray(csr.indptr, dtype=np.int32)
+    J = np.ascontiguousarray(csr.indices, dtype=_HYPRE_BIGINT)
+    D = np.ascontiguousarray(csr.data, dtype=np.float64)
+    # (one partition array for both sides has hypre bring each row's diagonal entry first)
+    same = m == n and rows[0] == cols[0] and rows[1] == cols[1]
+    A = mfem.HypreParMatrix(world, ml, m, n, [I, J, D, rows] if same else [I, J, D, rows, cols])
+    A.CopyRowStarts()
+    A.CopyColStarts()
+    return A
 
 
 def to_dense(A, comm=None):

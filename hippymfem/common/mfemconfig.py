@@ -13,6 +13,7 @@ directly and without side effects.
 import math
 import os
 import re
+import time
 import warnings
 
 import mfem.par as mfem
@@ -171,6 +172,16 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
     set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)
+    global GPU_AWARE_SOLVES
+    want = os.environ.get("HIPPYMFEM_GPU_AWARE_MPI", "").strip().lower()
+    if want in ("0", "1", "on", "off", "true", "false", "yes", "no"):
+        set_hypre_gpu_aware_mpi(want in ("1", "on", "true", "yes"))
+    elif want == "solve":
+        # only while a Krylov solve runs on a hierarchy that is already set up
+        # (linSolvers): checked now as if it were on throughout
+        set_hypre_gpu_aware_mpi(True)
+        GPU_AWARE_SOLVES = bool(_check_gpu_aware_mpi(comm, quiet))
+        set_hypre_gpu_aware_mpi(False)
     aware = _check_gpu_aware_mpi(comm, quiet)
     # hypre's device memory: "auto" (the default) recycles up to HYPRE_POOL_SETUP_MB of
     # it while a BoomerAMG setup runs and keeps HYPRE_POOL_KEEP_MB of the smallest blocks
@@ -241,6 +252,189 @@ def _hypre_library():
     return None
 
 
+_MFEM_HANDLE = None
+
+#: BoomerAMG settings beyond the dozen that MFEM's wrapper makes and PyMFEM passes on, by
+#: name, with the call of hypre's C interface each one is (:func:`set_boomeramg_options`).
+BOOMERAMG_SETTERS = {
+    "coarsen": ("HYPRE_BoomerAMGSetCoarsenType", int),
+    "agg": ("HYPRE_BoomerAMGSetAggNumLevels", int),
+    "agg_interp": ("HYPRE_BoomerAMGSetAggInterpType", int),
+    "agg_pmax": ("HYPRE_BoomerAMGSetAggPMaxElmts", int),
+    "relax": ("HYPRE_BoomerAMGSetRelaxType", int),
+    "relax_wt": ("HYPRE_BoomerAMGSetRelaxWt", float),
+    "outer_wt": ("HYPRE_BoomerAMGSetOuterWt", float),
+    "sweeps": ("HYPRE_BoomerAMGSetNumSweeps", int),
+    "theta": ("HYPRE_BoomerAMGSetStrongThreshold", float),
+    "interp": ("HYPRE_BoomerAMGSetInterpType", int),
+    "pmax": ("HYPRE_BoomerAMGSetPMaxElmts", int),
+    "trunc": ("HYPRE_BoomerAMGSetTruncFactor", float),
+    "levels": ("HYPRE_BoomerAMGSetMaxLevels", int),
+    "coarse_size": ("HYPRE_BoomerAMGSetMaxCoarseSize", int),
+    "min_coarse_size": ("HYPRE_BoomerAMGSetMinCoarseSize", int),
+    # a hierarchy ends at its first level of at most this many rows and one process
+    # finishes it, gathered (check_seq_threshold: a device needs a patched hypre)
+    "seq_threshold": ("HYPRE_BoomerAMGSetSeqThreshold", int),
+    "redundant": ("HYPRE_BoomerAMGSetRedundant", int),
+    "coarse_relax": ("HYPRE_BoomerAMGSetCycleRelaxType", int),     # (type, 3): the coarsest level
+    "coarse_sweeps": ("HYPRE_BoomerAMGSetCycleNumSweeps", int),    # (count, 3)
+    "keep_transpose": ("HYPRE_BoomerAMGSetKeepTranspose", int),
+    "rap2": ("HYPRE_BoomerAMGSetRAP2", int),
+    "mod_rap2": ("HYPRE_BoomerAMGSetModuleRAP2", int),
+    "cheby_order": ("HYPRE_BoomerAMGSetChebyOrder", int),
+    "cheby_fraction": ("HYPRE_BoomerAMGSetChebyFraction", float),
+    "print": ("HYPRE_BoomerAMGSetPrintLevel", int),
+    "debug": ("HYPRE_BoomerAMGSetDebugFlag", int),         # 1: the time of each phase of a setup, by level
+}
+
+
+def parse_boomeramg_options(text, what="HIPPYMFEM_AMG"):
+    """``"relax=7,pmax=6"`` as a dict of the names of :data:`BOOMERAMG_SETTERS`."""
+    out = {}
+    for item in (text or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, _, val = item.partition("=")
+        key = key.strip()
+        if key not in BOOMERAMG_SETTERS:
+            raise ValueError("%s: unknown setting %r (known: %s)"
+                             % (what, key, ", ".join(sorted(BOOMERAMG_SETTERS))))
+        out[key] = BOOMERAMG_SETTERS[key][1](val)
+    return out
+
+
+def seq_on_device(library):
+    """Whether a hypre (a ``ctypes`` handle) can finish a device hierarchy with a gathered
+    level: one built with ``tools/hypre-3.2.0-seqdevice.patch``, which marks itself with
+    a function of its own.  The function returns the patch's version, and the first is
+    not enough: there every rank solved the gathered system with a hierarchy of its own
+    coarsening, and the ranks' corrections did not fit together."""
+    if library is None or not hasattr(library, "hypre_BoomerAMGSeqOnDevice"):
+        return False
+    try:
+        return int(library.hypre_BoomerAMGSeqOnDevice()) >= 2
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
+def seq_solvers(pc, comm=None, library=None):
+    """Who solves the gathered level of a BoomerAMG that is set up (``seq_threshold``, hypre
+    on a device): ``"all"`` every rank that holds rows of it, ``"first"`` the first of
+    them, ``None`` where there is no such level or the library cannot tell.  ``pc`` is an
+    ``mfem.HypreBoomerAMG`` or hypre's handle of one (of ``library``, default the hypre
+    of this process); with ``comm`` the answer is one for all its ranks."""
+    import ctypes
+
+    H = library if library is not None else _hypre_library()
+    if H is None or not hasattr(H, "hypre_BoomerAMGSeqSolvers"):
+        return None
+    handle = pc if isinstance(pc, (int, ctypes.c_void_p)) else boomeramg_handle(pc)
+    if not handle:
+        return None
+    fn = H.hypre_BoomerAMGSeqSolvers
+    fn.argtypes, fn.restype = [ctypes.c_void_p], ctypes.c_int
+    mode = int(fn(handle if isinstance(handle, ctypes.c_void_p) else ctypes.c_void_p(handle)))
+    if comm is not None:
+        mode = max(comm.allgather(mode))
+    return {1: "all", 0: "first"}.get(mode)
+
+
+def check_seq_threshold(options, library, device):
+    """Refuse ``seq_threshold`` where hypre would fault on it, with the reason.
+
+    ``seq_threshold=n`` ends a hierarchy at its first level of at most ``n`` rows (in
+    all, not a rank) and gathers that level on the ranks that hold rows of it, where a
+    hierarchy of one process finishes it.  On thousands of ranks the last levels are a
+    few rows a rank that talk to many ranks, and each costs four exchanges a cycle: a
+    third to a half of a cycle of a linear-element hierarchy on 512 MI250X.  hypre's
+    own code for this reads device memory through host pointers; with the patch the
+    gathered level is solved on a device: the first rank's, which sends the solution to
+    the others, or with ``redundant=1`` every rank's (each keeps its own rows; the patch
+    makes the ranks' coarsenings draw the same random numbers, compares the solvers on
+    one right-hand side, and lets the first rank solve where they differ)."""
+    if int(options.get("seq_threshold", 0) or 0) > 0 and device and not seq_on_device(library):
+        raise RuntimeError("the BoomerAMG option seq_threshold needs, with hypre on a device, a "
+                           "hypre built with tools/hypre-3.2.0-seqdevice.patch (its second "
+                           "version); this one would fault in its set-up or give corrections "
+                           "that differ from rank to rank")
+
+
+def _mfem_library():
+    """A ``ctypes`` handle of the MFEM library of this process, or ``None``."""
+    global _MFEM_HANDLE
+    if _MFEM_HANDLE is not None:
+        return _MFEM_HANDLE
+    import ctypes
+
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libmfem" in line:
+                    _MFEM_HANDLE = ctypes.CDLL(line.split(None, 5)[-1].strip())
+                    return _MFEM_HANDLE
+    except OSError:
+        pass
+    return None
+
+
+def boomeramg_handle(pc):
+    """hypre's own handle (``HYPRE_Solver``) of an ``mfem.HypreBoomerAMG``, or ``None``.
+
+    MFEM converts its preconditioner to that handle with a conversion operator, which a
+    shared MFEM library exports and PyMFEM does not wrap; it is called here by its symbol.
+    With the handle every option of BoomerAMG is within reach, not only those that MFEM's
+    class has a method for (:func:`set_boomeramg_options`).
+    """
+    lib = _mfem_library()
+    name = "_ZNK4mfem14HypreBoomerAMGcvP19hypre_Solver_structEv"
+    if lib is None or not hasattr(lib, name):
+        return None
+    import ctypes
+
+    try:
+        fn = getattr(lib, name)
+        fn.restype, fn.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+        return fn(int(pc.this)) or None
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def set_boomeramg_options(pc, options):
+    """Apply ``options`` (a dict of the names of :data:`BOOMERAMG_SETTERS`) to an
+    ``mfem.HypreBoomerAMG`` that is not set up yet, through hypre's C interface.
+
+    Raises ``RuntimeError`` where the handle cannot be reached (a static MFEM, a build
+    whose symbols differ) and ``ValueError`` for a value hypre refuses.
+    """
+    if not options:
+        return pc
+    import ctypes
+
+    H, amg = _hypre_library(), boomeramg_handle(pc)
+    if H is None or amg is None:
+        raise RuntimeError("BoomerAMG options %s need hypre's handle of the preconditioner, which "
+                           "this MFEM library does not give" % ", ".join(sorted(options)))
+    check_seq_threshold(options, H, bool(_DEVICE))
+    amg = ctypes.c_void_p(amg)
+    for key, val in options.items():
+        name, kind = BOOMERAMG_SETTERS[key]
+        fn = getattr(H, name)
+        if key in ("coarse_relax", "coarse_sweeps"):
+            fn.argtypes, fn.restype = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int], ctypes.c_int
+            rc = fn(amg, int(val), 3)
+        else:
+            # (the hypre that MFEM uses has double-precision reals)
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_double if kind is float else ctypes.c_int]
+            fn.restype = ctypes.c_int
+            rc = fn(amg, val)
+        if rc:
+            if hasattr(H, "HYPRE_ClearAllErrors"):
+                H.HYPRE_ClearAllErrors()
+            raise ValueError("hypre refused the BoomerAMG option %s=%r (%s returned %d)" % (key, val, name, rc))
+    return pc
+
+
 def hypre_gpu_aware_mpi():
     """Whether the hypre of this process hands MPI its buffers on the GPU.
 
@@ -264,15 +458,54 @@ def hypre_gpu_aware_mpi():
         return False
 
 
+#: ``HIPPYMFEM_GPU_AWARE_MPI=solve``: hypre hands MPI its device buffers during the Krylov
+#: solves on a hierarchy that is set up, and stages them through CPU memory otherwise.  A
+#: product with a parallel matrix exchanges through two buffers that the matrix keeps, which
+#: an MPI library registers once; a BoomerAMG setup and a matrix product exchange through
+#: buffers of their own every time, and with Cray MPICH each of those costs a registration:
+#: the setup of 0.8 s at 128^3 on 8 MI250X had not ended after 8 minutes.
+#:
+#: Experimental, and off unless asked for.  On Frontier (Cray MPICH 9.1.0, October 2026) it
+#: took 10 to 20 % off an iteration on up to 64 MI250X and at 512^3 on 512, and deadlocked or
+#: faulted every time at 320^3 on 128 and at 400^3 on 256, with ranks of one node left in
+#: different exchanges of a V-cycle, whatever the MPI was told (no transfers between GPUs of
+#: a node, the signalled handle cache, no asynchronous copies, software matching).  hypre's
+#: own staging with page-locked buffers (tools/hypre-3.2.0-staging.patch) gains as much.
+GPU_AWARE_SOLVES = False
+
+
+def set_hypre_gpu_aware_mpi(on=True):
+    """Make hypre hand MPI its buffers on the GPU (``True``) or stage them through CPU
+    memory (``False``), whatever it was configured with.
+
+    Since hypre 2.30 the choice is a field of its handle that the build option only
+    presets, so one library serves both.  The MPI library has to read device memory
+    (:func:`mpi_gpu_support`): Cray MPICH does with ``MPICH_GPU_SUPPORT_ENABLED=1`` and
+    its GPU transport library in the process (``libmpi_gtl_hsa.so`` on AMD cards, linked
+    or preloaded).  ``HIPPYMFEM_GPU_AWARE_MPI=1`` or ``0`` sets it for
+    :func:`configure_device`.  Returns what is now in force, or ``None`` when the
+    library has no such switch.
+    """
+    lib = _hypre_library()
+    if lib is None or not hasattr(lib, "hypre_SetGpuAwareMPI"):
+        return None
+    import ctypes
+
+    lib.hypre_SetGpuAwareMPI(ctypes.c_int(1 if on else 0))
+    return hypre_gpu_aware_mpi()
+
+
 def mpi_gpu_support():
     """Whether the MPI library of this process says it can send from GPU memory:
     ``True``, ``False``, or ``None`` when it has no way of saying.
 
-    Open MPI answers through ``MPIX_Query_cuda_support``.  The MPICH family has no
-    such call; its support is switched on by ``MPICH_GPU_SUPPORT_ENABLED=1``, which is
-    what is read for it.  ``True`` says that the library can, not that the transport
-    chosen for this run does: Open MPI 4 with a UCX that was built without CUDA
-    still answers yes, and needs ``--mca pml ob1 --mca btl self,smcuda``.
+    Open MPI answers through ``MPIX_Query_cuda_support``, and MPICH 4 and Cray MPICH
+    through that and ``MPIX_Query_hip_support``, one call per vendor: the one for the
+    cards of this build is asked.  An older MPICH has no such call; its support is
+    switched on by ``MPICH_GPU_SUPPORT_ENABLED=1``, which is what is read for it.
+    ``True`` says that the library can, not that the transport chosen for this run does:
+    Open MPI 4 with a UCX that was built without CUDA still answers yes, and needs
+    ``--mca pml ob1 --mca btl self,smcuda``.
     """
     import ctypes
 
@@ -281,14 +514,16 @@ def mpi_gpu_support():
             names = {line.split(None, 5)[-1].strip() for line in f if "/libmpi" in line}
     except OSError:
         names = set()
+    query = "MPIX_Query_hip_support" if mfem_gpu_backend() == "hip" else "MPIX_Query_cuda_support"
     for name in sorted(names):
         try:
             lib = ctypes.CDLL(name)
         except OSError:
             continue
-        if hasattr(lib, "MPIX_Query_cuda_support"):
-            lib.MPIX_Query_cuda_support.restype = ctypes.c_int
-            return bool(lib.MPIX_Query_cuda_support())
+        if hasattr(lib, query):
+            ask = getattr(lib, query)
+            ask.restype = ctypes.c_int
+            return bool(ask())
     v = os.environ.get("MPICH_GPU_SUPPORT_ENABLED")
     if v is not None:
         return v.strip() == "1"
@@ -310,14 +545,17 @@ def _check_gpu_aware_mpi(comm=None, quiet=False):
     ok = mpi_gpu_support()
     if ok is False:
         raise RuntimeError(
-            "this hypre was built with HYPRE_WITH_GPU_AWARE_MPI: it gives MPI the "
-            "addresses of its buffers on the GPU, and the MPI library of this run says "
-            "it has no CUDA support, so it would read a device address as CPU memory "
-            "and crash at the first product with a parallel matrix.\n"
-            "  Run with a CUDA-aware MPI (Open MPI built --with-cuda; with Open MPI 4 "
-            "and a UCX without CUDA, 'mpirun --mca pml ob1 --mca btl self,smcuda'), or "
-            "use the libHYPRE.so that tools/build_pymfem_cuda.sh built, which stages "
-            "its buffers through CPU memory itself.")
+            "this hypre gives MPI the addresses of its buffers on the GPU (built with "
+            "HYPRE_WITH_GPU_AWARE_MPI, or HIPPYMFEM_GPU_AWARE_MPI=1), and the MPI library "
+            "of this run says it cannot read this card's memory, so it would read a "
+            "device address as CPU memory and crash at the first product with a parallel "
+            "matrix.\n"
+            "  Run with a GPU-aware MPI (Open MPI built --with-cuda; with Open MPI 4 "
+            "and a UCX without CUDA, 'mpirun --mca pml ob1 --mca btl self,smcuda'; Cray "
+            "MPICH with MPICH_GPU_SUPPORT_ENABLED=1 and its GTL library linked or "
+            "preloaded), or leave the exchange to hypre, which then stages its buffers "
+            "through CPU memory (HIPPYMFEM_GPU_AWARE_MPI=0, or the libHYPRE.so that the "
+            "PyMFEM build scripts produce).")
     if ok is None and not quiet and comm.Get_rank() == 0:
         import warnings
 
@@ -383,7 +621,13 @@ class HyprePool:
     Attributes (all in bytes or counts, for this rank): ``cached`` and ``peak_cached``,
     the freed memory the pool holds; ``in_use`` and ``peak_in_use``, the memory of the
     blocks it handed out; ``requests``, ``from_pool``, ``driver_allocs`` and
-    ``driver_frees``.
+    ``driver_frees``; ``driver_bytes``, the sum of the blocks the driver was asked for, and
+    ``driver_seconds``, the time its two functions took; ``peak_footprint``, the most the
+    blocks in use and the kept ones came to when a block was taken from the driver;
+    ``trims``, the times the pool was emptied (the device was out of memory, or a caller
+    asked), and ``refused``, the requests the driver refused even then; ``min_free``, the
+    least free memory the card had when hypre took a block of 16 MiB or more from the
+    driver, and ``device_total``, the card's memory.
     """
 
     #: size classes per factor of two; a recycled block is at most 2**(2/8) = 1.19
@@ -393,6 +637,9 @@ class HyprePool:
     #: Between setups a scoped pool holds at most this share of the most hypre has had
     #: in use at once (and at most ``keep``): a small problem keeps little.
     KEEP_SHARE = 0.25
+
+    #: The card's free memory is asked after a block of at least this many bytes.
+    _MEM_INFO_FROM = 1 << 24
 
     def __init__(self, hypre, runtime, max_cached, max_block=None, scoped=False, keep=0):
         import ctypes
@@ -405,14 +652,26 @@ class HyprePool:
         self.keep = int(keep) if self.scoped else int(max_cached)
 
         self._ct = ctypes
-        self._dev_malloc = runtime.cudaMalloc
+        # the runtime's own pair, cudaMalloc and cudaFree or hipMalloc and hipFree
+        vendor = "cuda" if hasattr(runtime, "cudaMalloc") else "hip"
+        self._dev_malloc = getattr(runtime, vendor + "Malloc")
         self._dev_malloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
         self._dev_malloc.restype = ctypes.c_int
-        self._dev_free = runtime.cudaFree
+        self._dev_free = getattr(runtime, vendor + "Free")
         self._dev_free.argtypes = [ctypes.c_void_p]
         self._dev_free.restype = ctypes.c_int
         # reads the runtime's last error, which resets it
-        self._last_error = getattr(runtime, "cudaGetLastError", None)
+        self._last_error = getattr(runtime, vendor + "GetLastError", None)
+        # the card's free and total memory, asked after each block taken from the driver
+        self._mem_info = getattr(runtime, vendor + "MemGetInfo", None)
+        if self._mem_info is not None:
+            self._mem_info.argtypes = [ctypes.POINTER(ctypes.c_size_t),
+                                       ctypes.POINTER(ctypes.c_size_t)]
+            self._mem_info.restype = ctypes.c_int
+        self._mem_free, self._mem_total = ctypes.c_size_t(), ctypes.c_size_t()
+        #: the least free memory of the card seen when hypre took a block from the driver,
+        #: and the card's memory, in bytes (0 until asked)
+        self.min_free = self.device_total = 0
         #: how many requests the driver refused even after the pool was emptied
         self.refused = 0
         self.max_cached = self.keep
@@ -421,6 +680,8 @@ class HyprePool:
         self._size = {}                    # pointer -> size, for the blocks handed out
         self.cached = self.peak_cached = self.in_use = self.peak_in_use = 0
         self.requests = self.from_pool = self.driver_allocs = self.driver_frees = 0
+        self.driver_bytes, self.driver_seconds = 0, 0.0
+        self.peak_footprint = self.trims = 0
         # hypre keeps the two function pointers: the callback objects must outlive it
         self._cb_malloc = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_void_p),
                                            ctypes.c_size_t)(self._malloc)
@@ -434,6 +695,7 @@ class HyprePool:
         return int(self.CLASSES * math.log2(size)) if size > 1 else 0
 
     def _driver_malloc(self, size):
+        t0 = time.perf_counter()
         p = self._ct.c_void_p()
         if self._dev_malloc(self._ct.byref(p), size) != 0 or not p.value:
             # out of device memory: give back what the pool holds and try once more
@@ -447,7 +709,24 @@ class HyprePool:
             if self._last_error is not None:
                 self._last_error()
         self.driver_allocs += 1
+        self.driver_bytes += size
+        self.driver_seconds += time.perf_counter() - t0
+        if self._mem_info is not None and size >= self._MEM_INFO_FROM:
+            # (how near the card came to full, which no counter of the pool's own shows:
+            # JAX and MFEM hold memory of the same card)
+            if self._mem_info(self._ct.byref(self._mem_free),
+                              self._ct.byref(self._mem_total)) == 0:
+                free = int(self._mem_free.value)
+                if not self.device_total or free < self.min_free:
+                    self.min_free = free
+                self.device_total = int(self._mem_total.value)
         return p.value
+
+    def _driver_free(self, p):
+        t0 = time.perf_counter()
+        self._dev_free(p)
+        self.driver_frees += 1
+        self.driver_seconds += time.perf_counter() - t0
 
     def _refuse(self, size):
         """The card has no room for a block hypre asks for.  hypre stops the run at a
@@ -496,6 +775,8 @@ class HyprePool:
             self.in_use += size
             if self.in_use > self.peak_in_use:
                 self.peak_in_use = self.in_use
+            if self.in_use + self.cached > self.peak_footprint:
+                self.peak_footprint = self.in_use + self.cached
         out[0] = p
 
     def _free(self, p):
@@ -514,8 +795,7 @@ class HyprePool:
                         self.peak_cached = self.cached
                     return
         # not handed out by this pool, too large, or the pool is full
-        self._dev_free(p)
-        self.driver_frees += 1
+        self._driver_free(p)
 
     def _largest(self):
         """The size class of the largest block held, or ``None``."""
@@ -537,8 +817,7 @@ class HyprePool:
                 return
             p, big = self._bins[top].pop()
             self.cached -= big
-            self._dev_free(p)
-            self.driver_frees += 1
+            self._driver_free(p)
 
     def _shrink(self):
         """Give blocks back to the driver, largest first, down to ``max_cached``."""
@@ -548,16 +827,16 @@ class HyprePool:
                 break
             p, big = self._bins[top].pop()
             self.cached -= big
-            self._dev_free(p)
-            self.driver_frees += 1
+            self._driver_free(p)
 
     def trim(self):
         """Return every block the pool holds to the driver; returns the bytes freed."""
         freed = self.cached
+        if freed:
+            self.trims += 1
         for blocks in self._bins.values():
             for p, _s in blocks:
-                self._dev_free(p)
-                self.driver_frees += 1
+                self._driver_free(p)
         self._bins.clear()
         self.cached = 0
         return freed
@@ -590,8 +869,9 @@ class HyprePool:
 
     def stats(self):
         return {k: getattr(self, k) for k in (
-            "requests", "from_pool", "driver_allocs", "driver_frees", "cached",
-            "peak_cached", "in_use", "peak_in_use")}
+            "requests", "from_pool", "driver_allocs", "driver_frees", "driver_bytes",
+            "driver_seconds", "cached", "peak_cached", "in_use", "peak_in_use",
+            "peak_footprint", "trims", "refused", "min_free", "device_total")}
 
 
 #: The pool :func:`set_hypre_pool` installed, or ``None``.
@@ -631,7 +911,7 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
 
     A hypre built without Umpire and without its own device pool, which is what the
     PyMFEM build scripts produce, takes every device array from ``cudaMalloc`` and
-    returns it with ``cudaFree``.  One BoomerAMG setup makes about two thousand such
+    returns it with ``cudaFree`` (``hipMalloc`` and ``hipFree`` on AMD cards).  One BoomerAMG setup makes about two thousand such
     pairs of calls.  Each is a trip into the driver that costs tens of microseconds
     when one process uses the node and several hundred when sixteen do, more than a
     second of a setup of 1.5 s (the GPU guide, "Several GPUs").
@@ -665,8 +945,8 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
     :data:`HYPRE_POOL_KEEP_MB` between setups, the latter changed by
     ``HIPPYMFEM_HYPRE_POOL_KEEP``, in megabytes, where 0 keeps nothing).
     ``HIPPYMFEM_HYPRE_POOL=<megabytes>`` asks for one limit at all times, and ``0`` for
-    no pool.  NVIDIA builds only.  Returns the :class:`HyprePool`, or ``None`` when
-    hypre is not on a CUDA device or the hooks are not available.
+    no pool.  CUDA and HIP builds.  Returns the :class:`HyprePool`, or ``None`` when
+    hypre is not on a device or the hooks are not available.
     """
     global HYPRE_POOL
     if HYPRE_POOL is not None and HYPRE_POOL.installed:
@@ -677,17 +957,19 @@ def set_hypre_pool(megabytes=1024.0, max_block_megabytes=None, scoped=False,
         HYPRE_POOL.max_cached = HYPRE_POOL.keep
         HYPRE_POOL._shrink()
         return HYPRE_POOL
-    if not _DEVICE or mfem_gpu_backend() != "cuda":
+    backend = mfem_gpu_backend()
+    if not _DEVICE or backend not in ("cuda", "hip"):
         return None
     import atexit
     import ctypes
 
     hypre = _hypre_library()
     runtime = None
+    name = "libcudart.so" if backend == "cuda" else "libamdhip64.so"
     try:
         with open("/proc/self/maps") as f:
             for line in f:
-                if "libcudart.so" in line:
+                if name in line:
                     runtime = ctypes.CDLL(line.split(None, 5)[-1].strip())
                     break
     except OSError:

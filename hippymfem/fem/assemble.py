@@ -15,7 +15,7 @@ import numpy as np
 import mfem.par as mfem
 
 from ..common.linalg import own  # noqa: F401  (re-exported)
-from ..common.parvector import host_sync, to_numpy
+from ..common.parvector import allreduce as _reduce, host_sync, to_numpy
 from .spaces import as_space
 from .csrassemble import assemble_matrix_csr, assemble_vector_csr
 
@@ -89,7 +89,7 @@ def assemble_scalar(comm, element_values):
             import jax.numpy as jnp
 
             loc += float(jnp.sum(v))
-    return comm.allreduce(float(loc), op=MPI.SUM)
+    return _reduce(comm, float(loc), MPI.SUM)
 
 
 def _policy(name):

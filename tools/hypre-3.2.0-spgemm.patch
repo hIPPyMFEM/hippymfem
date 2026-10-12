@@ -1,0 +1,499 @@
+--- a/seq_mv/csr_spgemm_device_rocsparse.c
++++ b/seq_mv/csr_spgemm_device_rocsparse.c
+@@ -11,6 +11,189 @@
+ 
+ #if defined(HYPRE_USING_HIP) && defined(HYPRE_USING_ROCSPARSE)
+ 
++/* hIPPyMFEM (tools/hypre-3.2.0-spgemm.patch).  rocSPARSE is given the column indices of each
++ * row in ascending order, and hypre sorts a copy of both operands before every product.  A
++ * setup of BoomerAMG multiplies matrices that are sorted already: a transpose, the result of
++ * the product before.  The copy and the sort of such an operand are most of the time of the
++ * product, and several GB of device memory taken and given back.  The rows are checked
++ * here, in one pass over the column indices, and an operand whose rows ascend is used as it
++ * is. */
++struct hypre_CSRSpGemmRowDescends
++{
++   const HYPRE_Int *ia, *ja;
++
++   hypre_CSRSpGemmRowDescends(const HYPRE_Int *ia_, const HYPRE_Int *ja_) : ia(ia_), ja(ja_) {}
++
++   __host__ __device__ bool operator()(const HYPRE_Int i) const
++   {
++      for (HYPRE_Int k = ia[i]; k < ia[i + 1] - 1; k++)
++      {
++         if (ja[k] >= ja[k + 1])
++         {
++            return true;
++         }
++      }
++      return false;
++   }
++};
++
++/* HYPRE_SPGEMM_SKIP_SORT in the environment: 0 has every operand copied and sorted by
++ * rocSPARSE, as hypre does; 1 uses an operand whose rows ascend as it is; 2 also writes the
++ * sorted copy of an operand with its first entries out of place in one pass; anything else,
++ * or nothing, also has a diagonal block and its off-processor one joined with their rows
++ * in order (hypre_ConcatDiagAndOffdDevice) */
++static HYPRE_Int
++hypre_CSRSpGemmSkipSort(void)
++{
++   static HYPRE_Int skip_sort = -1;
++
++   if (skip_sort < 0)
++   {
++      char *env = getenv("HYPRE_SPGEMM_SKIP_SORT");
++      skip_sort = (env && env[0] == '0') ? 0 : (env && env[0] == '1') ? 1 : 2;
++   }
++
++   return skip_sort;
++}
++
++static HYPRE_Int
++hypre_CSRSpGemmDiagFirstPass(void)
++{
++   return hypre_CSRSpGemmSkipSort() > 1;
++}
++
++static HYPRE_Int
++hypre_CSRSpGemmRowsAscend(HYPRE_Int        nrows,
++                          const HYPRE_Int *d_ia,
++                          const HYPRE_Int *d_ja)
++{
++   if (!hypre_CSRSpGemmSkipSort())
++   {
++      return 0;
++   }
++
++   return 0 == HYPRE_THRUST_CALL( count_if,
++                                  thrust::make_counting_iterator(0),
++                                  thrust::make_counting_iterator(nrows),
++                                  hypre_CSRSpGemmRowDescends(d_ia, d_ja) );
++}
++
++/* The largest operand of a setup is not sorted: the diagonal block of a square matrix of
++ * hypre has the diagonal entry of each row first, and the block that joins it with the
++ * off-processor one inherits that.  Where the matrix was assembled with its other entries
++ * in ascending order (the fine matrix of a solve), a row is sorted by moving that one
++ * entry, and the sorted copy is written here in one pass, a warp a row, instead of being
++ * copied and handed to rocSPARSE's sort with a permutation and a second copy of the values
++ * beside it (22 bytes a nonzero of device memory taken and given back).  A row of another
++ * kind raises the flag and the caller sorts as before. */
++__global__ void
++hypre_GPUKernelCSRSpGemmSortedCopyDiagFirst( hypre_DeviceItem &item,
++                                             HYPRE_Int         nrows,
++                                             HYPRE_Int        *ia,
++                                             HYPRE_Int        *ja,
++                                             HYPRE_Complex    *aa,
++                                             HYPRE_Int        *js,
++                                             HYPRE_Complex    *as,
++                                             HYPRE_Int        *other )
++{
++   const HYPRE_Int row  = hypre_gpu_get_grid_warp_id<1, 1>(item);
++   const HYPRE_Int lane = hypre_gpu_get_lane_id<1>(item);
++
++   if (row >= nrows)
++   {
++      return;
++   }
++
++   HYPRE_Int p = 0, q = 0, d = 0;
++
++   if (lane < 2)
++   {
++      p = read_only_load(ia + row + lane);
++   }
++   q = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, p, 1);
++   p = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, p, 0);
++
++   if (q <= p)
++   {
++      return;
++   }
++
++   /* the first entry of the row, and its place when none of the others is smaller */
++   if (lane == 0)
++   {
++      d = read_only_load(ja + p);
++      if (p + 1 == q || read_only_load(ja + p + 1) > d)
++      {
++         js[p] = d;
++         as[p] = read_only_load(aa + p);
++      }
++   }
++   d = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, d, 0);
++
++   /* the others: one place down when smaller than the first, and the first behind the
++    * last of those */
++   for (HYPRE_Int j = p + 1 + lane; j < q; j += HYPRE_WARP_SIZE)
++   {
++      const HYPRE_Int c    = read_only_load(ja + j);
++      const HYPRE_Int last = (j + 1 == q);
++      const HYPRE_Int next = last ? c : read_only_load(ja + j + 1);
++
++      if (c == d || (!last && c >= next))
++      {
++         *other = 1;
++      }
++      if (c < d)
++      {
++         js[j - 1] = c;
++         as[j - 1] = read_only_load(aa + j);
++         if (last || next > d)
++         {
++            js[j] = d;
++            as[j] = read_only_load(aa + p);
++         }
++      }
++      else
++      {
++         js[j] = c;
++         as[j] = read_only_load(aa + j);
++      }
++   }
++}
++
++/* the sorted copy of a matrix whose rows are sorted but for their first entry; returns 0,
++ * with the copy to be made anew, when some row is of another kind */
++static HYPRE_Int
++hypre_CSRSpGemmSortedCopyDiagFirst(HYPRE_Int      nrows,
++                                   HYPRE_Int      nnz,
++                                   HYPRE_Int     *d_ia,
++                                   HYPRE_Int     *d_ja,
++                                   HYPRE_Complex *d_a,
++                                   HYPRE_Int     *d_ja_sorted,
++                                   HYPRE_Complex *d_a_sorted)
++{
++   HYPRE_Int  other = 0;
++   HYPRE_Int *d_other;
++
++   if (nrows <= 0 || nnz <= 0)
++   {
++      return 0;
++   }
++
++   d_other = hypre_CTAlloc(HYPRE_Int, 1, HYPRE_MEMORY_DEVICE);
++
++   dim3 bDim = hypre_GetDefaultDeviceBlockDimension();
++   dim3 gDim = hypre_GetDefaultDeviceGridDimension(nrows, "warp", bDim);
++
++   HYPRE_GPU_LAUNCH( hypre_GPUKernelCSRSpGemmSortedCopyDiagFirst, gDim, bDim,
++                     nrows, d_ia, d_ja, d_a, d_ja_sorted, d_a_sorted, d_other );
++
++   hypre_ForceSyncComputeStream();
++   hypre_TMemcpy(&other, d_other, HYPRE_Int, 1, HYPRE_MEMORY_HOST, HYPRE_MEMORY_DEVICE);
++   hypre_TFree(d_other, HYPRE_MEMORY_DEVICE);
++
++   return !other;
++}
++
+ static HYPRE_Int
+ hypre_CSRSpGemmSortDeviceCopy(hypre_CSRMatrix *A,
+                               HYPRE_Int       *A_j_sorted,
+@@ -58,10 +241,14 @@
+    HYPRE_Int  *d_ja_sorted, *d_jb_sorted;
+    HYPRE_Complex *d_c, *d_a_sorted, *d_b_sorted;
+ 
+-   d_a_sorted  = hypre_TAlloc(HYPRE_Complex, nnzA, HYPRE_MEMORY_DEVICE);
+-   d_b_sorted  = hypre_TAlloc(HYPRE_Complex, nnzB, HYPRE_MEMORY_DEVICE);
+-   d_ja_sorted = hypre_TAlloc(HYPRE_Int,     nnzA, HYPRE_MEMORY_DEVICE);
+-   d_jb_sorted = hypre_TAlloc(HYPRE_Int,     nnzB, HYPRE_MEMORY_DEVICE);
++   /* an operand whose rows ascend already is neither copied nor sorted */
++   const HYPRE_Int sortedA = hypre_CSRSpGemmRowsAscend(m, d_ia, d_ja);
++   const HYPRE_Int sortedB = hypre_CSRSpGemmRowsAscend(hypre_CSRMatrixNumRows(B), d_ib, d_jb);
++
++   d_a_sorted  = sortedA ? d_a  : hypre_TAlloc(HYPRE_Complex, nnzA, HYPRE_MEMORY_DEVICE);
++   d_b_sorted  = sortedB ? d_b  : hypre_TAlloc(HYPRE_Complex, nnzB, HYPRE_MEMORY_DEVICE);
++   d_ja_sorted = sortedA ? d_ja : hypre_TAlloc(HYPRE_Int,     nnzA, HYPRE_MEMORY_DEVICE);
++   d_jb_sorted = sortedB ? d_jb : hypre_TAlloc(HYPRE_Int,     nnzB, HYPRE_MEMORY_DEVICE);
+ 
+    rocsparse_handle handle = hypre_HandleCusparseHandle(hypre_handle());
+ 
+@@ -69,17 +256,38 @@
+    rocsparse_operation transB = rocsparse_operation_none;
+ 
+    /* Copy the unsorted over as the initial "sorted" */
+-   hypre_TMemcpy(d_ja_sorted, d_ja, HYPRE_Int,     nnzA, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
+-   hypre_TMemcpy(d_a_sorted,  d_a,  HYPRE_Complex, nnzA, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
+-   hypre_TMemcpy(d_jb_sorted, d_jb, HYPRE_Int,     nnzB, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
+-   hypre_TMemcpy(d_b_sorted,  d_b,  HYPRE_Complex, nnzB, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
++   /* (an operand that is sorted but for the first entry of each row: by one pass) */
++   const HYPRE_Int placedA = !sortedA && hypre_CSRSpGemmDiagFirstPass() &&
++                             hypre_CSRSpGemmSortedCopyDiagFirst(m, nnzA, d_ia, d_ja, d_a,
++                                                                d_ja_sorted, d_a_sorted);
++   const HYPRE_Int placedB = !sortedB && hypre_CSRSpGemmDiagFirstPass() &&
++                             hypre_CSRSpGemmSortedCopyDiagFirst(hypre_CSRMatrixNumRows(B), nnzB,
++                                                                d_ib, d_jb, d_b,
++                                                                d_jb_sorted, d_b_sorted);
++
++   if (!sortedA && !placedA)
++   {
++      hypre_TMemcpy(d_ja_sorted, d_ja, HYPRE_Int,     nnzA, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
++      hypre_TMemcpy(d_a_sorted,  d_a,  HYPRE_Complex, nnzA, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
++   }
++   if (!sortedB && !placedB)
++   {
++      hypre_TMemcpy(d_jb_sorted, d_jb, HYPRE_Int,     nnzB, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
++      hypre_TMemcpy(d_b_sorted,  d_b,  HYPRE_Complex, nnzB, HYPRE_MEMORY_DEVICE, HYPRE_MEMORY_DEVICE);
++   }
+ 
+    /* For rocSPARSE, the CSR SpGEMM implementation does not require the columns to be sorted! */
+    /* RL: for matrices with long rows, it seemed that the sorting is still needed */
+    /* VPM: Adding sorting back since it is necessary for correctness in a few cases */
+ #if 1
+-   hypre_CSRSpGemmSortDeviceCopy(A, d_ja_sorted, d_a_sorted);
+-   hypre_CSRSpGemmSortDeviceCopy(B, d_jb_sorted, d_b_sorted);
++   if (!sortedA && !placedA)
++   {
++      hypre_CSRSpGemmSortDeviceCopy(A, d_ja_sorted, d_a_sorted);
++   }
++   if (!sortedB && !placedB)
++   {
++      hypre_CSRSpGemmSortDeviceCopy(B, d_jb_sorted, d_b_sorted);
++   }
+ #endif
+ 
+    // nnzTotalDevHostPtr points to host memory
+@@ -157,10 +365,16 @@
+    *d_c_out  = d_c;
+    *nnzC_out = nnzC;
+ 
+-   hypre_TFree(d_a_sorted,  HYPRE_MEMORY_DEVICE);
+-   hypre_TFree(d_b_sorted,  HYPRE_MEMORY_DEVICE);
+-   hypre_TFree(d_ja_sorted, HYPRE_MEMORY_DEVICE);
+-   hypre_TFree(d_jb_sorted, HYPRE_MEMORY_DEVICE);
++   if (!sortedA)
++   {
++      hypre_TFree(d_a_sorted,  HYPRE_MEMORY_DEVICE);
++      hypre_TFree(d_ja_sorted, HYPRE_MEMORY_DEVICE);
++   }
++   if (!sortedB)
++   {
++      hypre_TFree(d_b_sorted,  HYPRE_MEMORY_DEVICE);
++      hypre_TFree(d_jb_sorted, HYPRE_MEMORY_DEVICE);
++   }
+ 
+    return hypre_error_flag;
+ }
+--- a/parcsr_mv/par_csr_matop_device.c
++++ b/parcsr_mv/par_csr_matop_device.c
+@@ -71,6 +71,130 @@
+    }
+ }
+ 
++#if defined(HYPRE_USING_ROCSPARSE)
++/* hIPPyMFEM (tools/hypre-3.2.0-spgemm.patch): [Adiag, Aoffd] with every row in ascending
++ * order, for rocSPARSE's product (csr_spgemm_device_rocsparse.c), which then takes the
++ * matrix as it is.  The rows of a diagonal block have the diagonal entry first; where the
++ * other entries ascend, and those of the off-processor block do, the first entry is put in
++ * its place as the row is written.  A row of another kind raises the flag, and the caller
++ * writes the matrix again with the kernel above. */
++__global__ void
++hypre_GPUKernelConcatDiagAndOffdSorted( hypre_DeviceItem &item,
++                                        HYPRE_Int  nrows,    HYPRE_Int  diag_ncol,
++                                        HYPRE_Int *d_diag_i, HYPRE_Int *d_diag_j, HYPRE_Complex *d_diag_a,
++                                        HYPRE_Int *d_offd_i, HYPRE_Int *d_offd_j, HYPRE_Complex *d_offd_a,
++                                        HYPRE_Int *d_ib,     HYPRE_Int *d_jb,     HYPRE_Complex *d_ab,
++                                        HYPRE_Int *other )
++{
++   const HYPRE_Int row = hypre_gpu_get_grid_warp_id<1, 1>(item);
++
++   if (row >= nrows)
++   {
++      return;
++   }
++
++   /* lane id inside the warp */
++   const HYPRE_Int lane_id = hypre_gpu_get_lane_id<1>(item);
++   HYPRE_Int i, j = 0, k = 0, d = 0, p, istart, iend, bstart;
++
++   /* diag part */
++   if (lane_id < 2)
++   {
++      j = read_only_load(d_diag_i + row + lane_id);
++   }
++   if (lane_id == 0)
++   {
++      k = read_only_load(d_ib + row);
++   }
++   istart = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, j, 0);
++   iend   = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, j, 1);
++   bstart = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, k, 0);
++
++   p = bstart - istart;
++   if (iend > istart)
++   {
++      /* the first entry, and its place when none of the others is smaller */
++      if (lane_id == 0)
++      {
++         d = read_only_load(d_diag_j + istart);
++         if (istart + 1 == iend || read_only_load(d_diag_j + istart + 1) > d)
++         {
++            d_jb[p + istart] = d;
++            d_ab[p + istart] = read_only_load(d_diag_a + istart);
++         }
++      }
++      d = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, d, 0);
++
++      /* the others: one place down when smaller than the first, and the first behind
++       * the last of those */
++      for (i = istart + 1 + lane_id; i < iend; i += HYPRE_WARP_SIZE)
++      {
++         const HYPRE_Int c    = read_only_load(d_diag_j + i);
++         const HYPRE_Int last = (i + 1 == iend);
++         const HYPRE_Int next = last ? c : read_only_load(d_diag_j + i + 1);
++
++         if (c == d || (!last && c >= next))
++         {
++            *other = 1;
++         }
++         if (c < d)
++         {
++            d_jb[p + i - 1] = c;
++            d_ab[p + i - 1] = read_only_load(d_diag_a + i);
++            if (last || next > d)
++            {
++               d_jb[p + i] = d;
++               d_ab[p + i] = read_only_load(d_diag_a + istart);
++            }
++         }
++         else
++         {
++            d_jb[p + i] = c;
++            d_ab[p + i] = read_only_load(d_diag_a + i);
++         }
++      }
++   }
++
++   /* offd part */
++   if (lane_id < 2)
++   {
++      j = read_only_load(d_offd_i + row + lane_id);
++   }
++   bstart += iend - istart;
++   istart = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, j, 0);
++   iend   = warp_shuffle_sync(item, HYPRE_WARP_FULL_MASK, j, 1);
++
++   p = bstart - istart;
++   for (i = istart + lane_id; i < iend; i += HYPRE_WARP_SIZE)
++   {
++      const HYPRE_Int t = read_only_load(d_offd_j + i);
++
++      if (i + 1 < iend && t >= read_only_load(d_offd_j + i + 1))
++      {
++         *other = 1;
++      }
++      d_jb[p + i] = t + diag_ncol;
++      d_ab[p + i] = read_only_load(d_offd_a + i);
++   }
++}
++
++/* HYPRE_SPGEMM_SKIP_SORT in the environment: 0, 1 or 2 leave the rows as the blocks have
++ * them (see csr_spgemm_device_rocsparse.c) */
++static HYPRE_Int
++hypre_ConcatDiagAndOffdSorts(void)
++{
++   static HYPRE_Int sorts = -1;
++
++   if (sorts < 0)
++   {
++      char *env = getenv("HYPRE_SPGEMM_SKIP_SORT");
++      sorts = (env && env[0] >= '0' && env[0] <= '2') ? 0 : 1;
++   }
++
++   return sorts;
++}
++#endif
++
+ hypre_CSRMatrix*
+ hypre_ConcatDiagAndOffdDevice(hypre_ParCSRMatrix *A)
+ {
+@@ -105,20 +229,54 @@
+    HYPRE_Int *d_ib = hypre_CSRMatrixI(B);
+    HYPRE_Int *d_jb = hypre_CSRMatrixJ(B);
+    HYPRE_Complex *d_ab = hypre_CSRMatrixData(B);
+-   HYPRE_GPU_LAUNCH( hypre_GPUKernelConcatDiagAndOffd,
+-                     gDim, bDim,
+-                     nrows,
+-                     diag_ncol,
+-                     d_diag_i,
+-                     d_diag_j,
+-                     d_diag_a,
+-                     d_offd_i,
+-                     d_offd_j,
+-                     d_offd_a,
+-                     cols_offd_map,
+-                     d_ib,
+-                     d_jb,
+-                     d_ab );
++#if defined(HYPRE_USING_ROCSPARSE)
++   /* hIPPyMFEM: the rows in ascending order where a move of their first entry gives that */
++   HYPRE_Int sorted = 0;
++
++   if (nrows > 0 && hypre_HandleSpgemmUseVendor(hypre_handle()) && hypre_ConcatDiagAndOffdSorts())
++   {
++      HYPRE_Int  other = 0;
++      HYPRE_Int *d_other = hypre_CTAlloc(HYPRE_Int, 1, HYPRE_MEMORY_DEVICE);
++
++      HYPRE_GPU_LAUNCH( hypre_GPUKernelConcatDiagAndOffdSorted,
++                        gDim, bDim,
++                        nrows,
++                        diag_ncol,
++                        d_diag_i,
++                        d_diag_j,
++                        d_diag_a,
++                        d_offd_i,
++                        d_offd_j,
++                        d_offd_a,
++                        d_ib,
++                        d_jb,
++                        d_ab,
++                        d_other );
++
++      hypre_ForceSyncComputeStream();
++      hypre_TMemcpy(&other, d_other, HYPRE_Int, 1, HYPRE_MEMORY_HOST, HYPRE_MEMORY_DEVICE);
++      hypre_TFree(d_other, HYPRE_MEMORY_DEVICE);
++      sorted = !other;
++   }
++
++   if (!sorted)
++#endif
++   {
++      HYPRE_GPU_LAUNCH( hypre_GPUKernelConcatDiagAndOffd,
++                        gDim, bDim,
++                        nrows,
++                        diag_ncol,
++                        d_diag_i,
++                        d_diag_j,
++                        d_diag_a,
++                        d_offd_i,
++                        d_offd_j,
++                        d_offd_a,
++                        cols_offd_map,
++                        d_ib,
++                        d_jb,
++                        d_ab );
++   }
+ 
+    hypre_GpuProfilingPopRange();
+ 
+--- a/parcsr_mv/par_csr_triplemat_device.c
++++ b/parcsr_mv/par_csr_triplemat_device.c
+@@ -1148,6 +1148,17 @@
+       hypre_CSRMatrixJ(IE)    = ie_j;
+       hypre_CSRMatrixData(IE) = ie_a;
+ 
++#if defined(HYPRE_USING_ROCSPARSE)
++      /* hIPPyMFEM (tools/hypre-3.2.0-spgemm.patch): the rows of Cext come as the ranks sent
++       * them, those of Cbar sorted from the product before.  With the few of Cext sorted
++       * here the stacked matrix is sorted, and rocSPARSE's product below takes it as it is
++       * instead of sorting a copy of the whole (csr_spgemm_device_rocsparse.c). */
++      if (hypre_HandleSpgemmUseVendor(hypre_handle()) && hypre_CSRMatrixNumNonzeros(Cext) > 0)
++      {
++         hypre_CSRMatrixSortDevice(Cext, 0);
++      }
++#endif
++
+       // CC = [Cbar_local; Cext]
+       hypre_CSRMatrix *CC = hypre_CSRMatrixStack2Device(Cbar_local, Cext);
+       hypre_CSRMatrixDestroy(Cbar);
