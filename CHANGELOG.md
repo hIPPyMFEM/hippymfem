@@ -4,6 +4,23 @@
 
 ### Added
 
+- **Two applications that follow published inversions.**  `applications/seismic/` infers
+  the wave speed of the Earth from seismograms, the problem of Bui-Thanh et al. (SC12,
+  2012): the acoustic wave equation as a density at a point, continuous spectral
+  elements with leapfrog and time reversal for the adjoint and Hessian sweeps, and the
+  library's `Model`, `ReducedSpaceNewtonCG`, `MultiVector` and `GaussianLRPosterior`
+  unchanged.  With 987 387 parameters and 26.4 million wave unknowns the MAP point takes
+  12 Gauss-Newton iterations and the low rank 800 Hessian products; a forward solve was
+  run on 24.2 billion unknowns.  `applications/icesheet/` infers the basal friction of
+  the Antarctic ice sheet from the velocity of its surface, the problem of Isaac et al.
+  (J. Comput. Phys. 296, 2015): full Stokes with Glen's law as one residual density over
+  the velocity, the pressure and the friction, a class that implements the library's
+  `PDEProblem` interface with a direct solver on the card (cuDSS) or without any matrix,
+  a posterior from a low rank or from the misfit Hessian as a sparse matrix, and a
+  forward solve on 1.09 billion unknowns.  Both fetch their data on first use
+  (`earth.py fetch`, `antarctica.py fetch`); their READMEs have the commands, the
+  results and what was checked.  They are not part of the continuous integration, which
+  has neither their data nor a GPU.
 - **The geothermal application builds its mesh in parallel** (`model.cube_mesh`,
   `run.py --coarse`).  Every rank used to build and partition the whole mesh: 635 bytes
   an element while METIS partitions it, which is 42 s and 10 GB a rank at 256^3 on 32

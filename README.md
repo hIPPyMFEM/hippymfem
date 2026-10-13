@@ -200,7 +200,14 @@ mixed-family spaces, and forward uncertainty propagation.
 [`applications/`](applications/) holds complete drivers for larger problems: subsurface flow,
 advection-diffusion, a Robin boundary coefficient, MCMC, forward UQ, discontinuous Galerkin
 transport at high Péclet number, and the 3D basin-scale geothermal inversion pictured above,
-with a tabulated, temperature-dependent conductivity.
+with a tabulated, temperature-dependent conductivity.  Two more follow published inversions,
+at their size and beyond: [`seismic/`](applications/seismic/), the wave speed of the Earth
+from seismograms (Bui-Thanh et al., SC12), an explicitly stepped wave equation with a forward
+solve on 24.2 billion unknowns, and [`icesheet/`](applications/icesheet/), the friction under
+the Antarctic ice sheet from the velocity of its surface (Isaac et al., J. Comput. Phys.
+2015), a full Stokes problem with a forward solve on 1.09 billion unknowns.  Both fetch their
+data on first use, and the ice sheet needs CuPy beside the library; their READMEs say how
+they are run.
 
 ## Cross-validation against hIPPYlibx
 
