@@ -596,6 +596,27 @@ on eight the solve either ran to 200 iterations or stopped after a few on a
 preconditioner that was no longer positive definite (the weights of the finest
 relaxation are the old matrix's), with a residual of the size of the right-hand side.
 
+**The blocks of a linearization point in single precision** (``single_blocks``,
+``HIPPYMFEM_SINGLE_BLOCKS``).  The CG of a Newton step applies ``C``, ``W_um`` and their
+transposes in every iteration.  hypre on a device has no transposed product: it needs
+the transpose of a matrix, which MFEM forms and keeps at the first transposed product
+after each linearization point.  At 120\ :sup:`3` quadratic hexahedra a rank the two
+blocks and their transposes are 9.7 GiB of a card in double precision (217 million
+nonzeros each, twelve bytes a nonzero, four times), and at 128\ :sup:`3` a card of 64 GiB
+has 1.0 GiB left with them.  A product with these blocks does not need double precision:
+the incremental solves on either side of it stop at 1e-5 to 1e-6, and in the mixed
+precision the element matrices of the blocks are single precision's already.  With the
+setting, the blocks whose elimination folds into the scatter are matrices of the
+single-precision library: four bytes a value, one copy of the column indices for the
+blocks of a pattern (which the pattern keeps, so that finishing a block uploads no index),
+and the two transposes in single precision as well.  On one node of MI250X GPUs the
+least free memory of a card goes from 15.6 to 20.3 GiB at 120\ :sup:`3` elements a GPU
+and from 1.0 to 6.8 GiB at 128\ :sup:`3`, the assembly of the blocks from 1.04 to 0.84 s
+and from 1.22 to 1.01 s, and the operations of two Newton-CG steps by 0.43 and 0.53 s
+(2.6 %); a product costs 1.3 to 2 ms more, for the two conversions of a vector around
+it, so a Newton step of many CG iterations gains less.  ``W_mm`` and a block with a facet part stay in double precision.
+Off by default.
+
 **The tolerance of the incremental solves** is the third and the largest: with the
 reorthogonalized CG they need 1e-6 where the recurrence needed round-off.
 

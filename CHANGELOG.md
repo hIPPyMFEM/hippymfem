@@ -4,6 +4,34 @@
 
 ### Added
 
+- **The blocks of a linearization point in the single-precision hypre**
+  (`HIPPYMFEM_SINGLE_BLOCKS=1`, `single_blocks`; `fem.tdofassemble.SINGLE_BLOCKS`,
+  `PDEVariationalProblem._single_blocks`, `singlesolve.SingleParMatrix.keep_transpose`).
+  The CG of a Newton step applies `C` and `W_um` and their transposes in every iteration,
+  and with hypre on a device a transposed product needs the transpose stored: MFEM forms
+  and keeps it at the first such product after each linearization point.  With 120^3
+  quadratic hexahedra on a rank the two blocks have 217 million nonzeros each, and they
+  and their transposes took 9.7 GiB of a card in double precision, each transpose asking
+  the driver for 4.9 GiB when it was formed; with 128^3 a card had 1.0 GiB left, and
+  forming the second transpose on it took three times as long as the first.  A product
+  with these blocks has no use for more than single precision beside the incremental
+  solves around it (1e-5 to 1e-6), and in the mixed precision their element matrices are
+  computed in it.  With the setting on, and the single-precision library loaded, the
+  blocks whose elimination folds into the scatter are made as matrices of that library:
+  four bytes a value, one copy of the column indices for the blocks of one pattern, which
+  the pattern keeps from point to point so that finishing a block uploads nothing, and
+  the two that are applied transposed keep their transposes there.  On one node of
+  MI250X GCDs, in the benchmark's configuration: at 120^3 elements a GCD the least free
+  memory of a card rises from 15.6 to 20.3 GiB and at 128^3 from 1.0 to 6.8 GiB; the
+  assembly of the blocks takes 0.84 s in place of 1.04 s and 1.01 s in place of 1.22 s;
+  a product takes 1.3 to 2 ms more (two conversions of a vector), and at 128^3 the two
+  transposed products no longer wait for the driver (18 ms in place of 47 ms for the
+  slower one, averaged over the calls of two steps); the operations of two Newton-CG
+  steps take 16.6 s in place of 17.1 s and 19.7 s in place of 20.4 s, with the same
+  iterations (0.43 and 0.53 s of that are the blocks' and the products', 2.6 %; the rest
+  is the line searches' excess, which differs between two runs).  The products agree
+  with the double-precision ones to 1e-7.  `W_mm`, which
+  has no elimination to fold, and a block with a facet part stay MFEM's.  Off by default.
 - **The small geometric levels of a p-multigrid in host memory beside the device** (the
   solvers' parameter `pmg_h_host`, `HIPPYMFEM_PMG_H_HOST`, in rows a rank, with `pmg_h`;
   `singlesolve.PMGEngine._levels`, `_enter_host`, `_HostGathered`, `_Library.to_host`,

@@ -350,6 +350,7 @@ def run(check, COMM=MPI.COMM_WORLD):
     _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got)
     _pmg_meshes(check, COMM)
     _prior_cycle(check, COMM)
+    _single_blocks(check, COMM)
 
 
 def _row_sums(check, COMM, pde, Vu, m, rhs, got):
@@ -1008,3 +1009,86 @@ def _prior_cycle(check, COMM):
     check("on a mesh that was last cut by three a side the prior's cycle stays BoomerAMG, with a warning",
           p3 is not None and getattr(p3, "geometric", 1) is None and said == 1,
           "(a cycle over meshes: %s, warned: %s)" % (getattr(p3, "geometric", "?"), bool(said)))
+
+
+def _single_blocks(check, COMM):
+    """The blocks of a linearization point as matrices of the single-precision library
+    (``tdofassemble.SINGLE_BLOCKS``): the blocks whose elimination folds into the scatter
+    are made there and the others stay MFEM's, every product and every transposed product
+    is the double-precision one to single precision, a transposed product is the
+    transpose of the plain one, and a second point's blocks are that point's (with a
+    device, the two blocks that are applied transposed keep their transposes, which must
+    not outlive their matrices)."""
+    import jax.numpy as jnp
+
+    from hippymfem.algorithms import singlesolve as ss
+    from hippymfem.fem import tdofassemble as td
+    from hippymfem.modeling.variables import STATE
+
+    if ss.library() is None:
+        return
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(6, 6, 6, mfem.Element.HEXAHEDRON))
+    Vu, Vm = hp.FunctionSpace.H1(pmesh, 2), hp.FunctionSpace.H1(pmesh, 1)
+    bc = hp.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
+    # (not linear in the state, so that the state-state block exists)
+    pde = hp.PDEVariationalProblem(
+        [Vu, Vm, Vu], lambda u, m, p, x: jnp.exp(m.val) * (1.0 + u.val * u.val) * hp.inner(u.grad, p.grad),
+        bc, bc.homogeneous(), is_fwd_linear=False)
+    pde.set_solvers(hp.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=1e-10, max_iter=500)
+    du, dm = Vu.vector(), Vm.vector()
+    hp.parRandom.set_seed(53)
+    hp.parRandom.normal(1.0, du)
+    pde.bc0.zero(du)
+    hp.parRandom.normal(1.0, dm)
+    pairs = [(ADJOINT, PARAMETER), (PARAMETER, ADJOINT), (STATE, STATE), (STATE, PARAMETER),
+             (PARAMETER, STATE), (PARAMETER, PARAMETER)]
+
+    def point(seed):
+        x = [Vu.vector(), Vm.vector(), Vu.vector()]
+        hp.parRandom.set_seed(seed)
+        hp.parRandom.normal(0.3, x[STATE])
+        hp.parRandom.normal(0.3, x[PARAMETER])
+        hp.parRandom.normal(1.0, x[ADJOINT])
+        pde.bc0.zero(x[ADJOINT])
+        return x
+
+    def products(x, single):
+        was, td.SINGLE_BLOCKS = td.SINGLE_BLOCKS, bool(single)
+        try:
+            pde.setLinearizationPoint(x, gauss_newton_approx=False)
+        finally:
+            td.SINGLE_BLOCKS = was
+        kinds = [type(b).__name__ for b in (pde.C, pde.Wuu, pde.Wum, pde.Wmm)]
+        out = {}
+        for _ in range(2):                      # (the second transposed product finds the transpose kept)
+            for i, j in pairs:
+                y = (Vm if i == PARAMETER else Vu).vector()
+                pde.apply_ij(i, j, du if j in (STATE, ADJOINT) else dm, y)
+                out[(i, j)] = y
+        return kinds, out
+
+    worst, moved, kinds_single, adjoint = 0.0, [], None, 0.0
+    first = None
+    for seed in (57, 59):
+        x = point(seed)
+        kinds_single, s = products(x, True)
+        kinds_double, d = products(x, False)
+        worst = max([worst] + [s[k].copy().axpy(-1.0, d[k]).norm("l2") / max(d[k].norm("l2"), 1e-300)
+                               for k in pairs])
+        # <dm, C^T du> against <C dm, du>, both from the single-precision block
+        a, b = dm.inner(s[(PARAMETER, ADJOINT)]), s[(ADJOINT, PARAMETER)].inner(du)
+        adjoint = max(adjoint, abs(a - b) / max(abs(a), abs(b), 1e-300))
+        if first is None:
+            first = s
+        else:
+            moved = [first[k].copy().axpy(-1.0, s[k]).norm("l2") / max(s[k].norm("l2"), 1e-300)
+                     for k in ((PARAMETER, ADJOINT), (PARAMETER, STATE))]
+    pde.release_linearization_point()
+    check("with SINGLE_BLOCKS the blocks of a linearization point that fold their elimination are "
+          "matrices of the single-precision library, and their products and transposed products are "
+          "the double-precision ones to single precision, at a first point and at a second",
+          kinds_single[:3] == ["SingleParMatrix"] * 3 and "SingleParMatrix" not in kinds_double
+          and worst < 5e-6 and adjoint < 5e-6 and min(moved) > 1e-3,
+          "(C, W_uu, W_um, W_mm: %s; worst relative difference %.1e; <dm, C^T du> and <C dm, du> "
+          "differ by %.1e; the transposed products of the two points differ by %.1e and %.1e)"
+          % (", ".join(kinds_single), worst, adjoint, moved[0], moved[1]))

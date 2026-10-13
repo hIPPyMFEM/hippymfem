@@ -120,6 +120,20 @@ SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "0").lower() in (
     "1", "yes", "true", "on")
 
 
+#: Whether the blocks of a linearization point (``C`` and the ``W`` blocks of the reduced
+#: Hessian) are matrices of the single-precision hypre where that library is loaded and
+#: their elimination folds into the scatter: ``HIPPYMFEM_SINGLE_BLOCKS=1``.  A product
+#: with such a block is single precision's, 1e-7 of its size, which the CG of a Newton
+#: step does not see beside its incremental solves (1e-5 to 1e-6).  They then take two
+#: thirds of the memory: four bytes a value in place of eight, and one copy of the column
+#: indices for the blocks of one pattern (``C`` and ``W_um``); with hypre on a device the
+#: two that are applied transposed keep their transposes in single precision as well.
+#: 120^3 quadratic hexahedra on a rank: 5.7 GiB of a card for ``C``, ``W_um`` and the two
+#: transposes in place of 9.7 GiB.
+SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "0").lower() in (
+    "1", "yes", "true", "on")
+
+
 @contextlib.contextmanager
 def single_target():
     """Within this block a complete matrix (its elimination folded into the scatter) is

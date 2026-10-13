@@ -177,6 +177,10 @@ for completeness:
                                             meshes that its mesh was refined from, in the
                                             single-precision hypre, where the mesh was last
                                             cut in two (:ref:`gpu-pmg-h`)
+``single_blocks``           off             the blocks of a linearization point are matrices
+                                            of the single-precision hypre where it is loaded:
+                                            two thirds of their memory, products to single
+                                            precision (``HIPPYMFEM_SINGLE_BLOCKS``)
 ==========================  ==============  ================================================
 
 Some switches of the device assembly and of the single-precision solves are read from the

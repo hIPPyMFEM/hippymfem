@@ -312,6 +312,11 @@ _KNOBS = [
           "a device: the ones of at most this many rows a rank, and what is under them, where the "
           "gathered last matrix has no more rows than that in all (0: none)",
           _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST")),
+    _Knob("single_blocks", "HIPPYMFEM_SINGLE_BLOCKS",
+          "the blocks of a linearization point are matrices of the single-precision hypre where it is "
+          "loaded: two thirds of their memory, products to single precision",
+          _module_attr("fem.tdofassemble", "SINGLE_BLOCKS"),
+          _module_assign("fem.tdofassemble", "SINGLE_BLOCKS", _bool)),
 ]
 _BY_NAME = {k.name: k for k in _KNOBS}
 

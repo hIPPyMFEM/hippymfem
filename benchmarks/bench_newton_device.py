@@ -689,6 +689,7 @@ def main():
            # kept, and the rows of the linear elements on the coarser meshes in use
            "h_levels": str(args.h_levels), "pmg_h_rows": h_rows, "pmg_h_host": h_host, "pmg_h_timer": h_timer,
            "prior_h_rows": prior_h_rows,
+           "single_blocks": bool(tdof_mod.SINGLE_BLOCKS),
            "pmg_h_host_setting": int(os.environ.get("HIPPYMFEM_PMG_H_HOST", "0") or 0),
            "prior_h_setting": int(os.environ.get("HIPPYMFEM_PRIOR_H", "0") or 0),
            # how the element Hessians were differentiated, and two choices of the Jacobian in

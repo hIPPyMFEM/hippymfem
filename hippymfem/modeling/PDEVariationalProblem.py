@@ -1228,13 +1228,16 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             need += [(STATE, PARAMETER), (PARAMETER, PARAMETER)]
         need = [ij for ij in need if not self._mf_slots.intersection(ij)]
         loc = self._locals(x) + self._aux_locals()
+        # (tdofassemble.SINGLE_BLOCKS: the blocks as matrices of the single-precision hypre)
+        single = self._single_blocks()
         streamed = None
         if len(need) > 1 and SHARE_HESSIAN_PASS and self._stream_shared_pass():
             # One pass, a chunk at a time, straight into every block's scatter:
             # nothing larger than a chunk is ever resident, where gluing the blocks
             # first (what element_matrices_many does) would make the glued arrays
             # the device peak whatever the chunk size.
-            streamed = self._blocks_streamed(need, loc, ess)
+            with single():
+                streamed = self._blocks_streamed(need, loc, ess)
             mats = None
         elif len(need) > 1 and SHARE_HESSIAN_PASS:
             mats = self.kernel.element_matrices_many(need, loc)
@@ -1256,9 +1259,17 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                        ((PARAMETER, PARAMETER), {})):
             if ij not in need:
                 continue                        # left to the kernels, or not needed
-            blocks[ij] = (streamed[ij] if streamed is not None else
-                          self._block(ij[0], ij[1], x, mats=mats[ij], loc=loc, **kw))
+            if streamed is not None:
+                blocks[ij] = streamed[ij]
+            else:
+                with single():
+                    blocks[ij] = self._block(ij[0], ij[1], x, mats=mats[ij], loc=loc, **kw)
         del mats, streamed
+        for ij in ((ADJOINT, PARAMETER), (STATE, PARAMETER)):
+            # the two that every CG iteration applies transposed: a single-precision one
+            # keeps its transpose from the first such product on, as MFEM's do
+            if hasattr(blocks.get(ij), "keep_transpose"):
+                blocks[ij].keep_transpose = True
         # The attributes alone hold the blocks: anything else keeping them would
         # keep every linearization point's blocks alive for the life of the problem.
         self.C = blocks.get((ADJOINT, PARAMETER))
@@ -1292,6 +1303,23 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         local = self.kernel.will_chunk(weight=self.kernel.nslots)
         return bool(_reduce(self.comm, int(local), MPI.MAX))
 
+    def _single_blocks(self):
+        """The context in which the blocks of a linearization point are assembled: one
+        that asks for matrices of the single-precision hypre where
+        :data:`~hippymfem.fem.tdofassemble.SINGLE_BLOCKS` is set, that library is loaded
+        and the blocks have no facet part (which is added to a block of MFEM's), and one
+        that changes nothing otherwise.  The same on every rank."""
+        import contextlib
+
+        from ..fem import tdofassemble as td
+
+        if td.SINGLE_BLOCKS and self.facet_kernel is None:
+            from ..algorithms import singlesolve
+
+            if singlesolve.library() is not None:
+                return td.single_target
+        return contextlib.nullcontext
+
     def _blocks_streamed(self, need, loc, ess):
         """The blocks of a linearization point from one streamed pass."""
 
@@ -1302,6 +1330,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             e, pol = spec[ij]
             plans[ij] = plan_block(self.Vh[ij[0]], self.Vh[ij[1]],
                                    self.batches.groups, test_ess=e, diag_policy=pol)
+            # (the defect of the row sums is for a Jacobian's solver: of no use to a block)
+            plans[ij].row_sums = False
         finite = _FiniteFlag()
         chunks = finite.wrap(lambda: self.kernel.element_matrix_chunks_many(need, loc))
         accs = scatter_many(plans, chunks())

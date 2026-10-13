@@ -236,6 +236,11 @@ class _Library:
         for name, (args, res) in sig.items():
             fn = getattr(H, name)
             fn.argtypes, fn.restype = args, res
+        #: forms and keeps the transposes of a matrix's two blocks (hypre on a device has
+        #: no transposed product of its own: without them it forms one at every call)
+        self.local_transpose = getattr(H, "hypre_ParCSRMatrixLocalTranspose", None)
+        if self.local_transpose is not None:
+            self.local_transpose.argtypes, self.local_transpose.restype = [p], i
         # What the p-multigrid calls beside these (PTransfer, PMGEngine).  The Galerkin
         # product is hypre's own of a coarsening on a device, hypre_ParCSRMatrixRAPKT with
         # the arguments it has had since hypre 3.2, and before that the two products MFEM
@@ -756,6 +761,12 @@ class SingleParMatrix:
         self.par = None
         self._vecs = None
         self._columns = None
+        #: with the library on a device: whether the first transposed product forms the
+        #: transposes of the two blocks and the matrix keeps them (as MFEM's matrices
+        #: do), at the memory of a second matrix; ``False``: hypre forms one at every
+        #: transposed product.  For a matrix that is applied transposed many times.
+        self.keep_transpose = False
+        self._transposed = False
         #: :class:`RowDefect`, or ``None``
         self.row_defect = None
         n, nd, no = int(tp.ntd), int(tp.nnz_diag), int(tp.nnz_t - tp.nnz_diag)
@@ -952,10 +963,16 @@ class SingleParMatrix:
         vy.get(y)
 
     def MultTranspose(self, x, y):
+        """``y = A^T x`` on two of MFEM's vectors, the product in single precision."""
+        lib = self.lib
         vx, vy = self._work()
         vy.set(x)
-        self.lib.check(self.lib.H.hypre_ParCSRMatrixMatvecT(1.0, self.par, vy.par, 0.0, vx.par),
-                       "MatvecT", self.comm)
+        if self.keep_transpose and not self._transposed and lib.device and lib.local_transpose is not None:
+            # (every rank is here together, as for the product below)
+            lib.check(lib.local_transpose(self.par), "ParCSRMatrixLocalTranspose", self.comm)
+            self._transposed = True
+        lib.check(lib.H.hypre_ParCSRMatrixMatvecT(1.0, self.par, vy.par, 0.0, vx.par),
+                  "MatvecT", self.comm)
         vx.get(y)
 
     def destroy(self):
