@@ -250,6 +250,16 @@ def main():
                          "them, for the geometric levels of a p-multigrid (HIPPYMFEM_PMG_H); or the cuts themselves "
                          "from the first to the last, as 5,3,2,2,2 (the coarse mesh is then N over their product "
                          "unless --coarse names it)")
+    ap.add_argument("--pmg-h-host", type=int, default=None,
+                    help="with the geometric levels of a p-multigrid (HIPPYMFEM_PMG_H) and hypre on a device: the "
+                         "levels of at most this many rows a rank live in host memory (the solvers' pmg_h_host).  "
+                         "Default: HIPPYMFEM_PMG_H_HOST where it is set, else 5000 for a mesh built by cuts "
+                         "(--h-levels); 0: every level on the device")
+    ap.add_argument("--prior-h", type=int, default=None,
+                    help="the multigrid cycles of the prior's preconditioner (--cg-prec-cycles) go over up to this "
+                         "many of the meshes that the mesh was cut from, in the single-precision hypre (a prior's "
+                         "h_levels).  Default: HIPPYMFEM_PRIOR_H where it is set, else every mesh of a mesh built "
+                         "by cuts whose last cut is in two, with that hypre loaded; 0: BoomerAMG on the operator")
     ap.add_argument("--rank-table", action="store_true",
                     help="after the steps: every rank's own times (its stages, its waits at the collectives, two "
                          "kernels on its card) and its side of the card's memory gathered into OUT.ranks.json, "
@@ -262,6 +272,21 @@ def main():
     args = ap.parse_args()
 
     hm.configure_device(args.device, COMM, quiet=(RANK != 0))
+    # The benchmark's own defaults for a mesh built by cuts, since the eighth series on Frontier
+    # (12 October 2026): the small geometric levels of the p-multigrid in host memory, and the
+    # prior's cycles over the meshes.  Both are settings of the library that are off there; the
+    # solvers and the prior read them from the environment when they are made, below.
+    cuts = [f for f in str(args.h_levels).split(",") if f.strip()]
+    by_cuts = args.coarse is not None and (len(cuts) > 1 or (len(cuts) == 1 and int(cuts[0]) > 0))
+    last_in_two = by_cuts and (len(cuts) == 1 or int(cuts[-1]) == 2)
+    if args.pmg_h_host is not None:
+        os.environ["HIPPYMFEM_PMG_H_HOST"] = str(int(args.pmg_h_host))
+    elif by_cuts and os.environ.get("HIPPYMFEM_PMG_H_HOST", "") == "":
+        os.environ["HIPPYMFEM_PMG_H_HOST"] = "5000"
+    if args.prior_h is not None:
+        os.environ["HIPPYMFEM_PRIOR_H"] = str(int(args.prior_h))
+    elif last_in_two and os.environ.get("HIPPYMFEM_PRIOR_H", "") == "" and single_mod.HYPRE_SINGLE:
+        os.environ["HIPPYMFEM_PRIOR_H"] = str(len(cuts) if len(cuts) > 1 else int(cuts[0]))
     # what MFEM actually runs on: "cuda" or "gpu" means the backend the build has (hip on AMD)
     from hippymfem.common.mfemconfig import mfem_gpu_backend
     mfem_dev = args.device if args.device in ("cpu", None) else (mfem_gpu_backend() or args.device)
@@ -584,11 +609,16 @@ def main():
         say("  the p-multigrid's coarser meshes: %s rows of linear elements, BoomerAMG on the last%s"
             % (", ".join("%d" % r for r in h_rows),
                "; in host memory from the matrix of %d rows on" % h_host["rows"] if h_host else ""))
-        if _ss.TIMERS["calls"]:
-            # (HIPPYMFEM_PMG_TIMERS: a probe's clock on the levels from one of them down, rank 0's)
-            h_timer = {"level": _ss.PMG_TIMERS, "calls": int(_ss.TIMERS["calls"]), "seconds": float(_ss.TIMERS["seconds"])}
-            say("  the corrections from level %d of them down: %d, %.3f ms each (timed with the device at rest around each)"
-                % (h_timer["level"], h_timer["calls"], 1e3 * h_timer["seconds"] / h_timer["calls"]))
+        if _ss.TIMERS:
+            # (HIPPYMFEM_PMG_TIMERS: a probe's clocks on the corrections from some levels down,
+            # rank 0's, for the Jacobian's p-multigrid and for the prior's cycles apart)
+            h_timer = [{"cycle": kind, "level": int(k), "calls": int(v[1]), "seconds": float(v[0])}
+                       for (kind, k), v in sorted(_ss.TIMERS.items()) if v[1]]
+            for kind in sorted(set(t["cycle"] for t in h_timer)):
+                say("  the corrections of %s from a level down, timed with the device at rest around each: %s"
+                    % ("the p-multigrid" if kind == "PMGEngine" else "the prior's cycles" if kind == "HCycle" else kind,
+                       "; ".join("level %d: %d, %.3f ms each" % (t["level"], t["calls"], 1e3 * t["seconds"] / t["calls"])
+                                 for t in h_timer if t["cycle"] == kind)))
     say("  %d Newton step(s) %.2f s  newton %d  cg %d  J %.8e  |grad| %.4e  err(m) %.8f  (%s)"
         % (args.steps, t_step, solver.it, solver.total_cg_iter, solver.final_cost,
            solver.final_grad_norm, err, solver.termination_reasons[solver.reason]))
@@ -659,6 +689,8 @@ def main():
            # kept, and the rows of the linear elements on the coarser meshes in use
            "h_levels": str(args.h_levels), "pmg_h_rows": h_rows, "pmg_h_host": h_host, "pmg_h_timer": h_timer,
            "prior_h_rows": prior_h_rows,
+           "pmg_h_host_setting": int(os.environ.get("HIPPYMFEM_PMG_H_HOST", "0") or 0),
+           "prior_h_setting": int(os.environ.get("HIPPYMFEM_PRIOR_H", "0") or 0),
            # how the element Hessians were differentiated, and two choices of the Jacobian in
            # the single-precision hypre: the defect of its row sums kept for the solver's
            # product, and the products of the p-multigrid made from its element matrices

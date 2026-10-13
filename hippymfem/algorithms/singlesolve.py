@@ -1314,12 +1314,17 @@ if PMG_H_SMOOTH not in ("chebyshev", "sweep"):
 PMG_H_HOST = int(os.environ.get("HIPPYMFEM_PMG_H_HOST", "0") or 0)
 
 #: A probe's clock on the coarser meshes of a p-multigrid: ``HIPPYMFEM_PMG_TIMERS=k`` times
-#: every correction from level ``k`` of the meshes down (0: the linear elements of the mesh
-#: itself; the hierarchy on the last matrix included), with the device brought to rest
-#: before and after, into :data:`TIMERS` (seconds and calls of this process).  It costs two
-#: waits a cycle: for a measurement, not for a run that is timed as a whole.
-PMG_TIMERS = int(os.environ.get("HIPPYMFEM_PMG_TIMERS", "-1") or -1)
-TIMERS = {"seconds": 0.0, "calls": 0}
+#: the correction from level ``k`` of them down (0: the linear elements of the mesh itself;
+#: the number of levels: the last matrix alone), with the device at rest before and after,
+#: into :data:`TIMERS`.  Several levels, as ``2,3,4``, are timed one inside the other, so
+#: that the differences are what each level takes by itself.  A clock costs two waits for
+#: the device a cycle: a run with it is for the clock, not for the time of the steps.
+PMG_TIMERS = tuple(sorted(set(int(t) for t in os.environ.get("HIPPYMFEM_PMG_TIMERS", "").replace(";", ",").split(",")
+                              if t.strip().lstrip("-").isdigit() and int(t) >= 0)))
+#: what the clocks of :data:`PMG_TIMERS` measured in this process: by the kind of cycle
+#: (``"PMGEngine"``: a Jacobian's p-multigrid; ``"HCycle"``: a prior's cycle over the meshes)
+#: and the level, the seconds and the calls
+TIMERS = {}
 
 #: ``HIPPYMFEM_PMG_TRACE=1``: the first and the middle rank say where a p-multigrid with
 #: levels in host memory is, in its set-up and in its first cycles (to find a rank that
@@ -1618,7 +1623,7 @@ class PMGEngine(SingleEngine):
         #: where nothing does), the copy of its matrix there, the two vectors that carry a
         #: cycle across, and where the device has the same two
         self._host_at = self._host_top = self._host_b = self._host_x = self._host_io = None
-        self._in_host = self._timing = False
+        self._in_host, self._timing = False, set()
         #: the matrix's own products, where it came with them (not this engine's to destroy)
         self._given = None
         if lib.no_pmg:
@@ -1825,21 +1830,23 @@ class PMGEngine(SingleEngine):
         A V-cycle from there down: relax, correct from the next mesh, relax; under the
         last mesh, one V-cycle of the hierarchy."""
         lib, H = self.lib, self.lib.H
-        if k == PMG_TIMERS and not self._timing:
+        if k in PMG_TIMERS and k not in self._timing:
             # (a probe's clock on this level and everything under it)
             import time
 
             if lib.device:
                 bridge.synchronize()
-            t0, self._timing = time.perf_counter(), True
+            t0 = time.perf_counter()
+            self._timing.add(k)
             try:
                 self._correct(k, b, x)
             finally:
-                self._timing = False
+                self._timing.discard(k)
             if lib.device:
                 bridge.synchronize()
-            TIMERS["seconds"] += time.perf_counter() - t0
-            TIMERS["calls"] += 1
+            tally = TIMERS.setdefault((type(self).__name__, k), [0.0, 0])
+            tally[0] += time.perf_counter() - t0
+            tally[1] += 1
             return
         if k == self._host_at and not self._in_host:
             # the levels from here down live in host memory: the right-hand side goes
@@ -2066,7 +2073,7 @@ class HCycle(PMGEngine):
         self.amg = self.pcg = self.coarse = self.ap = self._product = None
         self._h, self._bottom = [], None
         self._host_at = self._host_top = self._host_b = self._host_x = self._host_io = None
-        self._in_host = self._timing = False
+        self._in_host, self._timing = False, set()
         self._gathered = self._gathered_io = None
         #: (the matrix is the caller's: nothing of it is this cycle's to destroy)
         self._given = {}

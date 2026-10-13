@@ -216,9 +216,10 @@ variable                            what it decides
                                     whose next mesh is three or more times coarser a
                                     side: ``chebyshev`` (a polynomial of as many steps)
                                     or ``sweep`` (the one sweep of the other levels)
-``HIPPYMFEM_PMG_TIMERS``            a probe's clock on the correction from one of a
-                                    p-multigrid's coarser meshes down (the index of the
-                                    level), with the device at rest around each
+``HIPPYMFEM_PMG_TIMERS``            a probe's clocks on the corrections from some of a
+                                    p-multigrid's coarser meshes down (the indices of
+                                    the levels, as ``2,3,4``: one clock inside the
+                                    other), with the device at rest around each
 ``HIPPYMFEM_PMG_TRACE``             the first and the middle rank say where a
                                     p-multigrid with levels in host memory is, in its
                                     set-up and its first cycles

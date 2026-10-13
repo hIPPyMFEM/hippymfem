@@ -641,6 +641,19 @@
 
 ### Changed
 
+- **The Newton benchmark takes the small geometric levels to host memory and the prior's
+  cycles over the meshes by default** (`bench_newton_device.py --pmg-h-host`, `--prior-h`).
+  For a mesh built by cuts (`--h-levels`) the solvers' `pmg_h_host` is 5000 and the prior's
+  `h_levels` is the number of cuts, the latter where the last cut is in two and the
+  single-precision hypre is loaded: the configuration of the eighth series on Frontier.
+  `HIPPYMFEM_PMG_H_HOST` and `HIPPYMFEM_PRIOR_H` in the environment and the two options
+  override it, and `0` for both is the configuration of the seventh series.  The
+  library's own defaults are as they were: both off.  The record has what was in force
+  (`pmg_h_host_setting`, `prior_h_setting`).
+- **The clock on a p-multigrid's cycle takes several levels** (`HIPPYMFEM_PMG_TIMERS=0,1,2,3`):
+  one clock inside the other, so that the differences are what each level takes by
+  itself, and the cycles of a Jacobian's p-multigrid and of a prior are tallied apart
+  (`singlesolve.TIMERS`, the record's `pmg_h_timer`, now a list).
 - **The reductions and gathers of the Newton steps are MPI's own** (`parvector.allreduce`,
   `Layout.of_range`, `ParVector.offsets`; `singlesolve._Library.check` and `agree`;
   `linSolvers`, `PDEVariationalProblem`, `fem.assemble`).  mpi4py's `allreduce` and
