@@ -1,0 +1,8 @@
+# the SC12 paper is IEEE's: a local copy to work from, not to be committed or pushed
+paper/*.pdf
+# S20RTS's coefficients (python earth.py fetch)
+data/
+# runs, records and figures stay local
+out/
+results/
+__pycache__/

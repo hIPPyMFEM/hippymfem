@@ -1,0 +1,8 @@
+# the paper is Elsevier's: a local copy to work from, not to be committed or pushed
+paper/*.pdf
+# ALBMAP, ITS_LIVE and the grids made from them (python antarctica.py fetch / cache)
+data/
+# runs, records and figures stay local
+out/
+results/
+__pycache__/
