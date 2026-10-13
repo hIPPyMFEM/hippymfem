@@ -99,6 +99,27 @@ def mfem_version():
     """MFEM's version string, e.g. ``"4.8.0"``."""
     return mfem_config().get("version")
 
+def _pool_settings():
+    """What ``HIPPYMFEM_HYPRE_POOL`` and ``HIPPYMFEM_HYPRE_POOL_KEEP`` ask for:
+    ``("auto", megabytes kept between set-ups)`` or ``(megabytes, None)``.
+
+    A value that is neither ``auto`` nor a number raises, with the variable's name.  It
+    was taken for 0: ``HIPPYMFEM_HYPRE_POOL=on`` ran without a pool, the opposite of what
+    was typed, and a ``HIPPYMFEM_HYPRE_POOL_KEEP`` that could not be read kept the
+    default, both without a word.  An empty value is the default."""
+    name = "HIPPYMFEM_HYPRE_POOL"
+    text = (os.environ.get(name, "auto") or "auto").strip().lower() or "auto"
+    try:
+        if text != "auto":
+            return float(text), None
+        name = "HIPPYMFEM_HYPRE_POOL_KEEP"
+        text = os.environ.get(name, "").strip()
+        return "auto", float(text) if text else HYPRE_POOL_KEEP_MB
+    except ValueError:
+        raise ValueError("%s must be %smegabytes, not %r"
+                         % (name, "" if name.endswith("KEEP") else '"auto" or ', text)) from None
+
+
 def configure_device(kind="gpu", comm=None, quiet=False):
     """Put MFEM (and therefore hypre) on a device, **one per rank**.
 
@@ -152,6 +173,14 @@ def configure_device(kind="gpu", comm=None, quiet=False):
             "  Set HIPPYMFEM_HYPRE_DEVICE=1 *before* importing hippymfem, which "
             "halves JAX's share so the two fit together. The cap is read once, "
             "when JAX is imported, so setting it afterwards has no effect.")
+    # The kernel named in the environment is checked before anything is made (without a
+    # device the call reads the name and sets nothing).  A mistyped name used to be refused
+    # after the device was registered: a caller that caught the error, or a second import,
+    # which returns the registered device as it is, then went on with one that had had no
+    # check of the MPI library and no pool.
+    spmv = os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto")
+    set_hypre_spmv(spmv, comm)
+    pool, keep = _pool_settings()           # (likewise: a value that cannot be read stops here)
     # The element kernels also pick their device by node-local rank, and the two must
     # agree: with MFEM on device 0 and JAX on device 1, hypre gets a pointer from the
     # wrong context and thrust aborts with "invalid device ordinal".
@@ -171,37 +200,43 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     dev.thisown = False
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
-    set_hypre_spmv(os.environ.get("HIPPYMFEM_HYPRE_SPMV", "auto"), comm)
+    set_hypre_spmv(spmv, comm)
     global GPU_AWARE_SOLVES
     want = os.environ.get("HIPPYMFEM_GPU_AWARE_MPI", "").strip().lower()
+    asked = None                           # what the variable asks of every exchange, if it does
     if want in ("0", "1", "on", "off", "true", "false", "yes", "no"):
-        set_hypre_gpu_aware_mpi(want in ("1", "on", "true", "yes"))
+        asked = want in ("1", "on", "true", "yes")
+        set_hypre_gpu_aware_mpi(asked)
     elif want == "solve":
         # only while a Krylov solve runs on a hierarchy that is already set up
         # (linSolvers): checked now as if it were on throughout
         set_hypre_gpu_aware_mpi(True)
         GPU_AWARE_SOLVES = bool(_check_gpu_aware_mpi(comm, quiet))
-        set_hypre_gpu_aware_mpi(False)
+        if set_hypre_gpu_aware_mpi(False):
+            # (a hypre that is compiled to hand MPI its buffers, 2.31 or 2.32, does so
+            # throughout: there is nothing to switch around a solve)
+            GPU_AWARE_SOLVES = False
     aware = _check_gpu_aware_mpi(comm, quiet)
+    if not quiet and local == 0 and _gpu_aware_fixed(_hypre_library()):
+        # (a hypre whose exchange is compiled one way: what the variable asks beyond that
+        # is said.  It used to be written into a field that this exchange does not read,
+        # and the check of the MPI library passed or refused by that field.)
+        if want == "solve" or (asked is not None and asked != bool(aware)):
+            warnings.warn(
+                "HIPPYMFEM_GPU_AWARE_MPI=%s changes nothing with this hypre: before hypre "
+                "2.33 the exchange is compiled one way, and this library %s whatever it is "
+                "asked at run time." % (want, "hands MPI its buffers on the GPU" if aware
+                                        else "stages its buffers through CPU memory"),
+                RuntimeWarning, stacklevel=2)
     # hypre's device memory: "auto" (the default) recycles up to HYPRE_POOL_SETUP_MB of
     # it while a BoomerAMG setup runs and keeps HYPRE_POOL_KEEP_MB of the smallest blocks
     # between setups (HIPPYMFEM_HYPRE_POOL_KEEP changes that; 0 keeps nothing); a number
     # of megabytes keeps that much at all times; "0" leaves every allocation to the
     # driver.
-    pool = (os.environ.get("HIPPYMFEM_HYPRE_POOL", "auto") or "auto").strip().lower()
     if pool == "auto":
-        try:
-            keep = float(os.environ.get("HIPPYMFEM_HYPRE_POOL_KEEP", HYPRE_POOL_KEEP_MB))
-        except ValueError:
-            keep = HYPRE_POOL_KEEP_MB
         set_hypre_pool(HYPRE_POOL_SETUP_MB, scoped=True, keep_megabytes=max(keep, 0.0))
-    else:
-        try:
-            megabytes = float(pool)
-        except ValueError:
-            megabytes = 0.0
-        if megabytes > 0:
-            set_hypre_pool(megabytes)
+    elif pool > 0:
+        set_hypre_pool(pool)
     if not quiet and local == 0:
         print("hippymfem: MFEM on %s device %d of %d%s"
               % (kind, idx, n, "; hypre hands MPI its buffers on the GPU" if aware else ""),
@@ -250,6 +285,19 @@ def _hypre_library():
     except OSError:
         pass
     return None
+
+
+def _single_library():
+    """A ``ctypes`` handle of the single-precision hypre that this process loaded beside
+    MFEM's (:data:`SINGLE_LIBRARY_PATH`), or ``None``."""
+    if not SINGLE_LIBRARY_PATH:
+        return None
+    import ctypes
+
+    try:
+        return ctypes.CDLL(SINGLE_LIBRARY_PATH)
+    except OSError:
+        return None
 
 
 _MFEM_HANDLE = None
@@ -307,13 +355,15 @@ def parse_boomeramg_options(text, what="HIPPYMFEM_AMG"):
 def seq_on_device(library):
     """Whether a hypre (a ``ctypes`` handle) can finish a device hierarchy with a gathered
     level: one built with ``tools/hypre-3.2.0-seqdevice.patch``, which marks itself with
-    a function of its own.  The function returns the patch's version, and the first is
-    not enough: there every rank solved the gathered system with a hierarchy of its own
-    coarsening, and the ranks' corrections did not fit together."""
+    a function of its own.  The function returns the patch's version, and the third is
+    asked for.  In the first every rank solved the gathered system with a hierarchy of
+    its own coarsening, and the ranks' corrections did not fit together; the second
+    still gathered a level that the coarsening could not make smaller, whatever its
+    size, and solved the gathered level of a system with the wrong functions."""
     if library is None or not hasattr(library, "hypre_BoomerAMGSeqOnDevice"):
         return False
     try:
-        return int(library.hypre_BoomerAMGSeqOnDevice()) >= 2
+        return int(library.hypre_BoomerAMGSeqOnDevice()) >= 3
     except Exception:                                            # noqa: BLE001
         return False
 
@@ -355,9 +405,10 @@ def check_seq_threshold(options, library, device):
     one right-hand side, and lets the first rank solve where they differ)."""
     if int(options.get("seq_threshold", 0) or 0) > 0 and device and not seq_on_device(library):
         raise RuntimeError("the BoomerAMG option seq_threshold needs, with hypre on a device, a "
-                           "hypre built with tools/hypre-3.2.0-seqdevice.patch (its second "
-                           "version); this one would fault in its set-up or give corrections "
-                           "that differ from rank to rank")
+                           "hypre built with tools/hypre-3.2.0-seqdevice.patch (its third "
+                           "version); this one would fault in its set-up, give corrections "
+                           "that differ from rank to rank, or gather a level that it cannot "
+                           "coarsen whatever its size")
 
 
 def _mfem_library():
@@ -411,13 +462,26 @@ def set_boomeramg_options(pc, options):
         return pc
     import ctypes
 
+    from .parvector import device_active
+
     H, amg = _hypre_library(), boomeramg_handle(pc)
     if H is None or amg is None:
         raise RuntimeError("BoomerAMG options %s need hypre's handle of the preconditioner, which "
                            "this MFEM library does not give" % ", ".join(sorted(options)))
-    check_seq_threshold(options, H, bool(_DEVICE))
+    # (whether MFEM is on a card, not whether a device was configured: the "cpu" one,
+    # which the drivers configure on a host run, leaves hypre in host memory)
+    check_seq_threshold(options, H, device_active())
     amg = ctypes.c_void_p(amg)
-    for key, val in options.items():
+    # What a setter returns is hypre's error flag, which is the process's and stays up
+    # after the call that raised it, on the ranks where it did (a set-up that met a zero
+    # row; a solve of hypre's PCG that ended at its limit, where nothing read it).
+    # Cleared first, it is the setter's own verdict, the same on every rank.
+    if hasattr(H, "HYPRE_ClearAllErrors"):
+        H.HYPRE_ClearAllErrors()
+    # hypre's setters of the relaxation and of its sweeps reset those of the coarsest
+    # level, so the coarsest level's own come after them, wherever they were written
+    for key, val in sorted(options.items(),
+                           key=lambda item: item[0] in ("coarse_relax", "coarse_sweeps")):
         name, kind = BOOMERAMG_SETTERS[key]
         fn = getattr(H, name)
         if key in ("coarse_relax", "coarse_sweeps"):
@@ -443,8 +507,9 @@ def hypre_gpu_aware_mpi():
     what it receives back.  Configured with ``HYPRE_WITH_GPU_AWARE_MPI``
     (``tools/rebuild_hypre.sh --gpu-aware-mpi``) it gives MPI the address of the buffer
     on the GPU instead, which needs an MPI that can read one (:func:`mpi_gpu_support`).
-    The option is fixed when hypre is compiled; this reads what the loaded library was
-    built with.
+    Before hypre 2.33 the option is fixed when hypre is compiled, and this reads what the
+    loaded library was built with; from 2.33 on the option presets a setting of the
+    library (:func:`set_hypre_gpu_aware_mpi`), and this reads what is in force.
     """
     lib = _hypre_library()
     if lib is None or not hasattr(lib, "hypre_GetGpuAwareMPI"):
@@ -456,6 +521,30 @@ def hypre_gpu_aware_mpi():
         return bool(lib.hypre_GetGpuAwareMPI())
     except Exception:                                            # noqa: BLE001
         return False
+
+
+def _gpu_aware_fixed(lib):
+    """Whether the hypre ``lib`` has the switch of :func:`set_hypre_gpu_aware_mpi` and an
+    exchange that does not follow it: hypre 2.31 and 2.32.
+
+    The switch and the field of the handle that it writes came with 2.31, and the exchange
+    (``hypre_ParCSRCommHandleCreate_v2``) reads the field from 2.33 on.  In between it is
+    compiled one way or the other by ``HYPRE_WITH_GPU_AWARE_MPI`` alone, as MFEM notes
+    where it prepares one (``linalg/hypre.cpp``): the field says nothing of what a library
+    does once something has written it.  The build option presets it, so the field of such
+    a library is never written here and goes on saying what the library was built to do.
+    """
+    if (lib is None or not hasattr(lib, "hypre_GetGpuAwareMPI")
+            or not hasattr(lib, "HYPRE_VersionNumber")):
+        return False
+    import ctypes
+
+    number = ctypes.c_longlong(0)                   # (room for hypre's integer, 4 or 8 bytes)
+    try:
+        lib.HYPRE_VersionNumber(None, None, None, ctypes.byref(number))
+    except Exception:                                            # noqa: BLE001
+        return False
+    return 0 < number.value < 23300
 
 
 #: ``HIPPYMFEM_GPU_AWARE_MPI=solve``: hypre hands MPI its device buffers during the Krylov
@@ -478,8 +567,11 @@ def set_hypre_gpu_aware_mpi(on=True):
     """Make hypre hand MPI its buffers on the GPU (``True``) or stage them through CPU
     memory (``False``), whatever it was configured with.
 
-    Since hypre 2.30 the choice is a field of its handle that the build option only
-    presets, so one library serves both.  The MPI library has to read device memory
+    Since hypre 2.33 the choice is a field of its handle that the build option only
+    presets, so one library serves both.  hypre 2.31 and 2.32 have the field and this
+    switch, but their exchange is compiled one way and does not read it
+    (:func:`_gpu_aware_fixed`): such a library is left as it was built, and what is
+    returned says which way that is.  The MPI library has to read device memory
     (:func:`mpi_gpu_support`): Cray MPICH does with ``MPICH_GPU_SUPPORT_ENABLED=1`` and
     its GPU transport library in the process (``libmpi_gtl_hsa.so`` on AMD cards, linked
     or preloaded).  ``HIPPYMFEM_GPU_AWARE_MPI=1`` or ``0`` sets it for
@@ -491,7 +583,8 @@ def set_hypre_gpu_aware_mpi(on=True):
         return None
     import ctypes
 
-    lib.hypre_SetGpuAwareMPI(ctypes.c_int(1 if on else 0))
+    if not _gpu_aware_fixed(lib):
+        lib.hypre_SetGpuAwareMPI(ctypes.c_int(1 if on else 0))
     return hypre_gpu_aware_mpi()
 
 
@@ -544,6 +637,12 @@ def _check_gpu_aware_mpi(comm=None, quiet=False):
         return True
     ok = mpi_gpu_support()
     if ok is False:
+        # hypre goes back to staging before the run is stopped.  The device is configured
+        # by now and a second configure_device returns it without this check, so a caller
+        # that catches the error would otherwise go on with the exchange it was refused.
+        # A hypre before 2.33 that is compiled to hand MPI its buffers cannot go back, and
+        # the variable is no way out of this for it: the advice is then the other library.
+        compiled = set_hypre_gpu_aware_mpi(False)
         raise RuntimeError(
             "this hypre gives MPI the addresses of its buffers on the GPU (built with "
             "HYPRE_WITH_GPU_AWARE_MPI, or HIPPYMFEM_GPU_AWARE_MPI=1), and the MPI library "
@@ -554,8 +653,12 @@ def _check_gpu_aware_mpi(comm=None, quiet=False):
             "and a UCX without CUDA, 'mpirun --mca pml ob1 --mca btl self,smcuda'; Cray "
             "MPICH with MPICH_GPU_SUPPORT_ENABLED=1 and its GTL library linked or "
             "preloaded), or leave the exchange to hypre, which then stages its buffers "
-            "through CPU memory (HIPPYMFEM_GPU_AWARE_MPI=0, or the libHYPRE.so that the "
-            "PyMFEM build scripts produce).")
+            "through CPU memory (%s)."
+            % ("the libHYPRE.so that the PyMFEM build scripts produce: this hypre is older "
+               "than 2.33 and compiled to hand MPI its buffers, which HIPPYMFEM_GPU_AWARE_MPI "
+               "does not change" if compiled else
+               "HIPPYMFEM_GPU_AWARE_MPI=0, or the libHYPRE.so that the PyMFEM build scripts "
+               "produce"))
     if ok is None and not quiet and comm.Get_rank() == 0:
         import warnings
 
@@ -834,11 +937,14 @@ class HyprePool:
         freed = self.cached
         if freed:
             self.trims += 1
-        for blocks in self._bins.values():
+        # The bins are taken out before the first call of the driver.  Python's collector
+        # can start inside this loop, at one of those calls, and where it finalizes a
+        # dropped matrix, hypre frees that matrix's arrays through this pool: such a block
+        # goes into bins of its own, not into the table that the loop is reading.
+        bins, self._bins, self.cached = self._bins, {}, 0
+        for blocks in bins.values():
             for p, _s in blocks:
                 self._driver_free(p)
-        self._bins.clear()
-        self.cached = 0
         return freed
 
     def open(self):
@@ -862,8 +968,14 @@ class HyprePool:
         still in use are freed by hypre's own ``cudaFree`` afterwards, which takes any
         device pointer."""
         if self.installed:
-            self._hypre.hypre_SetUserDeviceMalloc(None)
-            self._hypre.hypre_SetUserDeviceMfree(None)
+            # A single-precision hypre beside MFEM's allocates through the module's pool
+            # as well (singlesolve._Library).  Left with the pool's two functions it would
+            # go on filling a pool that nothing opens, closes or trims any more.
+            single = _single_library() if self is HYPRE_POOL else None
+            for library in (self._hypre, single):
+                if library is not None and hasattr(library, "hypre_SetUserDeviceMalloc"):
+                    library.hypre_SetUserDeviceMalloc(None)
+                    library.hypre_SetUserDeviceMfree(None)
             self.installed = False
             self.trim()
 

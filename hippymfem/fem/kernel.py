@@ -602,10 +602,20 @@ def _is_oom(exc):
             or "out of memory" in text)
 
 
+#: How many times an element pass of this process ran out of memory and was tried again
+#: in smaller chunks.  The group's passes of that weight keep the smaller chunk for the
+#: rest of the run (:meth:`GroupKernel._chunked`), and a warning on that rank is all that
+#: says so.  For a benchmark's record: 0 where every pass ran as planned.
+RETRIES = 0
+
+
 def _release_for_retry():
     """Before a retry after the device ran out of memory: whatever else holds freed
     memory on the card gives it back (hypre's recycling pool keeps some between
-    BoomerAMG setups, :func:`hippymfem.common.mfemconfig.set_hypre_pool`)."""
+    BoomerAMG setups, :func:`hippymfem.common.mfemconfig.set_hypre_pool`).  The retry
+    is counted in :data:`RETRIES`."""
+    global RETRIES
+    RETRIES += 1
     try:
         from ..common.mfemconfig import hypre_pool_trim
 
@@ -1655,6 +1665,12 @@ class GroupKernel:
             if k is not None:
                 self.hessian_route[(d, int(j))] = names[k]
                 return k, (fa, fb)[k](*args)
+            if any(isinstance(z, jax.core.Tracer) for z in jax.tree_util.tree_leaves(args)):
+                # A trace runs nothing, so there is nothing to time, and a chunk loop
+                # traces a kernel before its first call (_used_mapped): the route kept
+                # for the run would be the one that was traced faster.  The element
+                # route is traced, and the first call on arrays decides.
+                return 0, fa(*args)
             best, out = None, None
             for k, fn in enumerate((fa, fb)):
                 out = None
@@ -1967,7 +1983,12 @@ class QuadratureKernel:
         Bit-identical to :meth:`element_matrices` in the first case, and in the
         second the splitting has already cost that, so the fused scatter is free.
         """
-        if self.will_chunk():
+        # Asked at the weight of the pass that follows, the slot pass over ``j``, which
+        # plans its chunk and remembers a retry's at that weight: asked at weight 1, a
+        # batch that fits at 1 and not at the slot's (1.3 for the columns of a quadratic
+        # state beside a linear parameter) was handed over whole, and its pass then
+        # split it and joined the chunks, the array that the chunk thunk is there to avoid.
+        if any(gk.will_chunk(gk._slot_weight(j)) for gk in self.group_kernels):
             return lambda: self.element_matrix_chunks(i, j, local_arrays, params,
                                                       consistent=consistent)
         return self.element_matrices(i, j, local_arrays, params, consistent=consistent)

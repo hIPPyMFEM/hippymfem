@@ -97,8 +97,10 @@ def profile_setup(spec, A, make_pc, b, xw):
     for hypre's printout of the phases of a setup by level.  For each set, twice: a new
     preconditioner in hypre's PCG, the first solve to 1e-8 (which sets the hierarchy up,
     with hypre's memory pool open as a solver of the library has it) and a second one; the
-    setup is their difference.  Then ten V-cycles.  Returns ``{name: {"settings", "runs"}}``
-    and prints the faster of the two setups of each set.
+    setup is their difference.  Then ten V-cycles, after one that is not timed: MFEM sets a
+    preconditioner up at the first application of its own whatever hypre's PCG did before.
+    Returns ``{name: {"settings", "runs"}}`` and prints the faster of the two setups of each
+    set.
     """
     import ctypes
 
@@ -132,6 +134,12 @@ def profile_setup(spec, A, make_pc, b, xw):
                 t2, _ = timed(lambda: cg.Mult(b.hypre, xw.hypre), xw)
                 its = mfem.intp()
                 cg.GetNumIterations(its)
+                # MFEM sets a preconditioner up at the first application of its own, whatever
+                # hypre's PCG did before (ChebyshevSolver.setup): that application is made here,
+                # outside the clock of the ten, with the pool open as for any setup.
+                mc.hypre_pool_open()
+                timed(lambda: pc.Mult(b.hypre, xw.hypre), xw)
+                mc.hypre_pool_close()
                 t10, _ = timed(lambda: [pc.Mult(b.hypre, xw.hypre) for _ in range(10)], xw)
                 runs.append({"setup": t1 - t2, "solve": t2, "its": int(its.value()), "cycle": t10 / 10.0,
                              "finite": bool(np.isfinite(xw.norm("l2")))})
@@ -346,9 +354,15 @@ def main():
     # ways, hypre staging the exchange through CPU memory and handing MPI the device buffers.
     mc = hm.common.mfemconfig
     A = getattr(pde.solver_fwd_inc, "A", None) or getattr(pde.solver, "A", None)
+    # A Jacobian that lives in the single-precision hypre (HIPPYMFEM_HYPRE_SINGLE) is multiplied
+    # from here by SingleParMatrix.Mult: the conversion of its two vectors and a reduction of
+    # hypre's verdict over the ranks around the product, which is not the unit of a V-cycle.  It
+    # is timed under the name of what it is, once: that library always stages its exchange.
+    in_single = A is not None and not isinstance(A, mfem.HypreParMatrix)
     t_prod = {}
     if A is not None:
-        for name in (["staged", "aware"] if mc.GPU_AWARE_SOLVES else ["staged"]):
+        for name in (["single, with the conversion of its two vectors"] if in_single
+                     else ["staged", "aware"] if mc.GPU_AWARE_SOLVES else ["staged"]):
             if name == "aware":
                 mc.set_hypre_gpu_aware_mpi(True)
             try:
@@ -371,10 +385,15 @@ def main():
     # ends two entries after the hierarchy stops growing (its nonzeros are recorded), since
     # the last levels have a handful of rows and add nothing that the sum can show.
     vprof = None
-    if args.profile_vcycle and A is not None and getattr(pde.solver, "precond_type", None) == "amg":
+    # (the two profiles are of MFEM's BoomerAMG: a Jacobian that lives in the single-precision
+    # hypre, HIPPYMFEM_HYPRE_SINGLE, is no matrix of MFEM's to build one on)
+    of_mfem = isinstance(A, mfem.HypreParMatrix)
+    if (args.profile_vcycle or args.profile_setup) and A is not None and not of_mfem:
+        say("  no profile of BoomerAMG: the Jacobian is in the single-precision hypre")
+    if args.profile_vcycle and of_mfem and getattr(pde.solver, "precond_type", None) == "amg":
         import ctypes
 
-        H = mc._hypre_library()
+        hypre = mc._hypre_library()                 # (H is the reduced Hessian, applied again below)
         modes = ["staged", "aware"] if mc.GPU_AWARE_SOLVES else ["staged"]
         vprof = {"levels": [], "setup": [], "cum_nnz": [], **{m: [] for m in modes}}
         b, xw = rhs_fwd, model.generate_vector(STATE)
@@ -383,12 +402,12 @@ def main():
             pc = pde.solver._make_pc(A)
             mc.set_boomeramg_options(pc, {"levels": L})
             h = ctypes.c_void_p(mc.boomeramg_handle(pc))
-            H.HYPRE_BoomerAMGSetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.c_double]
-            H.HYPRE_BoomerAMGSetCumNnzAP(h, 1.0)
+            hypre.HYPRE_BoomerAMGSetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.c_double]
+            hypre.HYPRE_BoomerAMGSetCumNnzAP(h, 1.0)
             t_first, _ = timed(lambda: pc.Mult(b.hypre, xw.hypre), xw)      # the setup and one cycle
             nnz = ctypes.c_double(0.0)
-            H.HYPRE_BoomerAMGGetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
-            H.HYPRE_BoomerAMGGetCumNnzAP(h, ctypes.byref(nnz))
+            hypre.HYPRE_BoomerAMGGetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
+            hypre.HYPRE_BoomerAMGGetCumNnzAP(h, ctypes.byref(nnz))
             same = same + 1 if (last is not None and nnz.value <= last) else 0
             if same > 2:
                 del pc
@@ -423,7 +442,7 @@ def main():
         say("  a dot product %.3f ms, a vector update %.3f ms" % (1e3 * vprof["t_dot"], 1e3 * vprof["t_axpy"]))
     # ---- the setup of the Jacobian's hierarchy with other settings (profile_setup)
     sprof = None
-    if args.profile_setup and A is not None and getattr(pde.solver, "precond_type", None) == "amg":
+    if args.profile_setup and of_mfem and getattr(pde.solver, "precond_type", None) == "amg":
         sprof = profile_setup(args.profile_setup, A, pde.solver._make_pc, rhs_fwd, model.generate_vector(STATE))
     solves = op["solveFwdInc"] + op["solveAdjInc"]
     say("  the two solves are %.1f %% of the action; the eight products and R are %.1f %%"
@@ -438,6 +457,8 @@ def main():
            "coarse": args.coarse, "t_mesh": t_mesh, "elements_per_rank": [int(min(ne)), int(max(ne))] if ne else None,
            "t_product": t_prod, "vcycle": vprof, "setup_profile": sprof, "gpu_aware_solves": bool(mc.GPU_AWARE_SOLVES),
            "gpu_aware_mpi": bool(hm.common.mfemconfig.hypre_gpu_aware_mpi()),
+           # (whether the Jacobian and its solves were in the single-precision hypre)
+           "hypre_single": bool(in_single),
            "hypre_pool": (hm.common.mfemconfig.HYPRE_POOL.stats()
                           if hm.common.mfemconfig.HYPRE_POOL is not None else None),
            "t_fwd": t_fwd, "it_fwd": it_fwd, "t_adj": t_adj, "it_adj": it_adj, "t_grad": t_grad,
@@ -455,12 +476,17 @@ def main():
         op2, itf2, ita2 = action_profile()
         t2 = sum(op2.values())
         hm.common.mfemconfig.set_hypre_spmv(first, COMM)
-        say("  with the %s kernel: Hessian action %.4f s; incremental solves fwd %d it "
+        # (the switch is of MFEM's hypre.  A single-precision hypre beside it took its kernel
+        # when it was loaded and keeps it, so the two solves of a Jacobian that lives there,
+        # most of the action, were not on the other kernel: the line and the record say so)
+        kept = first if in_single else None
+        say("  with the %s kernel%s: Hessian action %.4f s; incremental solves fwd %d it "
             "(%.2f ms/it), adj %d it (%.2f ms/it)"
-            % (other, t2, itf2, 1e3 * op2["solveFwdInc"] / max(itf2, 1),
+            % (other, " in MFEM's hypre (the solves, in the single-precision hypre, keep the %s one)"
+               % kept if kept else "", t2, itf2, 1e3 * op2["solveFwdInc"] / max(itf2, 1),
                ita2, 1e3 * op2["solveAdjInc"] / max(ita2, 1)))
         rec["other_kernel"] = {"hypre_spmv": other, "t_action": t2, "op": op2,
-                               "it_fwd_inc": itf2, "it_adj_inc": ita2}
+                               "it_fwd_inc": itf2, "it_adj_inc": ita2, "single_hypre_spmv": kept}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:

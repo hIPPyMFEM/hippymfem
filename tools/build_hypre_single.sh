@@ -40,6 +40,8 @@ fi
 set -u
 mkdir -p "$NEW"
 NEW=$(cd "$NEW" && pwd)
+# (the installed build as well: the autotools branch reads it from the directory it builds in)
+[ ! -d "$PYMFEM" ] || PYMFEM=$(cd "$PYMFEM" && pwd)
 
 # ------------------------------------------------- an autotools build (the HIP stack)
 if [ ! -f "$PYMFEM/external/hypre/src/cmbuild/CMakeCache.txt" ] && [ -x "$PYMFEM/src/hypre/src/config.status" ]; then
@@ -58,7 +60,9 @@ if [ ! -f "$PYMFEM/external/hypre/src/cmbuild/CMakeCache.txt" ] && [ -x "$PYMFEM
   make clean > /dev/null 2>&1 || true
   n=0
   until make -j "${JOBS:-12}" > "$NEW/build.log" 2>&1; do
-    bad=$(grep -o '[A-Za-z0-9_]*\.obj\] Error' "$NEW/build.log" | sed 's/\] Error//' | sort -u | tr '\n' ' ')
+    # (a failure that is not a device object's: grep then finds nothing, and under pipefail
+    # its status would end the script at this line, before the log is shown)
+    bad=$(grep -o '[A-Za-z0-9_]*\.obj\] Error' "$NEW/build.log" | sed 's/\] Error//' | sort -u | tr '\n' ' ' || true)
     n=$((n + 1))
     [ -n "$bad" ] && [ "$n" -le 8 ] || { tail -30 "$NEW/build.log"; exit 1; }
     echo "  the compiler failed at -O2, building at -Os: $bad"

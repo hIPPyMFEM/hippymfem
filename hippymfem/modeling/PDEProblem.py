@@ -156,7 +156,8 @@ class PDEProblem(object):
             s = KrylovSolver(template.comm, method=template.method,
                              precond=template.precond_type,
                              systems_dim=template.systems_dim,
-                             elasticity=template.elasticity, fes=template.fes)
+                             elasticity=template.elasticity, fes=template.fes,
+                             systems_bynodes=template.systems_bynodes)
         elif isinstance(template, LUSolver):
             s = LUSolver(template.comm, method=template.method,
                          max_global_size=template.max_global_size)

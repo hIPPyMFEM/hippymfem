@@ -370,7 +370,17 @@ def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem
         acc = p.target.data_fused(element_matrices(), zero_slots=p.zero, host=host,
                                   dtype=_accumulator_dtype(p, host))
     else:
-        acc = p.target.data(element_matrices, zero_slots=p.zero, host=host)
+        from . import tdofassemble as td
+
+        # A whole batch is summed where its element matrices are and, on a device, in
+        # their precision.  For a matrix that is to keep the defect of its row sums that
+        # has to be double precision whatever theirs is (tdofassemble.SINGLE_ROW_SUMS), as
+        # in the accumulator of a split batch: sums made in single precision have their
+        # rounding in them, and no defect is left to keep.
+        wide = (p.tpat is not None and p.fold and td.single_requested()
+                and td.SINGLE_ROW_SUMS and p.row_sums)
+        acc = p.target.data(element_matrices, zero_slots=p.zero, host=host,
+                            dtype=np.float64 if wide else None)
     if boundary is not None:
         acc = add_boundary_entries(p, acc, boundary)
     return finish_block(p, acc)

@@ -15,6 +15,15 @@ import hippymfem as hp
 from hippymfem.modeling.variables import ADJOINT, PARAMETER
 
 
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
+
+
 def run(check, COMM=MPI.COMM_WORLD):
     """The Jacobian is assembled into the single-precision library and exists there
     alone, the forward and the adjoint solve are corrected against double-precision
@@ -64,6 +73,49 @@ def run(check, COMM=MPI.COMM_WORLD):
                COMM.allreduce(raised(lambda: lib.agree(COMM, None)), op=MPI.MAX)]
     check("a failure on one rank raises on every rank, and none without one",
           stopped == [1, 1, 0, 0], "(%s, on %d rank(s))" % (stopped, COMM.size))
+
+    # A rank that owns no row of a matrix holds vectors of no entries, and MFEM has no
+    # pointer for such a vector where it has allocated nothing for it (None: with hypre
+    # on a device for every one of them, since no device memory is made for no entries).
+    # A vector of the library without entries takes and gives nothing, whatever it is
+    # handed.
+    none, said = singlesolve.SingleVector(lib, COMM, 0, [0, 0]), ""
+    try:
+        none.set(mfem.Vector(0))
+        none.get(mfem.Vector(0))
+    except TypeError as e:
+        said = "TypeError: %s" % e
+    none.destroy()
+    check("a vector of the library without entries (a rank without rows) takes and gives nothing, also "
+          "where MFEM has no pointer for its own", not said, "(%s)" % (said or "set and get return"))
+
+    # The options of a hierarchy in this library (the solver's, then HIPPYMFEM_SINGLE_AMG):
+    # hypre's setters of the relaxation and of its sweeps reset those of the coarsest level,
+    # so the coarsest level's own hold wherever they were written, and an error that an
+    # earlier call of the library left up is not taken for a refusal of an option.
+    import ctypes
+
+    prm = hp.KrylovSolver(COMM, "cg", "amg").parameters
+    prm["amg_options"] = "coarse_relax=7,coarse_sweeps=4,relax=18,sweeps=2"
+    lib.H.HYPRE_BoomerAMGSetMaxLevels(ctypes.c_void_p(), 0)       # (no solver: hypre raises its flag)
+    up, said, got = int(lib.H.HYPRE_GetError()), "", ()
+    try:
+        amg = singlesolve._boomeramg(lib, prm, gather=False)
+        value = ctypes.c_int()
+        for name, k in (("HYPRE_BoomerAMGGetCycleRelaxType", 1), ("HYPRE_BoomerAMGGetCycleRelaxType", 3),
+                        ("HYPRE_BoomerAMGGetCycleNumSweeps", 1), ("HYPRE_BoomerAMGGetCycleNumSweeps", 3)):
+            fn = getattr(lib.H, name)
+            fn.restype, fn.argtypes = ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+            fn(amg, ctypes.byref(value), k)
+            got += (value.value,)
+        lib.H.HYPRE_BoomerAMGDestroy(amg)
+    except ValueError as e:
+        said = str(e)
+    lib.H.HYPRE_ClearAllErrors()
+    check("the coarsest level's relaxation and sweeps hold when they are written before the others', and an "
+          "error left up by an earlier call is not taken for a refusal",
+          up != 0 and not said and got == (18, 7, 2, 4),
+          "(%s; the flag was %d%s)" % (", ".join("%d" % v for v in got), up, said and "; " + said))
 
     n = 10
     pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
@@ -202,7 +254,7 @@ def run(check, COMM=MPI.COMM_WORLD):
         again = A3._columns is not None
         del A3
         pde.invalidate_jacobian()
-        d = max(ys[0].copy().axpy(-1.0, ys[1]).norm("l2"), ys[0].copy().axpy(-1.0, y3).norm("l2"))
+        d = largest([ys[0].copy().axpy(-1.0, ys[1]).norm("l2"), ys[0].copy().axpy(-1.0, y3).norm("l2")])
         check("the single-precision matrices of a pattern share its column indices",
               shared and again and d == 0.0,
               "(two live ones share: %s; a later one finds them: %s; products differ by %.1e)"
@@ -282,10 +334,10 @@ def run(check, COMM=MPI.COMM_WORLD):
         off.append(y.scale(2.0 ** -power).axpy(-1.0, one).norm("l2") / one.norm("l2"))
     none = ks.solve(y, Vu.vector())
     check("right-hand sides of size 1e-30 to 1e30 are solved as one of size one, and zero gives zero",
-          max(abs(k - its[0]) for k in its[1:]) <= 1 and max(off) < 1e-3 and none == 0
+          max(abs(k - its[0]) for k in its[1:]) <= 1 and largest(off) < 1e-3 and none == 0
           and ks.converged and y.norm("l2") == 0.0,
           "(%d iterations, and %s for the sizes 2^%s; the solutions differ by at most %.1e; "
-          "zero: %d iterations)" % (its[0], its[1:], list(powers), max(off), none))
+          "zero: %d iterations)" % (its[0], its[1:], list(powers), largest(off), none))
     del ks, S
 
     # With a preconditioner that is not positive definite hypre's PCG stops after a few
@@ -350,6 +402,7 @@ def run(check, COMM=MPI.COMM_WORLD):
     _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got)
     _pmg_meshes(check, COMM)
     _prior_cycle(check, COMM)
+    _rank_without_coarse_rows(check, COMM)
     _single_blocks(check, COMM)
 
 
@@ -360,6 +413,7 @@ def _row_sums(check, COMM, pde, Vu, m, rhs, got):
     (``singlesolve.RowDefect``)."""
     from hippymfem.algorithms import singlesolve as ss
     from hippymfem.common import devicebridge as bridge
+    from hippymfem.common.parvector import allreduce_extreme
     from hippymfem.fem import tdofassemble as td
 
     lib = ss.library()
@@ -415,12 +469,13 @@ def _row_sums(check, COMM, pde, Vu, m, rhs, got):
     c = rd.values().astype(np.float64) if rd is not None else np.zeros(0)
     want = exact - stored_row_sums(S) if rd is not None else np.zeros(0)
     without = exact - stored_row_sums(plain)
-    size = COMM.allreduce(float(np.max(np.abs(want))) if want.size else 0.0, op=MPI.MAX)
-    off = COMM.allreduce(float(np.max(np.abs(c - want))) if want.size else 0.0, op=MPI.MAX)
+    # (a rank's NaN has to reach every rank: MPI's MAX of one may drop it)
+    size = allreduce_extreme(COMM, float(np.max(np.abs(want))) if want.size else 0.0, MPI.MAX)
+    off = allreduce_extreme(COMM, float(np.max(np.abs(c - want))) if want.size else 0.0, MPI.MAX)
     from hippymfem.common.linalg import get_diagonal
 
     d = get_diagonal(D, Vu.vector()).array.copy()
-    scale = COMM.allreduce(float(np.max(np.abs(d))) if d.size else 0.0, op=MPI.MAX)
+    scale = allreduce_extreme(COMM, float(np.max(np.abs(d))) if d.size else 0.0, MPI.MAX)
     check("a Jacobian of the single-precision library keeps what the rounding of its values took "
           "from the sum of each row, where it is asked to, and no vector otherwise",
           rd is not None and plain.row_defect is None and 0.0 < size < 1e-5 * scale
@@ -449,9 +504,95 @@ def _row_sums(check, COMM, pde, Vu, m, rhs, got):
           left[0][2] and not left[1][2] and left[0][0] < 1e-3 < 0.05 < left[1][0],
           "(its residual %.1e after %d iterations; %.1e with the matrix alone, %d iterations)"
           % (left[0][0], left[0][1], left[1][0], left[1][1]))
+
+    # The ranks of one assembly need not hand values of one kind: a rank that finishes on
+    # the host stands beside ranks on their cards, and values in single precision, which
+    # keep no defect, beside values in double.  What the matrix makes of them is one for
+    # all ranks (SingleParMatrix._set_row_defect): the product that finds a card's defect
+    # is an exchange with a reduced check, and hypre's PCG with the defect's product on
+    # some ranks only would leave out a residual that the others exchange for.  Here the
+    # last rank hands another kind than the others, of values a 2^-27th above numbers of
+    # single precision: the rounding takes exactly that, so the defect of a row is its sum
+    # over 2^27, and zero on a rank whose values came in single precision.
+    from hippymfem.fem.kernel import _put
+
+    tb = ss.matrix_blocks(D, COMM)
+    S0 = ss.SingleParMatrix.from_pattern(tb, tb.values, lib)
+    S0.Mult(ones.hypre, y.hypre)
+    sums = y.array.copy()
+    S0.Mult(rhs.hypre, y.hypre)
+    ref = y.copy()
+    lifted = tb.values.astype(np.float64) * (1.0 + 2.0 ** -27)
+    card = _put if lib.device else (lambda a: a)
+    # (as above, the reductions that carry a rank's NaN to every rank)
+    size = 2.0 ** -27 * allreduce_extreme(COMM, float(np.max(np.abs(sums))) if sums.size else 0.0, MPI.MAX)
+    odd, mixed = COMM.size > 1 and COMM.rank == COMM.size - 1, []
+    for name, other in (("in host memory", lambda: lifted), ("in single precision", lambda: card(tb.values))):
+        M = ss.SingleParMatrix.from_pattern(tb, other() if odd else card(lifted), lib, row_sums=True)
+        kept = COMM.allgather(M.row_defect is not None)
+        want = 0.0 if odd and name == "in single precision" else 2.0 ** -27 * sums
+        off = allreduce_extreme(COMM, float(np.max(np.abs(M.row_defect.values() - want)))
+                                if kept[COMM.rank] and sums.size else 0.0 if kept[COMM.rank] else float("inf"),
+                                MPI.MAX)
+        M.Mult(rhs.hypre, y.hypre)
+        dv = y.axpy(-1.0, ref).norm("l2") / ref.norm("l2")
+        its, own, done = -1, [None], False
+        if len(set(kept)) == 1:
+            # (the same PCG on every rank: one with the vector's product on some ranks
+            # only does not return)
+            eng = ss.SingleEngine(M, pde.solver.parameters)
+            try:
+                its, _ = eng.solve(x.hypre, rhs.hypre, 1e-5, 0.0, 200)
+                own, done = COMM.allgather(eng._product is not None), bool(eng.converged)
+            finally:
+                eng.destroy()
+        mixed.append((name, sum(kept), len(kept), off / max(size, 1e-300), dv, its,
+                      all(kept) and off <= 1e-3 * size and dv <= 1e-6 and done and len(set(own)) == 1
+                      and abs(its - left[1][1]) <= 2))
+        M.destroy()
+    S0.destroy()
+    check("with values of another kind on the last rank every rank keeps the defect of its rows, zero where "
+          "the values came in single precision, the matrix has its values, and hypre's PCG is the same on "
+          "all ranks",
+          all(g[6] for g in mixed),
+          "(%s; %d iterations with the matrix alone)"
+          % ("; ".join("%s: a vector on %d of %d ranks, off by %.1e of the largest defect, a product with the "
+                       "values by %.1e, %d iterations" % g[:6] for g in mixed), left[1][1]))
     del S, plain, D, rd
     pde.invalidate_jacobian()
     pde._release_operators("solver", "solver_adj")
+
+    # The element matrices of a batch that is not split, in single precision and where a
+    # card's kernels leave them (HIPPYMFEM_PRECISION=mixed on a device; in host memory
+    # arrays of JAX's, which take the device's route through the scatter).  Summed there in
+    # their own precision, the sums had their rounding in them and the matrix kept no
+    # defect, without a word: they are summed in double precision.
+    from hippymfem.fem import csrassemble as csr
+    from hippymfem.modeling.variables import STATE
+
+    loc = pde._locals([u, m, None]) + pde._aux_locals()
+    mats = [np.asarray(E, dtype=np.float32) for E in pde.kernel.element_matrices(ADJOINT, STATE, loc)]
+    kw = dict(test_ess=pde.bc0.ess_tdof, diag_policy="one")
+    old, td.SINGLE_ROW_SUMS = td.SINGLE_ROW_SUMS, True
+    try:
+        with td.single_target():
+            M = csr.assemble_matrix_csr(Vu, Vu, pde.batches.groups, [_put(E) for E in mats], pde.nelem, **kw)
+    finally:
+        td.SINGLE_ROW_SUMS = old
+    # (the same entries summed in double precision, as a matrix of MFEM's)
+    D = csr.assemble_matrix_csr(Vu, Vu, pde.batches.groups, mats, pde.nelem, **kw)
+    D.Mult(ones.hypre, y.hypre)
+    kept = COMM.allgather(M.row_defect is not None)
+    want = y.array - stored_row_sums(M)
+    c = M.row_defect.values().astype(np.float64) if kept[COMM.rank] else np.full(want.size, np.inf)
+    size = allreduce_extreme(COMM, float(np.max(np.abs(want))) if want.size else 0.0, MPI.MAX)
+    off = allreduce_extreme(COMM, float(np.max(np.abs(c - want))) if want.size else 0.0, MPI.MAX)
+    check("and keeps it where the element matrices of a whole batch come in single precision from a device",
+          all(kept) and size > 0.0 and off <= 1e-4 * size,
+          "(a vector on %d of %d ranks; against the sums of the stored rows %.1e of the largest defect)"
+          % (sum(kept), len(kept), off / max(size, 1e-300)))
+    M.destroy()
+    del M, D
 
     # the refined solves with it: the state of double precision, in as many passes
     old, td.SINGLE_ROW_SUMS = td.SINGLE_ROW_SUMS, True
@@ -482,6 +623,12 @@ def _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got):
     from hippymfem.fem import ptransfer
     from hippymfem.fem.elementbatch import get_batches
 
+    if ss.library() is None or ss.library().no_pmg:
+        # (a library without one of the p-multigrid's calls: the solves keep BoomerAMG, and
+        # an engine made by name, as below, raises)
+        check("a p-multigrid in place of BoomerAMG on the Jacobian", True,
+              "(skipped: %s)" % (ss.library().no_pmg if ss.library() is not None else ss.why_not()))
+        return
     H = ss.library().H
     solvers = [getattr(pde, a) for a in ("solver", "solver_fwd_inc", "solver_adj_inc")]
     varf = lambda u, m_, p, x: jnp.exp(m_.val) * hp.inner(u.grad, p.grad)      # noqa: E731
@@ -539,8 +686,14 @@ def _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got):
         if not ss.library().device or _mc.seq_on_device(H):
             pars = pde.solver.parameters
             was = pars["amg_options"]
-            for extra, who in (("seq_threshold=60", "the first rank"),
-                               ("seq_threshold=60,redundant=1", "every rank")):
+            cases = (("seq_threshold=60", "the first rank"),
+                     ("seq_threshold=60,redundant=1", "every rank"))
+            if COMM.size == 1:
+                # hypre drops the setting on one rank (the set-up's "if (num_procs == 1)
+                # seq_threshold = 0"), so both hierarchies would be the default one, compared
+                # with itself under names that speak of a gathered level
+                cases = (("seq_threshold=60,redundant=1", None),)
+            for extra, who in cases:
                 pars["amg_options"] = (str(was) + "," if was else "") + extra
                 try:
                     other = ss.PMGEngine(S, T, pars)
@@ -552,8 +705,11 @@ def _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got):
                 finally:
                     pars["amg_options"] = was
                 dseq = xg.axpy(-1.0, xp).norm("l2") / xp.norm("l2")
-                check("with the last levels of its hierarchy gathered and solved by %s a "
-                      "p-multigrid takes about the same iterations" % who,
+                check(("with the last levels of its hierarchy gathered and solved by %s a "
+                       "p-multigrid takes about the same iterations" % who) if who else
+                      ("on one rank, where hypre drops seq_threshold, a p-multigrid with the setting takes "
+                       "about the default one's iterations (the checks of a gathered level take two "
+                       "ranks: skipped)"),
                       held and its_seq <= its_pmg + 2 and dseq < 1e-3,
                       "(%d iterations against %d; the solutions differ by %.1e)"
                       % (its_seq, its_pmg, dseq))
@@ -678,12 +834,12 @@ def _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got):
                 T2 = ss.PTransfer(ptransfer.interpolation(Vf, Vc, get_batches(pm, 2 * order).groups))
                 vc, vf, y = Vc.project(f), Vf.project(f), Vf.vector()
                 T2.P.Mult(vc.hypre, y.hypre)
-                worst["%s %d" % (name, order)] = max(y.axpy(-1.0, vf).norm("linf"), T2.row_sum_error)
+                worst["%s %d" % (name, order)] = largest([y.axpy(-1.0, vf).norm("linf"), T2.row_sum_error])
                 T2.destroy()
                 del T2, Vf
         check("the interpolation carries a linear function to the same function, on four kinds of "
               "elements and for orders two and three",
-              max(worst.values()) < 1e-5, "(%s)" % ", ".join("%s: %.1e" % kv for kv in worst.items()))
+              largest(worst.values()) < 1e-5, "(%s)" % ", ".join("%s: %.1e" % kv for kv in worst.items()))
     finally:
         for s in solvers:
             s.parameters["pmg"] = 0
@@ -737,7 +893,7 @@ def _pmg_meshes(check, COMM):
         want = [int(hp.FunctionSpace.H1(q, 1).fes.GlobalTrueVSize()) for q in (mid, coarse)]
         check("a p-multigrid asked for geometric levels has the interpolations from the meshes that its "
               "mesh was refined from",
-              T is not None and rows == want and max(t.row_sum_error for t in chain) < 1e-12,
+              T is not None and rows == want and largest(t.row_sum_error for t in chain) < 1e-12,
               "(%s rows of linear elements; the meshes have %s)" % (rows, want))
         if chain:
             eng = ss.PMGEngine(S, T, pde.solver.parameters)
@@ -773,13 +929,19 @@ def _pmg_meshes(check, COMM):
             # ranks to save).  Without a device the setting changes nothing.
             lib, size = ss.library(), COMM.Get_size()
             beside = bool(lib.device and lib.host_levels)
-            got = []
+            got, said = [], []
             for name, rows_a_rank, first in (("from the mesh in between", want[0] // size + 1, 1),
                                              ("from the linear elements", 10 ** 9, 0),
                                              ("the last matrix alone", want[1] // size + 1, None)):
                 pde.solver.parameters["pmg_h_host"] = rows_a_rank
+                if not beside:
+                    # (what an engine before this one leaves in the record beside a device)
+                    ss.HOST_LEVELS["PMGEngine"] = {"level": -1, "rows": 0}
                 try:
                     eng = ss.PMGEngine(S, T, pde.solver.parameters)
+                    said.append((name, dict(ss.HOST_LEVELS.get("PMGEngine") or {}),
+                                 {"level": first, "rows": ([int(T.P.global_cols)] + rows)[first]}
+                                 if beside and first is not None else {}))
                     xh = Vu.vector()
                     its, _ = eng.solve(xh.hypre, rhs.hypre, 1e-5, 0.0, 200)
                     where, done = eng._host_at, eng.converged
@@ -797,19 +959,44 @@ def _pmg_meshes(check, COMM):
                   "(%s; all on the device: %d iterations%s)"
                   % ("; ".join("%s: %d iterations, the solution differs by %.1e, host from level %s"
                                % g[:4] for g in got), its_h, "" if beside else "; no device here"))
+            check("the record of what a p-multigrid put in host memory (HOST_LEVELS) is that engine's: its first "
+                  "level there with the rows of that matrix, and nothing for one that put nothing there, "
+                  "whatever the engine before it left",
+                  all(record == wanted for _, record, wanted in said),
+                  "(%s%s)" % ("; ".join("%s: %s" % (name, record or "nothing") for name, record, _ in said),
+                              "" if beside else "; no device here, an older record put there by hand"))
             # the last matrix in host memory and gathered (seq_threshold): by the engine itself,
             # one system on every rank, beside a device and without one
             options = pde.solver.parameters["amg_options"]
             pde.solver.parameters["amg_options"] = ",".join(
                 [t for t in (str(options or ""), "seq_threshold=%d" % (want[1] + 1), "redundant=1") if t])
             pde.solver.parameters["pmg_h_host"] = want[0] // size + 1
+            apart, odd, warned = None, None, 0
             try:
                 eng = ss.PMGEngine(S, T, pde.solver.parameters)
                 xq = Vu.vector()
                 its_q, _ = eng.solve(xq.hypre, rhs.hypre, 1e-5, 0.0, 200)
                 whole, done = eng._gathered is not None and eng.amg is None, eng.converged
+                if whole:
+                    apart = (eng._gathered.spread, dict(ss.GATHERED.get("PMGEngine") or {}))
                 eng.destroy()
                 del eng
+                if whole and size > 1:
+                    # the last rank's solver of the gathered matrix made another one (its
+                    # strength threshold): the engine says so when it is set up
+                    theta = pde.solver.parameters["amg_strength_threshold"]
+                    if COMM.rank == size - 1:
+                        pde.solver.parameters["amg_strength_threshold"] = 0.9
+                    try:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always")
+                            eng = ss.PMGEngine(S, T, pde.solver.parameters)
+                        odd = eng._gathered.spread
+                        warned = COMM.allreduce(sum("differ" in str(w.message) for w in caught), op=MPI.SUM)
+                        eng.destroy()
+                        del eng
+                    finally:
+                        pde.solver.parameters["amg_strength_threshold"] = theta
             finally:
                 pde.solver.parameters["amg_options"] = options
                 pde.solver.parameters["pmg_h_host"] = 0
@@ -819,6 +1006,14 @@ def _pmg_meshes(check, COMM):
                   whole and bool(done) and abs(its_q - its_h) <= 2 and dq < 1e-3,
                   "(%d iterations, %d without the gathering; the solutions differ by %.1e; gathered by the "
                   "engine: %s)" % (its_q, its_h, dq, whole))
+            check("the ranks' solvers of a gathered matrix are compared when they are set up: the same on "
+                  "every rank, and a rank whose solver is another is said",
+                  apart is not None and apart[0] == 0.0 and apart[1] == {"rows": want[1], "spread": 0.0}
+                  and (size == 1 or (odd is not None and odd > ss.GATHERED_AGREE and warned == 1)),
+                  "(solutions of one right-hand side apart by %s of their size; with another solver on the "
+                  "last rank %s, %d warning(s))"
+                  % ("%.1e" % apart[0] if apart else "?", "%.1e" % odd if odd is not None else "not tried: one rank",
+                     warned))
             # the refined forward solve through the solver itself, against double precision
             pde.single_solves = True
             us = pde.generate_state()
@@ -868,12 +1063,12 @@ def _pmg_meshes(check, COMM):
             T2 = ss.PTransfer(ptransfer.refinement(Vf, Vc))
             vc, vf, y = Vc.project(f), Vf.project(f), Vf.vector()
             T2.P.Mult(vc.hypre, y.hypre)
-            worst["%s by %d" % (name, cut)] = max(y.axpy(-1.0, vf).norm("linf"), T2.row_sum_error)
+            worst["%s by %d" % (name, cut)] = largest([y.axpy(-1.0, vf).norm("linf"), T2.row_sum_error])
             T2.destroy()
             del T2, Vc, Vf, above
     check("the interpolation between the linear elements of a mesh and of the mesh cut from it carries a "
           "linear function to the same function, for cuts in two, three and five a side",
-          max(worst.values()) < 1e-5, "(%s)" % ", ".join("%s: %.1e" % kv for kv in worst.items()))
+          largest(worst.values()) < 1e-5, "(%s)" % ", ".join("%s: %.1e" % kv for kv in worst.items()))
     # a mesh that knows no coarser one: BoomerAMG on the linear elements, and a warning
     lone = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(6, 6, 6, hexa))
     Wu, Wm = hp.FunctionSpace.H1(lone, 2), hp.FunctionSpace.H1(lone, 1)
@@ -945,7 +1140,10 @@ def _prior_cycle(check, COMM):
         inner.parameters["rel_tolerance"] = was
     size = COMM.Get_size()
     beside = bool(lib.device and lib.host_levels)
-    got = []
+    got, records = [], []
+    # (the record of a Jacobian's p-multigrid, which a prior's cycle must leave as it is)
+    kept = ss.HOST_LEVELS.get("PMGEngine")
+    ss.HOST_LEVELS["PMGEngine"] = other = {"level": 1, "rows": 1}
     for name, host_rows in (("on the device", 0), ("its small levels in host memory", want[0] // size + 1)):
         prior.h_levels = 2
         inner.parameters["pmg_h_host"] = host_rows
@@ -958,6 +1156,9 @@ def _prior_cycle(check, COMM):
         if geo is None:
             got.append((name, None, 1.0, 1.0, 1.0, 0.0, False))
             continue
+        records.append((name, dict(ss.HOST_LEVELS.get("HCycle") or {}), ss.HOST_LEVELS.get("PMGEngine"),
+                        {"level": geo._host_at, "rows": ([int(A.GetGlobalNumRows())] + geo.rows)[geo._host_at]}
+                        if geo._host_at is not None else {}))
         ch.solve(su, u)
         ch.solve(sv, v)
         d = su.copy().axpy(-1.0, x0)
@@ -982,6 +1183,14 @@ def _prior_cycle(check, COMM):
           all(g[6] for g in got),
           "(%s)" % "; ".join("%s: %s rows, error %.1e in the energy norm (bound %.1e), <v, S u> and <u, S v> differ "
                              "by %.1e, against the precision's solver %.1e" % g[:6] for g in got))
+    check("a prior's cycle records what it put in host memory under its own kind (HOST_LEVELS), and leaves the "
+          "record of a Jacobian's p-multigrid as it was",
+          len(records) == 2 and all(record == wanted and pmg is other for _, record, pmg, wanted in records),
+          "(%s)" % "; ".join("%s: %s" % (name, record or "nothing") for name, record, _, _ in records))
+    if kept is None:
+        ss.HOST_LEVELS.pop("PMGEngine", None)
+    else:
+        ss.HOST_LEVELS["PMGEngine"] = kept
     prior.__dict__.pop("_hessian_cheb", None)
     # a mesh that knows no coarser one
     lone = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(6, 6, 6, hexa))
@@ -1009,6 +1218,196 @@ def _prior_cycle(check, COMM):
     check("on a mesh that was last cut by three a side the prior's cycle stays BoomerAMG, with a warning",
           p3 is not None and getattr(p3, "geometric", 1) is None and said == 1,
           "(a cycle over meshes: %s, warned: %s)" % (getattr(p3, "geometric", "?"), bool(said)))
+
+
+def _rank_without_coarse_rows(check, COMM):
+    """A rank that owns no row of the last matrix of a p-multigrid's coarser meshes: the
+    case that the levels in host memory and the gathering by the engine
+    (``_HostGathered``) were written for, and one that MFEM's own partition of a small
+    cube gives no rank on 2 or on 8 ranks.  The last rank is handed the one element in the
+    middle of a 3^3 mesh, whose vertices all belong to lower ranks; on the meshes cut from
+    it by three and then by two a side it owns the vertices inside that element.  Over
+    these meshes a p-multigrid solves the Jacobian's system as it does with BoomerAMG on
+    the linear elements, with the last matrix on the device, in host memory between the
+    ranks, and gathered by the engine; the interpolation from the coarsest mesh, of whose
+    columns that rank has none, and its transpose are what they should be; and a prior's
+    cycle over the meshes is within its bound, with the small levels in host memory too."""
+    import jax.numpy as jnp
+
+    from hippymfem.algorithms import singlesolve as ss
+    from hippymfem.fem import ptransfer
+
+    lib, size = ss.library(), COMM.Get_size()
+    if lib is None or lib.no_pmg:
+        return
+    if not 2 <= size <= 27:
+        check("a rank without rows of the last matrix of a p-multigrid's coarser meshes", True,
+              "(skipped: for 2 to 27 ranks, not %d)" % size)
+        return
+    closed, hexa = mfem.BasisType.ClosedUniform, mfem.Element.HEXAHEDRON
+    serial = mfem.Mesh.MakeCartesian3D(3, 3, 3, hexa)
+    # MFEM gives a vertex that ranks share to the lowest of them: the element whose vertices
+    # are all inside the cube goes to the last rank, and the 26 around it to the lower
+    # ranks in the order of their numbers
+    ne = serial.GetNE()
+    inside = [all(0.0 < c < 1.0 for v in serial.GetElementVertices(e) for c in serial.GetVertexArray(v))
+              for e in range(ne)]
+    around = [e for e in range(ne) if not inside[e]]
+    part = [size - 1] * ne
+    for k, e in enumerate(around):
+        part[e] = k * (size - 1) // len(around)
+    part = mfem.intArray(part)
+    coarse = mfem.ParMesh(COMM, serial, part.GetData())
+    mid = mfem.ParMesh.MakeRefined(coarse, 3, closed)
+    pmesh = mfem.ParMesh.MakeRefined(mid, 2, closed)
+    ptransfer.set_coarser_meshes(pmesh, [mid, coarse])
+    Vu, Vm = hp.FunctionSpace.H1(pmesh, 2), hp.FunctionSpace.H1(pmesh, 1)
+    Vmid, Vc = hp.FunctionSpace.H1(mid, 1), hp.FunctionSpace.H1(coarse, 1)
+    owned = COMM.allgather(int(Vc.fes.GetTrueVSize()))
+    want = [int(Vmid.fes.GlobalTrueVSize()), int(Vc.fes.GlobalTrueVSize())]
+    bc = hp.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
+    pde = hp.PDEVariationalProblem([Vu, Vm, Vu],
+                                   lambda u, m, p, x: jnp.exp(m.val) * hp.inner(u.grad, p.grad),
+                                   bc, bc.homogeneous(), is_fwd_linear=True)
+    pde.set_solvers(hp.auto_solver, Vu, COMM, max_direct=0, rel_tolerance=1e-12, max_iter=500)
+    solvers = [getattr(pde, a) for a in ("solver", "solver_fwd_inc", "solver_adj_inc")]
+    # a parameter that the coarse meshes do not resolve: the coefficient varies by e^4
+    m = Vm.project(lambda x: 2.0 * np.sin(7.0 * x[0]) * np.cos(9.0 * x[1]) + np.sin(11.0 * x[2]))
+    rhs = Vu.vector()
+    hp.parRandom.set_seed(47)
+    hp.parRandom.normal(1.0, rhs)
+    pde.bc0.zero(rhs)
+    pars = pde.solver.parameters
+    # (pmg_h_host: with this many rows a rank the mesh in between and the last matrix under
+    # it live in host memory beside a device; without a device the setting changes nothing)
+    small, beside = max(want[0] // size + 1, want[1]), bool(lib.device and lib.host_levels)
+
+    def solve(host_rows=0, extra=""):
+        """An engine of the Jacobian with these settings and its solve: the iterations, the
+        solution, whether it converged, the level from which host memory holds it, its
+        coarser meshes, and the rows a rank has of a last matrix that the engine gathered."""
+        options = pars["amg_options"]
+        pars["amg_options"] = ",".join(t for t in (str(options or ""), extra) if t)
+        pars["pmg_h_host"] = host_rows
+        try:
+            eng = ss.PMGEngine(S, T, pars)
+            x = Vu.vector()
+            its, _ = eng.solve(x.hypre, rhs.hypre, 1e-5, 0.0, 200)
+            held = None if eng._gathered is None else COMM.allgather(int(eng._gathered.n))
+            out = (its, x, bool(eng.converged), eng._host_at, len(eng._h), held)
+            eng.destroy()
+        finally:
+            pars["amg_options"], pars["pmg_h_host"] = options, 0
+        return out
+
+    for s in solvers:
+        s.parameters["pmg"], s.parameters["pmg_h"] = 1, 2
+    try:
+        S, _ = pde._jacobian([pde.generate_state(), m, None])
+        T = getattr(S, "transfer", None)
+        chain = list(getattr(T, "h", None) or ())
+        rows = [int(t.P.global_cols) for t in chain]
+        check("the last rank owns no vertex of the coarsest mesh, and a p-multigrid has the interpolations "
+              "from it and from the mesh in between",
+              owned[-1] == 0 and rows == want,
+              "(%s vertices a rank; %s rows of linear elements, the meshes have %s)" % (owned, rows, want))
+        if rows == want:
+            its_h, xg, done, _at, levels, _held = solve()
+            # the same matrix with BoomerAMG on the linear elements
+            T.h = []
+            try:
+                its_amg, xa = solve()[:2]
+            finally:
+                T.h = chain
+            y = Vu.vector()
+            S.Mult(xg.hypre, y.hypre)
+            res = y.axpy(-1.0, rhs).norm("l2") / rhs.norm("l2")
+            dx = xg.copy().axpy(-1.0, xa).norm("l2") / xa.norm("l2")
+            check("where a rank owns no row of the last matrix of the coarser meshes a p-multigrid solves the "
+                  "Jacobian's system in about the iterations that it takes with BoomerAMG on the linear elements",
+                  done and levels == 2 and its_h <= its_amg + 3 and dx < 1e-3 and res < 1e-3,
+                  "(%d iterations, with BoomerAMG %d; the solutions differ by %.1e, the residual left %.1e)"
+                  % (its_h, its_amg, dx, res))
+            # that matrix in host memory beside a device, with BoomerAMG between the ranks
+            # and gathered by the engine (seq_threshold), where the last rank gathers nothing
+            got = []
+            for name, extra in (("between the ranks", ""),
+                                ("gathered", "seq_threshold=%d,redundant=1" % (want[1] + 1))):
+                its, x, done, where, _levels, held = solve(small, extra)
+                d = x.axpy(-1.0, xg).norm("l2") / xg.norm("l2")
+                whole = held is not None and held[-1] == 0 and sum(held) == want[1]
+                got.append((name, its, d, where, held,
+                            done and where == (1 if beside else None) and abs(its - its_h) <= 2 and d < 1e-3
+                            and (whole if extra else held is None)))
+            check("with that matrix in host memory, between the ranks and gathered by the engine, the rank "
+                  "without rows of it changes neither the iterations nor the solution",
+                  all(g[5] for g in got),
+                  "(%s; all on the device: %d iterations%s)"
+                  % ("; ".join("%s: %d iterations, the solution differs by %.1e, host from level %s, rows a rank "
+                               "of a gathered matrix %s" % g[:5] for g in got), its_h,
+                     "" if beside else "; no device here"))
+            # the interpolation from the coarsest mesh and its transpose, on vectors of
+            # which the last rank has no entry
+            f = lambda x: 1.0 + 2.0 * x[0] - 3.0 * x[1] + 0.5 * x[2]            # noqa: E731
+            T2 = ss.PTransfer(ptransfer.refinement(Vmid, Vc))
+            vc, vf, y, w, z = Vc.project(f), Vmid.project(f), Vmid.vector(), Vmid.vector(), Vc.vector()
+            hp.parRandom.normal(1.0, w)
+            T2.P.Mult(vc.hypre, y.hypre)
+            T2.P.MultTranspose(w.hypre, z.hypre)
+            adj = abs(y.inner(w) - vc.inner(z)) / max(y.norm("l2") * w.norm("l2"), 1e-300)
+            off = largest([y.axpy(-1.0, vf).norm("linf"), T2.row_sum_error])
+            T2.destroy()
+            del T2
+            check("the interpolation from a mesh of which a rank owns no vertex carries a linear function to "
+                  "the same function, and its transposed product is the transpose of the plain one",
+                  off < 1e-5 and adj < 1e-5,
+                  "(off by %.1e; <P c, w> and <c, P^T w> differ by %.1e of their sizes)" % (off, adj))
+            # a prior's cycle over the same meshes (HCycle)
+            prior = hp.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True, solver_type="krylov")
+            inner = prior.Rsolver.Asolver
+            A = inner.A
+            u, x0, su, w1 = (hp.ParVector(COMM, A.Height()) for _ in range(4))
+            hp.parRandom.normal(1.0, u)
+            was = inner.parameters["rel_tolerance"]
+            inner.parameters["rel_tolerance"] = 1e-13
+            try:
+                inner.solve(x0, u)
+            finally:
+                inner.parameters["rel_tolerance"] = was
+            A.Mult(x0.hypre, w1.hypre)
+            energy = max(w1.inner(x0), 1e-300) ** 0.5
+            got = []
+            for name, host_rows in (("on the device", 0), ("its small levels in host memory", small)):
+                prior.h_levels = 2
+                inner.parameters["pmg_h_host"] = host_rows
+                prior.__dict__.pop("_hessian_cheb", None)
+                try:
+                    pc = prior.getHessianPreconditioner(cycles=5)
+                finally:
+                    inner.parameters["pmg_h_host"] = 0
+                geo, ch = getattr(pc, "geometric", None), pc.Asolver
+                if geo is None:
+                    got.append((name, None, 1.0, 1.0, False))
+                    continue
+                ch.solve(su, u)
+                d = su.copy().axpy(-1.0, x0)
+                A.Mult(d.hypre, w1.hypre)
+                err = max(w1.inner(d), 0.0) ** 0.5 / energy
+                got.append((name, geo.rows, err, ch.error_bound,
+                            geo.rows == want and err <= 1.05 * ch.error_bound + 1e-5
+                            and geo._host_at == ((1 if host_rows else None) if beside else None)))
+            prior.__dict__.pop("_hessian_cheb", None)
+            check("a prior's cycle over these meshes is within its bound of the exact solve, with the small "
+                  "levels in host memory as well",
+                  all(g[4] for g in got),
+                  "(%s)" % "; ".join("%s: %s rows, error %.1e in the energy norm (bound %.1e)" % g[:4] for g in got))
+        del S
+    finally:
+        for s in solvers:
+            s.parameters["pmg"], s.parameters["pmg_h"], s.parameters["pmg_h_host"] = 0, 0, 0
+        pde.invalidate_jacobian()
+        pde.release_linearization_point()
+        pde._release_operators("solver", "solver_adj")
 
 
 def _single_blocks(check, COMM):
@@ -1073,11 +1472,11 @@ def _single_blocks(check, COMM):
         x = point(seed)
         kinds_single, s = products(x, True)
         kinds_double, d = products(x, False)
-        worst = max([worst] + [s[k].copy().axpy(-1.0, d[k]).norm("l2") / max(d[k].norm("l2"), 1e-300)
-                               for k in pairs])
+        worst = largest([worst] + [s[k].copy().axpy(-1.0, d[k]).norm("l2") / max(d[k].norm("l2"), 1e-300)
+                                   for k in pairs])
         # <dm, C^T du> against <C dm, du>, both from the single-precision block
         a, b = dm.inner(s[(PARAMETER, ADJOINT)]), s[(ADJOINT, PARAMETER)].inner(du)
-        adjoint = max(adjoint, abs(a - b) / max(abs(a), abs(b), 1e-300))
+        adjoint = largest([adjoint, abs(a - b) / max(abs(a), abs(b), 1e-300)])
         if first is None:
             first = s
         else:
@@ -1088,7 +1487,7 @@ def _single_blocks(check, COMM):
           "matrices of the single-precision library, and their products and transposed products are "
           "the double-precision ones to single precision, at a first point and at a second",
           kinds_single[:3] == ["SingleParMatrix"] * 3 and "SingleParMatrix" not in kinds_double
-          and worst < 5e-6 and adjoint < 5e-6 and min(moved) > 1e-3,
+          and worst < 5e-6 and adjoint < 5e-6 and all(v > 1e-3 for v in moved),
           "(C, W_uu, W_um, W_mm: %s; worst relative difference %.1e; <dm, C^T du> and <C dm, du> "
           "differ by %.1e; the transposed products of the two points differ by %.1e and %.1e)"
           % (", ".join(kinds_single), worst, adjoint, moved[0], moved[1]))

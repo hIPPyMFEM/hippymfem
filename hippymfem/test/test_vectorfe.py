@@ -38,6 +38,7 @@ import jax.numpy as jnp
 
 import hippymfem as hp
 from hippymfem.common.linalg import to_dense
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.fem.assemble import assemble_matrix
 from hippymfem.fem.elementbatch import MeshBatches
 from hippymfem.fem.kernel import QuadratureKernel
@@ -55,6 +56,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def mk(kind, n):
@@ -105,7 +115,7 @@ def compare(kind, family, order, n=3):
     else:
         errs.append(against(lambda u, m, p, x: u.div * p.div,
                             mfem.DivDivIntegrator(), "div-div"))
-    worst = max(e for _, e in errs)
+    worst = largest(e for _, e in errs)
     check("%-4s %s order %d (nd=%d, DofTransformation=%s)"
           % (kind, family, order, tab.nd, "yes" if tab.T is not None else "no"),
           worst < 1e-13,
@@ -392,7 +402,7 @@ def test_mixed_formulation_blocks():
     worst = 0.0
     for ours, ref in ((A11, M_ref), (A21, D_ref)):
         a, b = to_dense(ours), to_dense(ref)
-        worst = max(worst, np.abs(a - b).max() / max(np.abs(b).max(), 1e-300))
+        worst = largest([worst, np.abs(a - b).max() / max(np.abs(b).max(), 1e-300)])
     check("mixed-family blocks match MFEM's own integrators", worst < 1e-12,
           "(RT x RT mass and L2 x RT divergence, worst rel %.1e)" % worst)
 
@@ -462,7 +472,7 @@ def test_poroelasticity_blocks():
     worst = 0.0
     for ours, ref in ((Kuu, el), (Kpp, pr)):
         a, b = to_dense(ours), to_dense(ref)
-        worst = max(worst, np.abs(a - b).max() / max(np.abs(b).max(), 1e-300))
+        worst = largest([worst, np.abs(a - b).max() / max(np.abs(b).max(), 1e-300)])
     check("poroelastic diagonal blocks match MFEM's integrators", worst < 1e-12,
           "(elasticity, and mass + diffusion; worst rel %.1e)" % worst)
 
@@ -498,7 +508,7 @@ def test_poroelasticity_blocks():
     ref_all = np.concatenate([yu.array, yp.array])
     e = (np.abs(y.array - ref_all).max()
          / max(COMM.allreduce(np.abs(ref_all).max(), op=MPI.MAX), 1e-300))
-    e = COMM.allreduce(e, op=MPI.MAX)
+    e = allreduce_extreme(COMM, e, MPI.MAX)
     check("the glued operator acts as the four blocks do", e < 1e-12,
           "(%d unknowns, max rel %.1e)" % (mono.GetGlobalNumRows(), e))
 
@@ -522,7 +532,7 @@ def test_vector_bc_values():
     v.array[:] = 7.0
     bc.apply(v)
     got = v.array[bc.ess] if bc.ess.size else np.zeros(0)
-    worst = COMM.allreduce(float(np.abs(got - 0.5).max()) if got.size else 0.0, op=MPI.MAX)
+    worst = allreduce_extreme(COMM, float(np.abs(got - 0.5).max()) if got.size else 0.0, MPI.MAX)
     ndofs = COMM.allreduce(int(bc.ess.size), op=MPI.SUM)
     check("a scalar value applies to every component", worst < 1e-14 and ndofs > 0,
           "(%d essential dofs, worst |u - 0.5| = %.1e)" % (ndofs, worst))

@@ -57,9 +57,9 @@ def _env_only(env, default=""):
     return get
 
 
-def _env_setter(env):
+def _env_setter(env, cast=None):
     def put(value):
-        os.environ[env] = str(value)
+        os.environ[env] = str(value if cast is None else cast(value))
     return put
 
 
@@ -73,6 +73,20 @@ class _Knob(object):
 
 def _bool(v):
     return str(v).lower() in ("1", "yes", "true", "on") if not isinstance(v, bool) else v
+
+
+def _int(v):
+    """A cast for a whole number that lives in the environment and is read back with
+    ``int``: ``True`` is written as 1 and ``2.0`` as 2, where ``str`` alone would write
+    ``"True"`` and ``"2.0"``, which ``int`` does not take and the readers refuse by the
+    variable's name (before they did, the default ran in its place without a word).  An
+    empty string stays: the default."""
+    if isinstance(v, str) and not v.strip():
+        return ""
+    n = int(v)
+    if not isinstance(v, str) and n != v:
+        raise ValueError("must be a whole number, not %r" % (v,))
+    return n
 
 
 def _choice(*allowed):
@@ -278,40 +292,41 @@ _KNOBS = [
           _env_only("HIPPYMFEM_HYPRE_POOL_KEEP", "512"), when="import"),
     _Knob("gpu_aware_mpi", "HIPPYMFEM_GPU_AWARE_MPI",
           "hypre hands MPI its buffers on the GPU (1), stages them through CPU memory (0), or hands "
-          "them over only inside Krylov solves (solve, experimental); empty: as the library was built",
+          "them over only inside Krylov solves (solve, experimental); empty: as the library was built "
+          "(a hypre before 2.33 does what it was built to do, whatever is set)",
           _env_only("HIPPYMFEM_GPU_AWARE_MPI", ""), when="import"),
     _Knob("amg_relax", "HIPPYMFEM_AMG_RELAX",
           "default BoomerAMG relaxation type for new solvers; -1 keeps MFEM's (16 is Chebyshev, SPD only)",
-          _env_only("HIPPYMFEM_AMG_RELAX", "-1"), _env_setter("HIPPYMFEM_AMG_RELAX")),
+          _env_only("HIPPYMFEM_AMG_RELAX", "-1"), _env_setter("HIPPYMFEM_AMG_RELAX", _int)),
     _Knob("amg_max_levels", "HIPPYMFEM_AMG_MAX_LEVELS",
           "default BoomerAMG level cap for new solvers; -1 keeps hypre's",
-          _env_only("HIPPYMFEM_AMG_MAX_LEVELS", "-1"), _env_setter("HIPPYMFEM_AMG_MAX_LEVELS")),
+          _env_only("HIPPYMFEM_AMG_MAX_LEVELS", "-1"), _env_setter("HIPPYMFEM_AMG_MAX_LEVELS", _int)),
     _Knob("amg", "HIPPYMFEM_AMG",
           "further BoomerAMG settings of new solvers by hypre's names, such as relax_wt=1.8,pmax=6 "
           "(mfemconfig.BOOMERAMG_SETTERS); empty keeps MFEM's",
           _env_only("HIPPYMFEM_AMG", ""), _env_setter("HIPPYMFEM_AMG")),
     _Knob("pc_reuse", "HIPPYMFEM_PC_REUSE",
           "default for reusing a solver's AMG hierarchy across operators (0: rebuild each time)",
-          _env_only("HIPPYMFEM_PC_REUSE", "0"), _env_setter("HIPPYMFEM_PC_REUSE")),
+          _env_only("HIPPYMFEM_PC_REUSE", "0"), _env_setter("HIPPYMFEM_PC_REUSE", _int)),
     _Knob("pmg", "HIPPYMFEM_PMG",
           "default of new solvers for a p-multigrid in the single-precision solves of a space of "
           "order two or more (0: BoomerAMG on the matrix itself)",
-          _env_only("HIPPYMFEM_PMG", "0"), _env_setter("HIPPYMFEM_PMG")),
+          _env_only("HIPPYMFEM_PMG", "0"), _env_setter("HIPPYMFEM_PMG", _int)),
     _Knob("pmg_h", "HIPPYMFEM_PMG_H",
           "default of new solvers for the meshes under the linear elements of a p-multigrid: a V-cycle "
           "over up to this many of the meshes that the mesh was refined from (0: BoomerAMG on the "
           "linear elements)",
-          _env_only("HIPPYMFEM_PMG_H", "0"), _env_setter("HIPPYMFEM_PMG_H")),
+          _env_only("HIPPYMFEM_PMG_H", "0"), _env_setter("HIPPYMFEM_PMG_H", _int)),
     _Knob("prior_h", "HIPPYMFEM_PRIOR_H",
           "default of priors for the meshes that the multigrid cycles of their Hessian preconditioner go "
           "over, in the single-precision hypre, where the mesh was last cut in two (0: BoomerAMG on the "
           "prior's operator)",
-          _env_only("HIPPYMFEM_PRIOR_H", "0"), _env_setter("HIPPYMFEM_PRIOR_H")),
+          _env_only("HIPPYMFEM_PRIOR_H", "0"), _env_setter("HIPPYMFEM_PRIOR_H", _int)),
     _Knob("pmg_h_host", "HIPPYMFEM_PMG_H_HOST",
           "default of new solvers for the levels of those meshes that live in host memory with hypre on "
           "a device: the ones of at most this many rows a rank, and what is under them, where the "
           "gathered last matrix has no more rows than that in all (0: none)",
-          _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST")),
+          _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST", _int)),
     _Knob("single_blocks", "HIPPYMFEM_SINGLE_BLOCKS",
           "the blocks of a linearization point are matrices of the single-precision hypre where it is "
           "loaded: two thirds of their memory, products to single precision",

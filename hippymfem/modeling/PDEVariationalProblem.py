@@ -437,16 +437,20 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # when it does not: the scatter then consumes each chunk as it is
             # produced and the full (ne, nd, nd) array is never formed.
             mats = self.kernel.element_matrices_or_chunks(i, j, loc, consistent=consistent)
-        finite = None
+        # One flag and one collective for the overflow check, after the assembly, whether
+        # this rank's batch is split or not.  That is each rank's own answer (its element
+        # count, its memory, a chunk it remembers from a retry): ranks that reduced the
+        # flag of a whole batch here would wait for the ranks that reduce theirs after the
+        # assembly, and those for them in the collectives of that assembly.
+        finite = _FiniteFlag()
         if callable(mats):
             # The arrays never exist all at once, so the overflow check rides along
             # with the chunks: each reduces to a flag on its own device and the one
             # collective comes after the loop.  An allreduce per chunk would
             # desynchronize the ranks, which need not have the same number of chunks.
-            finite = _FiniteFlag()
             mats = finite.wrap(mats)
         else:
-            require_finite_arrays(mats, self.comm, "block (%d, %d)" % (i, j))
+            finite.ok = bool(_kernel.all_finite(mats))
         boundary = None
         if self.bdr_kernel is not None:
             bmats = self.bdr_kernel.element_matrices(i, j, loc)
@@ -465,8 +469,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             A = assemble_matrix_csr(self.Vh[i], self.Vh[j], self.batches.groups,
                                     mats, self.nelem, test_ess=test_ess,
                                     diag_policy=diag_policy, boundary=boundary)
-        if finite is not None:
-            finite.check(self.comm, "block (%d, %d)" % (i, j))
+        finite.check(self.comm, "block (%d, %d)" % (i, j))
         return A
 
     def _boundary_vanishes(self, bmats):
@@ -647,7 +650,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         (the parameter's, often) serves, otherwise one is made.  Where the state space
         allows none (:func:`hippymfem.fem.ptransfer.why_not`: linear elements already,
         another family, a nonconforming mesh), or the library lacks a call, the solves
-        keep BoomerAMG, with a warning.
+        keep BoomerAMG, with a warning.  So do the linear elements where there is no
+        interpolation between the meshes under them (``pmg_h``) for the space: a state of
+        several components.
         """
         prm = getattr(self._get_solver("solver"), "parameters", None)
         if prm is None or "pmg" not in prm or not int(prm["pmg"]):
@@ -671,7 +676,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                                if s is not V and not ptransfer.why_not(V, s)), None)
                 if coarse is None:
                     coarse = FunctionSpace.H1(self.mesh, 1, V.vdim)
-                self._ptransfer = singlesolve.PTransfer(ptransfer.interpolation(
+                T = singlesolve.PTransfer(ptransfer.interpolation(
                     V, coarse, self.batches.groups, self.bc0.ess_tdof))
                 # under the linear elements: the meshes that the mesh was refined from,
                 # where the solver asks for them and the mesh has them (``pmg_h``)
@@ -683,17 +688,32 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                     warnings.warn("pmg_h: the mesh knows no mesh it was refined from "
                                   "(fem.ptransfer.set_coarser_meshes); the linear elements keep BoomerAMG",
                                   RuntimeWarning, stacklevel=2)
-                space, ess, chain = coarse, self._ptransfer.coarse_ess, []
+                space, ess, chain = coarse, T.coarse_ess, []
                 # (a matrix that the hierarchy gathers at once needs no mesh under it)
                 gathered = singlesolve.gather_threshold(prm)
-                for mesh in meshes:
-                    if gathered and int(space.fes.GlobalTrueVSize()) <= gathered:
-                        break
-                    below = FunctionSpace.H1(mesh, 1, space.vdim)
-                    blocks = ptransfer.refinement(space, below, ess)
-                    chain.append(singlesolve.PTransfer(blocks))
-                    space, ess = below, blocks.coarse_ess
-                self._ptransfer.h = chain
+                try:
+                    for mesh in meshes:
+                        if gathered and int(space.fes.GlobalTrueVSize()) <= gathered:
+                            break
+                        below = FunctionSpace.H1(mesh, 1, space.vdim)
+                        blocks = ptransfer.refinement(space, below, ess)
+                        chain.append(singlesolve.PTransfer(blocks))
+                        space, ess = below, blocks.coarse_ess
+                except NotImplementedError as e:
+                    # No interpolation between the meshes for this space (a state of
+                    # several components), which every rank finds alike: as on a mesh
+                    # that knows no coarser one, the p-multigrid stays without them.
+                    chain = []
+                    if self.comm.rank == 0:
+                        import warnings
+
+                        warnings.warn("pmg_h: no levels of coarser meshes for the Jacobian's solves "
+                                      "(%s); the linear elements keep BoomerAMG" % e,
+                                      RuntimeWarning, stacklevel=2)
+                T.h = chain
+                # (kept once it is whole: an error on the way leaves nothing half built
+                # for the next call to take for the transfer)
+                self._ptransfer = T
         return self._ptransfer or None
 
     #: Whether this problem's solves may run in a single-precision hypre when one is
@@ -1641,11 +1661,13 @@ def require_finite(v, what):
     if not v.local_size:
         ok = True
     elif getattr(v, "_dev", False):
-        # A vector MFEM holds on a GPU is reduced there: its norm is not finite as
-        # soon as one entry is not, and nothing is copied to the host for the check.
+        # A vector MFEM holds on a GPU is reduced there, and nothing is copied to the
+        # host for the check: the sum of its entries' magnitudes is not finite as soon
+        # as one entry is not.  (Not the Euclidean norm: MFEM's passes over an entry
+        # that is not a number and comes out as the norm of the others.)
         import math
 
-        ok = math.isfinite(v.hypre.Norml2())
+        ok = math.isfinite(v.hypre.Norml1())
     else:
         ok = bool(np.isfinite(v._host_read()).all())
     if not _reduce(v.comm, int(ok), MPI.MIN):
@@ -1686,6 +1708,9 @@ def _same(a, b):
     if a is None or b is None:
         return a is b
     if a.local_size != b.local_size:
+        # Into the reduction of the ranks whose sizes agree, with a term that makes it
+        # not zero on every rank: a return here left those ranks waiting in it.
+        _reduce(a.comm, np.inf, MPI.SUM)
         return False
     return a.copy().axpy(-1.0, b).norm("l2") == 0.0
 

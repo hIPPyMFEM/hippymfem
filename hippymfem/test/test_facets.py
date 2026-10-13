@@ -38,6 +38,7 @@ import jax.numpy as jnp
 
 import hippymfem as hp
 from hippymfem.common.linalg import to_dense
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.fem.facets import (assemble_facet_matrix, assemble_facet_vector,
                                   avg, avg_grad, facet_values, get_facet_batches,
                                   jump, jump_grad)
@@ -58,6 +59,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def mesh(n=4):
@@ -500,8 +510,8 @@ def test_facets_with_essential_bcs():
     worst = np.abs(got[ess] - 1.0).max() if ess.size else 0.0
     keep = np.ones(got.size, dtype=bool)
     keep[ess] = False
-    worst = max(worst, np.abs(got[keep]).max() if keep.any() else 0.0)
-    worst = COMM.allreduce(float(worst), op=MPI.MAX)
+    worst = largest([worst, np.abs(got[keep]).max() if keep.any() else 0.0])
+    worst = allreduce_extreme(COMM, worst, MPI.MAX)
     check("the essential rows come out as the identity", worst < 1e-14,
           "(worst %.2e over %d essential dofs)"
           % (worst, COMM.allreduce(int(ess.size), op=MPI.SUM)))

@@ -32,7 +32,7 @@ from mpi4py import MPI
 
 import mfem.par as mfem
 
-from ..common.parvector import host_sync
+from ..common.parvector import allreduce_extreme, host_sync
 from .elementbatch import group_tables
 from .prolongation import _boolean_prolongation, _ess_ldof_mask, _prolongation
 from .spaces import as_space
@@ -196,7 +196,9 @@ def _blocks(fine, coarse, rows, cols, vals, done, ess, locals_):
     #: ones), for the products with element matrices (``P_e^T A_e P_e``, ``A_e P_e``)
     tb.local = locals_
     tb.coarse, tb.coarse_ess = coarse, coarse_ess
-    tb.row_sum_error = float(comm.allreduce(off, op=MPI.MAX))
+    # (a rank's NaN is the result on every rank: MPI's MAX keeps or loses it by the order
+    # the ranks' values meet in)
+    tb.row_sum_error = allreduce_extreme(comm, off, MPI.MAX)
     tb.global_nnz = int(comm.allreduce(tb.nnz_t, op=MPI.SUM))
     return tb
 
@@ -257,7 +259,11 @@ def refinement(fine, coarse, ess=None):
     vals = np.array(sp.GetDataArray(), dtype=np.float64)
     rows = np.repeat(np.arange(nld2, dtype=np.int64), np.diff(I))
     del sp, T, I
-    keep = np.abs(vals) > 1e-12                    # (an element's whole row is stored: 8 numbers, most of them zero)
+    # (an element's whole row is stored: 8 numbers, most of them zero.  A weight that is
+    # not a number is kept: left out with the zeros it was a hole in its row, and the row
+    # sums were off by a number.  Kept, the row sums are not a number, and in a row of
+    # this rank's own the single-precision library refuses the matrix, on every rank)
+    keep = ~(np.abs(vals) <= 1e-12)
     rows, cols, vals = rows[keep], cols[keep], vals[keep]
     done = np.zeros(nld2, dtype=bool)
     done[rows] = True

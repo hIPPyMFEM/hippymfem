@@ -579,6 +579,32 @@ def main():
                         (model, "applyWmu"), (model, "applyWmm"), (model, "applyR")):
         if owner is not None and hasattr(owner, attr):
             staged(owner, attr, "+" + attr.lstrip("_"))
+    # The Jacobian with the products of a p-multigrid (pde._jacobian_with_products) takes its
+    # three functions from the module that defines them, at every call, and not by the names of
+    # the problem's module staged above: those count the blocks of a linearization point.  The
+    # Jacobian's are counted under names of their own, staged in that module while such a call
+    # runs and no longer (assemble_matrix plans and finishes its block through the same names,
+    # inside its own stage).
+    if hasattr(pde, "_jacobian_with_products"):
+        from hippymfem.fem import csrassemble as _csr
+
+        plain = {attr: getattr(_csr, attr) for attr in ("plan_block", "scatter_derived", "finish_block")}
+        for attr in plain:
+            staged(_csr, attr, "+jacobian " + attr)
+        counted = {attr: getattr(_csr, attr) for attr in plain}
+        vars(_csr).update(plain)
+        with_products = pde._jacobian_with_products
+
+        @functools.wraps(with_products)
+        def with_stages(*a, **k):
+            vars(_csr).update(counted)
+            try:
+                return with_products(*a, **k)
+            finally:
+                vars(_csr).update(plain)
+
+        pde._jacobian_with_products = with_stages
+        staged(pde, "_jacobian_with_products", "+jacobian_with_products")
     staged(misfit, "cost", "+misfit cost")
     staged(prior, "cost", "+prior cost")
     calls0 = dict(pde.n_calls)
@@ -601,11 +627,21 @@ def main():
     err = (mtrue.copy().axpy(-1.0, xs[PARAMETER]).norm("l2") / max(mtrue.norm("l2"), 1e-300))
     # the meshes under the linear elements of the p-multigrid, where it has them (pmg_h)
     h_rows = [int(t.P.global_cols) for t in (getattr(getattr(pde, "_ptransfer", None), "h", None) or ())]
-    h_host, h_timer = {}, None
-    if h_rows:
+    h_host, h_timer, h_gathered = {}, None, {}
+    if h_rows or prior_h_rows:
         from hippymfem.algorithms import singlesolve as _ss
 
-        h_host = dict(_ss.HOST_LEVELS)
+        # (the ranks' solvers of a last matrix gathered in host memory, compared at each set-up:
+        # the last one's.  Zero by construction; cycles that were weaker in one job alone left
+        # nothing to tell why, "Probe 98" of the scaling study.)
+        h_gathered = {kind: dict(g) for kind, g in sorted(_ss.GATHERED.items())}
+        for kind, g in h_gathered.items():
+            say("  the ranks' solvers of the gathered last matrix of %s (%d rows): their solutions of one right-hand "
+                "side lie %.1e of their size apart"
+                % ("the p-multigrid" if kind == "PMGEngine" else "the prior's cycles" if kind == "HCycle" else kind,
+                   g["rows"], g["spread"]))
+    if h_rows:
+        h_host = dict(_ss.HOST_LEVELS.get("PMGEngine") or {})    # (the prior's cycle has its own, above)
         say("  the p-multigrid's coarser meshes: %s rows of linear elements, BoomerAMG on the last%s"
             % (", ".join("%d" % r for r in h_rows),
                "; in host memory from the matrix of %d rows on" % h_host["rows"] if h_host else ""))
@@ -622,19 +658,34 @@ def main():
     say("  %d Newton step(s) %.2f s  newton %d  cg %d  J %.8e  |grad| %.4e  err(m) %.8f  (%s)"
         % (args.steps, t_step, solver.it, solver.total_cg_iter, solver.final_cost,
            solver.final_grad_norm, err, solver.termination_reasons[solver.reason]))
+    # the card at the end of the steps, on rank 0: what JAX's allocator holds (it gives nothing
+    # back, so its peak is what hypre never gets) and what everything on the card holds; read
+    # before the kernels of --rank-table, which take memory of their own
+    jax_mem, card = None, None
+    try:
+        import jax
+
+        st = jax.devices()[0].memory_stats() or {}
+        jax_mem = {k: int(st[k]) for k in ("bytes_in_use", "peak_bytes_in_use", "bytes_reserved", "peak_bytes_reserved",
+                                           "bytes_limit", "pool_bytes", "peak_pool_bytes", "largest_alloc_size") if k in st}
+        card = hm.common.devicebridge.device_memory()
+    except Exception:                                            # noqa: BLE001
+        pass
     # Every rank's own times.  The stages above are rank 0's, and a rank that is done waits
     # at the next collective for the slowest one: so the times of a run are those of its
     # slowest card, and "+check" (the collective after an element pass) on a rank is how
     # far behind it the slowest rank was.
     rank_spread = None
     if args.rank_table:
+        # (the memory first: the probe's arrays are 1.5 GiB that JAX's allocator then keeps)
+        memory = card_memory()
         probe = card_probe()
         table = COMM.gather({"host": platform.node(),
                              "gpu": os.environ.get("ROCR_VISIBLE_DEVICES", os.environ.get("CUDA_VISIBLE_DEVICES", "")),
                              # (calls, seconds, and of those the seconds and bytes of the pool's
                              # requests to the driver)
                              "stages": {k: [v[0], v[1], v[4], v[5]] for k, v in stages.items()}, "probe": probe,
-                             "memory": card_memory()}, root=0)
+                             "memory": memory}, root=0)
         if RANK == 0:
             rank_spread = spread_summary(table)
             if args.out:
@@ -647,18 +698,6 @@ def main():
                     say("  over the ranks, %s: least %.4f s, median %.4f, largest %.4f (%+.1f %% of the median, on %s)"
                         % (k, v["min"], v["median"], v["max"], 100.0 * (v["max"] / v["median"] - 1.0) if v["median"] else 0.0,
                            v["host_of_max"]))
-    # the card at the end of the steps, on rank 0: what JAX's allocator holds (it gives nothing
-    # back, so its peak is what hypre never gets) and what everything on the card holds
-    jax_mem, card = None, None
-    try:
-        import jax
-
-        st = jax.devices()[0].memory_stats() or {}
-        jax_mem = {k: int(st[k]) for k in ("bytes_in_use", "peak_bytes_in_use", "bytes_reserved", "peak_bytes_reserved",
-                                           "bytes_limit", "pool_bytes", "peak_pool_bytes", "largest_alloc_size") if k in st}
-        card = hm.common.devicebridge.device_memory()
-    except Exception:                                            # noqa: BLE001
-        pass
     rec = {"host": platform.node(), "gpu": gpu_name(), "ranks": COMM.size, "n": N, "order": ORDER,
            "jax_memory": jax_mem, "card_used_total": list(card) if card else None, "stage_norms": stage_norms,
            "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(), "mfem_device": mfem_dev,
@@ -688,8 +727,12 @@ def main():
            # the geometric levels of the p-multigrid: the halvings the mesh was built by and
            # kept, and the rows of the linear elements on the coarser meshes in use
            "h_levels": str(args.h_levels), "pmg_h_rows": h_rows, "pmg_h_host": h_host, "pmg_h_timer": h_timer,
+           "pmg_h_gathered": h_gathered,
            "prior_h_rows": prior_h_rows,
            "single_blocks": bool(tdof_mod.SINGLE_BLOCKS),
+           # element passes that ran out of memory on a card and were tried again in smaller
+           # chunks, over all ranks: the rank keeps the smaller chunk and is slower from then on
+           "element_retries": int(COMM.allreduce(int(kernel_mod.RETRIES), op=MPI.SUM)),
            "pmg_h_host_setting": int(os.environ.get("HIPPYMFEM_PMG_H_HOST", "0") or 0),
            "prior_h_setting": int(os.environ.get("HIPPYMFEM_PRIOR_H", "0") or 0),
            # how the element Hessians were differentiated, and two choices of the Jacobian in
@@ -727,7 +770,10 @@ def main():
         from bench_scaling import profile_setup
 
         A = getattr(pde.solver_fwd_inc, "A", None) or getattr(pde.solver, "A", None)
-        if A is not None and getattr(pde.solver, "precond_type", None) == "amg":
+        if A is not None and not isinstance(A, mfem.HypreParMatrix):
+            # (the setups are of MFEM's BoomerAMG, which has no matrix of its own to take here)
+            say("  no profile of BoomerAMG: the Jacobian is in the single-precision hypre")
+        elif A is not None and getattr(pde.solver, "precond_type", None) == "amg":
             b = model.generate_vector(STATE)
             hm.parRandom.normal(1.0, b)
             rec["setup_profile"] = profile_setup(args.profile_setup, A, pde.solver._make_pc, b,

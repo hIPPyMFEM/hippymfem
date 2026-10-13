@@ -17,6 +17,7 @@ import jax.numpy as jnp
 
 import hippymfem as hm
 from hippymfem.common.linalg import operator_to_dense
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.algorithms.singlesolve import action_tolerance
 from hippymfem.fem.kernel import matrix_tolerance
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
@@ -32,6 +33,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def mesh2d(n=12):
@@ -585,6 +595,11 @@ def test_model_verify():
     sH = hm.best_slope(e, eH)
     check("gradient FD error is first order", 0.8 < sg < 1.3, "(slope %.3f)" % sg)
     check("Hessian FD error is first order", 0.8 < sH < 1.3, "(slope %.3f)" % sH)
+    # (a cost that is not a number at one step: the other steps' slope does not stand for it)
+    spoiled = eg.copy()
+    spoiled[eg.size // 2] = float("nan")
+    check("an error that is not a number at one step gives no slope",
+          math.isnan(hm.best_slope(e, spoiled)), "(slope %.3f)" % hm.best_slope(e, spoiled))
     return model, Vh, m0
 
 
@@ -725,7 +740,7 @@ def test_third_dir():
                             ref.axpy(w, work)
             diff = fused.copy()
             diff.axpy(-1.0, ref)
-            worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
+            worst = largest([worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300)])
         check("fused = pairwise, %s" % name, worst < 1e-12, "(rel %.1e)" % worst)
 
 
@@ -788,7 +803,7 @@ def test_apply_ij_at():
             got = pde.apply_ij_at(i, j, x, d, Vh[i].vector())
             diff = got.copy()
             diff.axpy(-1.0, ref)
-            worst = max(worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300))
+            worst = largest([worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300)])
         check("matrix-free = assembled, %s" % name, worst < mtol, "(rel %.1e)" % worst)
         # a linearization point with every block, or the parameter's, left to the
         # kernels gives the same products through apply_ij
@@ -805,7 +820,7 @@ def test_apply_ij_at():
                     diff = got.copy()
                     diff.axpy(-1.0, ref[ij])
                     scale = ref[ij].norm("l2")
-                    worst = max(worst, diff.norm("l2") / scale if scale > 0 else got.norm("l2"))
+                    worst = largest([worst, diff.norm("l2") / scale if scale > 0 else got.norm("l2")])
                 check("matrix-free point (%s%s) = assembled, %s"
                       % ("all" if mode is True else "parameter", ", Gauss-Newton" if gn else "",
                          name), worst < mtol, "(rel %.1e)" % worst)
@@ -836,6 +851,157 @@ def test_apply_ij_at():
     gb = other.kernel.group_kernels[0].mapped()[1]
     shared = ga is not None and gb is not None and all(a is b for a, b in zip(ga, gb))
     check("kernels on one mesh share its device geometry", shared)
+
+
+def test_require_finite():
+    """``require_finite`` finds an entry that is not a number, and an infinite one, on
+    one rank of a vector, and takes a large finite one for what it is: in a vector that
+    numpy holds and in one that MFEM holds, which on a GPU is reduced there.  (MFEM's
+    Euclidean norm leaves an entry that is not a number out, and the square of 1e200 is
+    not a number of double precision.)"""
+    from hippymfem.modeling.PDEVariationalProblem import require_finite
+
+    if RANK == 0:
+        print("PDE: the finite check of a vector")
+    V = hm.FunctionSpace.H1(mesh2d(6), 1)
+    wrong = []
+    for holder in ("numpy", "MFEM"):
+        for bad in (float("nan"), float("inf"), -float("inf"), 1e200):
+            v = V.vector()
+            v.set(1.0)
+            if RANK == 0:
+                v.array[v.local_size // 2] = bad
+            if holder == "MFEM":
+                v.hypre                 # handed to MFEM, which reduces it where it is
+                v._dev = True           # (and on the host as well)
+            try:
+                require_finite(v, "the vector")
+                raised = False
+            except RuntimeError:
+                raised = True
+            if COMM.allgather(raised) != [not math.isfinite(bad)] * NP:
+                wrong.append("%r with %s" % (bad, holder))
+    check("an entry that is not finite raises on every rank, and a finite one on none",
+          not wrong, "(wrong: %s)" % ", ".join(wrong) if wrong else "")
+
+
+def test_same_vectors():
+    """``_same``, which decides whether a point has moved, makes its one reduction on a
+    rank whose two vectors have different sizes as on a rank whose sizes agree.  It
+    returned there without it: with sizes that differ on some ranks only (a vector of
+    another space, beside a rank that owns no dof of either), the ranks whose sizes agree
+    waited in the reduction for the others.
+
+    The reductions are counted with every rank on one side and then with every rank on
+    the other, where nothing can wait.  Only where the counts agree are the ranks put on
+    different sides, the last with a vector one entry longer."""
+    import sys
+
+    import hippymfem.common.parvector as pv
+    from hippymfem.modeling.PDEVariationalProblem import _same
+
+    if RANK == 0:
+        print("PDE: whether two vectors are the same, on ranks whose sizes differ")
+    pvp = sys.modules[_same.__module__]
+    made, real = [], pv.allreduce
+
+    def counted(comm, value, op=MPI.SUM):
+        made.append(op)
+        return real(comm, value, op)
+
+    def answer(longer):
+        """What every rank says of a vector and one that is an entry longer on the ranks
+        ``longer``, and the reductions this rank made for it."""
+        a = hm.ParVector(COMM, 3)
+        b = hm.ParVector(COMM, 4 if RANK in longer else 3)
+        a.set(1.0)
+        b.set(1.0)
+        del made[:]
+        return COMM.allgather(_same(a, b)), len(made)
+
+    pv.allreduce = pvp._reduce = counted
+    try:
+        equal, n_equal = answer(())
+        other, n_other = answer(range(NP))
+        counts = COMM.allgather((n_equal, n_other))
+        one = all(c == (1, 1) for c in counts)
+        check("two vectors of one size and two of different sizes are compared in one "
+              "reduction each", one and all(equal) and not any(other),
+              "(%d and %d reductions%s)"
+              % (n_equal, n_other, "" if one or NP == 1 else "; sizes that differ on some "
+                 "ranks only are not tried, the others would wait for them"))
+        if NP == 1:
+            check("one rank has one size at a time (sizes that differ on some ranks only: "
+                  "skipped)", True)
+        elif one:
+            mixed, _n = answer((NP - 1,))
+            check("sizes that differ on the last rank alone: no rank takes the vectors for "
+                  "the same", not any(mixed), "(%d of %d ranks say the same)" % (sum(mixed), NP))
+    finally:
+        pv.allreduce = pvp._reduce = real
+
+
+def test_pmg_levels_for_components():
+    """A p-multigrid asked for levels of coarser meshes (``pmg_h``) under a state of two
+    components, for which there is no interpolation between meshes: the forward solve
+    keeps BoomerAMG on the linear elements, with a warning, and gives the state of double
+    precision.  (It raised, and left half a transfer behind, with which the next call
+    went on without a word.)  Skipped when no single-precision hypre is named."""
+    import warnings
+
+    from hippymfem.algorithms import singlesolve as ss
+    from hippymfem.fem import ptransfer
+
+    lib = ss.library()
+    if lib is None or lib.no_pmg:
+        if RANK == 0:
+            print("PDE: a p-multigrid's coarser meshes under a state of components "
+                  "(skipped: no single-precision hypre with a p-multigrid)")
+        return
+    if RANK == 0:
+        print("PDE: a p-multigrid's coarser meshes under a state of components")
+    coarse = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(6, 6, mfem.Element.QUADRILATERAL))
+    pmesh = mfem.ParMesh.MakeRefined(coarse, 2, mfem.BasisType.ClosedUniform)
+    ptransfer.set_coarser_meshes(pmesh, [coarse])
+    Vu, Vm = hm.FunctionSpace.H1(pmesh, 2, vdim=2), hm.FunctionSpace.H1(pmesh, 1)
+    bc = hm.DirichletBC(Vu, None, "all")
+    m = Vm.project(lambda x: 0.3 * np.sin(3.0 * x[0]))
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * hm.inner(u.grad, p.grad) - p.val[0] - 2.0 * p.val[1]
+
+    states, said, levels = {}, "", None
+    for single in (False, True):
+        pde = hm.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                       is_fwd_linear=True, symmetric_jacobian=True)
+        pde.single_solves = single
+        for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            s = hm.KrylovSolver(COMM, "cg", "amg")
+            s.parameters["rel_tolerance"] = 1e-12
+            s.parameters["pmg"], s.parameters["pmg_h"] = 1, 1
+            setattr(pde, a, s)
+        u = pde.generate_state()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                pde.solveFwd(u, [u, m, None])
+                states[single] = u
+            except NotImplementedError as e:
+                said = str(e)
+        if single:
+            T = pde._ptransfer
+            levels = None if not T else getattr(T, "h", None)
+            warned = COMM.allreduce(sum("pmg_h" in str(w.message) for w in caught), op=MPI.SUM)
+    if len(states) < 2:
+        check("the forward solve of a state of two components keeps BoomerAMG under the "
+              "linear elements", False, "(%s)" % said)
+        return
+    e = states[True].copy().axpy(-1.0, states[False]).norm("l2") / states[False].norm("l2")
+    check("the forward solve of a state of two components keeps BoomerAMG under the "
+          "linear elements, and says so once",
+          levels == [] and warned == 1 and e < 1e-9,
+          "(%s geometric levels, %d warnings, the state against double precision %.1e)"
+          % ("no" if levels == [] else levels, warned, e))
 
 
 def test_hessian_properties():
@@ -893,7 +1059,8 @@ def test_hessian_properties():
         Hv = Vm.vector()
         Hm.mult(v, Hv)
         q = Hv.inner(v)
-        worst = q if worst is None else min(worst, q)
+        # (the smallest, and NaN where one of them is NaN)
+        worst = q if worst is None else -largest([-worst, -q])
     check("full Hessian positive definite at the MAP point", worst > 0,
           "(smallest of 8 random quadratic forms: %.6e)" % worst)
 
@@ -930,9 +1097,9 @@ def test_lumped_mass_prior():
         hm.parRandom.set_seed(3)
         hm.parRandom.normal(1.0, x)
         lump.M.Mult(x.hypre, y.hypre)
-        rows = COMM.allreduce(float(np.abs(a.array - d).max()) if d.size else 0.0, op=MPI.MAX)
-        diag = COMM.allreduce(float(np.abs(y.array - d * x.array).max()) if d.size else 0.0, op=MPI.MAX)
-        scale = COMM.allreduce(float(np.abs(d).max()) if d.size else 0.0, op=MPI.MAX)
+        rows = allreduce_extreme(COMM, float(np.abs(a.array - d).max()) if d.size else 0.0, MPI.MAX)
+        diag = allreduce_extreme(COMM, float(np.abs(y.array - d * x.array).max()) if d.size else 0.0, MPI.MAX)
+        scale = allreduce_extreme(COMM, float(np.abs(d).max()) if d.size else 0.0, MPI.MAX)
         check("%s: the lumped mass is diagonal, the sums of the consistent one's rows" % kind,
               rows < 1e-13 * scale and diag < 1e-13 * scale * max(x.norm("linf"), 1.0),
               "(%.1e and %.1e of the largest entry)" % (rows / scale, diag / scale))
@@ -965,6 +1132,63 @@ def test_lumped_mass_prior():
     except ValueError as err:
         refused = str(err)
     check("a parameter space of second order is refused", "first order" in refused, "(%s)" % refused[:60])
+    # Elements that are no parallelograms or parallelepipeds: |det J| is another at every
+    # vertex of an element, and the square root has to weigh each vertex as the mass matrix
+    # does (MFEM's batched geometry has the vertices of a square and of a cube in the order
+    # of a tensor grid, which is not the order of the rule).
+    for kind, serial in (
+            ("quadrilaterals", mfem.Mesh.MakeCartesian2D(max(8, NP), 6, mfem.Element.QUADRILATERAL)),
+            ("hexahedra", mfem.Mesh.MakeCartesian3D(6, 5, 4, mfem.Element.HEXAHEDRON, 1.0, 1.3, 0.7))):
+        dim = serial.Dimension()
+        other = [(d + 1) % dim for d in range(dim)]
+        for v in serial.GetVertexArray():                # every rank moves the same vertices
+            v[:dim] = v[:dim] + 0.05 * np.sin(3.0 * v[:dim] + 2.0 * v[other])
+        Vm = hm.FunctionSpace.H1(mfem.ParMesh(COMM, serial), 1)
+        lump = hm.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True, lumped_mass=True)
+        x, y, z = Vm.vector(), Vm.vector(), Vm.vector()
+        hm.parRandom.set_seed(3)
+        hm.parRandom.normal(1.0, x)
+        noise = lump.noise_vector()
+        lump.sqrtM.multTranspose(x, noise)
+        lump.sqrtM.mult(noise, y)
+        lump.M.Mult(x.hypre, z.hypre)
+        e = y.copy().axpy(-1.0, z).norm("l2") / max(z.norm("l2"), 1e-300)
+        check("distorted %s: sqrtM sqrtM^T is the lumped mass matrix" % kind, e < 1e-12, "(%.1e)" % e)
+    if NP == 1:
+        check("two kinds of element, one a rank, are refused (skipped: one rank holds both)", True)
+    else:
+        # A mesh of two kinds of element none of whose ranks holds both: the mixed mesh of
+        # the kernel tests, its triangles on the first ranks and its quadrilaterals on the
+        # others.  (The geometry in slices: MFEM's batched call takes no mesh that is mixed
+        # on the whole.)
+        from hippymfem.fem import elementbatch as eb
+        from .mixed_mesh import write_mixed_mesh
+
+        n = max(8, 4 * NP)
+        path = "/tmp/_hippymfem_mixed_n%d.mesh" % n
+        if RANK == 0:
+            write_mixed_mesh(path, n)
+        COMM.Barrier()
+        serial = mfem.Mesh(path, 1, 1)
+        kinds = np.array([serial.GetElementGeometry(e) for e in range(serial.GetNE())])
+        part = np.zeros(kinds.size, dtype=int)
+        for ranks, kind in ((range(NP // 2), mfem.Geometry.TRIANGLE),
+                            (range(NP // 2, NP), mfem.Geometry.SQUARE)):
+            for r, elems in zip(ranks, np.array_split(np.flatnonzero(kinds == kind), len(ranks))):
+                part[elems] = r
+        part = mfem.intArray([int(r) for r in part])
+        Vm = hm.FunctionSpace.H1(mfem.ParMesh(COMM, serial, part.GetData()), 1)
+        local = COMM.allreduce(int(Vm.mesh.GetNumGeometries(2)), op=MPI.MAX)
+        refused, sliced = "", eb.GEOMETRY_SLICE
+        eb.GEOMETRY_SLICE = 64
+        try:
+            hm.BiLaplacianPrior(Vm, 0.1, 0.5, lumped_mass=True)
+        except ValueError as err:
+            refused = str(err)
+        finally:
+            eb.GEOMETRY_SLICE = sliced
+        check("two kinds of element, one a rank, are refused", local == 1 and "2 kinds" in refused,
+              "(%d a rank; %s)" % (local, refused[-40:]))
 
 
 def test_mixed_precision():
@@ -1043,13 +1267,13 @@ def test_mixed_precision():
 
     def worst(f):
         v = [f(*Ks) for Ks in zip(*[sums[k] for k in ("fp64", "plain", "mixed", "two-sided")])]
-        return COMM.allreduce(max(v) if v else 0.0, op=MPI.MAX)
+        return allreduce_extreme(COMM, largest(v) if v else 0.0, MPI.MAX)
 
-    scale = COMM.allreduce(max([np.abs(K).sum(axis=2).max() for K in sums["fp64"]] or [0.0]), op=MPI.MAX)
+    scale = allreduce_extreme(COMM, largest([np.abs(K).sum(axis=2).max() for K in sums["fp64"]] or [0.0]), MPI.MAX)
     plain = worst(lambda K64, Kp, Ks, Kt: np.abs(Kp.sum(axis=2) - K64.sum(axis=2)).max()) / scale
     fixed = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks.sum(axis=2) - K64.sum(axis=2)).max()) / scale
-    both = worst(lambda K64, Kp, Ks, Kt: max(np.abs(Kt.sum(axis=2) - K64.sum(axis=2)).max(),
-                                             np.abs(Kt.sum(axis=1) - K64.sum(axis=1)).max())) / scale
+    both = worst(lambda K64, Kp, Ks, Kt: largest([np.abs(Kt.sum(axis=2) - K64.sum(axis=2)).max(),
+                                                  np.abs(Kt.sum(axis=1) - K64.sum(axis=1)).max()])) / scale
     asym = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks - np.swapaxes(Ks, 1, 2)).max()) / scale
     entry = worst(lambda K64, Kp, Ks, Kt: np.abs(Ks - K64).max()) / scale
     check("single-precision element matrices: the row sums are off", plain > 1e-9, "(%.1e)" % plain)
@@ -1060,12 +1284,12 @@ def test_mixed_precision():
 
     def qworst(f, *keys):
         v = [f(*Ks) for Ks in zip(*[quad[k] for k in keys])]
-        return COMM.allreduce(max(v) if v else 0.0, op=MPI.MAX)
+        return allreduce_extreme(COMM, largest(v) if v else 0.0, MPI.MAX)
 
-    qscale = COMM.allreduce(max([np.abs(K).sum(axis=2).max() for K in quad["fp64"]] or [0.0]), op=MPI.MAX)
-    qsum = max(qworst(lambda K64, K: max(np.abs(K.sum(axis=2) - K64.sum(axis=2)).max(),
-                                         np.abs(K.sum(axis=1) - K64.sum(axis=1)).max()),
-                      "fp64", c) for c in ("symmetric", "two-sided")) / qscale
+    qscale = allreduce_extreme(COMM, largest([np.abs(K).sum(axis=2).max() for K in quad["fp64"]] or [0.0]), MPI.MAX)
+    qsum = largest(qworst(lambda K64, K: largest([np.abs(K.sum(axis=2) - K64.sum(axis=2)).max(),
+                                                  np.abs(K.sum(axis=1) - K64.sum(axis=1)).max()]),
+                          "fp64", c) for c in ("symmetric", "two-sided")) / qscale
     qasym = qworst(lambda K: np.abs(K - np.swapaxes(K, 1, 2)).max(), "symmetric") / qscale
     qentry = qworst(lambda K64, K: np.abs(K - K64).max(), "fp64", "symmetric") / qscale
     check("quadrature route, consistent: row and column sums are the double-precision ones",
@@ -1095,6 +1319,9 @@ if __name__ == "__main__":
     test_model_verify_nonlinear_inhomogeneous_bc()
     test_third_dir()
     test_apply_ij_at()
+    test_require_finite()
+    test_same_vectors()
+    test_pmg_levels_for_components()
     test_hessian_properties()
     test_lumped_mass_prior()
     test_mixed_precision()

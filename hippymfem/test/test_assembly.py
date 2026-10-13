@@ -42,6 +42,7 @@ from hippymfem.fem import kernel as kernel_mod
 from hippymfem.fem.kernel import QuadratureKernel
 from hippymfem.fem.spaces import FunctionSpace
 from hippymfem.common.linalg import _local_diag, hypre_to_scipy, to_dense
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
 COMM = MPI.COMM_WORLD
@@ -55,6 +56,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def rss_kb():
@@ -570,8 +580,8 @@ def test_shared_hessian_pass():
         for (i, j) in pairs:
             one = K.element_matrices(i, j, loc)
             for a, c in zip(one, many[(i, j)]):
-                worst = max(worst, float(np.abs(np.asarray(a)
-                                                - np.asarray(c)).max()))
+                worst = largest([worst, float(np.abs(np.asarray(a)
+                                                     - np.asarray(c)).max())])
         check("shared pass == per-block (%s order %d)" % (kind, order),
               worst == 0.0, "(%.3e)" % worst)
 
@@ -604,7 +614,7 @@ def test_column_restricted_pass():
             worst = 0.0
             for ij in pairs:
                 for a, c in zip(sub[ij], ref[ij]):
-                    worst = max(worst, float(np.abs(np.asarray(a) - np.asarray(c)).max()))
+                    worst = largest([worst, float(np.abs(np.asarray(a) - np.asarray(c)).max())])
             cols = sorted({j for _, j in pairs})
             check("columns %s == full pass (%s order %d)" % (cols, kind, order),
                   worst == 0.0, "(%.3e)" % worst)
@@ -788,10 +798,15 @@ def test_fused_scatter():
     in a different order, so it agrees to round-off rather than exactly.  It is
     used *only* where the batch is split, which has already given up exact
     agreement with an unsplit run, so it costs no further exactness.
+
+    "mixed" has two element groups whose elements interleave in the mesh, so its
+    pattern keeps the entries in mesh-element order and a chunk, some elements of
+    one group, is not a slice of them: scattered through such a slice, every chunk
+    lands in the slots of other elements, in a matrix with the right graph.
     """
     if RANK == 0:
         print("fused chunk scatter")
-    for kind, order in (("quad", 2), ("tri", 1), ("hex", 2)):
+    for kind, order in (("quad", 2), ("tri", 1), ("hex", 2), ("mixed", 2)):
         pm, Vh, b, K = build(kind, 5 if kind != "hex" else 3, order)
         loc = locals_at(Vh)
         bc = hp.DirichletBC(Vh[0], None, "all")
@@ -816,6 +831,349 @@ def test_fused_scatter():
               not K.will_chunk(), "(will_chunk=%s)" % K.will_chunk())
 
 
+def test_split_and_whole_ranks():
+    """A block on ranks whose element batch is split beside ranks whose batch runs whole.
+
+    Whether a batch is split is each rank's own answer: its element count against a
+    chunk that is pinned, planned from that rank's free memory or remembered from a retry
+    on that rank alone.  Ranks of the two kinds must therefore make the same collectives
+    in the same order.  They did not: the finite check of a whole batch was reduced
+    before the assembly and that of a split one after it, and each kind waited for the
+    other, in that reduction and in the collectives of the assembly.
+
+    The order is recorded with every rank on one side and then with every rank on the
+    other, where nothing can wait.  Only where it is one order are the ranks put on
+    different sides: the chunk is the element count of the smallest rank, on a mesh whose
+    element count is no multiple of the rank count, so that no partition gives every rank
+    that many.  The blocks must then be those of whole batches to round-off, and a block
+    that is not finite on one rank must raise on all of them.  A single rank is on one
+    side at a time, and the order is what it checks.  Where a single-precision hypre is
+    named the Jacobian is assembled into it as well, to that precision.
+    """
+    import contextlib
+    import sys
+
+    from hippymfem.algorithms import singlesolve
+    from hippymfem.fem.tdofassemble import single_target
+
+    if RANK == 0:
+        print("ranks with a split element batch beside ranks with a whole one")
+    n = max(9, 2 * NP)
+    while NP > 1 and (n * n) % NP == 0:
+        n += 1
+    pm = make_mesh("quad", n)
+    counts = COMM.allgather(pm.GetNE())
+    lo, hi = min(counts), max(counts)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    bc = hp.DirichletBC(Vu, None, "all")
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * jnp.dot(u.grad, p.grad) + u.val * u.val * m.val * p.val
+
+    pde = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous())
+    ess = pde.bc0.ess_tdof
+    hp.parRandom.set_seed(7)
+    x = [Vu.vector(), Vm.vector(), Vu.vector()]
+    probes = [Vu.vector(), Vm.vector()]
+    for v in x + probes:
+        hp.parRandom.normal(1.0, v)
+    # A and C applied to a vector each, and A of the single-precision hypre where one is
+    # named: the trial variable, the vector, where the matrix is made, what it may differ by
+    tol = kernel_mod.matrix_tolerance(1e-13)
+    cases = [(STATE, probes[0], contextlib.nullcontext, tol),
+             (PARAMETER, probes[1], contextlib.nullcontext, tol)]
+    if singlesolve.library() is not None:
+        cases.append((STATE, probes[0], single_target, max(tol, 1e-5)))
+    # a parameter whose exponential overflows in the one element at the origin: the
+    # block is not finite on the rank that holds it, and finite on every other
+    X = Vm.coordinates()
+    corner = Vm.vector()
+    corner.array[(X[:, 0] < 0.5 / n) & (X[:, 1] < 0.5 / n)] = 1.0e4
+
+    # the module's reductions and its assemblies, in the order this rank makes them
+    pvp = sys.modules[type(pde).__module__]
+    order, real = [], (pvp._reduce, pvp.assemble_matrix)
+
+    def reduction(*args, **kwargs):
+        order.append("reduction")
+        return real[0](*args, **kwargs)
+
+    def assembly(*args, **kwargs):
+        order.append("assembly")
+        return real[1](*args, **kwargs)
+
+    def pin(chunk):
+        kernel_mod.ELEMENT_CHUNK = chunk
+        for gk in pde.kernel.group_kernels:
+            gk._chunk.clear()          # a remembered plan wins over ELEMENT_CHUNK
+        return bool(pde.kernel.will_chunk())
+
+    def blocks(chunk):
+        """The products of the cases with the chunk pinned at ``chunk`` elements, this
+        rank's order of reductions and assemblies, and whether its batch was split."""
+        split = pin(chunk)
+        del order[:]
+        out = []
+        for j, v, target, _tol in cases:
+            with target():
+                A = pde._block(ADJOINT, j, x, test_ess=ess)
+            y = Vu.vector()
+            A.Mult(v.hypre, y.hypre)
+            out.append(y)
+            del A
+        return out, list(order), split
+
+    def refused(chunk):
+        """Whether the block that is not finite raised, rank by rank."""
+        pin(chunk)
+        said = ""
+        try:
+            pde._block(ADJOINT, STATE, [x[0], corner, x[2]], test_ess=ess)
+        except RuntimeError as e:
+            said = str(e)
+        return COMM.allgather("non-finite" in said)
+
+    def apart(got, ref):
+        # the products' differences over what each may be (a sum, in which a
+        # difference that is not a number stays one)
+        return sum(a.copy().axpy(-1.0, b).norm("l2") / max(b.norm("l2"), 1e-300) / case[3]
+                   for a, b, case in zip(got, ref, cases))
+
+    half = max(1, lo // 2)
+    old = kernel_mod.ELEMENT_CHUNK
+    pvp._reduce, pvp.assemble_matrix = reduction, assembly
+    try:
+        whole, order_whole, s0 = blocks(hi)         # no rank holds more than the chunk
+        split, order_split, s1 = blocks(half)       # every rank holds more
+        sides = COMM.allgather((s0, s1))
+        same = (all(COMM.allgather(order_whole == order_split))
+                and "reduction" in order_whole and "assembly" in order_whole
+                and all(s == (False, True) for s in sides))
+        check("a whole batch and a split one make their reductions and assemblies in one order",
+              same, "(whole: %s; split: %s%s)"
+              % (", ".join(order_whole), ", ".join(order_split),
+                 "" if same or NP == 1 else "; ranks on different sides are not tried, "
+                 "they would wait for each other"))
+        d = apart(split, whole)
+        check("every batch split gives the blocks of whole batches, to round-off",
+              d <= 1.0, "(%.1e of the tolerance; %d products)" % (d, len(cases)))
+        raised = refused(hi) + refused(half)
+        check("a block that is not finite on one rank raises on every rank, whole or split",
+              all(raised), "(%d of %d)" % (sum(raised), len(raised)))
+        if NP == 1:
+            check("one rank is on one side at a time (ranks on different sides: skipped)", True)
+        elif same:
+            mixed, _order, s2 = blocks(lo)          # the smallest ranks hold no more
+            sides = COMM.allgather(s2)
+            d = apart(mixed, whole)
+            check("ranks on different sides give the blocks of whole batches, to round-off",
+                  any(sides) and not all(sides) and d <= 1.0,
+                  "(%d of %d ranks split, with %d to %d elements a rank; %.1e of the "
+                  "tolerance)" % (sum(sides), NP, lo, hi, d))
+            raised = refused(lo)
+            check("and a block that is not finite on one rank raises on every rank",
+                  all(raised), "(%d of %d)" % (sum(raised), len(raised)))
+    finally:
+        kernel_mod.ELEMENT_CHUNK = old
+        pvp._reduce, pvp.assemble_matrix = real
+        for gk in pde.kernel.group_kernels:
+            gk._chunk.clear()
+
+
+def test_auto_route_from_a_run():
+    """``HIPPYMFEM_HESSIAN=auto`` keeps the route that ran faster, not one that was traced.
+
+    A chunk loop that streams geometry reads a kernel's program before the kernel's
+    first call, to copy only the arrays that the kernel reads (``kernel._used_mapped``).
+    That is a trace: nothing runs in it, so nothing can be timed, and it has to leave the
+    choice to the first call on arrays.  It timed the two routes on tracers instead and
+    kept the winner for the run.
+    """
+    if RANK == 0:
+        print("the route of auto is timed on arrays, not in a trace")
+    pm, Vh, b, K = build("hex", 3, 2)
+    loc = locals_at(Vh)
+    old = kernel_mod.HESSIAN_MODE
+    keys, left, taken = [], True, True
+    try:
+        kernel_mod.set_hessian_mode("auto")
+        for gk in K.group_kernels:
+            ne = int(gk.group.ne)
+            fn = gk._block_fn(ADJOINT, STATE)
+            dofs, pr = gk.gather(loc), kernel_mod._params(())
+            args = (dofs,) + tuple(gk.mapped(streaming=True)) + (pr,)
+            key = gk._route_key(STATE) + (kernel_mod.device(),)
+            keys.append(key)
+            kernel_mod._ROUTES.pop(key, None)
+            # what a chunk loop does ahead of its first chunk (kernel._chunk_slices)
+            kernel_mod._used_mapped(fn._raw, args, gk._axes(), max(1, ne // 2))
+            left = left and key not in kernel_mod._ROUTES and not gk.hessian_route
+            for _chunk in gk.in_chunks(fn, dofs, gk.mapped(streaming=True), pr):
+                pass
+            taken = taken and (not ne or kernel_mod._ROUTES.get(key) in (0, 1))
+    finally:
+        kernel_mod.set_hessian_mode(old)
+        for key in keys:
+            kernel_mod._ROUTES.pop(key, None)
+    left = COMM.allreduce(bool(left), op=MPI.LAND)
+    taken = COMM.allreduce(bool(taken), op=MPI.LAND)
+    check("a trace of the kernel leaves the choice of the route open", left)
+    check("and the first pass over arrays makes it", taken)
+
+
+def test_chunk_of_the_slot_pass():
+    """Whether a block's batch is handed over whole or in chunks is asked at the weight
+    of the pass that computes it, and an out-of-memory retry is counted.
+
+    A slot pass plans its chunk by its share of the tangents: 1.3 times the working set
+    of weight 1 for the columns of a quadratic state beside a linear parameter.  The
+    question was asked at weight 1, so a batch that fits at 1 and not at 1.3 was handed
+    over whole, and its pass then split it and joined the chunks: the array that the
+    chunk thunk is there to avoid.  The budget here puts the batch between the two.
+    """
+    import warnings
+
+    import jax
+
+    if RANK == 0:
+        print("the chunk of a slot pass")
+    n = 8
+    while n ** 3 < 512 * NP:
+        n += 1                              # (a plan is never under 256 elements a rank)
+    pm, Vh, b, K = build("hex", n, 2)
+    loc = locals_at(Vh)
+    gk, d = K.group_kernels[0], kernel_mod.device()
+    ne = int(gk.group.ne)
+    weight = gk._slot_weight(STATE)
+    saved, retries = kernel_mod._free_budget, getattr(kernel_mod, "RETRIES", None)
+
+    def forget():
+        for g in K.group_kernels:
+            g._chunk.clear()
+
+    def route(j):
+        """What a block with the columns of slot ``j`` is handed over as, and the chunks
+        that its pass planned for the glued route and for the streamed one."""
+        forget()
+        mats = K.element_matrices_or_chunks(ADJOINT, j, loc)
+        if callable(mats):
+            for _chunk in mats():
+                pass
+        plans = {k[3]: v for k, v in gk._chunk.items() if len(k) == 4 and k[1] == "plan"}
+        return callable(mats), plans.get(True), plans.get(False)
+
+    try:
+        kernel_mod._free_budget = lambda dev: 2 ** 50
+        gk._plan(ne, d, 1, announce=False, remember=False)
+        per = gk._last_estimate             # (the planner's bytes an element at weight 1)
+        # a plan of 1.15 times the batch at weight 1 is 0.88 times the batch at 1.3
+        kernel_mod._free_budget = lambda dev: int(1.15 * ne * per / 0.33)
+        between = (gk._plan(ne, d, 1, announce=False, remember=False) == ne
+                   > gk._plan(ne, d, weight, announce=False, remember=False))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # (a split batch says so)
+            state, param = route(STATE), route(PARAMETER)
+        ok = (ne == 0 or (weight > 1.2 and between and state[0] and state[1] is None
+                          and state[2] is not None and state[2] < ne and param == (False, ne, None)))
+
+        def words(handed, glued, streamed):
+            ran = ("streamed in chunks of %d" % streamed if streamed is not None
+                   else "joined from chunks of %d" % glued if glued is not None and glued < ne
+                   else "in one piece")
+            return "%s, the pass %s" % ("a chunk thunk" if handed else "arrays", ran)
+
+        check("a batch that fits at weight 1 and not at the weight of its slot pass is handed "
+              "over in chunks, and one whose pass has weight 1 whole",
+              bool(COMM.allreduce(bool(ok), op=MPI.LAND)),
+              "(%d elements; the state's columns, weight %.2f: %s; the parameter's, weight 1: %s)"
+              % (ne, weight, words(*state), words(*param)))
+
+        # a streamed chunk over 40 elements does not fit: every retry is counted, for a
+        # benchmark's record, and its chunk stays with the pass
+        real = gk.grad_block(ADJOINT)._raw
+
+        def small_only(*a):
+            lead = jax.tree_util.tree_leaves(a)[0]
+            if not isinstance(lead, jax.core.Tracer) and lead.shape[0] > 40:
+                raise RuntimeError("RESOURCE_EXHAUSTED: Out of memory while trying to "
+                                   "allocate 4096 bytes.")
+            return real(*a)
+
+        def streamed():
+            pass
+        streamed._raw, streamed._weight = small_only, 1
+        forget()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            spans = [(lo, hi) for lo, hi, _ in gk.in_chunks(
+                streamed, gk.gather(loc), gk.mapped(streaming=True), kernel_mod._params(()))]
+        tried = getattr(kernel_mod, "RETRIES", None)
+        kept = gk._chunk.get((d, 1))
+        ok = (ne == 0 or (retries is not None and tried > retries and kept is not None
+                          and kept <= 40 and max(hi - lo for lo, hi in spans) == kept))
+        check("an out-of-memory retry of an element pass is counted, and the pass keeps its chunk",
+              bool(COMM.allreduce(bool(ok), op=MPI.LAND)),
+              "(%s retries on rank 0, down to chunks of %s)"
+              % ("no count of the" if retries is None else tried - retries, kept))
+    finally:
+        kernel_mod._free_budget = saved
+        forget()
+
+
+def test_interpolation_not_a_number():
+    """A weight that is not a number in the interpolation between two meshes stays in it,
+    and the row sums say so on every rank.
+
+    MFEM gives that interpolation with an element's whole row, most of it zeros, which
+    are left out.  A weight that is not a number went with them: its row kept a hole, the
+    row sums were off by the size of the weight and not by something that is not a
+    number, and the solver was given the interpolation.  And the largest of the ranks'
+    figures was taken with MPI's MAX, which keeps a rank's NaN or loses it by the order
+    the values meet in: the weight is spoiled on the first rank and then on the last.
+    """
+    import math
+
+    from hippymfem.fem import ptransfer
+
+    if RANK == 0:
+        print("a weight that is not a number in the interpolation between two meshes")
+    below = make_mesh("quad", max(6, 2 * NP))
+    above = mfem.ParMesh.MakeRefined(below, 2, mfem.BasisType.ClosedUniform)
+    Vc, Vf = FunctionSpace.H1(below, 1), FunctionSpace.H1(above, 1)
+    clean = ptransfer.refinement(Vf, Vc)
+    real, where = mfem.Opr2SparseMat, [None]
+
+    def spoiled(op):
+        sp = real(op)
+        if RANK == where[0]:
+            data = sp.GetDataArray()                # (a view of MFEM's values)
+            data[np.flatnonzero(np.abs(data - 0.5) < 1e-12)[0]] = np.nan
+        return sp
+
+    seen = []
+    mfem.Opr2SparseMat = spoiled
+    try:
+        for rank in sorted({0, NP - 1}):
+            where[0] = rank
+            T = ptransfer.refinement(Vf, Vc)
+            kept = COMM.allreduce(int(np.isnan(T.values).sum()), op=MPI.SUM)
+            said = COMM.allgather(math.isnan(T.row_sum_error))
+            seen.append((rank, kept, T.global_nnz, sum(said), T.row_sum_error))
+    finally:
+        mfem.Opr2SparseMat = real
+    # (the weight is in the matrix where its row is the spoiled rank's own, and in the row
+    # sums of that rank either way)
+    check("a weight that is not a number is not left out of the interpolation, and the row "
+          "sums are not a number on every rank",
+          clean.row_sum_error < 1e-12
+          and all(nnz == clean.global_nnz and said == NP for _rank, _kept, nnz, said, _off in seen)
+          and (NP > 1 or seen[0][1] == 1),
+          "(%s; %d entries as MFEM gives it)"
+          % ("; ".join("spoiled on rank %d: %d entries, %d of them not a number, row sums off by "
+                       "%r on %d of %d ranks" % (rank, nnz, kept, off, said, NP)
+                       for rank, kept, nnz, said, off in seen), clean.global_nnz))
+
+
 def test_compact_scatter_map():
     """The compact scatter map gives the fused route the slots of the full one.
 
@@ -837,7 +1195,8 @@ def test_compact_scatter_map():
 
     pat._fused_add_coded = counting
     try:
-        for kind, order in (("quad", 2), ("tri", 1), ("hex", 2)):
+        # ("mixed": both maps are made from the slots in the order of the element arrays)
+        for kind, order in (("quad", 2), ("tri", 1), ("hex", 2), ("mixed", 2)):
             pm, Vh, b, K = build(kind, 5 if kind != "hex" else 3, order)
             loc = locals_at(Vh)
             bc = hp.DirichletBC(Vh[0], None, "all")
@@ -947,7 +1306,7 @@ def test_release_linearization_on_move():
     for name in ("A", "C", "Wum", "Wmm"):
         a = to_dense(getattr(keep, name), COMM)
         b = to_dense(getattr(rel, name), COMM)
-        worst = max(worst, float(np.abs(a - b).max()))
+        worst = largest([worst, float(np.abs(a - b).max())])
     check("the next point's blocks are identical", worst == 0.0, "(%.3e)" % worst)
 
 
@@ -987,7 +1346,7 @@ def test_triple_product():
         else:
             ours = csr._triple(Aloc, P, Pr, (test.fes, trial.fes))
             ref = take_ownership(mfem.RAP(P, Aloc, Pr))
-        worst = max(worst, float(np.abs(to_dense(ours, COMM) - to_dense(ref, COMM)).max()))
+        worst = largest([worst, float(np.abs(to_dense(ours, COMM) - to_dense(ref, COMM)).max())])
         same_nnz = same_nnz and (COMM.allreduce(int(hypre_to_scipy(ours).nnz))
                                  == COMM.allreduce(int(hypre_to_scipy(ref).nnz)))
         del ours, ref, Aloc
@@ -1074,7 +1433,7 @@ def test_parmat_routes():
         (da, ia), (dc, ic) = both_parmat(repeat)
         check("%s %s: pattern indices survive the copying constructor" % (kind, order), ia)
         check("%s %s: pattern indices survive the aliasing constructor" % (kind, order), ic)
-        worst = max(float(np.abs(x - da[0]).max()) for x in da + dc)
+        worst = largest(float(np.abs(x - da[0]).max()) for x in da + dc)
         check("%s %s: three assemblies agree across both constructors" % (kind, order),
               worst == 0.0, "(%.3e)" % worst)
 
@@ -1145,9 +1504,92 @@ def test_tdof_route():
             return out, intact
         outs, intact = under("tdof", repeat)
         check("%s %s: pattern indices survive the true-dof route" % (kind, order), intact)
-        worst = max(float(np.abs(x - outs[0]).max()) for x in outs)
+        worst = largest(float(np.abs(x - outs[0]).max()) for x in outs)
         check("%s %s: repeated true-dof assemblies identical" % (kind, order),
               worst == 0.0, "(%.3e)" % worst)
+
+
+def test_rank_without_elements_of_a_block():
+    """A rank that holds no element of a block still owns rows of it and builds its
+    true-dof pattern with the others.
+
+    A boundary term's element matrices carry the dofs of the adjacent volume element,
+    and a shared dof belongs to the lowest rank that holds it.  The strip here has one
+    element a rank and the term on its right end: the last rank holds the one boundary
+    element, and the rank before it, which holds none, owns the rows of the two vertices
+    they share.  Two things went wrong on such a rank.  Its true-dof target has slots
+    and no element arrays; taken for a rank that owns nothing of the block, it was given
+    no accumulator and stopped, the others waiting for it in the exchange.  And it has
+    no group to key its pattern on; keyed on the two spaces alone, the second term on
+    them found the first one's pattern and true-dof pattern there, and the rank went on
+    while the others were building theirs, which is collective.  The first two checks
+    ask for the same on any number of ranks, one included.
+
+    The block is ``u dp/dn``, whose rows of those two vertices are not zero, at two
+    quadrature degrees (two sets of groups), and the check is ``x^T M 1``, the length of
+    the end: with the two rows lost it is the number of elements instead.
+    """
+    from hippymfem.fem.boundary import BoundaryBatches, BoundaryKernel, assemble_boundary_matrix
+    from hippymfem.fem.pattern import ScatterPattern
+
+    if RANK == 0:
+        print("a rank without elements of a block")
+    n = max(NP, 2)
+    m = mfem.Mesh.MakeCartesian2D(n, 1, mfem.Element.QUADRILATERAL)
+    c, part = mfem.Vector(2), []
+    for e in range(n):
+        m.GetElementCenter(e, c)
+        part.append(min(int(c[0] * n), NP - 1))          # one a rank, from left to right
+    part = mfem.intArray(part)
+    pm = mfem.ParMesh(COMM, m, part.GetData())
+    V = FunctionSpace.H1(pm, 1)
+
+    # what that rank's target is: no groups, and slots for the rows it is sent
+    T = ScatterPattern([], [], test_space=V, trial_space=V)
+    T.nnz = 5
+    try:
+        acc = T.data([])
+    except ValueError:
+        acc = None
+    check("a target with slots and no elements gives a zero accumulator of its length",
+          acc is not None and acc.shape == (5,) and not acc.any(),
+          "(%s)" % ("none" if acc is None else "%d entries" % acc.size))
+    # and its patterns: one for each set of groups, which its (empty) list stands for,
+    # also once that list is gone
+    none1, none2 = [], []
+    P1, P2 = get_pattern(V, V, none1), get_pattern(V, V, none2)
+    gone = [get_pattern(V, V, []) for _ in range(3)]
+    apart = (P1 is not P2 and get_pattern(V, V, none1) is P1 and get_pattern(V, V, none2) is P2
+             and len({id(P) for P in gone + [P1, P2]}) == 5)
+    csr.clear_pattern_cache()
+    check("two sets of groups without an element here have a pattern each", apart)
+    if acc is None or not apart:
+        return                 # (the assemblies below would stop or hang on several ranks)
+
+    lengths, held, sent = [], None, None
+    loc = V.local_values(V.vector())
+    ones, xc, y = V.vector(), V.vector(), V.vector()
+    ones.array[:] = 1.0
+    xc.array[:] = V.coordinates()[:, 0]
+    for degree in (4, 6):
+        bb = BoundaryBatches(pm, degree, [2], COMM)      # the right end
+        K = BoundaryKernel(lambda u, m_, p, x, nor: u.val * jnp.dot(p.grad, nor),
+                           [V, V, V], bb)
+        M = assemble_boundary_matrix(V, V, bb.groups,
+                                     K.element_matrices(ADJOINT, STATE, [loc, loc, loc]))
+        held = COMM.allgather(sum(g.ne for g in bb.groups))
+        plan = csr.plan_block(V, V, bb.groups)           # (that assembly's, from the caches)
+        sent = COMM.allgather(0 if plan.tpat is None else int(plan.tpat.nrecv))
+        M.Mult(ones.hypre, y.hypre)
+        lengths.append(y.inner(xc))
+        del M
+    csr.clear_pattern_cache()
+    # (on the true-dof route of several ranks the rank before the last is that rank)
+    there = NP == 1 or plan.tpat is None or any(h == 0 and s > 0 for h, s in zip(held, sent))
+    check("a rank without the boundary element assembles the rows it owns, of two blocks",
+          all(abs(length - 1.0) < kernel_mod.matrix_tolerance(1e-12) for length in lengths) and there,
+          "(x^T M 1 = %.15f and %.15f; boundary elements per rank %s, entries received %s)"
+          % (lengths[0], lengths[1], held, sent))
 
 
 def test_eliminated_diagonal():
@@ -1185,7 +1627,7 @@ def test_eliminated_diagonal():
                 parmat.COPYING_CONSTRUCTOR = False
                 csr.set_parmat_mode(old)
                 csr.clear_pattern_cache()
-            worst = COMM.allreduce(worst, op=MPI.MAX)
+            worst = allreduce_extreme(COMM, worst, MPI.MAX)
             check("diag=%s leaves %.1f on every eliminated row (%s constructor)"
                   % (pol, want, "copying" if copying else "aliasing"),
                   worst == 0.0, "(%.3e)" % worst)
@@ -1447,10 +1889,10 @@ def test_coordinates_and_project():
         gf.ProjectCoefficient(_ScalarPy(f))
         gf.GetTrueDofs(tmp.hypre)
         uref = tmp.array.copy()
-        worst = max(worst, float(np.abs(X - ref).max()),
-                    float(np.abs(V.project(f).array - uref).max()),
-                    float(np.abs(V.project(fv).array - uref).max()))
-    worst = COMM.allreduce(worst, op=MPI.MAX)
+        worst = largest([worst, float(np.abs(X - ref).max()),
+                         float(np.abs(V.project(f).array - uref).max()),
+                         float(np.abs(V.project(fv).array - uref).max())])
+    worst = allreduce_extreme(COMM, worst, MPI.MAX)
     check("coordinates and nodal projection match the callback route", worst < 1e-12,
           "(max abs diff %.1e)" % worst)
 
@@ -1470,11 +1912,16 @@ def main():
     test_triple_product()
     test_coordinates_and_project()
     test_fused_scatter()
+    test_split_and_whole_ranks()
+    test_auto_route_from_a_run()
+    test_chunk_of_the_slot_pass()
+    test_interpolation_not_a_number()
     test_compact_scatter_map()
     test_geometric_factors_freed()
     test_release_linearization_on_move()
     test_parmat_routes()
     test_tdof_route()
+    test_rank_without_elements_of_a_block()
     test_eliminated_diagonal()
     test_boolean_prolongation()
     test_no_leak()

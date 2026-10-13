@@ -46,7 +46,13 @@ indefinite Jacobian fails where GMRES converges.
 :class:`~hippymfem.algorithms.linSolvers.KrylovSolver` wraps MFEM's CG, GMRES,
 FGMRES, BiCGSTAB and MINRES with BoomerAMG, ILU, Jacobi, Gauss-Seidel, ParaSails or
 Euclid.  For vector-valued problems pass ``systems_dim`` (and ``elasticity=True``
-with the space) so BoomerAMG uses its systems-of-PDEs mode.  ``parameters["amg_relax_type"]``
+with the space) so BoomerAMG uses its systems-of-PDEs mode.  BoomerAMG also has to know
+which row belongs to which component, and it is told: component after component
+(``systems_bynodes``, the default, which is the ordering of this library's spaces unless
+another is asked for; read from the space where one is given) or interleaved
+(``systems_bynodes=False``, for ``mfem.Ordering.byVDIM``).  Told the wrong one, it pairs
+rows of different components and a solve takes two to five times the iterations.
+``parameters["amg_relax_type"]``
 selects hypre's relaxation (``-1``, the default, keeps MFEM's choice, l1-Jacobi on a
 device); ``16``, Chebyshev, measured 12 % faster per CG + AMG solve of a 2.1 M-dof
 SPD operator on L40S cards, on one card and on four alike, with half the CG
@@ -56,7 +62,11 @@ model's Jacobian is not) and the gain is a constant, not a change in scaling.
 CG with a hypre preconditioner runs in hypre's own PCG (MFEM's ``HyprePCG``), not in
 MFEM's ``CGSolver`` (``HIPPYMFEM_HYPRE_PCG=0`` or ``hm.config.hypre_pcg = False`` for the
 latter).  The two make the same iteration: the same iterates, counts and stopping test
-from a zero initial guess.  The difference is in the V-cycle.  hypre's PCG marks the
+from a zero initial guess.  (Where hypre's PCG leaves an iteration that is none, with a
+preconditioner or a matrix that is not positive definite or a right-hand side that is
+not a number, the solver takes hypre's own verdict and a residual that is a number,
+and reports the failure that MFEM's CG reports.)  The difference is in the V-cycle.
+hypre's PCG marks the
 vector it hands to BoomerAMG as zero, and the first relaxation on the finest level then
 skips its matrix-vector product; MFEM zeroes the vector without saying so.  With
 l1-Jacobi relaxation on a GPU that is one product of four per iteration: a solve of 2.1

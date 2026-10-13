@@ -37,6 +37,15 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
+
+
 def build_linear_problem(nx=8, ntargets=12, noise_std=0.05, seed=1):
     """A *linear* inverse problem, so the exact posterior is available.
 
@@ -583,7 +592,7 @@ def test_mass_functional():
             ref = V.vector()
             M.Mult((one if field is None else field).hypre, ref.hypre)
             ell = mass_functional(V, field)
-            worst = max(worst, ell.copy().axpy(-1.0, ref).norm("linf") / ref.norm("linf"))
+            worst = largest([worst, ell.copy().axpy(-1.0, ref).norm("linf") / ref.norm("linf")])
         # with a coefficient, as the mollified prior's right-hand side uses it: MFEM
         # adds nothing to the mass rule for a coefficient, so the two still agree
         cf = _ScalarPy(lambda x: 0.5 + x[0] * x[1])
@@ -591,13 +600,13 @@ def test_mass_functional():
         ref = V.vector()
         Mc.Mult(w.hypre, ref.hypre)
         ell = mass_functional(V, w, coeff=cf)
-        worst = max(worst, ell.copy().axpy(-1.0, ref).norm("linf") / ref.norm("linf"))
+        worst = largest([worst, ell.copy().axpy(-1.0, ref).norm("linf") / ref.norm("linf")])
         q = weighted_mean_qoi(V, w)
         u = V.project(lambda z: 2.0 + z[..., 0])           # its w-weighted mean, exactly
         ref = V.vector()
         M.Mult(w.hypre, ref.hypre)
         expect = ref.inner(u) / ref.inner(one)
-        worst = max(worst, abs(q.eval([u, None, None]) - expect) / abs(expect))
+        worst = largest([worst, abs(q.eval([u, None, None]) - expect) / abs(expect)])
     check("mass functional and weighted mean match the matrix route", worst < 1e-13,
           "(worst rel %.1e, straight and curved hexahedra, P1 and P2)" % worst)
 

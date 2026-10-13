@@ -41,8 +41,9 @@ NJ="${NJ:-$(nproc)}"
 HYPRE_TAG="${HYPRE_TAG:-v3.2.0}"
 export ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
 export HIP_PATH="${HIP_PATH:-$ROCM_PATH}"
-MPICXX=$(command -v mpicxx)
-MPICC=$(command -v mpicc)
+MPICXX=$(command -v mpicxx || true)
+MPICC=$(command -v mpicc || true)
+[ -n "$MPICXX" ] && [ -n "$MPICC" ] || { echo "no mpicxx or mpicc on PATH (load the MPI to build with first)" >&2; exit 1; }
 # the MPI include directories, for the two compilers that are not the MPI wrapper (hipcc
 # and CMake's HIP language): OpenMPI's wrapper lists them, an MPICH one shows its command
 MPIINC=$($MPICXX -showme:incdirs 2>/dev/null | tr ' ' '\n' | sed '/^$/d; s/^/-I/' | tr '\n' ' ')
@@ -63,7 +64,8 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
   # exception 0x1016 in hypreGPUKernel_CSRMoveDiagFirst, hypre's own ij driver included)
   if [ ! -d "$PREFIX/src/hypre" ]; then
     curl -sL --retry 5 -o "$PREFIX/src/hypre-$HYPRE_TAG.tar.gz" \
-        "https://github.com/hypre-space/hypre/archive/refs/tags/$HYPRE_TAG.tar.gz"
+        "https://github.com/hypre-space/hypre/archive/refs/tags/$HYPRE_TAG.tar.gz" \
+        || { echo "hypre $HYPRE_TAG was not downloaded (curl ended with $?)" >&2; exit 1; }
     mkdir -p "$PREFIX/src/hypre"
     tar xzf "$PREFIX/src/hypre-$HYPRE_TAG.tar.gz" -C "$PREFIX/src/hypre" --strip-components=1
   fi
@@ -76,8 +78,13 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # (tools/hypre-3.2.0-staging.patch; two Newton-CG steps at 512^3 on 512 MI250X of
    # Frontier in 10.0 s instead of 10.8 s).  HYPRE_STAGE_PINNED=0 and HYPRE_STAGE_EARLY=0
    # in the environment of a run switch either part off.
+   # (Each of the three patches is tried whole before it is applied, and without fuzz.  One
+   # that failed part of the way left the hunks that had applied, the first of them with
+   # the name the next run takes for "patched already", and that run built the tree as it
+   # was; and patch's default fuzz put a hunk whose context had changed somewhere else.)
    if [ "${HYPRE_PINNED_STAGING:-0}" = 1 ] && ! grep -q hm_pin_get parcsr_mv/par_csr_communication.c; then
-     patch -p1 --forward < "$HERE/hypre-3.2.0-staging.patch" > "$LOG/hypre_patch.log" 2>&1 \
+     patch -p1 --forward --fuzz=0 --dry-run < "$HERE/hypre-3.2.0-staging.patch" > "$LOG/hypre_patch.log" 2>&1 \
+       && patch -p1 --forward --fuzz=0 < "$HERE/hypre-3.2.0-staging.patch" > "$LOG/hypre_patch.log" 2>&1 \
        || { echo "tools/hypre-3.2.0-staging.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch.log" >&2; exit 1; }
    fi
    # HYPRE_SORTED_SPGEMM=1: hypre copies and sorts both operands of every sparse product
@@ -92,7 +99,8 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # and half the device memory at its peak (the GPU guide, "Several GPUs").
    # HYPRE_SPGEMM_SKIP_SORT=0 in the environment of a run has every operand sorted again.
    if [ "${HYPRE_SORTED_SPGEMM:-0}" = 1 ] && ! grep -q hypre_CSRSpGemmRowsAscend seq_mv/csr_spgemm_device_rocsparse.c; then
-     patch -p1 --forward < "$HERE/hypre-3.2.0-spgemm.patch" > "$LOG/hypre_patch_spgemm.log" 2>&1 \
+     patch -p1 --forward --fuzz=0 --dry-run < "$HERE/hypre-3.2.0-spgemm.patch" > "$LOG/hypre_patch_spgemm.log" 2>&1 \
+       && patch -p1 --forward --fuzz=0 < "$HERE/hypre-3.2.0-spgemm.patch" > "$LOG/hypre_patch_spgemm.log" 2>&1 \
        || { echo "tools/hypre-3.2.0-spgemm.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch_spgemm.log" >&2; exit 1; }
    fi
    # HYPRE_SEQ_DEVICE=1: BoomerAMG's seq_threshold (a hierarchy ended at a level of a few
@@ -107,9 +115,14 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # hierarchy takes 7.1 ms instead of 8.8 ms on 512 MI250X of Frontier, and a solve of
    # the prior 0.088 s instead of 0.101 s (the GPU guide, "AMD cards").  Nothing changes
    # for a solver that does not set seq_threshold.
-   if [ "${HYPRE_SEQ_DEVICE:-0}" = 1 ] && ! grep -q hypre_BoomerAMGSeqOnDevice parcsr_ls/gen_redcs_mat.c; then
-     patch -p1 --forward < "$HERE/hypre-3.2.0-seqdevice.patch" > "$LOG/hypre_patch_seqdevice.log" 2>&1 \
-       || { echo "tools/hypre-3.2.0-seqdevice.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch_seqdevice.log" >&2; exit 1; }
+   # (The source is known for patched by a line of the patch's third version, not by the
+   # name of its first function: one that carries an older version is not built as it is.)
+   if [ "${HYPRE_SEQ_DEVICE:-0}" = 1 ] && ! grep -q 'coarse_size <= (HYPRE_BigInt) seq_threshold' parcsr_ls/par_amg_setup.c; then
+     patch -p1 --forward --fuzz=0 --dry-run < "$HERE/hypre-3.2.0-seqdevice.patch" > "$LOG/hypre_patch_seqdevice.log" 2>&1 \
+       && patch -p1 --forward --fuzz=0 < "$HERE/hypre-3.2.0-seqdevice.patch" > "$LOG/hypre_patch_seqdevice.log" 2>&1 \
+       || { echo "tools/hypre-3.2.0-seqdevice.patch did not apply to hypre $HYPRE_TAG: $LOG/hypre_patch_seqdevice.log" \
+                 "(a source that carries an older version of the patch is not patched over: remove" \
+                 "$PREFIX/src/hypre, which is then unpacked and patched again, and give every HYPRE_* switch of the first build)" >&2; exit 1; }
    fi
    # hypre 3 turns Umpire on for GPU builds; MFEM manages device memory itself.  Its
    # device sources go to hipcc, which is not the MPI wrapper and finds mpi.h only if
@@ -119,7 +132,8 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
    # has no --enable-bigint: its device kernels and the vendor's take 32-bit local indices.
    MIXED=""; [ "${HYPRE_MIXEDINT:-0}" = 1 ] && MIXED="--enable-mixedint"
    ./configure --prefix="$PREFIX/hypre" --with-hip --with-gpu-arch="$ARCH" --enable-shared --without-umpire $MIXED \
-       CC="$MPICC" CXX="$MPICXX" HIPCXXFLAGS="$MPIINC" > "$LOG/hypre_configure.log" 2>&1
+       CC="$MPICC" CXX="$MPICXX" HIPCXXFLAGS="$MPIINC" > "$LOG/hypre_configure.log" 2>&1 \
+       || { echo "hypre's configure failed: $LOG/hypre_configure.log" >&2; exit 1; }
    make clean > /dev/null 2>&1 || true
    # A compiler that cannot build a device source at -O2 gets that one source at -Os.
    # The clang of ROCm 7.2.0 on Frontier (22.0.0git, roc-7.2.0 26014) stops in its AMDGPU
@@ -134,7 +148,22 @@ if [ ! -f "$PREFIX/hypre/lib/libHYPRE.so" ]; then
      echo "  the compiler failed at -O2, building at -Os: $bad"
      echo "$bad: CUFLAGS += -Os" >> config/Makefile.config
    done
-   make install > "$LOG/hypre_install.log" 2>&1)
+   make install > "$LOG/hypre_install.log" 2>&1 \
+     || { echo "hypre did not install: $LOG/hypre_install.log" >&2; exit 1; })
+else
+  # hypre is built and stays as it is, so a patch asked for now is not applied.  It is said
+  # where the source of the library does not carry it: what is built on top of this prefix,
+  # and tools/build_hypre_single.sh, which copies that source, would take it for there.
+  for sw in "HYPRE_PINNED_STAGING|hm_pin_get|parcsr_mv/par_csr_communication.c" \
+            "HYPRE_SORTED_SPGEMM|hypre_CSRSpGemmRowsAscend|seq_mv/csr_spgemm_device_rocsparse.c" \
+            "HYPRE_SEQ_DEVICE|coarse_size <= (HYPRE_BigInt) seq_threshold|parcsr_ls/par_amg_setup.c"; do
+    IFS='|' read -r name mark file <<< "$sw"
+    if [ "${!name:-0}" = 1 ] && ! grep -qs "$mark" "$PREFIX/src/hypre/src/$file"; then
+      echo "$name=1 is not applied: $PREFIX/hypre/lib/libHYPRE.so is built already and is kept, and" \
+           "the patch as it stands is not in $PREFIX/src/hypre (to build hypre again remove $PREFIX/hypre," \
+           "and $PREFIX/src/hypre too where it carries an older version of the patch)" >&2
+    fi
+  done
 fi
 ls "$PREFIX/hypre/lib/libHYPRE.so"
 
@@ -198,9 +227,12 @@ SPMV
       -DMFEM_USE_HIP=ON -DHIP_ARCH="$ARCH" -DCMAKE_HIP_ARCHITECTURES="$ARCH" \
       -DCMAKE_HIP_COMPILER="$ROCM_PATH/lib/llvm/bin/clang++" \
       -DCMAKE_HIP_FLAGS="$MPIINC" \
-      > "$LOG/mfem_cmake.log" 2>&1
-  cmake --build "$PREFIX/src/mfem/cmbuild_par" -j "$NJ" > "$LOG/mfem_make.log" 2>&1
-  cmake --install "$PREFIX/src/mfem/cmbuild_par" > "$LOG/mfem_install.log" 2>&1
+      > "$LOG/mfem_cmake.log" 2>&1 \
+      || { echo "MFEM's cmake failed: $LOG/mfem_cmake.log" >&2; exit 1; }
+  cmake --build "$PREFIX/src/mfem/cmbuild_par" -j "$NJ" > "$LOG/mfem_make.log" 2>&1 \
+      || { echo "MFEM did not build: $LOG/mfem_make.log" >&2; exit 1; }
+  cmake --install "$PREFIX/src/mfem/cmbuild_par" > "$LOG/mfem_install.log" 2>&1 \
+      || { echo "MFEM did not install: $LOG/mfem_install.log" >&2; exit 1; }
   unset OMPI_CXX MPICH_CXX
 fi
 ls "$PREFIX/mfem/par/lib/libmfem.so"
@@ -284,7 +316,8 @@ if "extra_tpl_defines" not in s:
     print("  patched", p)
 PATCH
 (cd "$PREFIX/PyMFEM/mfem/_par" && "$PY" setup.py build_ext --inplace --force --parallel "$NJ" \
-     > "$LOG/wrappers.log" 2>&1)
+     > "$LOG/wrappers.log" 2>&1) \
+     || { echo "the wrappers did not build: $LOG/wrappers.log" >&2; exit 1; }
 SITE="$PREFIX/PyMFEM/lib/$PYVER/site-packages"
 mkdir -p "$SITE"
 rm -rf "$SITE/mfem"

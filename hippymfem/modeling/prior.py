@@ -43,7 +43,6 @@ results can be compared across rank counts.
 
 import math
 import numbers
-import os
 
 import numpy as np
 from mpi4py import MPI
@@ -58,7 +57,7 @@ from ..fem.assemble import assemble_native_matrix, mass_functional
 from ..fem.elementbatch import get_batches
 from ..fem.spaces import as_space
 from ..algorithms.multivector import MultiVector
-from ..algorithms.linSolvers import ChebyshevSolver, CycleOf, KrylovSolver, LUSolver
+from ..algorithms.linSolvers import ChebyshevSolver, CycleOf, KrylovSolver, LUSolver, _env_default
 
 #: ``prior_h()``: how many of the meshes that a prior's mesh was refined from
 #: (:func:`hippymfem.fem.ptransfer.set_coarser_meshes`) the multigrid cycles of its elliptic
@@ -68,9 +67,10 @@ from ..algorithms.linSolvers import ChebyshevSolver, CycleOf, KrylovSolver, LUSo
 #: where ``HIPPYMFEM_PMG_H_HOST`` says so) in place of a cycle of BoomerAMG on the operator,
 #: and the polynomial of cycles wholly in that library.  0, the default: BoomerAMG.  A
 #: prior's own ``h_levels`` overrides it.  ``HIPPYMFEM_PRIOR_H``, read when the
-#: preconditioner is asked for.
+#: preconditioner is asked for; a value that is no whole number raises there, with the
+#: variable's name, as the solvers' settings do.
 def prior_h():
-    return int(os.environ.get("HIPPYMFEM_PRIOR_H", "0") or 0)
+    return _env_default("HIPPYMFEM_PRIOR_H", int, 0)
 from ..common.operators import MatrixOperator, Operator2Solver
 from ..algorithms.randomizedEigensolver import doublePass, doublePassG
 from ..common.linalg import estimate_diagonal_inv2
@@ -724,13 +724,18 @@ class SqrtPrecisionPDE_Prior(_Prior):
 
             mesh = self.Vh.mesh
             kinds = self.comm.allreduce(int(mesh.GetNumGeometries(mesh.Dimension())), op=MPI.MAX)
+            # A rank counts the kinds of its own elements, so a mesh whose ranks each hold
+            # one kind, and not all the same one, counts one as well: the kinds of the ranks
+            # are put together, a bit each.
+            bits = self.comm.allreduce((1 << int(mesh.GetElementGeometry(0))) if mesh.GetNE() else 0,
+                                       op=MPI.BOR)
+            kinds = max(kinds, bin(bits).count("1"))
             if int(self.Vh.order) != 1 or kinds != 1:
                 # (the same on every rank)
                 raise ValueError("lumped_mass is for a parameter space of first order on a mesh "
                                  "of one kind of element (order %d, %d kinds here)"
                                  % (int(self.Vh.order), kinds))
-            geom = self.comm.allreduce(int(mesh.GetElementGeometry(0)) if mesh.GetNE() else -1,
-                                       op=MPI.MAX)
+            geom = bits.bit_length() - 1
             rule = integration_rule(geom, VERTEX_RULE)
             mass.SetIntRule(rule)
             self.keep(rule)
@@ -743,6 +748,7 @@ class SqrtPrecisionPDE_Prior(_Prior):
         self.Msolver, self.Asolver = _make_prior_solvers(
             self.comm, self.M, self.A, solver_type, rel_tol, max_iter,
             systems_dim=systems_dim or (self.Vh.vdim if self.Vh.vdim > 1 else None),
+            systems_bynodes=self.Vh.fes.GetOrdering() == mfem.Ordering.byNODES,
         )
         if quadrature_degree is None:
             quadrature_degree = 2 * self.Vh.order
@@ -801,6 +807,7 @@ class LaplacianPrior(_Prior):
         self.Msolver, self.Rsolver = _make_prior_solvers(
             self.comm, self.M, self.R, solver_type, rel_tol, max_iter,
             systems_dim=self.Vh.vdim if self.Vh.vdim > 1 else None,
+            systems_bynodes=self.Vh.fes.GetOrdering() == mfem.Ordering.byNODES,
         )
         if quadrature_degree is None:
             quadrature_degree = 2 * self.Vh.order
@@ -837,14 +844,14 @@ class LaplacianPrior(_Prior):
 
 
 def _make_prior_solvers(comm, M, A, solver_type, rel_tol, max_iter,
-                        systems_dim=None):
+                        systems_dim=None, systems_bynodes=None):
     """Mass and precision solvers with hIPPYlib's choices of method."""
 
     if solver_type == "lu":
         Ms, As = LUSolver(comm), LUSolver(comm)
     elif solver_type == "krylov":
         Ms = KrylovSolver(comm, "cg", "jacobi")
-        As = KrylovSolver(comm, "cg", "amg", systems_dim=systems_dim)
+        As = KrylovSolver(comm, "cg", "amg", systems_dim=systems_dim, systems_bynodes=systems_bynodes)
     else:
         raise ValueError("unknown solver_type %r" % (solver_type,))
     Ms.set_operator(M)

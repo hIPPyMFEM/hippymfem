@@ -121,8 +121,11 @@ class FunctionSpace(KeepAlive):
 
     @property
     def order(self):
-        """Polynomial degree (of element 0)."""
-        return self.fes.GetOrder(0)
+        """Polynomial degree (of element 0; of the collection on a rank without an element,
+        where MFEM stops the process at the question for one)."""
+        if self.mesh.GetNE():
+            return self.fes.GetOrder(0)
+        return self.fec.GetOrder()
 
     def GetTrueVSize(self):
         return self.fes.GetTrueVSize()

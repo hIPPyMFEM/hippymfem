@@ -49,6 +49,7 @@ import math
 
 from ..common.parameterList import ParameterList
 from ..fem.kernel import gradient_floor
+from ..modeling.model import _takes
 from ..modeling.reducedHessian import ReducedHessian
 from ..modeling.variables import ADJOINT, PARAMETER, STATE
 from .cgsolverSteihaug import CGSolverSteihaug
@@ -179,17 +180,14 @@ class ReducedSpaceNewtonCG:
         # apply to it, with or without cg_reorthogonalize.  A prior that has no such
         # preconditioner returns what the tolerance gives.
         cycles = int(p["cg_preconditioner_cycles"] or 0)
-        if cycles > 0:
-            try:
-                return self.model.Rsolver(tol or None, cycles=cycles)
-            except TypeError:              # a model whose Rsolver takes no such argument
-                pass
-        if tol > 0.0:
-            try:
-                return self.model.Rsolver(tol)
-            except TypeError:              # a model whose Rsolver takes no argument
-                pass
-        return self.model.Rsolver()
+        # (a model whose Rsolver takes no such argument, or none, is not given it: asked
+        # of its signature, so that an error inside the prior is not taken for that)
+        Rsolver = self.model.Rsolver
+        if cycles > 0 and _takes(Rsolver, tol or None, cycles=cycles):
+            return Rsolver(tol or None, cycles=cycles)
+        if tol > 0.0 and _takes(Rsolver, tol):
+            return Rsolver(tol)
+        return Rsolver()
 
     def _rank0(self):
         return self.comm is None or self.comm.rank == 0
@@ -390,7 +388,11 @@ class ReducedSpaceNewtonCG:
             HessApply = ReducedHessian(self.model)
             solver = CGSolverSteihaug(comm=self.comm)
             solver.set_operator(HessApply)
-            solver.set_preconditioner(self.model.Rsolver())
+            # The polynomial of cg_preconditioner_cycles where one is asked for, as in the
+            # line search: it is one linear map, and the region is measured with R itself
+            # (set_TR).  The prior's Krylov solves are not stopped early here, which a CG
+            # tolerance of zero says: with cg_preconditioner_cycles at 0 this is Rsolver().
+            solver.set_preconditioner(self._cg_preconditioner(0.0))
             if delta_TR is not None:
                 solver.set_TR(delta_TR, self.model.prior.R)
             solver.parameters["rel_tolerance"] = tolcg

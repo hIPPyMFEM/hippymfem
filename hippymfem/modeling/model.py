@@ -22,7 +22,22 @@ reduced Hessian from the blocks the PDE problem and misfit provide.  Signatures
 follow hIPPYlib exactly.
 """
 
+import inspect
+
 from .variables import ADJOINT, PARAMETER, STATE
+
+
+def _takes(fn, *args, **kwargs):
+    """Whether ``fn`` can be called with these arguments, by its signature (one that
+    cannot be read: no).  For an argument that a model or a prior written before it
+    existed does not take.  Asked before the call: an ``except TypeError`` around the
+    call takes every ``TypeError`` raised inside it for a missing argument as well, and
+    the caller then goes on without the argument, on the rank that raised alone."""
+    try:
+        inspect.signature(fn).bind(*args, **kwargs)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _is_zero(term, i, j):
@@ -238,12 +253,9 @@ class Model(ReducedMap):
         if tolerance or cycles:
             get = getattr(self.prior, "getHessianPreconditioner", None)
             if get is not None:
-                try:
-                    return get(tolerance, cycles=cycles) if cycles else get(tolerance)
-                except TypeError:          # a prior written before the argument existed
-                    if cycles and tolerance:
-                        try:
-                            return get(tolerance)
-                        except TypeError:
-                            pass
+                # (a prior written before an argument existed is not given it)
+                if cycles and _takes(get, tolerance, cycles=cycles):
+                    return get(tolerance, cycles=cycles)
+                if tolerance and _takes(get, tolerance):
+                    return get(tolerance)
         return self.prior.Rsolver

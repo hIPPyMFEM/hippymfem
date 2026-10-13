@@ -156,12 +156,21 @@ def fd_slopes(eps, err):
 
 
 def best_slope(eps, err, lo=1e-7, hi=1e-2):
-    """Median observed slope over the step sizes where round-off has not taken over."""
+    """Median observed slope over the step sizes where round-off has not taken over.
+
+    NaN where an error at one of those step sizes is not a finite number.  A slope beside
+    an error of zero is left out, which is round-off; an error that is not a number is a
+    cost or a gradient that is not one, and the slope of the other steps must not stand
+    for it.
+    """
     eps = np.asarray(eps, float)
+    err = np.asarray(err, float)
     mask = (eps >= lo) & (eps <= hi)
     if mask.sum() < 3:
         mask = np.ones_like(eps, dtype=bool)
-    s = fd_slopes(eps[mask], np.asarray(err, float)[mask])
+    if not np.isfinite(err[mask]).all():
+        return float("nan")
+    s = fd_slopes(eps[mask], err[mask])
     s = s[np.isfinite(s)]
     return float(np.median(s)) if s.size else float("nan")
 

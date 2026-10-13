@@ -115,7 +115,10 @@ def _unpin_buffers(addresses):
 #: (:class:`~hippymfem.algorithms.singlesolve.RowDefect`, which says what it is for).  The
 #: values are then accumulated in double precision whatever :data:`SINGLE_ACCUMULATE` says,
 #: since the defect is the difference between those and their rounded copies: an
-#: accumulator twice as large for the duration of the assembly.  ``HIPPYMFEM_SINGLE_ROW_SUMS=1``.
+#: accumulator twice as large for the duration of the assembly, and, where a device sums a
+#: batch of single-precision element matrices whole
+#: (:meth:`~hippymfem.fem.pattern.ScatterPattern.data`), their entries in double precision
+#: for the sum.  ``HIPPYMFEM_SINGLE_ROW_SUMS=1``.
 SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "0").lower() in (
     "1", "yes", "true", "on")
 
@@ -207,6 +210,22 @@ def _slot_order(urow, ucol, in_diag, lead, nrow):
         del cum, before, rank, pos
     newslot[lead] = dstart[urow[lead]]
     return newslot
+
+
+def _unique_pairs(rows, cols):
+    """``(urow, ucol, inverse)`` of the ``(row, col)`` pairs in row-then-column order: what
+    ``np.unique(rows * ncol + cols, return_inverse=True)`` gives, decoded, without the key,
+    for sizes at which ``rows * ncol`` passes 64 bits.  A sort by two keys, so slower than
+    the sort of one: the route of a build without the compiled passes at such a size."""
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    order = np.lexsort((cols, rows))
+    r, c = rows[order], cols[order]
+    first = np.ones(r.size, dtype=bool)
+    first[1:] = (r[1:] != r[:-1]) | (c[1:] != c[:-1])
+    inverse = np.empty(r.size, dtype=np.int64)
+    inverse[order] = np.cumsum(first) - 1
+    return r[first], c[first], inverse
 
 
 class TrueDofPattern:
@@ -307,6 +326,13 @@ class TrueDofPattern:
                 nnz_t = int(ucol.size)
                 urow = np.repeat(np.arange(self.ntd, dtype=np.int64), np.diff(rowstart))
                 ucol = ucol.astype(np.int64, copy=False)
+            elif int(self.ntd) * int(self.gnc) >= 2 ** 63:
+                # (a pair no longer fits one 64-bit key: 17 million rows a rank beside
+                # 5.5e11 columns, eight times the columns of the largest run so far)
+                urow, ucol, inv = _unique_pairs(np.concatenate([rg[mine] - self.t0, r_rg - self.t0]),
+                                                np.concatenate([cg[mine], r_cg]))
+                del rg, cg, r_rg, r_cg
+                nnz_t = int(ucol.size)
             else:
                 keys = np.concatenate([
                     (rg[mine] - self.t0) * np.int64(self.gnc) + cg[mine],

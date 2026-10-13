@@ -203,4 +203,6 @@ Before trusting a gradient on a new residual:
 Both slopes should be 1.0.  ``best_slope`` takes the median over the step sizes where
 round-off has not taken over; choose the window from the measured error curve rather
 than leaving the default, because the Hessian difference reaches its floor much
-earlier than the gradient's when the misfit is nearly quadratic.
+earlier than the gradient's when the misfit is nearly quadratic.  An error that is not a
+finite number at a step of the window gives NaN, so that a cost which is not a number
+at one step cannot pass on the slope of the others.

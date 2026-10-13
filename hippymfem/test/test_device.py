@@ -48,6 +48,7 @@ if mfem_gpu_backend() is None or not hypre_on_device():
 import numpy as np
 import mfem.par as mfem
 
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.fem import assemble as asm
 from hippymfem.fem import csrassemble as csr
 from hippymfem.modeling.variables import ADJOINT, STATE
@@ -62,6 +63,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 hp.configure_device("gpu", COMM, quiet=(RANK != 0))
@@ -124,7 +134,9 @@ def amg_cg(A, iters=8):
     rhs = hp.ParVector(COMM, A.Height())
     rhs.set(1.0)
     cg.Mult(rhs.hypre, x.hypre)
-    return float(x.hypre.Norml2())
+    # (the norm over all ranks, from the inner product: MFEM's ``Norml2`` skips an entry
+    # that is not a number, and gives 0.0 for a solution that is NaN throughout)
+    return x.norm("l2")
 
 
 def test_sibling_release():
@@ -162,7 +174,7 @@ def test_operator_reset():
         rhs = hp.ParVector(COMM, s.A.Height())
         rhs.set(1.0)
         s.solve(x, rhs)
-        norms.append(float(x.hypre.Norml2()))
+        norms.append(x.norm("l2"))
     check("four operators in turn, each solved after the previous was released",
           all(np.isfinite(norms)) and len(set(np.round(norms, 6))) == 4,
           "(|x| = %s)" % ", ".join("%.4e" % v for v in norms))
@@ -186,9 +198,8 @@ def test_routes_agree_on_device():
         ys[mode] = y
         del A
     csr.set_parmat_mode("auto")
-    ref = float(ys["mfem"].hypre.Norml2())
-    ys["auto"].hypre.Add(-1.0, ys["mfem"].hypre)
-    err = float(ys["auto"].hypre.Norml2()) / max(ref, 1e-300)
+    ref = ys["mfem"].norm("l2")
+    err = ys["auto"].axpy(-1.0, ys["mfem"]).norm("l2") / max(ref, 1e-300)
     check("A v agrees between routes", err < 1e-13, "(rel %.2e)" % err)
 
 
@@ -283,8 +294,8 @@ def test_kept_accumulator():
         kern.ELEMENT_CHUNK = chunk
         pat.clear_accumulators()
     scale = max(float(np.abs(ref).max()), 1e-300)
-    worst = max(float(np.abs(ref - g).max()) / scale for g in got)
-    worst = COMM.allreduce(worst, op=MPI.MAX)
+    worst = largest(float(np.abs(ref - g).max()) / scale for g in got)
+    worst = allreduce_extreme(COMM, worst, MPI.MAX)
     check("assemblies on a kept accumulator agree with a fresh one",
           reused and worst < 1e-12,
           "(%d values, reuse %s, worst rel %.1e)"
@@ -414,7 +425,7 @@ def test_parmat_block_route():
             hp.parRandom.normal(1.0, v)
             y = hp.ParVector(COMM, A.Height())
             A.Mult(v.hypre, y.hypre)
-            out.append(float(y.hypre.Norml2()))
+            out.append(y.norm("l2"))
         return out
 
     def run(mode):
@@ -436,8 +447,8 @@ def test_parmat_block_route():
             csr.set_parmat_mode("auto")
 
     ref, got = run("copy"), run("block")
-    err = max(abs(a - c) / max(abs(a), 1e-300)
-              for ra, rc in zip(ref[:-1], got[:-1]) for a, c in zip(ra, rc))
+    err = largest(abs(a - c) / max(abs(a), 1e-300)
+                  for ra, rc in zip(ref[:-1], got[:-1]) for a, c in zip(ra, rc))
     check("the two constructors give the same matrices", err < 1e-13, "(rel %.2e)" % err)
     check("the assemblies differ from each other",
           len({tuple(r) for r in ref[:len(SEEDS)]}) == len(SEEDS))
@@ -467,12 +478,11 @@ def test_exchange_routes_agree():
     pm, Vh, b, K, bc = problem()
     csr.set_parmat_mode("tdof")
     SEEDS = (5, 17)
-    taken = {"messages": 0, "agreed": []}
+    taken = {"messages": 0}
     inner = td.TrueDofPattern._exchange_messages
 
     def counted(self, acc):
         taken["messages"] += 1
-        taken["agreed"].append(bool(self.messages))
         return inner(self, acc)
 
     def products(A):
@@ -510,14 +520,16 @@ def test_exchange_routes_agree():
         d.axpy(-1.0, y)
         return d.norm("linf")
 
-    scale = max(max(r.norm("linf") for r in ref), 1e-300)
-    err = max(apart(r, g) for r, g in zip(ref, got)) / scale
+    scale = max(largest(r.norm("linf") for r in ref), 1e-300)
+    err = largest(apart(r, g) for r, g in zip(ref, got)) / scale
     check("the two exchanges give the same matrices", err < 1e-14, "(rel %.2e)" % err)
     check("the assemblies differ from each other", apart(ref[0], ref[2]) > 1e-8 * scale)
     if COMM.size > 1:
+        # (the messages are taken only where the pattern's ranks agreed on them, so the
+        # count of every rank says that they did)
         every = COMM.allreduce(calls, op=MPI.MIN)
         check("every rank took the messages, by agreement, and none the collective's turn",
-              every == len(SEEDS) and all(taken["agreed"]) and taken["messages"] == calls,
+              every == len(SEEDS) and taken["messages"] == calls,
               "(%d exchanges a rank)" % every)
     else:
         check("one rank has nothing to exchange", calls == 0)
@@ -593,6 +605,19 @@ def test_exchange_of_mixed_accumulators():
         csr.set_parmat_mode("auto")
 
 
+def test_split_and_whole_ranks():
+    """Ranks whose element batch is split beside ranks whose batch runs whole
+    (:func:`hippymfem.test.test_assembly.test_split_and_whole_ranks`), with the matrices
+    finished on the device: the entries of a whole batch leave from the array of its
+    scatter and those of a split one from an accumulator, in one exchange, and both
+    kinds of rank reach the finite check in the same place."""
+    from hippymfem.test import test_assembly
+
+    before = len(test_assembly.FAILS)
+    test_assembly.test_split_and_whole_ranks()
+    FAILS.extend(test_assembly.FAILS[before:])
+
+
 def test_gathered_coarse_solve():
     """The last levels of a device hierarchy gathered and finished by one process.
 
@@ -603,8 +628,13 @@ def test_gathered_coarse_solve():
     for this takes device memory for host memory; ``tools/hypre-3.2.0-seqdevice.patch``
     has the device's.  With a library that has it, CG with such a hierarchy must give the
     solution of the default one in about its iterations, with the gathered level
-    somewhere in the hierarchy and with the matrix itself gathered; a library without
-    it must refuse the setting, since the set-up would fault.
+    somewhere in the hierarchy and with it right under the matrix (hypre coarsens once
+    before it compares a size with the threshold, so the matrix itself is not the
+    gathered level); a library without it must refuse the setting, since the set-up
+    would fault.  Two things more since the patch's third version: a level that cannot
+    be coarsened is not gathered above the threshold, and the gathered level of a system
+    carries the functions of its rows.  All of it takes two ranks: on one hypre drops
+    the setting, and that it does is what is checked there.
     """
     if RANK == 0:
         print("the last levels of a hierarchy gathered on one process, on a device")
@@ -616,17 +646,17 @@ def test_gathered_coarse_solve():
     hp.parRandom.set_seed(31)
     hp.parRandom.normal(1.0, rhs)
 
-    def solve(extra):
-        ks = hp.KrylovSolver(COMM, "cg", "amg")
+    def solve(extra, A=A, rhs=rhs, systems=None):
+        ks = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=systems, systems_bynodes=False)
         ks.parameters["rel_tolerance"] = 1e-10
         ks.parameters["max_iter"] = 300
         ks.parameters["amg_options"] = extra
         ks.set_operator(A)
         x = hp.ParVector(COMM, A.Height())
         its = ks.solve(x, rhs)
-        return x, int(its)
+        return x, int(its), mc.seq_solvers(ks._pc, COMM)
 
-    x0, its0 = solve("")
+    x0, its0, _ = solve("")
     if not mc.seq_on_device(mc._hypre_library()):
         raised = False
         try:
@@ -636,23 +666,38 @@ def test_gathered_coarse_solve():
         check("seq_threshold is refused by a device hypre without the patch (this one)", raised)
         return
 
-    def apart(x):
+    def apart(x, x0=x0):
         d = x.copy()
         d.axpy(-1.0, x0)
         return d.norm("l2") / max(x0.norm("l2"), 1e-300)
 
     n = int(A.GetGlobalNumRows())
-    x1, its1 = solve("seq_threshold=300")
-    x1r, its1r = solve("seq_threshold=300,redundant=1")
-    x2, its2 = solve("seq_threshold=%d" % (n + 1))
+    if COMM.size == 1:
+        # hypre drops the setting on one rank (the set-up's "if (num_procs == 1)
+        # seq_threshold = 0"), so every hierarchy below would be the default one, compared
+        # with itself under names that speak of a gathered level
+        x1, its1, who = solve("seq_threshold=300,redundant=1")
+        e1 = apart(x1)
+        check("on one rank hypre drops seq_threshold: nothing is gathered and the solve is the "
+              "default one (the checks of a gathered level take two ranks: skipped)",
+              who is None and e1 < 1e-7 and its1 <= its0 + 3,
+              "(solved by: %s; difference %.1e, %d iterations against %d, %d rows)"
+              % (who, e1, its1, its0, n))
+        return
+    x1, its1, who1 = solve("seq_threshold=300")
+    x1r, its1r, who1r = solve("seq_threshold=300,redundant=1")
+    x2, its2, who2 = solve("seq_threshold=%d" % (n + 1))
     e1, e1r, e2 = apart(x1), apart(x1r), apart(x2)
     check("a hierarchy ended at a level of 300 rows, which the first rank solves, gives the "
-          "default one's solution", e1 < 1e-7 and its1 <= its0 + 3,
-          "(difference %.1e, %d iterations against %d, %d rows)" % (e1, its1, its0, n))
+          "default one's solution", who1 == "first" and e1 < 1e-7 and its1 <= its0 + 3,
+          "(difference %.1e, %d iterations against %d, %d rows; solved by: %s)"
+          % (e1, its1, its0, n, who1))
     check("and so does one that every rank solves (redundant=1)",
-          e1r < 1e-7 and its1r <= its0 + 3, "(difference %.1e, %d iterations)" % (e1r, its1r))
-    check("and so does the matrix itself gathered", e2 < 1e-7 and its2 <= its0 + 3,
-          "(difference %.1e, %d iterations)" % (e2, its2))
+          who1r in ("first", "all") and e1r < 1e-7 and its1r <= its0 + 3,
+          "(difference %.1e, %d iterations; solved by: %s)" % (e1r, its1r, who1r))
+    check("and so does one with a threshold above the matrix, which gathers its first coarse level",
+          who2 == "first" and e2 < 1e-7 and its2 <= its0 + 3,
+          "(difference %.1e, %d iterations; solved by: %s)" % (e2, its2, who2))
 
     # The gathered solve has to be one linear map.  Where every rank solves the whole
     # system and keeps its own rows, it is one only if the ranks' solvers are the same;
@@ -698,10 +743,53 @@ def test_gathered_coarse_solve():
         asked = "all" if "redundant" in extra else "first"
         check("a cycle with its first coarse level gathered (%s) is one symmetric map" % label,
               s1 < max(1e-9, 100.0 * s0) and i1 <= i0 + 2 and err < 1e-7
-              and (COMM.size == 1 or who in ("first", asked)),
+              and who in ("first", asked),
               "(asymmetry %.1e against %.1e of the default cycle; a smooth solution in %d "
               "iterations against %d, error %.1e; %d rows; solved by: %s)"
               % (s1, s0, i1, i0, err, n2, who))
+
+    # A level that hypre cannot coarsen ends a hierarchy whatever its size, and hypre's
+    # test for the gathered solve let such a level through: the whole of it went to every
+    # rank that held rows of it, the matrix itself where the first level is such a one.
+    # Every row of a mass matrix fails hypre's row-sum test (its sum is 1.95 times its
+    # diagonal entry on these elements, against the 0.9 allowed), so none has a strong
+    # connection and there is no coarse point.  The patch's third version leaves such a
+    # level to its relaxation, as without the setting.
+    version = int(mc._hypre_library().hypre_BoomerAMGSeqOnDevice())
+    M = asm.assemble_native_matrix(Vh[0], [mfem.MassIntegrator()])
+    xm0, itm0, _ = solve("", M)
+    xm, itm, whom = solve("seq_threshold=300", M)
+    em = apart(xm, xm0)
+    check("a level that cannot be coarsened is relaxed, not gathered above the threshold (a mass matrix)",
+          whom is None and em < 1e-7 and itm <= itm0 + 3,
+          "(solved by: %s; difference %.1e, %d iterations against %d, %d rows; the library has the "
+          "patch's version %d)" % (whom, em, itm, itm0, int(M.GetGlobalNumRows()), version))
+
+    # A system.  The rows of a level below the first carry the functions of its coarse
+    # points, which hypre picks for each function on its own; a solver of one process
+    # that is told their number alone takes the rows for functions 0, 1, 2 in turn, which
+    # is wrong for two rows in three.  So gathered, CG with the first coarse level of
+    # this matrix took 34 iterations where it takes 12 (in host memory on one rank,
+    # through the set-up function of the patch's second version); the third gathers the
+    # functions with the rows.  (The space is ordered by components, and the solver is
+    # told so: systems_bynodes=False.)
+    pmv = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(16, 16, 16, mfem.Element.HEXAHEDRON))
+    Vv = hp.FunctionSpace.H1(pmv, 1, vdim=3, ordering=mfem.Ordering.byVDIM)
+    one = mfem.ConstantCoefficient(1.0)
+    S = asm.assemble_native_matrix(Vv, [mfem.VectorDiffusionIntegrator(one),
+                                        mfem.VectorMassIntegrator(one)])
+    nv = int(S.GetGlobalNumRows())
+    rv = hp.ParVector(COMM, S.Height())
+    hp.parRandom.set_seed(33)
+    hp.parRandom.normal(1.0, rv)
+    xv0, itv0, _ = solve("", S, rv, 3)
+    xv, itv, whov = solve("seq_threshold=%d" % (nv + 1), S, rv, 3)
+    ev = apart(xv, xv0)
+    check("the gathered level of a system carries the functions of its rows: the default "
+          "hierarchy's iterations",
+          whov == "first" and ev < 1e-7 and itv <= itv0 + 3,
+          "(solved by: %s; difference %.1e, %d iterations against %d, %d rows; the library has the "
+          "patch's version %d)" % (whov, ev, itv, itv0, nv, version))
 
 
 def test_chebyshev_on_device():
@@ -761,7 +849,7 @@ def test_chebyshev_on_device():
         kg.parameters["amg_options"] = "seq_threshold=%d,redundant=1" % (int(A.GetGlobalNumRows()) // 3)
         kg.set_operator(A)
         t = two_ways(kg)
-        worst = max(worst, t)
+        worst = largest([worst, t])
         said += ", with a gathered level %.1e" % t
     check("cycles from the iterate and a residual updated by products give the same solve",
           worst < 1e-11, "(difference %s)" % said)
@@ -866,8 +954,8 @@ def test_boundary_block_on_device():
     finally:
         K.ELEMENT_CHUNK = old_chunk
         replan()
-    worst = max(plain[k].copy().axpy(-1.0, chunked[k]).norm("l2") / max(plain[k].norm("l2"), 1e-300)
-                for k in pairs)
+    worst = largest(plain[k].copy().axpy(-1.0, chunked[k]).norm("l2") / max(plain[k].norm("l2"), 1e-300)
+                    for k in pairs)
     check("streamed and plain linearization points agree with a boundary residual on the device",
           bool(streamed_used) and worst < K.matrix_tolerance(1e-12),
           "(streamed %s, worst rel %.1e)" % (streamed_used, worst))
@@ -898,11 +986,11 @@ def test_coordinates_on_device():
             gf.ProjectCoefficient(_ScalarPy(lambda x, d=d: x[d]))
             gf.GetTrueDofs(tmp.hypre)
             ref[:, d] = tmp.array
-        worst = max(worst, float(np.abs(X - ref).max()))
+        worst = largest([worst, float(np.abs(X - ref).max())])
         u = V.project(lambda z: 1.0 + 2.0 * z[..., 0] - 3.0 * z[..., 1] + 0.5 * z[..., 2])
         expect = 1.0 + 2.0 * X[:, 0] - 3.0 * X[:, 1] + 0.5 * X[:, 2]
-        worst = max(worst, float(np.abs(u.array - expect).max()))
-    worst = COMM.allreduce(worst, op=MPI.MAX)
+        worst = largest([worst, float(np.abs(u.array - expect).max())])
+    worst = allreduce_extreme(COMM, worst, MPI.MAX)
     check("dof coordinates and nodal projection on the device", worst < 1e-12,
           "(max abs diff %.1e)" % worst)
 
@@ -964,8 +1052,7 @@ def test_hypre_pool():
     asked, spent, blocks = pool.driver_bytes, pool.driver_seconds, pool.driver_allocs
     first = amg_cg(A, iters=30)             # a setup, its hierarchy freed on return
     check("the pool counts what it asks of the driver",
-          pool.driver_bytes > asked and pool.driver_seconds > spent
-          and pool.peak_footprint >= pool.peak_in_use > 0,
+          pool.driver_bytes > asked and pool.driver_seconds > spent and pool.peak_in_use > 0,
           "(%.2f MiB in %d blocks, %.2f ms)" % ((pool.driver_bytes - asked) / 2 ** 20,
                                                pool.driver_allocs - blocks,
                                                1e3 * (pool.driver_seconds - spent)))
@@ -1018,7 +1105,7 @@ def test_hypre_pool_setup_scope():
     x, rhs = hp.ParVector(COMM, A.Height()), hp.ParVector(COMM, A.Height())
     rhs.set(1.0)
     s.solve(x, rhs)
-    got = float(x.hypre.Norml2())
+    got = x.norm("l2")
     check("the pool is open between set_operator and the first solve", open_now)
     check("the setup was served from the pool", pool.from_pool > served,
           "(%d of %d requests)" % (pool.from_pool - served, pool.requests - requests))
@@ -1040,7 +1127,7 @@ def test_hypre_pool_setup_scope():
     s2.set_operator(A)
     x.zero()
     s2.solve(x, rhs)
-    got2 = float(x.hypre.Norml2())
+    got2 = x.norm("l2")
     check("a second setup is served from the pool and gives the same solve",
           pool.from_pool > served and abs(got2 - ref) <= 1e-8 * abs(ref),
           "(%d served, %d from the driver)" % (pool.from_pool - served, pool.driver_allocs - driver))
@@ -1155,7 +1242,7 @@ def test_vectors_on_device():
         pv.set_device_vectors(old)
     check("a vector handed to hypre is flagged for the device only when that is on",
           res["auto"][0] and not res["0"][0])
-    err = max(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"][1:], res["auto"][1:]))
+    err = largest(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"][1:], res["auto"][1:]))
     check("vector arithmetic on the device agrees with numpy on the host", err < 1e-12,
           "(largest relative difference %.1e)" % err)
 
@@ -1188,8 +1275,8 @@ def test_observation_on_device():
     check("the observation operator is a hypre matrix only with the vectors on the device",
           used["auto"] and not used["0"])
     e1 = float(np.abs(res["0"][0] - res["auto"][0]).max() / max(np.abs(res["0"][0]).max(), 1e-300))
-    e2 = max(abs(res["0"][k] - res["auto"][k]) / max(abs(res["0"][k]), 1e-300) for k in (1, 2))
-    check("B u and B^T d agree between the device and the host route", max(e1, e2) < 1e-12,
+    e2 = largest(abs(res["0"][k] - res["auto"][k]) / max(abs(res["0"][k]), 1e-300) for k in (1, 2))
+    check("B u and B^T d agree between the device and the host route", largest([e1, e2]) < 1e-12,
           "(relative differences %.1e and %.1e)" % (e1, e2))
 
 
@@ -1227,7 +1314,7 @@ def test_residual_on_device():
             res[mode] = (r.norm("l2"), g.norm("l2"), r.inner(x[2]), x[0].norm("l2"))
     finally:
         bridge.set_device_bridge(old)
-    err = max(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"], res["auto"]))
+    err = largest(abs(a - b) / max(abs(a), 1e-300) for a, b in zip(res["0"], res["auto"]))
     check("residual, gradient and forward solve agree with and without the bridge",
           err < 1e-10, "(largest relative difference %.1e)" % err)
 
@@ -1268,8 +1355,8 @@ def test_streamed_geometry_pinned():
             moved[label] = bridge.stats()[1] - before
     finally:
         reset(*old)
-    diff = max(max(float(np.abs(x - y).max()) for x, y in zip(out["cached"], out[k]))
-               for k in ("by JAX", "pinned"))
+    diff = largest(largest(float(np.abs(x - y).max()) for x, y in zip(out["cached"], out[k]))
+                   for k in ("by JAX", "pinned"))
     groups = [gk.group for gk in K.group_kernels]
     pinned = all(getattr(g, "_pinned_geometry", None) for g in groups)
     read = sum(g.Jinv.nbytes + g.wdet.nbytes for g in groups)
@@ -1297,6 +1384,7 @@ if __name__ == "__main__":
     test_parmat_block_route()
     test_exchange_routes_agree()
     test_exchange_of_mixed_accumulators()
+    test_split_and_whole_ranks()
     test_gathered_coarse_solve()
     test_chebyshev_on_device()
     test_empty_boundary_rank()

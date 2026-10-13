@@ -1,6 +1,6 @@
 --- a/parcsr_ls/gen_redcs_mat.c
 +++ b/parcsr_ls/gen_redcs_mat.c
-@@ -11,6 +11,401 @@
+@@ -11,6 +11,432 @@
  
  #define USE_ALLTOALL 0
  
@@ -22,7 +22,9 @@
 + * the right-hand side to the host, gathers, and hands the whole to the device.  The
 + * counts of the gather are kept from the set-up, and the iterate of the level is taken
 + * as zero, as it is where a cycle comes down to its last level (it is gathered where
-+ * that level is the matrix itself).
++ * that level is the matrix itself: one of at most n rows that cannot be coarsened, a
++ * hierarchy of one level, which hypre's cycle relaxes without coming here, so that
++ * branch has not been run).
 + *
 + * Who solves.  The first of the ranks, which then sends the whole solution to the
 + * others: one solver, so the correction is one linear map.  With
@@ -45,9 +47,12 @@
 +
 +HYPRE_Int
 +hypre_BoomerAMGSeqOnDevice( void )     /* the mark of a library that has this: 2 since
-+                                          the ranks' solvers are compared */
++                                          the ranks' solvers are compared, 3 since a
++                                          level that cannot be coarsened is not gathered
++                                          above the threshold and a system's level is
++                                          gathered with the functions of its rows */
 +{
-+   return 2;
++   return 3;
 +}
 +
 +/* Who solves the gathered level of a hierarchy that is set up: 1 every rank, 0 the first
@@ -125,6 +130,9 @@
 +      HYPRE_Int          *info, *displs, *nnz_counts, *nnz_displs;
 +      HYPRE_Int           new_num_procs, my_id, i, j, cnt, size, num_nonzeros, total_nnz;
 +      HYPRE_Int           all_solve = hypre_ParAMGDataRedundant(amg_data) ? 1 : 0;
++      HYPRE_Int           num_functions = hypre_ParAMGDataNumFunctions(amg_data);
++      hypre_IntArray     *dof_func = hypre_ParAMGDataDofFuncArray(amg_data)[level];
++      HYPRE_Int          *tmp_dof_func, *seq_dof_func = NULL;
 +      HYPRE_BigInt        row_starts[2];
 +
 +      hypre_MPI_Comm_size(new_comm, &new_num_procs);
@@ -140,6 +148,20 @@
 +         displs[i + 1] = displs[i] + info[i];
 +      }
 +      size = displs[new_num_procs];
++
++      /* the function of every row, for a system: a hierarchy of one process that is told
++       * their number alone takes the rows for functions 0, 1, .. in turn, which the rows
++       * of a level below the first are not (they are those of its coarse points) */
++      if (num_functions > 1 && dof_func)
++      {
++         tmp_dof_func = hypre_TAlloc(HYPRE_Int, num_rows, HYPRE_MEMORY_HOST);
++         seq_dof_func = hypre_TAlloc(HYPRE_Int, size, HYPRE_MEMORY_HOST);
++         hypre_TMemcpy(tmp_dof_func, hypre_IntArrayData(dof_func), HYPRE_Int, num_rows,
++                       HYPRE_MEMORY_HOST, hypre_IntArrayMemoryLocation(dof_func));
++         hypre_MPI_Allgatherv(tmp_dof_func, num_rows, HYPRE_MPI_INT, seq_dof_func, info, displs,
++                              HYPRE_MPI_INT, new_comm);
++         hypre_TFree(tmp_dof_func, HYPRE_MEMORY_HOST);
++      }
 +
 +      /* this rank's rows, diagonal block first, with the columns' global indices */
 +      num_nonzeros = A_diag_i[num_rows] + A_offd_i[num_rows];
@@ -233,6 +255,14 @@
 +            HYPRE_BoomerAMGSetNumSweeps(coarse_solver, hypre_ParAMGDataUserNumSweeps(amg_data));
 +         }
 +         HYPRE_BoomerAMGSetNumFunctions(coarse_solver, hypre_ParAMGDataNumFunctions(amg_data));
++         if (seq_dof_func)
++         {
++            /* (in the memory of the matrix; the solver frees them with itself) */
++            tmp_dof_func = hypre_TAlloc(HYPRE_Int, size, memory_location);
++            hypre_TMemcpy(tmp_dof_func, seq_dof_func, HYPRE_Int, size, memory_location,
++                          HYPRE_MEMORY_HOST);
++            HYPRE_BoomerAMGSetDofFunc(coarse_solver, tmp_dof_func);
++         }
 +         HYPRE_BoomerAMGSetMaxIter(coarse_solver, 1);
 +         HYPRE_BoomerAMGSetTol(coarse_solver, 0);
 +
@@ -251,6 +281,7 @@
 +         hypre_TFree(A_seq_j, HYPRE_MEMORY_HOST);
 +         hypre_TFree(A_seq_data, HYPRE_MEMORY_HOST);
 +      }
++      hypre_TFree(seq_dof_func, HYPRE_MEMORY_HOST);
 +
 +      if (all_solve)
 +      {
@@ -402,7 +433,7 @@
  /* here we have the sequential setup and solve - called from the
   * parallel one - for the coarser levels */
  
-@@ -21,6 +416,14 @@
+@@ -21,6 +447,14 @@
  {
     HYPRE_UNUSED_VAR(coarse_threshold);
  
@@ -417,7 +448,7 @@
     /* Par Data Structure variables */
     hypre_ParCSRMatrix **Par_A_array = hypre_ParAMGDataAArray(amg_data);
  
-@@ -357,6 +760,14 @@
+@@ -357,6 +791,14 @@
  
     HYPRE_Int       first_index;
  
@@ -444,3 +475,18 @@
  
        hypre_TFree(hypre_ParAMGDataMaxEigEst(amg_data), HYPRE_MEMORY_HOST);
        hypre_TFree(hypre_ParAMGDataMinEigEst(amg_data), HYPRE_MEMORY_HOST);
+@@ -3147,8 +3150,14 @@
+    HYPRE_ANNOTATE_REGION_BEGIN("%s", "Coarse solve");
+ 
+    /* redundant coarse grid solve */
++   /* (hippymfem, tools/hypre-3.2.0-seqdevice.patch: of a level of at most seq_threshold
++    * rows only.  The loop above also ends at a level that it cannot coarsen, whatever
++    * the size of that level, and such a level was gathered too: the whole of it on
++    * every rank that holds rows of it, with 32-bit counts.  It is relaxed, as without
++    * the setting.) */
+    if ((seq_threshold >= coarse_threshold) &&
+        (coarse_size > (HYPRE_BigInt) coarse_threshold) &&
++       (coarse_size <= (HYPRE_BigInt) seq_threshold) &&
+        (level != max_levels - 1))
+    {
+       hypre_seqAMGSetup(amg_data, level, coarse_threshold);

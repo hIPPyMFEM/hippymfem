@@ -45,14 +45,18 @@ from ..common.operators import init_vector_like
 
 def _env_default(name, cast, fallback):
     """A default that an environment variable can override, for sweeping a setting
-    without touching every script that builds a solver."""
+    without touching every script that builds a solver.  A value that ``cast`` does not
+    take raises, with the variable's name: the default in its place was another
+    configuration than the job script asked for, run without a word
+    (``HIPPYMFEM_PMG=on`` kept BoomerAMG).  An empty value is the default."""
     v = os.environ.get(name)
-    if v is None or v == "":
+    if v is None or not v.strip():
         return fallback
     try:
         return cast(v)
     except (TypeError, ValueError):
-        return fallback
+        raise ValueError("%s must be %s, not %r"
+                         % (name, "a whole number" if cast is int else "a number", v)) from None
 
 
 def KrylovSolver_ParameterList():
@@ -238,10 +242,16 @@ class KrylovSolver(_SolverBase):
         converges poorly.
     elasticity : bool
         Turn on BoomerAMG's elasticity interpolation (needs ``systems_dim``).
+    systems_bynodes : bool, optional
+        How the unknowns of the components are ordered, which BoomerAMG has to be told
+        to pair the rows of one component: component after component
+        (``mfem.Ordering.byNODES``, the ordering of this library's spaces unless another
+        is asked for, and the default here), or interleaved (``byVDIM``: pass ``False``).
+        Taken from ``fes`` where that is given.
     """
 
     def __init__(self, comm, method="cg", precond="amg", systems_dim=None,
-                 elasticity=False, fes=None):
+                 elasticity=False, fes=None, systems_bynodes=None):
         super(KrylovSolver, self).__init__(comm)
         if method not in _METHODS:
             raise ValueError("unknown Krylov method %r; choose from %s"
@@ -251,6 +261,9 @@ class KrylovSolver(_SolverBase):
         self.systems_dim = systems_dim
         self.elasticity = elasticity
         self.fes = fes
+        if systems_bynodes is None:
+            systems_bynodes = fes is None or fes.GetOrdering() == mfem.Ordering.byNODES
+        self.systems_bynodes = bool(systems_bynodes)
         self._solver = None
         self._pc = None
         self._template = None
@@ -275,30 +288,68 @@ class KrylovSolver(_SolverBase):
         if t in (None, "none"):
             return None
         if t == "amg":
+            from ..common import mfemconfig as _mc
+
             pc = mfem.HypreBoomerAMG(A)
             pc.SetPrintLevel(0)
             self._set_error_mode(pc)
+            # MFEM's setters do not pass on what hypre says of a value.  hypre drops one that
+            # it refuses (a strength threshold above one) and raises its error flag: the
+            # solver went on with hypre's own value without a word, and the flag stayed up
+            # for whichever call returned it next (MFEM's set-up of the preconditioner, as
+            # an error of the set-up).  The flag is the process's: cleared here and read
+            # after each setter, it is that setter's verdict, the same on every rank (as in
+            # mfemconfig.set_boomeramg_options).
+            H = _mc._hypre_library()
+            if H is not None:
+                H.HYPRE_ClearAllErrors()
+
+            def taken(name, value):
+                flag = int(H.HYPRE_GetError()) if H is not None else 0
+                if flag:
+                    H.HYPRE_ClearAllErrors()
+                    raise ValueError("hypre refused the solver parameter %s=%r (its error flag "
+                                     "read %d)" % (name, value, flag))
+
+            if self.systems_dim:
+                # hypre takes the rows for components in turn unless it is told which
+                # component each is, and the rows of a space ordered by nodes are one
+                # component after another: with the number alone it pairs rows of
+                # different components, and a solve takes several times the iterations
+                dim, bynodes = int(self.systems_dim), self.systems_bynodes
+                if bynodes and _reduce(self.comm, int(A.Height() % dim != 0), MPI.MAX):
+                    # (MFEM stops the process there; an error of every rank instead)
+                    raise ValueError("systems_dim=%d with the components one after another "
+                                     "(systems_bynodes) needs the rows of every rank to be "
+                                     "that many times its nodes" % dim)
+                pc.SetSystemsOptions(dim, bynodes)
+                if self.elasticity:
+                    pc.SetElasticityOptions(self.fes)
+                # (Before the solver's own settings, which follow.  With the components MFEM
+                # writes settings of its own, no aggressive levels and a strength threshold
+                # of 0.5 among them: written last, they took the place of amg_agg_levels,
+                # amg_strength_threshold and the amg_options of a vector problem without a
+                # word.)
+                taken("systems_dim", dim)
             relax = int(self.parameters["amg_relax_type"])
             if relax >= 0:
                 pc.SetRelaxType(relax)
+                taken("amg_relax_type", relax)
             levels = int(self.parameters["amg_max_levels"])
             if levels > 0:
                 pc.SetMaxLevels(levels)
+                taken("amg_max_levels", levels)
             agg = int(self.parameters["amg_agg_levels"])
             if agg >= 0:
                 pc.SetAggressiveCoarsening(agg)
+                taken("amg_agg_levels", agg)
             theta = float(self.parameters["amg_strength_threshold"])
             if theta >= 0.0:
                 pc.SetStrengthThresh(theta)
+                taken("amg_strength_threshold", theta)
             extra = str(self.parameters["amg_options"] or "")
             if extra:
-                from ..common import mfemconfig as _mc
-
                 _mc.set_boomeramg_options(pc, _mc.parse_boomeramg_options(extra))
-            if self.systems_dim:
-                pc.SetSystemsOptions(int(self.systems_dim))
-                if self.elasticity:
-                    pc.SetElasticityOptions(self.fes)
             return pc
         if t == "ilu":
             pc = mfem.HypreILU()
@@ -395,7 +446,9 @@ class KrylovSolver(_SolverBase):
         # frees (mfemconfig.set_hypre_pool); it holds nothing afterwards
         self._setup_pending = self._pc is not None
         #: a hierarchy kept from an older matrix (pc_reuse) is set up already, and so is
-        #: one that another solver handed over after a solve of its own
+        #: one that another solver handed over after a solve of its own (read by a tally
+        #: of the solves, bench_newton_device's; solve asks the object that sets it up for
+        #: the solver it runs, the preconditioner for MFEM's and the PCG for hypre's)
         self._setup_due = (self._setup_pending and keep is None
                            and not getattr(self._pc, "_hm_set_up", False))
         if self._setup_pending:
@@ -555,9 +608,19 @@ class KrylovSolver(_SolverBase):
         from ..common import mfemconfig as _mc
 
         # a solve on a hierarchy that is set up exchanges through the buffers its
-        # matrices keep: those may go to a GPU-aware MPI (mfemconfig.GPU_AWARE_SOLVES)
-        aware = _mc.GPU_AWARE_SOLVES and not (getattr(self, "_setup_pending", False)
-                                              and getattr(self, "_setup_due", True))
+        # matrices keep: those may go to a GPU-aware MPI (mfemconfig.GPU_AWARE_SOLVES).
+        # Set up for the solver that applies it, that is: MFEM sets a preconditioner up
+        # at its own first application, whatever hypre's PCG did with it before (a
+        # hierarchy kept for the next operator, one lent without its owner's PCG, a solve
+        # from a nonzero guess after one from zero).  And hypre's PCG sets it up at its
+        # own first solve, whatever MFEM did with it before (a solve from zero after one
+        # from a nonzero guess, a PCG lent by an owner whose solves were all of those).
+        direct = self._pc is not None and not native
+        if direct:
+            setup = not getattr(self._pc, "_hm_direct", False)
+        else:
+            setup = native and not getattr(solver, "_hm_native", False)
+        aware = _mc.GPU_AWARE_SOLVES and not setup
         if aware:
             _mc.set_hypre_gpu_aware_mpi(True)
         try:
@@ -565,6 +628,16 @@ class KrylovSolver(_SolverBase):
         finally:
             if aware:
                 _mc.set_hypre_gpu_aware_mpi(False)
+        if direct:
+            try:
+                self._pc._hm_direct = True          # MFEM has set it up, for every solver
+            except AttributeError:
+                pass
+        elif native:
+            try:
+                solver._hm_native = True            # hypre's PCG has, for all that share it
+            except AttributeError:
+                pass
         if getattr(self, "_setup_pending", False):
             from ..common.mfemconfig import hypre_pool_close
 
@@ -580,10 +653,43 @@ class KrylovSolver(_SolverBase):
             solver.GetFinalResidualNorm(norm)
             self.iterations = int(its.value())
             final = float(norm.value())
-            # (stopped by the absolute tolerance, or by the relative one at the last
-            # iteration allowed)
-            self.converged = (self.iterations < int(self.parameters["max_iter"])
-                              or final <= float(self.parameters["rel_tolerance"]))
+            # Not the count.  hypre's PCG leaves an iteration that breaks down before the
+            # last one allowed (a matrix that is not positive definite); it takes one for
+            # converged when <C r, r> turns negative (a preconditioner that is not), with
+            # a residual that is not a number and a true one of order one; and where
+            # <C b, b> is not positive, or not a number, it does not begin, and returns
+            # the right-hand side or zero with the count and the residual of the solve
+            # before.  So: hypre's verdict, and a residual that is a number.
+            verdict, error = _pcg_verdict(solver)
+            if verdict is None:
+                # (no handle of hypre's solver from this MFEM library: the count, for a
+                # solve stopped by the absolute tolerance, or by the relative one at the
+                # last iteration allowed)
+                verdict = (self.iterations < int(self.parameters["max_iter"])
+                           or final <= float(self.parameters["rel_tolerance"]))
+            elif not verdict:
+                from .singlesolve import HYPRE_ERROR_CONV
+
+                # An iteration that fails, by a breakdown or at its limit, raises the bit.
+                # The verdict is one for all ranks, but the flag is a process's: what is
+                # read from it is reduced over them, or one rank would go on alone.
+                failed = _reduce(self.comm, 1 if error & HYPRE_ERROR_CONV else 0, MPI.MAX)
+                if not failed:
+                    # At its limit hypre raises the bit only where it has a test to miss,
+                    # and with both tolerances zero, or of a square that is, it has none.
+                    # What it returns then tells an iteration from none, which leaves zero
+                    # or the right-hand side (the count does not: without an iteration it
+                    # is the solve before's).
+                    p = self.parameters
+                    rel, least = float(p["rel_tolerance"]), float(p["abs_tolerance"])
+                    failed = (rel * rel == 0.0 == least * least and x.norm("l2") > 0.0
+                              and x.copy().axpy(-1.0, b).norm("l2") > 0.0)
+                if b.norm("l2") < 1e-300:
+                    x.zero()                       # zero (or nothing a double can square)
+                    self.iterations, final, verdict = 0, 0.0, True
+                elif not failed:
+                    self.iterations, final = 0, float("nan")      # hypre did not begin
+            self.converged = bool(verdict) and math.isfinite(final)
         else:
             self.iterations = solver.GetNumIterations()
             self.converged = bool(solver.GetConverged())
@@ -602,6 +708,44 @@ class KrylovSolver(_SolverBase):
                    final if final is not None else solver.GetFinalRelNorm())
             )
         return self.iterations
+
+
+def _pcg_verdict(pcg):
+    """What hypre says of the solve that an ``mfem.HyprePCG`` has just made, which MFEM's
+    class does not pass on: its verdict (``HYPRE_PCGGetConverged``; ``None`` where the
+    MFEM library does not give hypre's handle of the solver, as for
+    :func:`~hippymfem.common.mfemconfig.boomeramg_handle`) and its error flag, which is
+    read and cleared.
+
+    The flag is the process's, and MFEM's ``HyprePCG`` does not look at it: left up after
+    a solve that ended at its limit, or after a set-up that met a zero row on this rank,
+    it is what the next call that returns the flag hands back as its own, a setter of a
+    BoomerAMG option as a refusal and a set-up by MFEM as a failure."""
+    import ctypes
+
+    from ..common import mfemconfig as _mc
+
+    H, lib = _mc._hypre_library(), _mc._mfem_library()
+    if H is None:
+        return None, 0
+    error = int(H.HYPRE_GetError())
+    if error:
+        H.HYPRE_ClearAllErrors()
+    name = "_ZNK4mfem8HyprePCGcvP19hypre_Solver_structEv"
+    if lib is None or not hasattr(lib, name) or not hasattr(H, "HYPRE_PCGGetConverged"):
+        return None, error
+    try:
+        handle, get = getattr(lib, name), H.HYPRE_PCGGetConverged
+        handle.restype, handle.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+        get.restype, get.argtypes = ctypes.c_int, [ctypes.c_void_p, ctypes.c_void_p]
+        solver = handle(int(pcg.this))
+        if not solver:
+            return None, error
+        said = ctypes.c_longlong(0)                 # (room for hypre's integer, 4 or 8 bytes)
+        get(ctypes.c_void_p(solver), ctypes.byref(said))
+    except Exception:                                            # noqa: BLE001
+        return None, error
+    return bool(said.value), error
 
 
 def _layout_of(comm, A):

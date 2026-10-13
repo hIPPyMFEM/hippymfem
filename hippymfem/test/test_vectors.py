@@ -13,7 +13,7 @@ from mpi4py import MPI
 import mfem.par as mfem
 
 import hippymfem as hp
-from hippymfem.common.parvector import ParVector
+from hippymfem.common.parvector import ParVector, allreduce_extreme
 from hippymfem.algorithms.multivector import MultiVector, MatMvMult, MvDSmatMult
 
 COMM = MPI.COMM_WORLD
@@ -28,6 +28,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % (tag, name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def close(a, b, tol=1e-12):
@@ -134,7 +143,7 @@ def test_partition_matches_mfem():
     xm.GetDataArray()[:] = x.array
     M.Mult(xm, ym)
     err = np.abs(ym.GetDataArray() - y.array).max() if y.local_size else 0.0
-    err = COMM.allreduce(err, op=MPI.MAX)
+    err = allreduce_extreme(COMM, err, MPI.MAX)
     check("HypreParMatrix.Mult agrees on our partition", err == 0.0, "(err=%g)" % err)
 
     # Our offsets must equal MFEM's true-dof offsets: for every locally owned
@@ -272,7 +281,7 @@ def test_multivector():
     # X == Q R
     recon = MultiVector(v, n)
     MvDSmatMult(Z, r, recon)
-    err = max(recon[i].copy().axpy(-1.0, X[i]).norm("linf") for i in range(n))
+    err = largest(recon[i].copy().axpy(-1.0, X[i]).norm("linf") for i in range(n))
     check("orthogonalize: Q R == X", err < 1e-10, "(%.2e)" % err)
 
     # B-orthogonal QR with B = mass matrix
@@ -289,7 +298,7 @@ def test_multivector():
     check("Borthogonalize: Q^T B Q == I",
           np.abs(QtBQ - np.eye(n)).max() < 1e-9,
           "(%.2e)" % np.abs(QtBQ - np.eye(n)).max())
-    err = max(Bq[i].copy().axpy(-1.0, BW[i]).norm("linf") for i in range(n))
+    err = largest(Bq[i].copy().axpy(-1.0, BW[i]).norm("linf") for i in range(n))
     check("Borthogonalize: returns B Q", err < 1e-10, "(%.2e)" % err)
 
     # swap keeps aliases valid
@@ -473,6 +482,55 @@ def test_config_knobs():
               refused and c.pattern_sort == saved[3], "(%r)" % (c.pattern_sort,))
     finally:
         c.gpu_mem_reserve, c.fused_keep, c.fold_elimination, c.pattern_sort = saved
+    # The knobs that live in the environment are written as the code that reads them back
+    # parses them: ``True`` and ``2.0`` were written as ``"True"`` and ``"2.0"``, which a new
+    # solver read as 0 without a word and a prior stopped at.
+    import os
+
+    from hippymfem.modeling.prior import prior_h
+
+    names = ("HIPPYMFEM_PMG", "HIPPYMFEM_PMG_H", "HIPPYMFEM_PMG_H_HOST", "HIPPYMFEM_PRIOR_H")
+    kept = {n: os.environ.get(n) for n in names}
+    try:
+        c.pmg, c.pmg_h, c.pmg_h_host, c.prior_h = True, 2.0, 5e3, True
+        p = hp.KrylovSolver_ParameterList()
+        try:
+            got = (p["pmg"], p["pmg_h"], p["pmg_h_host"], prior_h())
+        except ValueError as e:
+            got = (p["pmg"], p["pmg_h"], p["pmg_h_host"], str(e))
+        check("a switch set to True and a count given as a float reach a new solver and a prior",
+              got == (1, 2, 5000, 1), "(%r)" % (got,))
+        try:
+            c.pmg_h = 2.5
+            refused = False
+        except ValueError:
+            refused = True
+        check("a count that is no whole number is refused",
+              refused and hp.KrylovSolver_ParameterList()["pmg_h"] == 2, "(%r)" % (c.pmg_h,))
+        # The same for a variable that a job script sets: a value that is no whole number
+        # is an error that names the variable.  A new solver took its default for it and
+        # ran another configuration without a word, and a prior stopped at the message of
+        # ``int``, which names none.  An empty value is the default, as it was.
+        os.environ["HIPPYMFEM_PMG_H"], os.environ["HIPPYMFEM_PRIOR_H"] = "two", "on"
+        said = []
+        for read in (hp.KrylovSolver_ParameterList, prior_h):
+            try:
+                read()
+                said.append("no error")
+            except ValueError as e:
+                said.append(str(e))
+        os.environ["HIPPYMFEM_PMG_H"] = os.environ["HIPPYMFEM_PRIOR_H"] = ""
+        check("a variable that is no whole number is an error that names it, for a new solver "
+              "and for a prior, and an empty one the default",
+              "HIPPYMFEM_PMG_H" in said[0] and "HIPPYMFEM_PRIOR_H" in said[1]
+              and hp.KrylovSolver_ParameterList()["pmg_h"] == 0 and prior_h() == 0,
+              "(%s)" % "; ".join(said))
+    finally:
+        for n, v in kept.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
 
 
 def test_ensemble():
@@ -502,7 +560,7 @@ def test_ensemble():
     Y1, Y2 = MultiVector(v, n), MultiVector(v, n)
     MatMvMult(A, X, Y1)
     MatMvMult(A, X, Y2, ensemble=COMM)
-    err = COMM.allreduce(float(np.abs(Y1.data - Y2.data).max()), op=MPI.MAX)
+    err = allreduce_extreme(COMM, float(np.abs(Y1.data - Y2.data).max()), MPI.MAX)
     check("MatMvMult divided among the ranks == one rank", err == 0.0, "(%.2e)" % err)
 
     # the generalized eigenproblem A u = lambda B u with a diagonal B
@@ -513,11 +571,12 @@ def test_ensemble():
     Omega.data[:] = np.random.default_rng(12).standard_normal(Omega.data.shape)
     d1, U1 = hp.doublePassG(A, B, B, MultiVector(Omega), 6)
     d2, U2 = hp.doublePassG(A, B, B, MultiVector(Omega), 6, ensemble=COMM)
-    err = COMM.allreduce(float(np.abs(d2 / d1 - 1.0).max()), op=MPI.MAX)
+    err = allreduce_extreme(COMM, float(np.abs(d2 / d1 - 1.0).max()), MPI.MAX)
     check("doublePassG divided among the ranks: eigenvalues", err < 1e-12, "(%.2e)" % err)
-    err = COMM.allreduce(float(np.abs(U1.data - U2.data).max()), op=MPI.MAX)
+    err = allreduce_extreme(COMM, float(np.abs(U1.data - U2.data).max()), MPI.MAX)
     check("doublePassG divided among the ranks: eigenvectors", err < 1e-10, "(%.2e)" % err)
-    spread = COMM.allreduce(float(d2[0]), op=MPI.MAX) - COMM.allreduce(float(d2[0]), op=MPI.MIN)
+    spread = (allreduce_extreme(COMM, float(d2[0]), MPI.MAX)
+              - allreduce_extreme(COMM, float(d2[0]), MPI.MIN))
     check("every rank returns the same eigenvalues", spread == 0.0, "(%.2e)" % spread)
 
 

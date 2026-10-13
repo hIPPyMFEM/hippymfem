@@ -17,6 +17,7 @@ import jax.numpy as jnp
 
 import hippymfem as hm
 from hippymfem.common.operators import Operator, init_vector_like
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
 COMM = MPI.COMM_WORLD
@@ -683,14 +684,25 @@ def test_newton_cg_reorthogonalized():
     if krylov:
         chb, m_chb = run(True, cycles=5)
         e_chb = m_chb.copy().axpy(-1.0, m_plain).norm("l2") / scale
+        # What the run left with the prior: the polynomial that Newton-CG asked for, which
+        # has solved.  (A run that never applied it is the reorthogonalized one over again,
+        # within every bound below, and the call here would make the polynomial itself.)
+        used = model.prior.__dict__.get("_hessian_cheb")
         cheb = model.prior.getHessianPreconditioner(cycles=5)
         check("the prior's solves as five multigrid cycles each leave the MAP point and about the count",
               chb.converged and e_chb < 1e-5 and cheb is not model.prior.Rsolver
+              and used is cheb and cheb.Asolver.iterations == 5
               and chb.it <= reo.it + 1
               and chb.total_cg_iter <= 1.15 * reo.total_cg_iter + 3,
               "(%d Newton and %d CG iterations, %d and %d with Krylov solves; MAP differs by %.1e; "
-              "bound of one solve %.1e)"
-              % (chb.it, chb.total_cg_iter, reo.it, reo.total_cg_iter, e_chb, cheb.Asolver.error_bound))
+              "bound of one solve %.1e; the polynomial %s)"
+              % (chb.it, chb.total_cg_iter, reo.it, reo.total_cg_iter, e_chb, cheb.Asolver.error_bound,
+                 "was applied" if used is cheb and cheb.Asolver.iterations else "was never applied"))
+    else:
+        # (a factorization has no solve to replace by cycles: Newton-CG gets the prior's own)
+        check("a prior solved by a factorization hands out its own solver for the cycles",
+              model.prior.getHessianPreconditioner(cycles=5) is model.prior.Rsolver,
+              "(nothing to count on one rank)")
     # Hessian actions less accurate as the CG converges: the incremental solves stop at
     # 1e-2 of the CG's tolerance times |r_0| / |r_k| where that is looser than their own
     # 1e-5.  The same MAP point in about as many Hessian actions, with fewer iterations
@@ -747,6 +759,98 @@ def test_trust_region():
     x = solver.solve([None, model.prior.mean.copy(), None])
     check("trust-region Newton-CG converged", solver.converged,
           "(%s, %d its)" % (solver.termination_reasons[solver.reason], solver.it))
+    # cg_preconditioner_cycles holds here as in the line search: the CG of every step asks
+    # the model for the polynomial of cycles, and for no tolerance, which is the line
+    # search's.  (The setting was passed over without a word, and the prior's Krylov
+    # solves ran.)  With Krylov solves the polynomial is what the run applied, to the same
+    # MAP point; a prior solved by a factorization has no solve to replace.
+    asked, own = [], model.Rsolver
+
+    def recorded(*args, **kwargs):
+        asked.append((args, kwargs))
+        return own(*args, **kwargs)
+
+    model.Rsolver = recorded
+    try:
+        params["cg_preconditioner_cycles"] = 5
+        cyc = hm.ReducedSpaceNewtonCG(model, params)
+        xc = cyc.solve([None, model.prior.mean.copy(), None])
+    finally:
+        del model.Rsolver
+    used = model.prior.__dict__.get("_hessian_cheb")
+    krylov = isinstance(model.prior.Asolver, hm.KrylovSolver)
+    e = xc[PARAMETER].copy().axpy(-1.0, x[PARAMETER]).norm("l2") / x[PARAMETER].norm("l2")
+    check("the trust region's CG is given the prior's solves as five multigrid cycles each "
+          "where that is asked for",
+          cyc.converged and e < 1e-5 and len(asked) == cyc.it
+          and all(a == ((None,), {"cycles": 5}) for a in asked)
+          and ((used is not None and used.Asolver.iterations == 5) if krylov else used is None),
+          "(%d Newton and %d CG iterations, %d and %d with the prior's own solves; MAP differs by "
+          "%.1e; asked for %s; %s)"
+          % (cyc.it, cyc.total_cg_iter, solver.it, solver.total_cg_iter, e,
+             ", ".join(sorted(set("cycles=%s" % k.get("cycles") for _a, k in asked))) or "nothing",
+             "a factorization here, nothing to replace" if not krylov
+             else "the polynomial was applied" if used is not None and used.Asolver.iterations
+             else "the polynomial was never applied"))
+
+
+def test_preconditioner_arguments():
+    """A model and a prior written before the arguments of the Hessian's preconditioner
+    existed (a tolerance, a number of cycles) are asked without them, and an error inside
+    a prior that takes them is raised.  Every ``TypeError`` of the call was taken for a
+    missing argument: one raised while the polynomial of cycles was built, on a rank
+    without rows, left that rank with the prior's Krylov solves beside ranks with the
+    polynomial, and nothing said so."""
+    if RANK == 0:
+        print("the arguments of the Hessian's preconditioner")
+
+    class _Oldest(object):                      # a prior with its solver and nothing else
+        Rsolver = "own"
+
+    class _Before(_Oldest):                     # one from before the cycles
+
+        def getHessianPreconditioner(self, tolerance=None):
+            return ("loosened", tolerance)
+
+    class _Broken(_Oldest):                     # one with them, and an error inside
+
+        def getHessianPreconditioner(self, tolerance=None, cycles=None):
+            return int(None) if cycles else ("loosened", tolerance)
+
+    class _Plain(object):                       # hIPPYlib's model
+
+        def Rsolver(self):
+            return "own"
+
+    def model_of(prior):
+        model = hm.Model.__new__(hm.Model)
+        model.prior = prior
+        return model
+
+    def newton(model):
+        """What the CG of a Newton step is given with five cycles asked for."""
+        params = hm.ReducedSpaceNewtonCG_ParameterList()
+        params["cg_preconditioner_cycles"] = 5
+        return hm.ReducedSpaceNewtonCG(model, params)._cg_preconditioner(0.5)
+
+    old = model_of(_Before())
+    got = (old.Rsolver(1e-6, cycles=5), old.Rsolver(None, cycles=5), old.Rsolver(1e-6),
+           old.Rsolver(), model_of(_Oldest()).Rsolver(1e-6, cycles=5), newton(old),
+           newton(_Plain()))
+    check("a prior without the cycles, one without a preconditioner of its own and a model "
+          "whose Rsolver takes no argument are asked without them",
+          got == (("loosened", 1e-6), "own", ("loosened", 1e-6), "own", "own",
+                  ("loosened", 1e-6), "own"), "(%r)" % (got,))
+    raised = []
+    for ask in (lambda: model_of(_Broken()).Rsolver(1e-6, cycles=5),
+                lambda: model_of(_Broken()).Rsolver(None, cycles=5),
+                lambda: newton(model_of(_Broken()))):
+        try:
+            raised.append("returned %r" % (ask(),))
+        except TypeError:
+            raised.append("raised")
+    check("an error inside the prior while the preconditioner is built is raised, not taken "
+          "for a missing argument", raised == ["raised"] * 3, "(%s)" % ", ".join(raised))
 
 
 def test_bfgs():
@@ -945,7 +1049,7 @@ def test_laplace_approximation():
     acc /= nsamp
     num = (np.abs(acc - pv.array).max() / max(np.abs(pv.array).max(), 1e-300)
            if pv.local_size else 0.0)
-    num = COMM.allreduce(num, op=MPI.MAX)
+    num = allreduce_extreme(COMM, num, MPI.MAX)    # (MPI's MAX may drop one rank's NaN)
     check("posterior sample variance ~ pointwise variance (%d samples)" % nsamp,
           num < 0.35, "(rel %.3f)" % num)
 
@@ -974,7 +1078,7 @@ def test_cg_sampler():
     pv = prior.pointwise_variance("Exact")
     rel = (np.abs(acc - pv.array).max() / max(np.abs(pv.array).max(), 1e-300)
            if pv.local_size else 0.0)
-    rel = COMM.allreduce(rel, op=MPI.MAX)
+    rel = allreduce_extreme(COMM, rel, MPI.MAX)    # (MPI's MAX may drop one rank's NaN)
     check("CGSampler variance ~ diag(R^{-1})", rel < 0.35, "(rel %.3f)" % rel)
 
     # A ParVector of variates is read in global order on every rank, so it gives the
@@ -1007,6 +1111,7 @@ if __name__ == "__main__":
     test_randomized_svd()
     test_trace_estimator()
     test_trust_region()
+    test_preconditioner_arguments()
     test_newton_cg_reorthogonalized()
     test_bfgs_operator()
     test_bfgs()

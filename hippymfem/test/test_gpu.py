@@ -78,6 +78,15 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
+
+
 def have_gpu():
     return accel() is not None
 
@@ -169,8 +178,8 @@ def test_blocks_agree():
             for r, g in zip(ref, got):
                 sc = max(float(np.abs(r).max()), 1e-300)
                 e = float(np.abs(r - g).max()) / sc
-                worst = max(worst, e)
-                if e > 1e-13:
+                worst = largest([worst, e])
+                if not e <= 1e-13:              # (a NaN compares false, and is a difference)
                     bad.append("%s %.2e" % (name, e))
         for var in (STATE, PARAMETER, ADJOINT):
             with on("cpu"):
@@ -180,8 +189,8 @@ def test_blocks_agree():
             for r, g in zip(ref, got):
                 sc = max(float(np.abs(r).max()), 1e-300)
                 e = float(np.abs(r - g).max()) / sc
-                worst = max(worst, e)
-                if e > 1e-13:
+                worst = largest([worst, e])
+                if not e <= 1e-13:
                     bad.append("vec %d %.2e" % (var, e))
         check("%s order %d %s: all blocks agree" % (kind, order, family), not bad,
               "" if not bad else "differs: " + ", ".join(bad))
@@ -213,10 +222,10 @@ def test_quadrature_hessian_on_gpu():
                     got = [np.asarray(a) for ij in pairs
                            for a in kern.element_matrices(*ij, loc)]
                 sc = max([float(np.abs(r).max()) for r in ref if r.size] + [1e-300])
-                e = max([float(np.abs(r - g).max()) / sc
-                         for r, g in zip(ref, got) if r.size] + [0.0])
-                worst = max(worst, e)
-                if e > 1e-13:
+                e = largest([float(np.abs(r - g).max()) / sc
+                             for r, g in zip(ref, got) if r.size] + [0.0])
+                worst = largest([worst, e])
+                if not e <= 1e-13:              # (a NaN compares false, and is a difference)
                     bad.append("%s %.2e" % (mode, e))
             routes |= {v for gk in kern.group_kernels for v in gk.hessian_route.values()}
             check("%s order %d: quadrature and auto on the GPU agree" % (kind, order), not bad,
@@ -352,7 +361,7 @@ def test_reproducible():
                 vals = [pat.data(kern.element_matrices(ADJOINT, STATE, loc))
                         for _ in range(5)]
             same = all(np.array_equal(vals[0], v) for v in vals[1:])
-            spread = max(float(np.abs(vals[0] - v).max()) for v in vals[1:])
+            spread = largest(float(np.abs(vals[0] - v).max()) for v in vals[1:])
             sc = max(float(np.abs(vals[0]).max()), 1e-300)
             if mode:
                 check("deterministic scatter: five assemblies are bit-identical",

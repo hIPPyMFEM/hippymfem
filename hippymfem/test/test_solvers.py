@@ -467,6 +467,114 @@ def test_hypre_pool_logic():
           "(%s)" % (short.stats(),))
     short._free(got)
     short.trim()
+    # A block that hypre frees while the pool is being emptied.  Python's collector can
+    # start inside trim's loop over the bins, at a call of the driver, and where it
+    # finalizes a dropped matrix, hypre frees that matrix's arrays through the pool there.
+    # The driver here does at its first call what such a finalizer does.
+    late, stray = [], []                        # blocks to come back; frees of blocks not held
+
+    def free_and_finalize(p):
+        if live.pop(p if isinstance(p, int) else p.value, None) is None:
+            stray.append(p)
+        while late:
+            busy._free(late.pop())
+        return 0
+
+    reentered = types.SimpleNamespace(cudaMalloc=Fn(dev_malloc), cudaFree=Fn(free_and_finalize))
+    busy = HyprePool(hypre, reentered, max_cached=2000, max_block=2000)
+
+    def grab(n):
+        busy._malloc(out, n)
+        return out[0]
+
+    t = [grab(1000), grab(700), grab(300), grab(40)]
+    for q in t[:3]:
+        busy._free(q)                           # the pool is full
+    late.append(t[3])                           # and this one is of a size it does not hold
+    try:
+        freed = busy.trim()
+    except RuntimeError as e:
+        freed = str(e)
+    kept = [q for blocks in busy._bins.values() for q, _n in blocks]
+    ok = freed == 2000 and kept == list(live) == [t[3]] and busy.cached == 40 and busy.in_use == 0
+    busy.trim()
+    check("pool: a block freed while the pool is emptied goes to the driver once, like the rest",
+          ok and not stray and not live,
+          "(trim returned %r; %d freed twice; %d left)" % (freed, len(stray), len(live)))
+    live.clear()                                # (what a failure left, for the check below)
+    # The single-precision hypre allocates through the same pool where it is loaded
+    # (singlesolve._Library gives it the pool's two functions).  Removing the pool gives
+    # both libraries their own allocator back: one that kept the two functions went on
+    # filling a pool that nothing opened, closed or trimmed any more.
+    from hippymfem.common import mfemconfig as mc
+
+    class Library:                              # takes the place of a libHYPRE
+        malloc = free = None
+
+        def hypre_SetUserDeviceMalloc(self, f):
+            self.malloc = f
+
+        def hypre_SetUserDeviceMfree(self, f):
+            self.free = f
+
+    first, second = Library(), Library()
+    shared = HyprePool(first, runtime, max_cached=3000, max_block=2000)
+    second.hypre_SetUserDeviceMalloc(shared._cb_malloc)
+    second.hypre_SetUserDeviceMfree(shared._cb_free)
+    ok = (first.malloc is second.malloc is shared._cb_malloc
+          and first.free is second.free is shared._cb_free)
+    was = mc.HYPRE_POOL, mc._single_library
+    mc.HYPRE_POOL, mc._single_library = shared, lambda: second
+    try:
+        shared._malloc(out, 500)
+        shared._free(out[0])                    # something for the removal to return
+        shared.uninstall()
+    finally:
+        mc.HYPRE_POOL, mc._single_library = was
+    check("pool: removing it gives every library that allocates through it its own allocator back",
+          ok and not shared.installed and first.malloc is first.free is None
+          and second.malloc is second.free is None and shared.cached == 0 and not live)
+
+
+def test_gpu_aware_mpi_check():
+    """The check of the MPI library before hypre hands it buffers on the GPU
+    (``mfemconfig._check_gpu_aware_mpi``), with stand-ins for hypre's switch, for the MPI
+    library and for a communicator of two ranks.  A refusal leaves hypre staging its
+    buffers: ``configure_device`` has the device by then, so a second call returns it
+    without the check, and a caller that caught the error went on with the exchange that
+    was refused."""
+    import types
+
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("the check of the MPI library for hypre's buffers on the GPU")
+    flag = [0]
+
+    def switch(on):
+        flag[0] = int(on.value)
+        return 0
+
+    hypre = types.SimpleNamespace(hypre_SetGpuAwareMPI=switch, hypre_GetGpuAwareMPI=lambda: flag[0])
+    two = types.SimpleNamespace(Get_size=lambda: 2, Get_rank=lambda: 0)
+    was = mc._HYPRE_HANDLE, mc.mpi_gpu_support
+    seen = {}
+    try:
+        mc._HYPRE_HANDLE = hypre
+        for can in (True, False):
+            mc.mpi_gpu_support = lambda can=can: can
+            mc.set_hypre_gpu_aware_mpi(True)
+            try:
+                passed = mc._check_gpu_aware_mpi(two, quiet=True)
+            except RuntimeError as e:
+                passed = "refused" if "HIPPYMFEM_GPU_AWARE_MPI=0" in str(e) else str(e)
+            seen[can] = (passed, mc.hypre_gpu_aware_mpi())
+    finally:
+        mc._HYPRE_HANDLE, mc.mpi_gpu_support = was
+    check("an MPI library that reads device memory passes, and hypre keeps handing it its buffers",
+          seen[True] == (True, True), "(%r)" % (seen[True],))
+    check("one that cannot is refused with the way out, and hypre is left staging its buffers",
+          seen[False] == ("refused", False), "(%r)" % (seen[False],))
 
 
 def test_boomeramg_options():
@@ -529,6 +637,29 @@ def test_boomeramg_options():
     check("a value hypre refuses raises by the name of the setting, and leaves no error behind",
           "levels=0" in said and H.HYPRE_GetError() == 0
           and read(pc, "HYPRE_BoomerAMGGetMaxLevels", ctypes.c_int) == 7)
+    # hypre's error flag is the process's, and every setter returns it: what an earlier
+    # call left up (here the same refusal from hypre itself, which nothing clears) is not
+    # a refusal of the settings that follow
+    fn = H.HYPRE_BoomerAMGSetMaxLevels
+    fn.restype, fn.argtypes = ctypes.c_int, [ctypes.c_void_p, ctypes.c_int]
+    up, said = fn(ctypes.c_void_p(mc.boomeramg_handle(pc)), 0), ""
+    try:
+        mc.set_boomeramg_options(pc, {"pmax": 5})
+    except ValueError as e:
+        said = str(e)
+    check("an error of hypre's that an earlier call left up is not taken for a refusal",
+          up != 0 and not said and H.HYPRE_GetError() == 0
+          and read(pc, "HYPRE_BoomerAMGGetPMaxElmts", ctypes.c_int) == 5,
+          "(the flag was %d%s)" % (up, said and "; " + said))
+    # hypre's setters of the relaxation and of its sweeps reset those of the coarsest
+    # level: the coarsest level's own hold wherever they are written
+    mc.set_boomeramg_options(pc, {"coarse_relax": 7, "coarse_sweeps": 4, "relax": 18, "sweeps": 2})
+    got = (read(pc, "HYPRE_BoomerAMGGetCycleRelaxType", ctypes.c_int, 1),
+           read(pc, "HYPRE_BoomerAMGGetCycleRelaxType", ctypes.c_int, 3),
+           read(pc, "HYPRE_BoomerAMGGetCycleNumSweeps", ctypes.c_int, 1),
+           read(pc, "HYPRE_BoomerAMGGetCycleNumSweeps", ctypes.c_int, 3))
+    check("the coarsest level's relaxation and sweeps hold when they are written before the others'",
+          got == (18, 7, 2, 4), "(%s)" % ", ".join("%d" % v for v in got))
     del pc
 
     def solver(extra):
@@ -561,7 +692,25 @@ def test_boomeramg_options():
     # needs tools/hypre-3.2.0-seqdevice.patch, and without it the setting is refused
     # with the reason, since hypre would fault in the set-up.  (On one rank hypre drops
     # the setting, and the solve is the default one.)
-    device = bool(mc._DEVICE)
+    from hippymfem.common.parvector import device_active
+
+    device = device_active()
+    if not device:
+        # MFEM's "cpu" device, which the drivers configure on a host run, is not a card:
+        # with it a hypre without the patch (this one answers as one here) takes the
+        # setting in host memory as it does without
+        saved_patch, saved_device, said = mc.seq_on_device, list(mc._DEVICE), ""
+        try:
+            mc.seq_on_device = lambda library: False
+            mc._DEVICE.append("cpu")
+            solver("seq_threshold=200")
+        except RuntimeError as e:
+            said = str(e)
+        finally:
+            mc.seq_on_device = saved_patch
+            mc._DEVICE[:] = saved_device
+        check("in host memory seq_threshold needs no patch, whatever device MFEM was configured with",
+              not said, said and "(%s ...)" % said[:70])
     if device and not mc.seq_on_device(H):
         raised = False
         try:
@@ -569,6 +718,23 @@ def test_boomeramg_options():
         except RuntimeError:
             raised = True
         check("seq_threshold is refused by a device hypre without the patch (this one)", raised)
+        return
+    if NP == 1:
+        # hypre drops the setting on one rank (the set-up's "if (num_procs == 1)
+        # seq_threshold = 0"), so every hierarchy below would be the default one, compared
+        # with itself under names that speak of a gathered level
+        ks = solver("seq_threshold=200,redundant=1")
+        arrived = read(ks._pc, "HYPRE_BoomerAMGGetSeqThreshold", ctypes.c_int)
+        x2 = V.vector()
+        its2 = ks.solve(x2, b)
+        res = residual(A, x2, b)
+        e = x2.axpy(-1.0, x0).norm("l2") / x0.norm("l2")
+        who = mc.seq_solvers(ks._pc, COMM)
+        check("on one rank hypre takes seq_threshold and drops it: nothing is gathered and the solve "
+              "is the default one (the checks of a gathered level take two ranks: skipped)",
+              arrived == 200 and who is None and res < 1e-10 and e < 1e-9 and its2 <= its0 + 3,
+              "(solved by: %s; residual %.1e, difference %.1e, %d iterations against %d%s)"
+              % (who, res, e, its2, its0, ", on a device" if device else ""))
         return
     for extra, who in (("seq_threshold=200", "the first rank"),
                        ("seq_threshold=200,redundant=1", "every rank")):
@@ -583,8 +749,9 @@ def test_boomeramg_options():
               arrived == 200 and res < 1e-10 and e < 1e-9 and its2 <= its0 + 3,
               "(residual %.1e, difference %.1e, %d iterations against %d%s)"
               % (res, e, its2, its0, ", on a device" if device else ""))
-    # the whole matrix under the threshold (the gathered level is the matrix itself), and
-    # a second operator through the same solver, which gathers again
+    # a threshold above the whole matrix (hypre coarsens once before it compares a size
+    # with the threshold, so the gathered level is the first coarse one, not the matrix
+    # itself), and a second operator through the same solver, which gathers again
     ks = solver("seq_threshold=%d" % (A.GetGlobalNumRows() + 1))
     x3 = V.vector()
     its3 = ks.solve(x3, b)
@@ -594,10 +761,474 @@ def test_boomeramg_options():
     x4 = V2.vector()
     its4 = ks.solve(x4, b2)
     res4 = residual(A2, x4, b2)
-    check("with a threshold above the matrix one process solves all of it, and a second "
-          "operator of the same solver is gathered in its turn",
+    check("with a threshold above the matrix its first coarse level is the gathered one, and a "
+          "second operator of the same solver is gathered in its turn",
           e3 < 1e-9 and res4 < 1e-10, "(difference %.1e in %d iterations; residual %.1e in %d)"
           % (e3, its3, res4, its4))
+
+
+def test_refused_settings():
+    """Settings that cannot be taken are refused, or said, and nothing is left half done.
+
+    A mistyped ``HIPPYMFEM_HYPRE_SPMV`` stops ``configure_device`` before there is a
+    device: stopped after the device was registered, a second call returned that device
+    without the check of the MPI library and without a pool.  A hypre before 2.33 has the
+    switch of its exchange and an exchange that is compiled one way
+    (``mfemconfig._gpu_aware_fixed``): the switch is left alone there, the check asks the
+    MPI library whatever ``HIPPYMFEM_GPU_AWARE_MPI`` says, and a setting that changes
+    nothing is said.  And a solver parameter that goes through one of MFEM's own setters
+    and that hypre refuses stops the solver's set-up, where MFEM dropped it without a
+    word.  MFEM's device, hypre's switch, the MPI library and a communicator of two ranks
+    are stand-ins here, on any build and without a GPU; the solver is a real one."""
+    import contextlib
+    import ctypes
+    import io
+    import types
+    import warnings
+
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("settings that are refused, or that a library cannot follow")
+    made = []
+
+    class Device:                               # takes the place of mfem.Device
+        def __init__(self, kind, index=0):
+            made.append(kind)
+
+    def hypre(version, built):
+        """hypre as far as the switch of its exchange goes: its version, and the field of
+        its handle that the build presets, with the field's switch."""
+        lib = types.SimpleNamespace(field=int(built), written=0)
+
+        def number(major, minor, patch, single):
+            ctypes.cast(single, ctypes.POINTER(ctypes.c_longlong))[0] = version
+            return 0
+
+        def switch(on):
+            lib.field, lib.written = int(on.value), lib.written + 1
+            return 0
+
+        lib.HYPRE_VersionNumber, lib.hypre_SetGpuAwareMPI = number, switch
+        lib.hypre_GetGpuAwareMPI = lambda: lib.field
+        return lib
+
+    two = types.SimpleNamespace(Get_size=lambda: 2, Get_rank=lambda: 0)
+    names = ("HIPPYMFEM_HYPRE_SPMV", "HIPPYMFEM_GPU_AWARE_MPI", "HIPPYMFEM_HYPRE_POOL",
+             "HIPPYMFEM_HYPRE_POOL_KEEP")
+
+    def configure(library, can, **variables):
+        """``configure_device`` with that hypre under an MPI library that says ``can``:
+        how it ended, how often the MPI library was asked, whether the device line says
+        that hypre hands MPI its buffers, and the warnings about the variable."""
+        asked = []
+        mc._HYPRE_HANDLE, mc.mpi_gpu_support = library, (lambda: asked.append(1) or can)
+        mc.GPU_AWARE_SOLVES = False
+        for k in names:
+            os.environ.pop(k, None)
+        os.environ.update({"HIPPYMFEM_HYPRE_POOL": "0", **variables})
+        line = io.StringIO()
+        with warnings.catch_warnings(record=True) as caught, contextlib.redirect_stdout(line):
+            warnings.simplefilter("always")
+            try:
+                mc.configure_device("gpu", two, quiet=False)
+                end = "configured"
+            except (ValueError, RuntimeError) as e:
+                end = "%s: %s" % (type(e).__name__, " ".join(str(e).split()))
+        said = [str(w.message) for w in caught if "HIPPYMFEM_GPU_AWARE_MPI" in str(w.message)]
+        return end, len(asked), "hands MPI its buffers" in line.getvalue(), said
+
+    env = {k: os.environ.get(k) for k in names}
+    was = (mfem.Device, mc.mfem_gpu_backend, mc.hypre_on_device, mc._device_count, mc._node_rank,
+           mc.mpi_gpu_support, mc._HYPRE_HANDLE, list(mc._DEVICE), mc.DEVICE_INDEX,
+           mc.GPU_AWARE_SOLVES, mc.HYPRE_SPMV)
+    backend = mc.mfem_gpu_backend() or "cuda"
+    try:
+        mfem.Device, mc.mfem_gpu_backend, mc.hypre_on_device = Device, (lambda: backend), (lambda: True)
+        mc._device_count, mc._node_rank = (lambda: 1), (lambda comm=None: 0)
+        # a mistyped kernel of the matrix-vector products, twice: the second call found the
+        # device that the first had registered before it was stopped, and returned it
+        del mc._DEVICE[:]
+        ends = [configure(hypre(30200, False), True, HIPPYMFEM_HYPRE_SPMV="vendr")[0] for _ in range(2)]
+        check("a mistyped HIPPYMFEM_HYPRE_SPMV stops configure_device before there is a device, at a "
+              "second call as at the first",
+              all(e.startswith("ValueError") and "HIPPYMFEM_HYPRE_SPMV" in e for e in ends)
+              and not made and not mc._DEVICE,
+              "(%s; %d device(s) made, %d registered)"
+              % (" then ".join(e.split(":")[0] for e in ends), len(made), len(mc._DEVICE)))
+        # the pool's two settings: one that is neither "auto" nor megabytes was taken for 0, no
+        # pool at all, and a number of megabytes to keep that could not be read for the default
+        del mc._DEVICE[:]
+        ends = [configure(hypre(30200, False), True, **v)[0]
+                for v in ({"HIPPYMFEM_HYPRE_POOL": "on"},
+                          {"HIPPYMFEM_HYPRE_POOL": "auto", "HIPPYMFEM_HYPRE_POOL_KEEP": "some"})]
+        os.environ.update(HIPPYMFEM_HYPRE_POOL="auto", HIPPYMFEM_HYPRE_POOL_KEEP="")
+        read = [mc._pool_settings()]
+        os.environ.update(HIPPYMFEM_HYPRE_POOL="512", HIPPYMFEM_HYPRE_POOL_KEEP="some")
+        read.append(mc._pool_settings())
+        check("a HIPPYMFEM_HYPRE_POOL or HIPPYMFEM_HYPRE_POOL_KEEP that cannot be read stops "
+              "configure_device before there is a device, by the variable's name",
+              ends[0].startswith("ValueError: HIPPYMFEM_HYPRE_POOL must")
+              and ends[1].startswith("ValueError: HIPPYMFEM_HYPRE_POOL_KEEP must")
+              and not made and not mc._DEVICE
+              and read == [("auto", mc.HYPRE_POOL_KEEP_MB), (512.0, None)],
+              "(%s; then %s; %d device(s) made; read where they can be: %s)"
+              % (ends[0][:44], ends[1][:49], len(made), read))
+        # hypre 2.32 compiled to hand MPI its buffers, under an MPI library that cannot read
+        # device memory, with the variable that the refusal used to advise: the exchange
+        # does not read what the variable sets, so the MPI library is asked all the same
+        old = hypre(23200, True)
+        del mc._DEVICE[:]
+        end, asked, _, _ = configure(old, False, HIPPYMFEM_GPU_AWARE_MPI="0")
+        check("a hypre before 2.33 that is compiled to hand MPI its buffers is checked against the MPI "
+              "library whatever HIPPYMFEM_GPU_AWARE_MPI says, and is not told that the variable is a way out",
+              end.startswith("RuntimeError") and "HIPPYMFEM_GPU_AWARE_MPI=0" not in end
+              and "build scripts" in end and asked == 1 and (old.field, old.written) == (1, 0),
+              "(%s; the MPI library asked %d time(s); the handle's field %d, written %d time(s))"
+              % (end[:40], asked, old.field, old.written))
+        # what such a library cannot follow is said, the device line says what the library
+        # does, and no solve is taken for one around which the exchange is switched
+        seen = {}
+        for label, built, can, want in (("compiled to hand over, =solve", True, True, "solve"),
+                                        ("compiled to stage, =1", False, False, "1")):
+            lib = hypre(23200, built)
+            del mc._DEVICE[:]
+            end, asked, line, said = configure(lib, can, HIPPYMFEM_GPU_AWARE_MPI=want)
+            seen[label] = (end[:20], line == built, len(said), mc.GPU_AWARE_SOLVES, lib.written)
+        check("a setting that such a library cannot follow is said, the device line says what the "
+              "library does, and no solve is taken for one that switches the exchange",
+              all(v == ("configured", True, 1, False, 0) for v in seen.values()), "(%s)" % (seen,))
+        # from 2.33 on the exchange reads the field: staged when told to, whatever the
+        # library was compiled for, and switched around a solve
+        new = hypre(23300, True)
+        del mc._DEVICE[:]
+        staged = configure(new, False, HIPPYMFEM_GPU_AWARE_MPI="0") + (new.field,)
+        new = hypre(30200, False)
+        del mc._DEVICE[:]
+        solves = configure(new, True, HIPPYMFEM_GPU_AWARE_MPI="solve") + (new.field, mc.GPU_AWARE_SOLVES)
+        check("from hypre 2.33 on the switch is followed as before",
+              staged == ("configured", 0, False, [], 0) and solves == ("configured", 1, False, [], 0, True),
+              "(=0: %s; =solve: %s)" % (staged, solves))
+    finally:
+        (mfem.Device, mc.mfem_gpu_backend, mc.hypre_on_device, mc._device_count, mc._node_rank,
+         mc.mpi_gpu_support, mc._HYPRE_HANDLE, mc._DEVICE[:], mc.DEVICE_INDEX,
+         mc.GPU_AWARE_SOLVES, mc.HYPRE_SPMV) = was
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # A value that hypre refuses through one of MFEM's setters, a strength threshold above
+    # one.  MFEM does not pass on what hypre returns: the solver was set up with hypre's
+    # own threshold, and hypre's error flag stayed up for whichever call returned it next.
+    A, b, V = make_operator(n=10)
+    H = mc._hypre_library()
+    ks = hp.KrylovSolver(COMM, "cg", "amg")
+    ks.parameters["amg_strength_threshold"] = 1.5
+    said = ""
+    try:
+        ks.set_operator(A)
+    except ValueError as e:
+        said = str(e)
+    left = int(H.HYPRE_GetError()) if H is not None else 0
+    if left:
+        H.HYPRE_ClearAllErrors()                # (not for the solvers that follow)
+    ks = hp.KrylovSolver(COMM, "cg", "amg")
+    ks.parameters["amg_strength_threshold"] = 0.5
+    ks.parameters["rel_tolerance"] = 1e-10
+    x = V.vector()
+    its = ks.set_operator(A).solve(x, b)
+    res = residual(A, x, b)
+    if H is None:
+        check("a solver parameter that hypre refuses stops the solver's set-up (skipped: hypre's "
+              "library is not found in this process, and MFEM does not say what hypre answered)",
+              res < 1e-8)
+    else:
+        check("a solver parameter that hypre refuses stops the solver's set-up by its name and leaves "
+              "no error of hypre's behind, and one that hypre takes solves",
+              "amg_strength_threshold=1.5" in said and left == 0 and res < 1e-8,
+              "(%s; flag %d; with 0.5 %d iterations to a residual of %.1e)"
+              % (said or "no error", left, its, res))
+
+
+def test_hypre_pcg_verdict():
+    """What ``KrylovSolver`` says of a CG solve that runs in hypre's own PCG
+    (``linSolvers.HYPRE_PCG``): hypre's verdict, not the count of its iterations, which
+    says nothing of an iteration that hypre abandons or does not begin; and hypre's error
+    flag, which MFEM's ``HyprePCG`` does not look at, does not outlive the solve."""
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("the verdict of a solve in hypre's PCG")
+    A, b, V = make_operator(n=24)
+    H = mc._hypre_library()
+
+    def solver(A, extra="", most=200):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-10
+        ks.parameters["max_iter"] = most
+        ks.parameters["amg_options"] = extra
+        return ks.set_operator(A)
+
+    def attempt(ks, x, rhs):
+        try:
+            ks.solve(x, rhs)
+        except RuntimeError as exc:
+            return str(exc)
+        return ""
+
+    def flag():
+        return H.HYPRE_GetError() if H is not None else 0
+
+    ks = solver(A)
+    x0, x, y = V.vector(), V.vector(), V.vector()
+    n = ks.solve(x0, b)
+    options = H is not None and mc.boomeramg_handle(ks._pc) is not None
+    # the tolerance met at the last iteration allowed: the same solve, its count the limit
+    ks.parameters["max_iter"] = n
+    said = attempt(ks, x, b)
+    e = x.axpy(-1.0, x0).norm("l2") / x0.norm("l2")
+    check("a solve that meets its tolerance at the last iteration allowed is converged",
+          not said and ks.converged and ks.iterations == n and e < 1e-12,
+          "(%d iterations of %d, difference %.1e%s)" % (ks.iterations, n, e, said and "; " + said))
+    # a zero right-hand side: hypre does not begin, and keeps the count and the residual
+    # of the solve before, here one that met its tolerance and below one that did not
+    y.set(1.0)
+    none = [attempt(ks, y, V.vector()), ks.converged, ks.iterations, y.norm("l2")]
+    # at its limit without the tolerance: an error, and no flag for the next solver's
+    # options to be judged by (every setter of hypre's returns the flag)
+    ks = solver(A, most=2)
+    said, left, took = attempt(ks, V.vector(), b), flag(), ""
+    try:
+        solver(A, "relax_wt=1.0,pmax=6" if options else "")
+    except ValueError as exc:
+        took = str(exc)
+    check("one that ends at its limit raises and leaves no error of hypre's behind: the next "
+          "solver's options are taken", "in 2 iterations" in said and not ks.converged
+          and left == 0 and not took, "(flag %d%s)" % (left, took and "; " + took))
+    y.set(1.0)
+    none += [attempt(ks, y, V.vector()), ks.converged, ks.iterations, y.norm("l2")]
+    check("a zero right-hand side gives zero without an iteration, whatever the solve before",
+          none == ["", True, 0, 0.0] * 2, "(%s)" % (none,))
+    # A preconditioner that is not positive definite (Jacobi relaxation with a weight far
+    # above what the matrix allows): <C r, r> turns negative, which hypre's test takes for
+    # converged after an iteration or two, the true residual of order one.
+    if options:
+        ks = solver(A, "relax=7,relax_wt=1.8")
+        x = V.vector()
+        said = attempt(ks, x, b)
+        res = residual(A, x, b)
+        check("a solve that hypre's PCG leaves because the preconditioner is not positive definite "
+              "is not taken for converged", "failed to converge" in said and not ks.converged
+              and not res < 1e-3 and flag() == 0, "(residual %.1e; %s)" % (res, said or "no error"))
+    # A matrix that is not positive definite, here the negative of one that is, with a
+    # hierarchy built on it: <C b, b> is negative, hypre's PCG takes the right-hand side
+    # for zero, returns it as the solution and gives no verdict.
+    minus = mfem.ConstantCoefficient(-1.0)
+    N = hp.assemble_native_matrix(V, [mfem.DiffusionIntegrator(minus), mfem.MassIntegrator(minus)])
+    ks = solver(N)
+    x = V.vector()
+    said = attempt(ks, x, b)
+    res = residual(N, x, b)
+    check("nor is one that hypre's PCG does not begin because the matrix is not positive definite",
+          "failed to converge" in said and not ks.converged and not res < 1e-3 and flag() == 0,
+          "(residual %.1e; %s)" % (res, said or "no error"))
+    if getattr(ks, "_native", False):
+        # (hypre's PCG only: MFEM's CG stops the process at a sum that is not a number)
+        bad = b.copy()
+        if bad.local_size:
+            bad.array[0] = float("nan")
+        ks = solver(A)
+        x = V.vector()
+        said = attempt(ks, x, bad)
+        check("nor one whose right-hand side is not a number, which hypre's PCG answers with zero",
+              "failed to converge" in said and not ks.converged and flag() == 0,
+              "(%s)" % (said or "no error"))
+        # A number of iterations and no test, both tolerances zero: at that limit hypre
+        # raises nothing, and it is still a solve that hypre made, with its count.  The
+        # right-hand side that is not a number gives none after it, though hypre keeps
+        # that count.
+        ks = solver(A, most=5)
+        ks.parameters["rel_tolerance"] = ks.parameters["abs_tolerance"] = 0.0
+        ks.parameters["error_on_nonconvergence"] = False
+        made = [ks.solve(V.vector(), b), ks.converged, ks.solve(V.vector(), bad), ks.converged, flag()]
+        check("one that makes the iterations it is allowed, both tolerances zero, has their count, "
+              "and is not taken for one that hypre does not begin",
+              made == [5, False, 0, False, 0], "(%s)" % (made,))
+
+
+def test_solve_mode_setups():
+    """``HIPPYMFEM_GPU_AWARE_MPI=solve`` hands MPI device buffers during the solves on a
+    hierarchy that is set up, and that is: set up for the solver that applies it.  MFEM
+    sets a preconditioner up at its own first application, whatever hypre's PCG did with
+    it before, so the first solve by one of MFEM's solvers is a set-up as well; and
+    hypre's PCG sets it up at its own first solve, whatever MFEM did with it before.  The
+    switch of the mode is recorded by a stand-in here, on any build and without a GPU
+    (the mode itself runs on a device in ``benchmarks/bench_scaling.py`` alone, when asked)."""
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("the solves that HIPPYMFEM_GPU_AWARE_MPI=solve leaves staged")
+    A, b, V = make_operator(n=24)
+    A2, b2, V2 = make_operator(n=24)
+    calls = []
+
+    def new(reuse=0):
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["rel_tolerance"] = 1e-10
+        ks.parameters["pc_reuse"] = reuse
+        return ks
+
+    def aware(ks, x, rhs):
+        del calls[:]
+        ks.solve(x, rhs)
+        return True in calls
+
+    saved = mc.GPU_AWARE_SOLVES, mc.set_hypre_gpu_aware_mpi
+    mc.GPU_AWARE_SOLVES, mc.set_hypre_gpu_aware_mpi = True, lambda on=True: calls.append(bool(on))
+    try:
+        # a solve from the vector it is given after solves from zero: MFEM's CG on the
+        # preconditioner that hypre's PCG has set up, where the solver runs hypre's PCG
+        ks = new().set_operator(A)
+        got = [aware(ks, V.vector(), b), aware(ks, V.vector(), b)]
+        ks.parameters["nonzero_initial_guess"] = True
+        got += [aware(ks, V.vector(), b), aware(ks, V.vector(), b)]
+        first = getattr(ks, "_native", False)
+        check("the first solve by MFEM's CG on a hierarchy of hypre's PCG is a set-up, and staged",
+              got == [False, True, not first, True], "(GPU-aware: %s%s)"
+              % (got, "" if first else "; no PCG of hypre's here"))
+        # a hierarchy kept for the next operator, which MFEM's CG applies
+        ks = new(reuse=1).set_operator(A)
+        got = [aware(ks, V.vector(), b)]
+        first = getattr(ks, "_native", False)
+        ks.set_operator(A2)
+        got += [ks._pc_age == 1, aware(ks, V2.vector(), b2), aware(ks, V2.vector(), b2)]
+        check("so is the first solve with a hierarchy kept from the operator before",
+              got == [False, True, not first, True], "(GPU-aware: %s)" % (got,))
+        # a hierarchy lent without the PCG of its owner
+        owner = new().set_operator(A)
+        got = [aware(owner, V.vector(), b)]
+        first = getattr(owner, "_native", False)
+        other = new().set_operator(A, pc=owner._pc)
+        got += [aware(other, V.vector(), b), aware(other, V.vector(), b), aware(owner, V.vector(), b)]
+        check("and the first solve of a solver that was lent one without its owner's PCG",
+              got == [False, not first, True, True], "(GPU-aware: %s)" % (got,))
+        # the other way round, a solve from zero after solves from the vector it is given:
+        # hypre's PCG sets up again, at its own first solve, what MFEM's CG has set up
+        ks = new().set_operator(A)
+        ks.parameters["nonzero_initial_guess"] = True
+        got = [aware(ks, V.vector(), b), aware(ks, V.vector(), b)]
+        ks.parameters["nonzero_initial_guess"] = False
+        got += [aware(ks, V.vector(), b), aware(ks, V.vector(), b)]
+        first = getattr(ks, "_native", False)
+        check("the first solve by hypre's PCG on a hierarchy of MFEM's CG is a set-up as well, and staged",
+              got == [False, True, not first, True], "(GPU-aware: %s)" % (got,))
+        # and so in a solver that is lent hierarchy and PCG by an owner with such solves only
+        owner = new().set_operator(A)
+        owner.parameters["nonzero_initial_guess"] = True
+        got = [aware(owner, V.vector(), b)]
+        other = new().set_operator(A, pc=owner._pc, donor=owner)
+        first = getattr(other, "_native", False)
+        got += [aware(other, V.vector(), b), aware(other, V.vector(), b)]
+        check("so is the first solve of a solver that was lent a PCG which has not solved yet",
+              got == [False, not first, True], "(GPU-aware: %s)" % (got,))
+    finally:
+        mc.GPU_AWARE_SOLVES, mc.set_hypre_gpu_aware_mpi = saved
+
+
+def test_systems_ordering():
+    """BoomerAMG for a vector space is told how its components are ordered
+    (``KrylovSolver(systems_dim=..., systems_bynodes=...)``): one after another, which is
+    the ordering of this library's spaces unless another is asked for, or interleaved.
+    With the number of components alone hypre takes the rows for components in turn, and
+    on a space ordered by nodes it then pairs rows of different components: the solve
+    takes several times the iterations (21 and 19 where it takes 6 and 7, on these
+    matrices on one rank in host memory)."""
+    if RANK == 0:
+        print("the ordering of a vector space's components, for BoomerAMG")
+    one = mfem.ConstantCoefficient(1.0)
+    n = 12 if NP <= 2 else 16
+    took = {}
+    for name, ordering in (("by nodes", mfem.Ordering.byNODES), ("interleaved", mfem.Ordering.byVDIM)):
+        pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
+        V = hp.FunctionSpace.H1(pm, 1, vdim=3, ordering=ordering)
+        A = hp.assemble_native_matrix(V, [mfem.VectorDiffusionIntegrator(one), mfem.VectorMassIntegrator(one)])
+        b = V.vector()
+        hp.parRandom.set_seed(5)
+        hp.parRandom.normal(1.0, b)
+        for told in (True, False):
+            ks = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, systems_bynodes=told)
+            ks.parameters["rel_tolerance"] = 1e-10
+            ks.parameters["max_iter"] = 500
+            ks.set_operator(A)
+            x = V.vector()
+            its = ks.solve(x, b)
+            took[(name, told)] = (its, residual(A, x, b))
+        # a solver that is handed the space reads the ordering from it
+        took[(name, None)] = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, fes=V.fes).systems_bynodes
+    right = (took[("by nodes", True)][0], took[("interleaved", False)][0])
+    wrong = (took[("by nodes", False)][0], took[("interleaved", True)][0])
+    # (numpy's maximum is not a number where a residual is not: Python's keeps one in the
+    # first place only)
+    worst = float(np.max([r for _, r in (took[k] for k in took if k[1] is not None)]))
+    # (half as many again is asked of the least of them, not twice: on two GPUs that was
+    # 31 against 15, and a device's coarsening draws from a random stream that every
+    # set-up before it has moved.  Were the default the wrong one, the two would change
+    # places.)
+    check("BoomerAMG told the ordering of a vector space's components solves in the same few iterations "
+          "for both orderings, and in half as many again or more when it is told the other one",
+          abs(right[0] - right[1]) <= 3 and min(wrong) >= 1.5 * max(right) and worst < 1e-8
+          and took[("by nodes", None)] is True and took[("interleaved", None)] is False,
+          "(%d and %d iterations told right, %d and %d told wrong; worst residual %.1e)"
+          % (right + wrong + (worst,)))
+    # the default is the ordering of the library's spaces, and a prior's solver is told its space's
+    Vd = hp.FunctionSpace.H1(mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON)),
+                             1, vdim=3)
+    prior = hp.VectorBiLaplacianPrior(Vd, [0.1] * 3, [0.5] * 3, robin_bc=True)
+    check("the default is by nodes, as the library's spaces are, and a vector prior's solver is told its space's",
+          hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3).systems_bynodes
+          and prior.Asolver.systems_dim == 3 and prior.Asolver.systems_bynodes
+          and Vd.fes.GetOrdering() == mfem.Ordering.byNODES)
+    # the solver's own settings hold for a systems hierarchy: with the components MFEM writes a strength
+    # threshold of its own (0.5), which used to come after them and take their place without a word
+    import ctypes
+    from hippymfem.common import mfemconfig as mc
+
+    H = mc._hypre_library()
+
+    def threshold(**parameters):
+        ks = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, systems_bynodes=False)
+        for k, v in parameters.items():
+            ks.parameters[k] = v
+        ks.set_operator(A)
+        handle, out = mc.boomeramg_handle(ks._pc), ctypes.c_double(-1.0)
+        if H is None or handle is None:
+            return None
+        get = H.HYPRE_BoomerAMGGetStrongThreshold
+        get.restype, get.argtypes = ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
+        get(ctypes.c_void_p(handle), ctypes.byref(out))
+        return out.value
+
+    held = (threshold(), threshold(amg_strength_threshold=0.7), threshold(amg_options="theta=0.6"))
+    check("a systems hierarchy keeps the solver's own strength threshold, by the parameter and by amg_options, "
+          "where MFEM's for a vector problem used to take its place",
+          held[0] is None or (abs(held[0] - 0.5) < 1e-12 and abs(held[1] - 0.7) < 1e-12 and abs(held[2] - 0.6) < 1e-12),
+          "(skipped: no handle of BoomerAMG)" if held[0] is None
+          else "(hypre holds %g where nothing is asked, %g and %g where it is)" % held)
+    # rows that are no multiple of the components: an error of every rank, where MFEM stops the process
+    Vs = hp.FunctionSpace.H1(mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(4, 4, 4, mfem.Element.HEXAHEDRON)), 1)
+    As = hp.assemble_native_matrix(Vs, [mfem.DiffusionIntegrator(one), mfem.MassIntegrator(one)])
+    odd = 2 if COMM.allreduce(int(As.Height() % 2 != 0), op=MPI.MAX) else 3 if COMM.allreduce(
+        int(As.Height() % 3 != 0), op=MPI.MAX) else 0
+    said = ""
+    if odd:
+        try:
+            hp.KrylovSolver(COMM, "cg", "amg", systems_dim=odd).set_operator(As)
+        except ValueError as e:
+            said = str(e)
+    check("rows that are no multiple of the components are an error, not MFEM's stop of the process",
+          (not odd) or "systems_bynodes" in said, "(%s)" % (said[:70] if odd else "skipped: every rank's rows divide"))
 
 
 def test_chebyshev_solver():
@@ -701,23 +1332,27 @@ def test_index_widths():
     """hypre's two integer types (``parvector._HYPRE_INT`` and ``_HYPRE_BIGINT``): arrays of
     global indices reach MFEM in the wider one, and a matrix goes from scipy to hypre and
     back with either pair of widths (one width, or the two of a hypre built
-    ``--enable-mixedint``)."""
+    ``--enable-mixedint``).  With 64-bit global indices and two or more ranks, a matrix
+    with global columns beyond 32 bits keeps them, in MFEM's library and in the copy in
+    the single-precision one."""
+    import ctypes
+
     import scipy.sparse as sp
 
+    from hippymfem.algorithms import singlesolve as ss
     from hippymfem.common import parvector as pv
-    from hippymfem.common.linalg import hypre_to_scipy, scipy_to_hypre
+    from hippymfem.common.linalg import _offd_block, hypre_to_scipy, scipy_to_hypre
 
     if RANK == 0:
         print("hypre's local and global index types")
+    # (the two types are made from the widths MFEM reports, so their widths are those by
+    # construction: what can go wrong is an index on its way, which the checks below see)
     narrow, wide = 8 * np.dtype(pv._HYPRE_INT).itemsize, 8 * np.dtype(pv._HYPRE_BIGINT).itemsize
-    check("the two types are the build's", narrow == 8 * mfem.sizeof_HYPRE_Int()
-          and wide == 8 * mfem.sizeof_HYPRE_BigInt(),
-          "(HYPRE_Int %d bits, HYPRE_BigInt %d bits)" % (narrow, wide))
     vals = [3, 5, 2 ** 31 - 1] + ([2 ** 40 + 7] if wide == 64 else [])
     arr = pv.bigint_array(vals)
     back = [int(v) for v in pv.bigint_view(arr.GetData(), len(vals))]
     check("global indices go to an MFEM array and back, up to the type's range", back == vals,
-          "(%s)" % back[-1])
+          "(%s; HYPRE_Int %d bits, HYPRE_BigInt %d bits)" % (back[-1], narrow, wide))
 
     # this rank's rows with global columns: a square matrix, and a rectangular one with
     # its own column partition
@@ -744,6 +1379,70 @@ def test_index_widths():
     err = abs(T - R).max() if T.shape == R.shape else np.inf
     check("and a rectangular one with its column partition", err == 0.0
           and int(B.GetGlobalNumCols()) == M and B.Width() == mloc, "(%g)" % err)
+
+    # Global columns beyond 32 bits.  hypre counts the columns a rank owns in HYPRE_Int, so
+    # only two or more ranks have a matrix with such a column, and no vector of its columns
+    # fits a test: a few entries a rank, in its own last columns and in the middle of the
+    # next rank's, go through scipy_to_hypre, the column map of the off-diagonal block, the
+    # refusal of hypre_to_scipy and the copy in the single-precision library.  No product.
+    if wide != 64 or NP == 1:
+        check("global columns beyond 32 bits (skipped: %s)"
+              % ("HYPRE_BigInt has 32 bits" if wide != 64 else "one rank owns every column, fewer than 2^31"),
+              True)
+        return
+    mloc = 3 * 2 ** 29                          # the columns of a rank: 3 * 2^30 on two ranks
+    M, c0 = mloc * NP, mloc * RANK
+    far = mloc * ((RANK + 1) % NP) + mloc // 2
+    cols = np.concatenate([[c0 + mloc - 1 - i, far + 7 * i, far + 7 * i + 3] for i in range(nloc)])
+    W = sp.csr_matrix((data, (rows, cols)), shape=(nloc, M))
+    W.sum_duplicates()
+    B = scipy_to_hypre(W, col_starts=[c0, c0 + mloc])
+    want = np.unique(cols[(cols < c0) | (cols >= c0 + mloc)])
+    top = COMM.allreduce(int(want.max()), op=MPI.MAX)
+    try:
+        cmap = _offd_block(B)[1]
+    except RuntimeError as e:                   # (a static MFEM: the map cannot be read)
+        check("global columns beyond 32 bits (skipped: %s)" % e, True)
+        return
+    refused = False
+    try:
+        hypre_to_scipy(B)
+    except ValueError:
+        refused = True
+    ok = (int(B.GetGlobalNumCols()) == M and B.Width() == mloc
+          and [int(v) for v in B.GetColPartArray()] == [c0, c0 + mloc]
+          and np.array_equal(cmap, want) and refused)
+    check("a matrix with global columns beyond 32 bits keeps them in its partition and in the column "
+          "map of its off-diagonal block, and hypre_to_scipy refuses it",
+          COMM.allreduce(int(ok), op=MPI.SUM) == NP and top >= 2 ** 31,
+          "(%d columns; the largest in a column map %d)" % (M, top))
+    # its rows as the copy in the single-precision library takes them, and the copy
+    tb = ss.matrix_blocks(B, COMM)
+    nd = tb.nnz_diag
+    T = (sp.csr_matrix((tb.values[:nd], tb.J_diag.astype(np.int64) + tb.c0, tb.I_diag), shape=W.shape)
+         + sp.csr_matrix((tb.values[nd:], tb.cmap[tb.J_offd], tb.I_offd), shape=W.shape))
+    err = abs(T - W).max()
+    check("its rows read from the two blocks, with their global columns, are the rows put in",
+          COMM.allreduce(int(err == 0.0 and tb.gnc == M), op=MPI.SUM) == NP, "(%g)" % err)
+    lib = ss.library()
+    if lib is None:
+        check("the copy of such a matrix in the single-precision library (skipped: no library)", True)
+        return
+    if lib.bigint.itemsize < 8:
+        raised = False
+        try:
+            ss.SingleParMatrix.from_pattern(tb, tb.values, lib)
+        except ValueError:
+            raised = True
+        check("a single-precision library with 32-bit global indices refuses such a matrix", raised)
+        return
+    C = ss.SingleParMatrix.from_pattern(tb, tb.values, lib)
+    held = np.array(np.ctypeslib.as_array((ctypes.c_longlong * tb.n_offd).from_address(
+        lib.pointer(C.par.value, "par_col_map_offd"))))
+    ok = np.array_equal(held, want) and C.global_cols == M and C.Width() == mloc
+    C.destroy()
+    check("the copy of such a matrix in the single-precision library has its column map",
+          COMM.allreduce(int(ok), op=MPI.SUM) == NP)
 
 
 def test_lumped_mass():
@@ -848,19 +1547,237 @@ def test_petsc():
     check("PETScKrylovSolver converges", rel < 1e-9, "(%.3e, %d its)" % (rel, its))
 
 
+def test_benchmarks():
+    """The two benchmarks of the scaling runs on a small problem, for what they report about
+    themselves (``benchmarks/bench_scaling.py`` and ``bench_newton_device.py``; skipped where
+    the package is installed without them).  The clock on the ten V-cycles of
+    ``--profile-setup`` holds no set-up.  The profiles of BoomerAMG and the second
+    matrix-vector kernel run to the record, and a Jacobian in the single-precision hypre is
+    left without the profiles.  The Newton benchmark reads the card's memory before the
+    kernels of ``--rank-table`` take theirs, and counts the three functions of a Jacobian
+    that is assembled with the products of a p-multigrid."""
+    import ctypes
+    import importlib.util
+    import sys
+    import tempfile
+
+    from hippymfem.algorithms import singlesolve as ss
+    from hippymfem.common import devicebridge
+    from hippymfem.common import mfemconfig as mc
+
+    if RANK == 0:
+        print("the benchmarks of the scaling runs on a small problem")
+    here = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "benchmarks")
+    if not os.path.isfile(os.path.join(here, "bench_scaling.py")):
+        check("the benchmarks report what they measure", True,
+              "(skipped: no benchmarks directory beside the package)")
+        return
+
+    def load(name):
+        # (a benchmark puts the root of the tree in front of the path: as it was afterwards)
+        path = list(sys.path)
+        spec = importlib.util.spec_from_file_location(name, os.path.join(here, name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = path
+        # their own reports stay out of the suite's, and no rank asks the vendor's tool
+        module.say, module.gpu_name = (lambda *a: None), (lambda: "none")
+        return module
+
+    scaling, newton = load("bench_scaling"), load("bench_newton_device")
+    single = bool(ss.HYPRE_SINGLE) and ss.library() is not None
+    out = COMM.bcast(os.path.join(tempfile.gettempdir(), "_hippymfem_bench_%d.json" % os.getpid()),
+                     root=0)
+
+    def record(bench, *args):
+        """What ``main`` of a benchmark writes for these arguments (the record, and with
+        ``--rank-table`` every rank's row), and what stopped it, if anything did."""
+        argv, device = sys.argv, hp.configure_device
+        sys.argv = [bench.__name__, "--out", out] + list(args)
+        hp.configure_device = lambda *a, **k: None          # (this process has its device)
+        raised = None
+        try:
+            code = bench.main()
+            raised = "main returned %r" % (code,) if code else None
+        except (Exception, SystemExit) as e:                         # noqa: BLE001
+            raised = "%s: %s" % (type(e).__name__, " ".join(str(e).split())[:160])
+        finally:
+            sys.argv, hp.configure_device = argv, device
+        written = [None, None]
+        if RANK == 0:
+            for i, name in enumerate((out, os.path.splitext(out)[0] + ".ranks.json")):
+                if os.path.exists(name):
+                    with open(name) as f:
+                        written[i] = json.load(f)
+                    os.remove(name)
+        rec, table = COMM.bcast(written, root=0)
+        return rec or {}, table or [], raised
+
+    # ---- the set-ups of --profile-setup.  hypre counts the nonzeros of a hierarchy again at
+    # every set-up where a count was asked for: a count of one, put there before a clock
+    # starts, is gone after it exactly when a set-up ran inside.
+    A, b, V = make_operator(n=24)
+    H = mc._hypre_library()
+    made, clocks, plain = [], [], scaling.timed
+
+    def make_pc(M):
+        made.append(mfem.HypreBoomerAMG(M))
+        made[-1].SetPrintLevel(0)
+        return made[-1]
+
+    def timed(fn, sync=None):
+        h = ctypes.c_void_p(mc.boomeramg_handle(made[-1]))
+        H.HYPRE_BoomerAMGSetCumNnzAP(h, 1.0)
+        t, result = plain(fn, sync)
+        nnz = ctypes.c_double(0.0)
+        H.HYPRE_BoomerAMGGetCumNnzAP(h, ctypes.byref(nnz))
+        clocks.append((len(made), t, nnz.value != 1.0))
+        return t, result
+
+    handle = H is not None and mc.boomeramg_handle(make_pc(A)) is not None
+    del made[:]
+    if not handle:
+        check("the clock on the V-cycles of --profile-setup holds no set-up", True,
+              "(skipped: this MFEM library does not give hypre's handle of a preconditioner)")
+    else:
+        H.HYPRE_BoomerAMGSetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.c_double]
+        H.HYPRE_BoomerAMGGetCumNnzAP.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
+        scaling.timed = timed
+        try:
+            prof = scaling.profile_setup("ref:", A, make_pc, b, V.vector())
+        finally:
+            scaling.timed = plain
+        runs = (prof.get("ref") or {}).get("runs", [])
+        # of each run: the set-ups inside its clocks, in their order; the first clock is on the
+        # first solve, and the one whose tenth is reported as the V-cycle is looked up
+        inside = [[(t, s) for n, t, s in clocks if n == i + 1] for i in range(len(runs))]
+        first = [[s for _, s in c][:1] for c in inside]
+        cycle = [[s for t, s in c if t / 10.0 == r["cycle"]] for c, r in zip(inside, runs)]
+        check("--profile-setup has the set-up of a hierarchy in the first solve of hypre's PCG and "
+              "none in the clock on its ten V-cycles (MFEM's own, at the first direct application, "
+              "is outside it)",
+              len(runs) == 2 and first == [[True]] * 2 and cycle == [[False]] * 2,
+              "(a set-up inside the clocks of a run, in their order: %s)"
+              % "; ".join(str([s for _, s in c]) for c in inside))
+        del made[:]
+
+    # ---- bench_scaling.py with its two profiles (they need that handle) and the other
+    # matrix-vector kernel
+    spmv = (mc.HYPRE_SPMV, mc.set_hypre_spmv)
+    if mc.HYPRE_SPMV is None:
+        # (in host memory hypre has one kernel and no switch: one is stood in for, so that
+        # --both-kernels takes its second action)
+        mc.HYPRE_SPMV, mc.set_hypre_spmv = "vendor", (lambda kernel="auto", comm=None: kernel)
+    try:
+        rec, _, raised = record(scaling, "--n", "6", "--ntargets", "20", "--repeats", "1",
+                                "--both-kernels",
+                                *(["--profile-vcycle", "--profile-setup", "ref:"] if handle else []))
+    finally:
+        mc.HYPRE_SPMV, mc.set_hypre_spmv = spmv
+    levels = len((rec.get("vcycle") or {}).get("levels", []))
+    sets = len(((rec.get("setup_profile") or {}).get("ref") or {}).get("runs", []))
+    other = (rec.get("other_kernel") or {}).get("t_action", 0.0)
+    none = (rec.get("vcycle"), rec.get("setup_profile")) == (None, None)
+    check("bench_scaling.py runs to its record with the two profiles of BoomerAMG and the second "
+          "kernel: the profiles of a Jacobian of MFEM's, and none of one in the single-precision "
+          "hypre",
+          raised is None and other > 0.0
+          and (none if (single or not handle) else (levels > 0 and sets == 2)),
+          "(%s)" % (raised or "V-cycles of %d hierarchies, %d set-ups, an action with the other "
+                    "kernel in %.4f s%s"
+                    % (levels, sets, other,
+                       "; the Jacobian in the single-precision hypre" if single else "")))
+    # A Jacobian in the single-precision hypre is multiplied from the benchmark through the
+    # conversion of its two vectors, in a library that stages its exchange always and that
+    # keeps the kernel it was loaded with: its product is one number under that name, and
+    # the action with the second kernel says which kernel its solves kept.
+    product = sorted(rec.get("t_product") or {})
+    kept = (rec.get("other_kernel") or {}).get("single_hypre_spmv", "no word")
+    check("and names a product with the Jacobian and the action with the second kernel for what "
+          "was measured, of a Jacobian of MFEM's and of one in the single-precision hypre",
+          bool(rec.get("hypre_single")) == single
+          and ((len(product) == 1 and product[0].startswith("single") and kept == (spmv[0] or "vendor"))
+               if single else ("staged" in product and kept is None)),
+          "(products: %s; the kernel that the single-precision solves kept: %s)"
+          % (", ".join(product) or "none", kept))
+
+    # ---- bench_newton_device.py --rank-table: the card's memory against the two kernels of
+    # the table (stood in for: the kernels are counted, and the memory read is their count),
+    # and the stages of a Jacobian with a p-multigrid's products where a library makes one
+    taken = []
+    kept = (newton.card_probe, devicebridge.device_memory, os.environ.get("HIPPYMFEM_PMG"))
+    newton.card_probe = lambda reps=7: taken.append(1) or {"triad": 1.0, "exp": 1.0}
+    devicebridge.device_memory = lambda: (len(taken), 1)
+    # The benchmark puts its clocks on functions of the problem's module, of three of the
+    # library's classes and of gc, and as a script it leaves them there: what those names
+    # hold now is put back after it, for the tests that run later in this process.
+    import gc
+
+    pvp = sys.modules[hp.PDEVariationalProblem.__module__]
+    owners = [o for o in (pvp, getattr(pvp, "_FiniteFlag", None), hp.KrylovSolver, hp.ReducedHessian, gc)
+              if o is not None]
+    unclocked = [(o, k, v) for o in owners for k, v in list(vars(o).items()) if callable(v)]
+    if single:
+        os.environ["HIPPYMFEM_PMG"] = "1"
+    try:
+        rec, table, raised = record(newton, "--n", "6", "--steps", "1", "--ntargets", "20",
+                                    "--newton-only", "--rank-table")
+    finally:
+        for o, k, v in unclocked:
+            if vars(o).get(k) is not v:
+                setattr(o, k, v)
+        newton.card_probe, devicebridge.device_memory = kept[:2]
+        if kept[2] is None:
+            os.environ.pop("HIPPYMFEM_PMG", None)
+        else:
+            os.environ["HIPPYMFEM_PMG"] = kept[2]
+    card = rec.get("card_used_total") or ["?"]
+    cards = [(row.get("memory") or {}).get("card") or ["?"] for row in table]
+    check("bench_newton_device.py --rank-table reads the card's memory, for its record and for "
+          "every rank's row, before the kernels of the table take theirs",
+          raised is None and len(taken) == 1 and card == [0, 1] and cards == [[0, 1]] * NP,
+          "(%s)" % (raised or "kernels run before the record's read: %s; before the ranks' reads: %s"
+                    % (card[0], sorted(set(str(c[0]) for c in cards)))))
+    stages = rec.get("stages_in_steps") or {}
+    calls = lambda k: int((stages.get(k) or {}).get("calls", 0))             # noqa: E731
+    n, each = calls("+jacobian_with_products"), 2 + int(ss.PMG_KEEP_AP)
+    plans, scatters, finished = (calls("+jacobian " + k)
+                                 for k in ("plan_block", "scatter_derived", "finish_block"))
+    if single and rec.get("single_engine") == "PMGEngine" and rec.get("pmg_element_products"):
+        check("and counts the three functions of a Jacobian that is assembled with the products of "
+              "a p-multigrid: its plans, its scatter and its matrices",
+              n > 0 and scatters == n and plans == finished == each * n,
+              "(%d such Jacobians in the steps: %d plans, %d scatters, %d matrices)"
+              % (n, plans, scatters, finished))
+    else:
+        check("and counts the three functions of a Jacobian that is assembled with the products of "
+              "a p-multigrid", raised is None and n == 0,
+              "(skipped: %s)" % ("no single-precision hypre is named" if not single
+                                 else "the Jacobian came without the products"))
+
+
 def main():
     test_gather()
     test_exact_solve()
     test_guards()
     test_inverse_problem()
     test_hypre_pool_logic()
+    test_gpu_aware_mpi_check()
     test_boomeramg_options()
+    test_refused_settings()
+    test_hypre_pcg_verdict()
+    test_solve_mode_setups()
+    test_systems_ordering()
     test_chebyshev_solver()
     test_index_widths()
     test_single_precision_solves()
     test_lumped_mass()
     test_transpose_solver()
     test_petsc()
+    test_benchmarks()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)

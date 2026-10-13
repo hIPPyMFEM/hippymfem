@@ -521,7 +521,9 @@ coarser meshes has a hierarchy without any of that.  Tell the library the meshes
 cut into the mesh at hand, the one that was cut into that, and so on;
 ``applications.geothermal.model.cube_mesh(n, comm, levels=...)`` does it for the mesh of
 the benchmarks, ``--h-levels`` there), and with ``pmg_h=k`` the correction from the
-linear elements is a V-cycle over up to ``k`` of them.  The interpolation between the
+linear elements is a V-cycle over up to ``k`` of them (for a state of one component: a
+state of several keeps BoomerAMG under its linear elements, with a warning).  The
+interpolation between the
 linear elements of two meshes is MFEM's own on local dofs
 (:func:`~hippymfem.fem.ptransfer.refinement`: the values of a coarse function at the
 fine vertices), with the essential dofs taken out as in the interpolation from the
@@ -934,8 +936,13 @@ overlap with that kernel.  At 128\ :sup:`3` on eight MI250X an iteration took 9.
 instead of 11.2 ms (10.7 with the buffers alone, 10.6 with the early start alone), and
 two Newton-CG steps at 512\ :sup:`3` on 512 took 10.0 s instead of 10.8 s.
 ``HYPRE_STAGE_PINNED=0`` and ``HYPRE_STAGE_EARLY=0`` in the environment of a run switch
-either off.  hypre 3 chooses between its staging and a GPU-aware MPI at run time, and
-``HIPPYMFEM_GPU_AWARE_MPI=1`` or ``0`` sets it whatever the library was built with.  With
+either off.  hypre 3 chooses between its staging and a GPU-aware MPI at run time (hypre
+2.31 and 2.32, the CUDA stack's, have the switch and an exchange that is compiled one
+way: the setting changes nothing there, which is said), and
+``HIPPYMFEM_GPU_AWARE_MPI=1`` or ``0`` sets it whatever the library was built with, for
+MFEM's hypre: the single-precision library (``HIPPYMFEM_HYPRE_SINGLE``) stages its
+exchanges always, so with the solves in single precision the setting reaches the
+double-precision ones alone.  With
 Cray MPICH 9.1.0 and its GTL library on Frontier that exchange took 10 to 20 % off an
 iteration where it ran, and deadlocked or faulted every time at 320\ :sup:`3` on 128 and
 at 400\ :sup:`3` on 256 GPUs, whatever the MPI library was told: the staging is what to
@@ -1435,7 +1442,18 @@ smooth right-hand side of an incremental forward solve, or stalled, while a rand
 right-hand side showed nothing.  The patch now sets the generator back before each rank's
 set-up and compares the solvers on one right-hand side, and the first rank solves where
 they differ (:func:`~hippymfem.common.mfemconfig.seq_solvers` says which it was); the
-cycle is symmetric to rounding either way, which ``test_device`` checks.
+cycle is symmetric to rounding either way, which ``test_device`` checks.  Its third
+version (``hypre_BoomerAMGSeqOnDevice()`` returns 3) closes two cases that hypre's own
+code has in host memory as well.  hypre's set-up also ends at a level on which the
+coarsening finds no coarse point (every row diagonally dominant: a mass matrix, or a
+prior at the level whose mesh width passes the correlation length), and it gathered
+that level whatever its size, the whole of it on every rank that holds rows, with 32-bit
+counts; such a level is now relaxed, as it is without the setting.  And the gathered
+solver of a system (``systems_dim``) was told the number of functions and not which row
+is which, so it paired rows of different functions below the first level (34 CG
+iterations where the hierarchy takes 12, on vector diffusion); it is handed the level's
+own labels.  A hierarchy of one equation that coarsens to its threshold, as every one of
+the scaling runs does, is the same in the second and the third version.
 
 Each CG iteration of a Newton step applies the prior's covariance as its preconditioner:
 two solves with the prior's operator, by CG to 1e-6 (``cg_preconditioner_tolerance``), 10

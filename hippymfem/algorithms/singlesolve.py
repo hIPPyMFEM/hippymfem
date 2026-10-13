@@ -309,6 +309,14 @@ class _Library:
             # Hypre::SetDefaultOptions) and what the library chose for its products
             H.HYPRE_SetMemoryLocation(DEVICE)
             H.HYPRE_SetExecutionPolicy(DEVICE)
+            # This library stages its exchanges through host memory, whatever it was built
+            # for: HIPPYMFEM_GPU_AWARE_MPI and the check of the MPI library that goes with
+            # it are for MFEM's hypre (mfemconfig.set_hypre_gpu_aware_mpi).  (From hypre
+            # 2.33 on.  A 2.31 or 2.32 does not follow the switch, and what it does is its
+            # build's choice: tools/build_hypre_single.sh takes the options of the
+            # installed library, which stages as PyMFEM builds it.)
+            if hasattr(H, "hypre_SetGpuAwareMPI"):
+                H.hypre_SetGpuAwareMPI(ctypes.c_int(0))
             # (MFEM: hypre's own sparse product on CUDA, the vendor's on HIP)
             H.HYPRE_SetSpGemmUseVendor(0 if mfemconfig.mfem_gpu_backend() == "cuda" else 1)
             H.HYPRE_SetUseGpuRand(1)
@@ -897,15 +905,27 @@ class SingleParMatrix:
         """Make :attr:`row_defect`.  ``defect`` is the vector on the host, or ``True``
         where the matrix holds, in place of its values, what the rounding of the device
         array ``acc`` took from each: the vector is then the product of that matrix with
-        the vector of ones (an exchange with the other ranks, who are all on this branch:
-        the route of an assembly is one for all), and the values are written afterwards.
-        ``None``: the values came in single precision, and there is nothing to keep."""
+        the vector of ones (an exchange with the other ranks), and the values are written
+        afterwards.  ``None``: the values came in single precision, and this rank has
+        nothing to keep.
+
+        Which of the three a rank holds is its own affair: a rank without elements hands
+        a host array beside device ones, and a batch that was not split hands values in
+        the element matrices' precision beside the double precision of a split one.  What
+        is made of them is one for all, so the ranks agree first.  Where one rank needs
+        the product, every rank makes it and its reduced check, and then puts its own
+        vector in the place of what it got.  Where one rank has a vector, every rank has
+        one, of zeros where there is nothing to keep: a PCG with the defect's product on
+        some ranks only would leave out a first residual that the other ranks exchange
+        for (:meth:`_Library.pcg`)."""
         lib, H = self.lib, self.lib.H
-        if defect is None or defect is False:
+        mine = 2 if defect is True else 0 if defect is None or defect is False else 1
+        kinds = _allreduce(self.comm, mine, MPI.MAX)
+        if not kinds:
             return
         rd = RowDefect(self)
         try:
-            if defect is True:
+            if kinds == 2:
                 ones = self.vector(columns=True)
                 try:
                     H.hypre_ParVectorSetConstantValues(ones.par, 1.0)
@@ -915,12 +935,15 @@ class SingleParMatrix:
                         bridge.synchronize()
                 finally:
                     ones.destroy()
+            if mine == 2:
                 for name, start, count in (("par_diag", 0, nd), ("par_offd", nd, no)):
                     if count:
                         _put_single(lib.pointer(lib.pointer(self.par.value, name), "csr_data"),
                                     acc, start, count)
-            else:
+            elif mine == 1:
                 lib.put(rd.c.data, np.ascontiguousarray(defect, dtype=np.float32))
+            else:
+                rd.c.zero()
             rd.finish()
         except Exception:
             rd.destroy()
@@ -1073,10 +1096,16 @@ class SingleVector:
 
     def set(self, x):
         """From one of MFEM's vectors (double precision)."""
+        if not self.n:
+            # (a rank without rows: MFEM allocates no device memory for a vector of no
+            # entries, and PyMFEM hands None for its pointer, which is no address)
+            return
         self.lib.convert(self.data, bridge.address(x.Read(self.lib.device)), self.n, np.float64, np.float32)
 
     def get(self, y):
         """Into one of MFEM's vectors."""
+        if not self.n:
+            return
         self.lib.convert(bridge.address(y.Write(self.lib.device)), self.data, self.n, np.float32, np.float64)
 
     def zero(self):
@@ -1142,7 +1171,13 @@ def _boomeramg(lib, p, gather=True):
             mfemconfig.check_seq_threshold(both, H, gpu)
         else:
             both = {k: v for k, v in both.items() if k not in ("seq_threshold", "redundant")}
-        for key, val in both.items():
+        # What a setter returns is hypre's error flag, which is the process's and stays up
+        # after the call that raised it: cleared first, it is the setter's own verdict.  And
+        # hypre's setters of the relaxation and of its sweeps reset those of the coarsest
+        # level, so the coarsest level's own come after them, wherever they were written
+        # (mfemconfig.set_boomeramg_options).
+        H.HYPRE_ClearAllErrors()
+        for key, val in sorted(both.items(), key=lambda item: item[0] in ("coarse_relax", "coarse_sweeps")):
             name, kind = _AMG_SETTERS[key]
             fn = getattr(H, name)
             if key in ("coarse_relax", "coarse_sweeps"):
@@ -1355,10 +1390,21 @@ def _trace(comm, text):
         print("[pmg, rank %d] %s" % (comm.rank, text), flush=True)
 
 
-#: What the last engine of this process put in host memory (:data:`PMG_H_HOST`): the index
-#: of the first such level among the coarser meshes and the rows of its matrix; empty
-#: where it put nothing there.  For a benchmark's record.
+#: What the last engine of each kind put in host memory (:data:`PMG_H_HOST`), by the kind of
+#: cycle as in :data:`TIMERS`: the index of the first such level among the coarser meshes
+#: and the rows of its matrix; no entry for a kind whose last engine put nothing there.
+#: For a benchmark's record.
 HOST_LEVELS = {}
+
+#: How far apart, relative to their size, the ranks' solutions of the gathered last matrix
+#: may lie before :class:`_HostGathered` says so; identical solvers give zero.
+GATHERED_AGREE = 1e-6
+
+#: The last matrix that the last engine of each kind gathered in host memory
+#: (:class:`_HostGathered`), by the kind of cycle as in :data:`HOST_LEVELS`: its rows and
+#: how far apart the ranks' solves of one right-hand side were; no entry for a kind whose
+#: last engine gathered none.  For a benchmark's record.
+GATHERED = {}
 
 #: a preconditioner as hypre's PCG calls it: (its data, the matrix, the residual, the result)
 _PRECOND = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -1529,6 +1575,7 @@ class _HostGathered:
             self._u = view(self.U.data, N, ctypes.c_float)
             self.amg = _boomeramg(lib, parameters, gather=False)
             self.code = int(H.HYPRE_BoomerAMGSetup(self.amg, self.par, self.F.par, self.U.par)) if N else 0
+            self.spread = self._agreement()
             if PMG_TRACE and N and not self.code:
                 # what one cycle leaves of the residual of a right-hand side without structure
                 rng = np.random.RandomState(7)
@@ -1549,6 +1596,56 @@ class _HostGathered:
         finally:
             if device:
                 lib.to_device()
+
+    def _agreement(self):
+        """How far apart the ranks' solutions of one right-hand side lie, relative to their
+        size: zero, since every rank holds the same matrix and sets the same hierarchy up
+        on it, and ``nan`` where a rank's set-up failed or its solution is not a number
+        (which is said).  Collective.
+
+        A cycle counts on the ranks' solvers being one: each rank keeps its own entries
+        of its own solution.  Ranks whose solvers differed would weaken every cycle of a
+        run without another sign, so one solve is compared at the set-up and a difference
+        is said.  (Two runs of one job on 512 GCDs took a third more iterations than every
+        other run with their settings, with right solutions, and left nothing to tell
+        why: the README of the scaling study, "Probe 98".)
+        """
+        H, marks = self.lib.H, np.zeros(5)
+        if self.code:
+            marks[4] = 1.0
+        elif self.N:
+            self._f[:] = np.cos(1.0 + 0.7 * np.arange(self.N))
+            self.lib.zero(self.U.par)
+            H.HYPRE_BoomerAMGSolve(self.amg, self.par, self.F.par, self.U.par)
+            # (the flag was clean after the set-up; what this solve raised is not for the
+            # next call to find)
+            H.HYPRE_ClearAllErrors()
+            u = self._u.astype(np.float64)
+            if np.isfinite(u).all():
+                marks[:4] = u.sum(), -u.sum(), np.abs(u).sum(), -np.abs(u).sum()
+            else:
+                # (a solution that is not a number is marked, not summed: MPI's MAX may drop
+                # a NaN, and no comparison below would see it)
+                marks[4] = 2.0
+        both = np.empty(5)
+        self.comm.Allreduce([marks, MPI.DOUBLE], [both, MPI.DOUBLE], op=MPI.MAX)
+        if both[4]:
+            if both[4] > 1.0 and self.comm.rank == 0:
+                import warnings
+
+                warnings.warn("the solver of the gathered last matrix of a p-multigrid's coarser meshes "
+                              "(%d rows) gave a solution that is not a number on a rank" % self.N,
+                              RuntimeWarning, stacklevel=2)
+            return float("nan")
+        spread = float(max(both[0] + both[1], both[2] + both[3]) / max(both[2], 1e-300))
+        if spread > GATHERED_AGREE and self.comm.rank == 0:
+            import warnings
+
+            warnings.warn("the ranks' solvers of the gathered last matrix of a p-multigrid's coarser meshes "
+                          "(%d rows) differ: their solutions of one right-hand side lie %.1e of their size "
+                          "apart, where every rank keeps its own entries of its own solution; the cycle is "
+                          "weaker for it" % (self.N, spread), RuntimeWarning, stacklevel=2)
+        return spread
 
     def solve(self, b, x, n):
         """The correction for the right-hand side whose entries on this rank are the ``n``
@@ -1714,6 +1811,9 @@ class PMGEngine(SingleEngine):
         layout (the interpolation, or the matrix, whose columns they are)."""
         lib, H, comm = self.lib, self.lib.H, self.matrix.comm
         transfers = list(transfers)
+        # (the record of the engine of this kind before this one; _enter_host writes this one's)
+        HOST_LEVELS.pop(type(self).__name__, None)
+        GATHERED.pop(type(self).__name__, None)
         host_rows = int(parameters["pmg_h_host"] or 0) if "pmg_h_host" in parameters else PMG_H_HOST
         if not (lib.device and lib.host_levels):
             host_rows = 0
@@ -1779,6 +1879,7 @@ class PMGEngine(SingleEngine):
             self._gathered = _HostGathered(lib, comm, bottom, int(above.col_starts[0]), parameters)
             self._gathered_io = (below[0].data, below[1].data, below[1].par.value, int(below[0].n))
             code = self._gathered.code
+            GATHERED[type(self).__name__] = {"rows": rows, "spread": self._gathered.spread}
         else:
             # (beside a device, a hierarchy in host memory goes on between the ranks
             # to its end: hypre's gathering there is the code that _HostGathered is
@@ -1838,7 +1939,7 @@ class PMGEngine(SingleEngine):
         self._host_x = above.vector(columns=True, host=True)
         self._host_at = len(self._h)
         self._host_io = (below[0].data, below[1].data, 4 * below[0].n)
-        HOST_LEVELS.update(level=self._host_at, rows=int(above.global_cols))
+        HOST_LEVELS[type(self).__name__] = {"level": self._host_at, "rows": int(above.global_cols)}
         return self._host_top
 
     def _correct(self, k, b, x):

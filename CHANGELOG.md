@@ -318,7 +318,8 @@
   that keeps the large blocks takes it from 0.26 to 0.10 s a forward solve and the solve
   from 4.36 to 4.28 s), the MPI library's own answer about device memory on a HIP build
   (`MPIX_Query_hip_support`), and `HIPPYMFEM_GPU_AWARE_MPI=0|1`, which sets hypre's
-  GPU-aware exchange whatever the library was built with.  `=solve` (experimental) turns it
+  GPU-aware exchange whatever the library was built with (from hypre 2.33 on: see "Fixed"
+  for 2.31 and 2.32).  `=solve` (experimental) turns it
   on only inside Krylov solves on a hierarchy that is set up, since a setup's exchanges
   each cost Cray MPICH a registration.  With Cray MPICH 9.1.0 it takes 10 to 20 % off an
   iteration and deadlocks or faults every time at 320^3 on 128 and at 400^3 on 256 GCDs, so
@@ -946,6 +947,246 @@
 
 ### Fixed
 
+- **A matrix assembled chunk by chunk on a mesh of several kinds of element was wrong**
+  (`fem.pattern.ScatterPattern._fused_maps`, `_array_order`).  Where the kinds of element
+  of a mesh interleave (triangles among quadrilaterals) a pattern keeps its slots in the
+  order of the mesh's elements, and the scatter that takes each chunk of element matrices
+  as it is produced read them in the order of the element arrays, one kind after the
+  other: every entry went into another entry's slot.  The matrix had the right sparsity
+  and finite values and was off by its own size.  That scatter is the route of a batch that
+  a device or the host splits, of the streamed pass of a linearization point, and of every
+  Jacobian with the element products of the p-multigrid.  A linear forward solve said so
+  (its one step leaves the residual where it was, and the single-precision solve gives up
+  and is repeated in double precision); the blocks of a linearization point and the
+  incremental solves said nothing.  One kind of element, which is every run on boxes,
+  takes the same arrays as before.  `test_assembly.test_fused_scatter` and
+  `test_compact_scatter_map` have the mixed mesh.
+- **On a mesh of several kinds of element a density that reads the coordinates got
+  none** (`fem.elementbatch.ElementGroup._geometry_elementwise`; older than the scaling
+  work).  PyMFEM's `ElementTransformation.Transform` hands the point back for an
+  integration point and does not write the vector it is given; the group kept that vector,
+  which nothing had written, as the coordinates of its quadrature points.  The integral of
+  `x` over the unit square came out as 1e-315.  Weights and Jacobians were right, so a
+  density without `x` was too.  `test_kernels.test_mixed_geometry` integrates `x`, `y`,
+  `x y` and `x^2` now.
+- **The rule at the vertices had the geometry of two vertices exchanged on quadrilaterals
+  and hexahedra** (`fem.elementbatch._tensor_places`; `BiLaplacianPrior(lumped_mass=True)`).
+  MFEM's batched geometric factors return the points of an element with a tensor basis
+  in the order of a tensor grid, whatever the order of the rule, and the rule at the
+  vertices follows the element's vertices, (1, 1) before (0, 1): its third and fourth
+  points (and its seventh and eighth) had each other's coordinates, Jacobian and weight.
+  The square root of a lumped mass matrix then weighed those vertices by each other's
+  |det J|, so that on elements that are no parallelograms or parallelepipeds
+  `sqrtM sqrtM^T` was not `M` (4 to 18 % of a diagonal entry on the meshes tried) and a
+  sample of the prior did not have the covariance of its precision; with the geometry
+  built in slices (`HIPPYMFEM_GEOMETRY_SLICE`) it was right.  Each point of such a rule now
+  takes the geometry from its place in MFEM's grid.  On uniform boxes |det J| is one number
+  an element and nothing but round-off moves (the benchmark's truth by 1e-15 of its size);
+  rules in MFEM's own order, which are all the others, are untouched to the last bit.
+  `test_kernels.test_vertex_rule_geometry`, and distorted quadrilaterals and hexahedra in
+  `test_modeling.test_lumped_mass_prior`.
+- **A mesh of two kinds of element whose ranks each hold one kind passed for a mesh of
+  one** (`fem.elementbatch.MeshBatches`, the lumped mass matrix of `BiLaplacianPrior`).
+  Each rank counted the kinds of its own elements.  MFEM's batched geometry does not take
+  such a mesh (it stops in a null pointer), and the lumped mass matrix was assembled with
+  the rule of the other kind.  The kinds of all ranks are put together now.  MFEM's own
+  partition of the suite's mixed mesh leaves a rank with both kinds on 2 to 16 ranks, which
+  is why it had not shown.
+- **A block whose ranks split their element batches differently hung**
+  (`PDEVariationalProblem._domain_block`; older than the scaling work).  Whether a batch is
+  split is each rank's own answer: its element count, its memory, a chunk it remembers
+  from an out-of-memory retry.  A rank with a whole batch reduced its overflow flag before
+  the assembly and a rank with a split one after it, so the two kinds waited in different
+  collectives: on eight ranks the forward solve did not return, on two one rank raised
+  "produced non-finite element values" for finite values (a flag paired with another
+  rank's reduction of something else).  One flag and one collective after the assembly
+  now, on both routes.  The scaling runs were not exposed (equal boxes, every rank splits,
+  and their Jacobian is streamed on every rank).  `test_assembly.test_split_and_whole_ranks`
+  puts the ranks on different sides, in host memory and on a device.
+- **`require_finite` let a vector with entries that are not numbers pass where MFEM holds
+  it on a GPU.**  It asked for the Euclidean norm, and MFEM 4.9's `Vector::Norml2` passes
+  over an entry that is not a number (`if (n > 0)`), on the host as on a device; an
+  infinite entry it finds.  The sum of the magnitudes is asked now.
+  `test_modeling.test_require_finite`.
+- **An error that hypre left up is no longer taken for a refusal of the next option, or
+  for the failure of the next set-up** (`mfemconfig.set_boomeramg_options`,
+  `singlesolve._boomeramg`, `linSolvers._pcg_verdict`).  hypre has one error flag a
+  process, every setter of an option returns it, and MFEM's `HyprePCG` neither reads nor
+  clears it.  After a `cg(amg)` solve that ended at its limit the next solver with
+  `amg_options` (the default is `HIPPYMFEM_AMG`) raised `ValueError: hypre refused the
+  BoomerAMG option relax_wt=1.8 (... returned 256)`, which no line search catches: a
+  Newton run died where it should have backtracked (seen in one probe of the scaling
+  work).  After a set-up that met a zero row the flag was up on the rank that holds the
+  row alone, and that rank alone raised (12) while the others went on.  The setters'
+  verdict is now read from a flag that was cleared first, and a solve in hypre's PCG
+  reads and clears the flag when it ends.
+- **A double-precision solve that hypre's PCG abandons is no longer taken for converged**
+  (`KrylovSolver.solve`), the counterpart of the single-precision entry below.  The verdict
+  was "fewer iterations than allowed, or the tolerance met".  hypre's PCG ends early in
+  four ways that are not convergence: a preconditioner that is not positive definite
+  (`<C r, r>` turns negative, its test passes, the residual is the root of a negative
+  number: BoomerAMG with `relax=7` and a weight above what the matrix allows), a
+  breakdown, a matrix that is not positive definite (it takes the right-hand side for
+  zero and returns it as the solution), and a right-hand side that is not a number (it
+  returns zero).  Each came back as converged, with the count and the residual of the
+  solve before in the last two.  The verdict is now hypre's own (`HYPRE_PCGGetConverged`,
+  read through the solver's handle as `boomeramg_handle` reads BoomerAMG's) together with
+  a residual that is a number; a zero right-hand side gives zero in no iterations.  A
+  solve that meets its tolerance at the last iteration allowed is converged as before,
+  and one that makes the iterations it is allowed with both tolerances zero keeps their
+  count (hypre raises nothing at its limit where it has no test to miss).
+  `test_solvers.test_hypre_pcg_verdict`.
+- **The coarsest level's relaxation and sweeps hold wherever they are written in a list
+  of options** (`coarse_relax`, `coarse_sweeps`; both precisions).  hypre's setters of the
+  relaxation and of its sweeps reset those of the coarsest level, so
+  `coarse_relax=7,relax=18` gave Gaussian elimination on the coarsest level, and with the
+  two names in `HIPPYMFEM_AMG` and `HIPPYMFEM_SINGLE_AMG` the order could not be chosen.
+- **`seq_threshold` no longer gathers a level that cannot be coarsened, and gathers the
+  level of a system with the functions of its rows** (`tools/hypre-3.2.0-seqdevice.patch`,
+  its third version; `hypre_BoomerAMGSeqOnDevice()` returns 3).  hypre's set-up also ends
+  at a level on which coarsening finds no coarse point (every row diagonally dominant: a
+  mass matrix; a prior at the level whose mesh width passes the correlation length), and
+  it gathered that level whatever its size, in host memory too: the whole of it on every
+  rank that holds rows, with 32-bit counts.  Such a level is relaxed now, as without the
+  setting.  And the gathered solver of a system was told the number of functions and not
+  which row is which, so it paired rows of different functions below the first level (34
+  CG iterations where the hierarchy takes 12, on vector diffusion); it gets the level's
+  own labels.  A hierarchy of one equation that coarsens to its threshold, which is every
+  scaling run, is the same.  The build scripts try each patch whole and without fuzz
+  before applying it, say which switch a kept library ignores, and
+  `build_hypre_single.sh` no longer ends without a word when a build fails or its first
+  argument is a relative path.  `seq_threshold` in host memory under MFEM's "cpu" device
+  is no longer refused for the lack of the patch.  On a device the setting now asks for
+  the third version (`mfemconfig.seq_on_device`): a library that carries the second, which
+  ran every series of the scaling study, is refused with the reason, so that neither
+  defect can come back with an older build.
+- **BoomerAMG is told how the components of a vector space are ordered**
+  (`KrylovSolver(systems_dim=..., systems_bynodes=...)`; older than the scaling work).
+  With the number of components alone hypre takes the rows for components in turn, which
+  is the interleaved ordering; this library's spaces are ordered component after component
+  unless another ordering is asked for, so every systems hierarchy of a default vector
+  space paired rows of different components: 58 CG iterations where 12 do on vector
+  diffusion with the coarsening and relaxation of a device, 21 where 6 do with the
+  host's, 15 where 5 do for `VectorBiLaplacianPrior`.  The solver now passes the
+  ordering (by nodes unless told otherwise, read from `fes` where one is given, and from
+  the space by the priors).  `test_solvers.test_systems_ordering`.
+- **In the single-precision library, what a matrix makes of the defect of its row sums is
+  one for all ranks** (`SingleParMatrix._set_row_defect`), and a vector without entries
+  asks MFEM for no pointer (`SingleVector.set`, `get`).  The kind of values a rank hands
+  over is its own (a host array on a rank without elements, single precision from a batch
+  that was not split), and the product that finds a card's defect, its reduced check and
+  the kind of PCG followed it; a rank without rows on a device took `int()` of a pointer
+  that PyMFEM returns as `None`.  Latent both: another failure came first.
+- **A state of several components with `pmg_h` keeps BoomerAMG under the linear elements,
+  with a warning** (`PDEVariationalProblem._p_transfer`), where the first Jacobian raised
+  `NotImplementedError` (taken by a line search for a failed trial) and the next call went
+  on with a half-built transfer and no levels, without a word.
+- **`HIPPYMFEM_HESSIAN=auto` no longer keeps the route that was traced faster**
+  (`fem.kernel`): a chunk loop that streams geometry traces a kernel before its first call,
+  and the timing of the two routes ran on tracers.
+- **A rank that holds no element of a block's groups** assembles the rows it is sent
+  (`ScatterPattern.data` raised on an empty list of arrays where its target had slots for
+  rows of other ranks: the suite's own boundary test at 6, 7 and 16 ranks), and two sets
+  of groups that are both empty on a rank no longer share one pattern there
+  (`get_pattern`: the other ranks built theirs collectively while that rank went on).
+- **Settings assigned through `hm.config` as `True` or as a float** (`pmg`, `pmg_h`,
+  `pmg_h_host`, `prior_h`, `pc_reuse`, `amg_relax`, `amg_max_levels`) were written as
+  text that the readers could not parse, and the solvers took the default without a word;
+  they are written as whole numbers, and a value that is none is refused.
+- **hypre's pool**: `trim` took the bins out before it called the driver (a block freed by
+  a finalizer during the call was listed twice or raised), `uninstall` gives the
+  single-precision library its allocator back as well, and a refused GPU-aware hypre is
+  left staging its buffers when the check raises.  The single-precision library stages
+  its exchanges whatever it was built for.  In the experimental mode
+  `HIPPYMFEM_GPU_AWARE_MPI=solve` the first solve by one of MFEM's solvers on a hierarchy
+  that hypre's PCG set up is a set-up too (MFEM builds it again) and is staged, and so is
+  the mirror, the first solve by hypre's PCG on a hierarchy that MFEM's CG has used (a
+  solve from zero after one from a given vector, or with a PCG lent before it solved).
+- **The benchmarks.**  `bench_scaling.py --profile-setup` reported as its V-cycle a tenth
+  of a second set-up plus a cycle (MFEM sets a preconditioner up again at its own first
+  application); `--profile-vcycle` with `--both-kernels` stopped before the record
+  (`H` rebound); both profiles were attempted on a Jacobian of the single-precision hypre.
+  `bench_newton_device.py --rank-table` read the card's memory after its two probe kernels
+  had taken 1.5 GiB (four smoke records are off by that; no series record), and its stages
+  now count the plans, the scatter and the matrices of a Jacobian with element products
+  under names of their own (`+jacobian plan_block` and so on: they were in no stage but
+  the inclusive `+jacobian`).  What an engine put in host memory is recorded by the kind
+  of cycle (`singlesolve.HOST_LEVELS`), so a prior's cycle no longer answers for the
+  Jacobian's.
+- **Checks that a NaN could not fail.**  Python's `max` keeps its first argument against a
+  NaN, mpi4py's reduction does the same between ranks, and MFEM's `Norml2` passes over
+  one: a check `worst < tol` printed `[ok]` for a NaN in any case but the first or on one
+  rank of several.  The maxima of the test suites go through a helper that carries a NaN
+  (`largest`), the reductions through `parvector.allreduce_extreme`, the norms through the
+  library's own, in every test file.  Conjuncts that could not fail are gone, and the
+  check of `cg_preconditioner_cycles` fails when the preconditioner is never applied.
+- Smaller ones: the warning about a growing arena no longer fires on a device that
+  reports no cap (the host: "448800 % of JAX's arena"); `FunctionSpace.order` answers on a
+  rank without elements (MFEM stops the process at the question for element 0); the
+  true-dof pattern built without the compiled passes sorts by two keys where a row times
+  the columns passes 64 bits (17 million rows a rank beside 5.5e11 columns).
+- **A setting that cannot be read is refused by its name, not replaced by the default.**
+  `HIPPYMFEM_PMG=on` or `HIPPYMFEM_PMG_H=two` in a job script ran the default configuration
+  without a word; the seven whole-number variables of the solvers and `HIPPYMFEM_PRIOR_H`
+  now raise `ValueError` with the variable's name at the first solver
+  (`linSolvers._env_default`), as assignments through `hm.config` already did.  A mistyped
+  `HIPPYMFEM_HYPRE_SPMV` is refused before the device is made (it was refused after, and a
+  caller that caught the error went on with a device that had had no check of the MPI
+  library and no pool), and so is a `HIPPYMFEM_HYPRE_POOL` that is neither `auto` nor
+  megabytes (`on` was taken for 0, no pool at all) or a `HIPPYMFEM_HYPRE_POOL_KEEP` that
+  is no number.  A solver parameter that hypre refuses (`amg_strength_threshold`
+  above one, which it dropped for its own 0.25) raises at `set_operator` with the
+  parameter's name (`KrylovSolver._make_pc`: MFEM's setters do not pass hypre's verdict on).
+  `test_solvers.test_refused_settings`.
+- **A systems hierarchy keeps the solver's own settings** (`KrylovSolver._make_pc`).  With
+  the number of components MFEM writes two settings of its own, no aggressive levels and a
+  strength threshold of 0.5, and they were written after the solver's: `amg_agg_levels`,
+  `amg_strength_threshold` and a `theta` or `agg` of `amg_options` were replaced for every
+  vector problem without a word.  The components are set first now.
+- **The trust-region method takes `cg_preconditioner_cycles`** (`NewtonCG`), which the
+  line search honoured and it ignored without saying so.
+- **An error inside a prior is no longer taken for an argument it does not know**
+  (`model._takes`; `Model.Rsolver`, `NewtonCG._cg_preconditioner`).  The call that builds
+  the prior's preconditioner sat in `except TypeError`, for priors and models written
+  before the arguments `tolerance` and `cycles` existed, and every `TypeError` raised
+  inside went the same way: the caller fell back on the plain solver, on the rank that
+  raised alone.  The signature is asked before the call.
+- **Row sums in single precision of a batch that is not split** (`ScatterPattern.data`,
+  `csrassemble.assemble_matrix_csr`).  With `HIPPYMFEM_SINGLE_ROW_SUMS=1` and
+  single-precision element matrices, a device summed a batch that fits whole in the
+  matrices' precision: the sums had their rounding in them and the matrix kept no defect,
+  without a word, while a split batch kept it.  Such a batch is summed in double precision
+  now.  The runs with the element products of the p-multigrid do not come there.
+- **GPU-aware MPI with hypre 2.31 and 2.32** (`mfemconfig._gpu_aware_fixed`; the CUDA
+  stack, whose PyMFEM brings hypre 2.32).  Those versions have the run-time switch and
+  the field it writes, and an exchange that is compiled one way and does not read the
+  field (MFEM says so where it prepares one).  A library compiled to hand MPI its buffers
+  under an MPI that cannot read device memory was refused with the advice
+  `HIPPYMFEM_GPU_AWARE_MPI=0`, and with that the check passed, by the field, while hypre
+  went on handing over device addresses.  The field of such a library is no longer
+  written, so that it goes on saying what the library was built to do; a setting it cannot
+  follow is warned of, and the refusal advises the other library.  Read from MFEM's source
+  and the tree's patch for 2.32; not run on that machine yet.
+- **Smaller ones of the second round.**  `PDEVariationalProblem._same` joins the other
+  ranks' reduction where its own sizes differ (it returned ahead of it);
+  `ptransfer`'s largest row-sum error carries a rank's NaN, and a weight of MFEM's
+  transfer matrix that is not a number is kept, so that the library refuses the matrix,
+  where it was left out with the zeros; `element_matrices_or_chunks` asks whether a batch
+  is split at the weight of the pass that follows (asked at weight 1, a batch between the
+  two was handed over whole and then split and joined); `fem.kernel.RETRIES` counts the
+  element passes that ran out of memory and were tried again in smaller chunks, and the
+  Newton benchmark records it over all ranks (`element_retries`) beside how far apart the
+  ranks' solvers of a gathered last matrix were (`pmg_h_gathered`); that comparison says
+  when a rank's solution is not a number; `vectorfe.vector_kind` asks MFEM for the typical
+  element, which a rank without elements has too; `modelVerify.best_slope` is NaN where an
+  error inside its window is not a finite number (it left the step out, and a cost that
+  was NaN at one step passed every slope check); `tools/build_pymfem_hip.sh` says which
+  step failed and where its log is, where it ended with status 1 and no word;
+  `bench_scaling.py` names what it measures with a Jacobian in the single-precision hypre
+  (the product with its two conversions; the kernel that those solves keep under
+  `--both-kernels`); the checks of `seq_threshold` on one rank, where hypre drops the
+  setting, say that nothing is gathered instead of comparing the default hierarchy with
+  itself under another name.
 - **`set_hessian_mode` also drops the consistent blocks of the mixed precision**
   (`fem.kernel`): a Jacobian compiled by one route kept that route when the mode was
   changed afterwards, since the block that is exact on the constants is cached under a key

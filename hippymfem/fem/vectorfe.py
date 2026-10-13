@@ -78,7 +78,10 @@ class HDivField(NamedTuple):
 def vector_kind(space):
     """``"hcurl"``, ``"hdiv"`` or ``None`` for the element family of ``space``."""
     space = as_space(space)
-    fe = space.fes.GetFE(0)
+    # (the typical element, which a rank without elements has too: MFEM stops the process
+    # at the question for element 0 there)
+    typical = getattr(space.fes, "GetTypicalFE", None)
+    fe = typical() if typical is not None else space.fes.GetFE(0)
     if fe is None or fe.GetRangeType() != mfem.FiniteElement.VECTOR:
         return None
     d = fe.GetDerivType()

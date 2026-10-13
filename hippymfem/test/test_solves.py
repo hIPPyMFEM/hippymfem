@@ -15,6 +15,7 @@ import jax.numpy as jnp
 
 import hippymfem as hp
 from hippymfem.algorithms.linSolvers import KrylovSolver, LUSolver
+from hippymfem.common.parvector import allreduce_extreme
 from hippymfem.fem.bcs import BCSet, DirichletBC
 from hippymfem.fem.jaxops import inner
 from hippymfem.algorithms.singlesolve import action_tolerance
@@ -34,6 +35,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def poisson_setup(n=16, order=2):
@@ -85,7 +95,7 @@ def test_linear_forward():
         bad = np.abs(ub.array[pde.bc.ess] - g.array[pde.bc.ess]).max()
     else:
         bad = 0.0
-    check("boundary data satisfied", COMM.allreduce(bad, op=MPI.MAX) < 1e-12)
+    check("boundary data satisfied", allreduce_extreme(COMM, bad, MPI.MAX) < 1e-12)
     return pmesh, Vh, pde, u, m
 
 
@@ -195,7 +205,9 @@ def test_gradient_by_fd():
         errs.append(rel)
         if RANK == 0:
             print("      %-10.0e %-16.9e %.3e" % (h, fd, rel))
-    check("adjoint gradient matches FD", min(errs) < 1e-7, "(best %.2e)" % min(errs))
+    # (the smallest, and NaN where one of them is NaN)
+    best = -largest([-e for e in errs])
+    check("adjoint gradient matches FD", best < 1e-7, "(best %.2e)" % best)
 
 
 def test_nonlinear_forward():

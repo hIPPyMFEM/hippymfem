@@ -118,6 +118,33 @@ def integration_rule(geom, degree):
     return ir
 
 
+def _tensor_places(ir, dim):
+    """Where MFEM's batched geometric factors have the points of the rule ``ir`` on an
+    element with a tensor basis (a square, a cube): the index of each point in what MFEM
+    returns, or ``None`` for a rule that is in that order already, as MFEM's own are.
+
+    MFEM evaluates such an element as a tensor product.  It takes the first
+    ``n = nq^(1/dim)`` points of the rule for the points along one axis
+    (``TensorBasisElement::GetTensorDofToQuad``) and returns the point ``(i, j, k)`` of
+    their grid at ``i + n (j + n k)``, whatever the order of the rule itself.  The rule at
+    the vertices (:data:`VERTEX_RULE`) follows the vertices of the element, (1, 1) before
+    (0, 1), so its third and fourth points (and its seventh and eighth) are the grid's
+    fourth and third.
+    """
+    nq = ir.GetNPoints()
+    n = int(round(nq ** (1.0 / dim)))
+    points = np.array([(ir.IntPoint(q).x, ir.IntPoint(q).y, ir.IntPoint(q).z)[:dim]
+                       for q in range(nq)])
+    along = np.abs(points[:, :, None] - points[None, None, :n, 0]).argmin(axis=2)
+    places = along @ (n ** np.arange(dim))
+    if (n ** dim != nq or np.unique(places).size != nq
+            or np.abs(points[:n, 0][along] - points).max() > 1e-12):
+        raise NotImplementedError(
+            "a rule of %d points that is not the grid of its first %d, which is how MFEM "
+            "evaluates an element with a tensor basis" % (nq, n))
+    return None if np.array_equal(places, np.arange(nq)) else places
+
+
 def default_quadrature_degree(spaces, extra=2):
     """A deliberately generous default: twice the highest degree present, plus ``extra``.
 
@@ -233,6 +260,16 @@ class ElementGroup(KeepAlive):
             det = gf.detJ.GetDataArray().reshape(nq, NE, order="F")
             X = gf.X.GetDataArray().reshape(nq, sdim, NE, order="F")
             sel = self.elems
+            # MFEM evaluates a square or a cube whose nodes have a tensor basis on a tensor
+            # grid and returns the points in the grid's order, which the rule at the
+            # vertices is not in: each point of such a rule takes its geometry from its
+            # place in the grid, in the same copy.  (MFEM's own rules are in that order,
+            # and ``sel`` stays as it is.)
+            places = None
+            if int(self.geom) in (int(mfem.Geometry.SQUARE), int(mfem.Geometry.CUBE)):
+                places = _tensor_places(self.ir, dim)
+            if places is not None and mfem.UsesTensorBasis(mesh.GetNodes().FESpace()):
+                sel = (sel[:, None], places[None, :])
             J = np.ascontiguousarray(np.transpose(J, (3, 0, 1, 2))[sel])
             det = np.ascontiguousarray(np.transpose(det, (1, 0))[sel])
             self.X = np.ascontiguousarray(np.transpose(X, (2, 0, 1))[sel])
@@ -331,9 +368,13 @@ class ElementGroup(KeepAlive):
                 host_sync(Jm)
                 J[a, q, :, :] = Jm.GetDataArray().reshape(sdim, dim, order="F")
                 det[a, q] = T.Weight()
-                T.Transform(ip, pt)
-                host_sync(pt)
-                X[a, q, :] = pt.GetDataArray()
+                # PyMFEM hands the point back for an integration point and leaves ``pt``
+                # as it was; a wrapper that fills ``pt`` returns nothing
+                x = T.Transform(ip, pt)
+                if x is None:
+                    host_sync(pt)
+                    x = pt.GetDataArray()
+                X[a, q, :] = x
         return J, det, X
 
     def __repr__(self):
@@ -539,8 +580,6 @@ class MeshBatches(KeepAlive):
         self.comm = comm if comm is not None else _mesh_comm(mesh)
         dim = mesh.Dimension()
         local_ngeom = mesh.GetNumGeometries(dim)
-        self.ngeom = self.comm.allreduce(local_ngeom, op=MPI.MAX)
-        batched = self.ngeom == 1
         geoms = {}
         if local_ngeom == 1 and mesh.GetNE():
             # one geometry: no per-element query
@@ -548,6 +587,12 @@ class MeshBatches(KeepAlive):
         else:
             for e in range(mesh.GetNE()):
                 geoms.setdefault(mesh.GetElementGeometry(e), []).append(e)
+        # A rank counts the kinds of its own elements, so ranks that each hold one kind,
+        # and not the same one, would count one kind on a mesh of two, which MFEM's
+        # batched call does not take: the kinds of all the ranks, a bit each.
+        kinds = self.comm.allreduce(sum(1 << int(g) for g in geoms), op=MPI.BOR)
+        self.ngeom = bin(kinds).count("1")
+        batched = self.ngeom == 1
         sliced = self._sliced(mesh, geoms)
         self.groups = [
             ElementGroup(mesh, g, np.array(v, dtype=np.int64),

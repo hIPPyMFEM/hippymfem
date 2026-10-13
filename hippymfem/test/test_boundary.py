@@ -57,6 +57,15 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
+
+
 def mesh_of(kind, n):
     m = (mfem.Mesh.MakeCartesian2D(n, n, mfem.Element.TRIANGLE) if kind == "tri"
          else mfem.Mesh.MakeCartesian2D(n, n, mfem.Element.QUADRILATERAL))
@@ -517,8 +526,8 @@ def test_streamed_pass_with_boundary():
         chunked = blocks()
     finally:
         K.ELEMENT_CHUNK = old_chunk
-    worst = max(plain[k].copy().axpy(-1.0, chunked[k]).norm("l2") / max(plain[k].norm("l2"), 1e-300)
-                for k in pairs)
+    worst = largest(plain[k].copy().axpy(-1.0, chunked[k]).norm("l2") / max(plain[k].norm("l2"), 1e-300)
+                    for k in pairs)
     check("the streamed pass ran with a boundary residual", bool(streamed_used))
     check("streamed and plain linearization points agree with a boundary residual",
           worst < K.matrix_tolerance(1e-12), "(worst rel %.1e)" % worst)

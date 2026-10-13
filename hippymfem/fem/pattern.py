@@ -10,6 +10,7 @@ CSR graph, the slot of every element entry, the masks and the device copies) and
 (space pair, element groups) in an :class:`~hippymfem.common.identitycache.IdentityCache`.
 """
 
+import copy
 import os
 import time
 import warnings
@@ -333,7 +334,9 @@ def _warn_if_growth_arena(d, n, itemsize=8):
     while the same arena preallocated as one region serves it with 5.6 GiB to spare.
     The message is what the failure otherwise never says.
     """
-    if n * itemsize < _GROWTH_WARN_SHARE * (_arena_limit(d) or 0) or d in _WARNED:
+    limit = _arena_limit(d)
+    if not limit or n * itemsize < _GROWTH_WARN_SHARE * limit or d in _WARNED:
+        # (a device that reports no cap, as the host does, has no arena to outgrow)
         return
     _WARNED.add(d)
     if os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "").lower() in (
@@ -346,7 +349,7 @@ def _warn_if_growth_arena(d, n, itemsize=8):
         "reading almost empty. Set XLA_PYTHON_CLIENT_PREALLOCATE=true (with "
         "HIPPYMFEM_GPU_MEM_FRACTION sized for hypre's share) to take the arena as "
         "one region, or use more ranks."
-        % (n * itemsize / 2 ** 30, 100.0 * n * itemsize / max(_arena_limit(d) or 1, 1)),
+        % (n * itemsize / 2 ** 30, 100.0 * n * itemsize / limit),
         RuntimeWarning, stacklevel=4)
 
 
@@ -744,7 +747,7 @@ class ScatterPattern(KeepAlive):
                             None if self.sign is None else _put(self.sign))
         return self._dev[d]
 
-    def data(self, element_matrices, zero_slots=None, host=True):
+    def data(self, element_matrices, zero_slots=None, host=True, dtype=None):
         """CSR ``data`` array for one set of element matrices.
 
         The reduction runs where the element matrices are: when the kernels ran on
@@ -753,15 +756,22 @@ class ScatterPattern(KeepAlive):
         ``host=False`` they do not come back either: the device array is returned as
         it is, for a consumer that builds the matrix on the device
         (:meth:`hippymfem.fem.tdofassemble.TrueDofPattern.finish`).
+
+        On a device the sums are made in the precision of the element matrices unless
+        ``dtype`` names another (on the host in double precision, whatever theirs is).
         """
         if len(element_matrices) != len(self.shapes):
             raise ValueError("expected %d element arrays, got %d"
                              % (len(self.shapes), len(element_matrices)))
-        if self.nnz == 0:                       # no elements on this rank
-            return np.zeros(0)
+        if self.nnz == 0 or not element_matrices:
+            # No elements on this rank.  A true-dof target has slots all the same
+            # where other ranks send it rows of the block (those of a boundary
+            # element beside this rank's part, whose owner it is): the accumulator
+            # is as long as they need.
+            return np.zeros(self.nnz)
         on_device = not all(isinstance(E, np.ndarray) for E in element_matrices)
         if on_device:
-            out = self._data_device(element_matrices, zero_slots)
+            out = self._data_device(element_matrices, zero_slots, dtype)
             return host_writable(out) if host else out
         if len(element_matrices) == 1:
             flat = np.asarray(element_matrices[0], dtype=np.float64).reshape(-1)
@@ -782,13 +792,37 @@ class ScatterPattern(KeepAlive):
         return out
 
     def fusable(self):
-        """Whether chunks can be scattered as they are produced.
+        """Whether chunks can be scattered through slices of ``slot`` as it is.
 
-        A chunk of elements must map onto a slice of ``slot``, which holds unless
-        the entries were permuted into mesh-element order across several geometry
-        groups, the only case ``perm`` is set for.
+        A chunk of elements must map onto a slice of the map, which ``slot`` gives
+        unless the entries were permuted into mesh-element order across several
+        geometry groups, the only case ``perm`` is set for.  The fused scatter slices
+        a copy in the order of the element arrays there (:meth:`_array_order`).
         """
         return self.perm is None and self.nnz > 0
+
+    def _array_order(self):
+        """This pattern for the fused scatter of a mesh of several geometries: a
+        shallow copy whose ``slot`` and ``sign`` are in the order of the element
+        arrays, group after group, and that has no ``perm``.
+
+        The pattern keeps the two in mesh-element order there (``__init__``): entry
+        ``perm[k]`` of the glued arrays goes to ``slot[k]``, so a slice of them is the
+        entries of other elements than a chunk's.  The copy costs an index array of
+        the size of the slots, which a mesh of one geometry never pays.  It has its
+        own device copies, since its maps differ, and is not kept: the fused maps
+        hold what they need of it.
+        """
+        twin = copy.copy(self)
+        slot = self.slot
+        twin._slot, twin._slot_again = np.empty_like(slot), None
+        twin._slot[self.perm] = slot
+        if self.sign is not None:
+            twin.sign = np.empty_like(self.sign)
+            twin.sign[self.perm] = self.sign
+        twin.perm = None
+        twin._dev = {}
+        return twin
 
     def data_fused(self, chunks, zero_slots=None, host=True, dtype=None):
         """Scatter each chunk of element matrices as it arrives.
@@ -915,7 +949,12 @@ class ScatterPattern(KeepAlive):
                 "base": base,
                 "nent": [int(a) * int(b) for _, a, b in self.shapes],
             }
-            compact = _compact_slots(self.slot, self.shapes, self.sizes) if COMPACT_PATTERN else None
+            # A chunk is added through a slice of the maps, so they are read in the order
+            # of the element arrays: the pattern's own on a mesh of one geometry, and
+            # not on a mesh of several, where a slice of ``slot`` would send every
+            # chunk into the slots of other elements (see _array_order).
+            src = self if self.perm is None else self._array_order()
+            compact = _compact_slots(src.slot, self.shapes, self.sizes) if COMPACT_PATTERN else None
             if compact is not None:
                 # (the full map is not kept on the device beside the compact one)
                 code, rows, bits = compact
@@ -923,7 +962,7 @@ class ScatterPattern(KeepAlive):
                 for ne, a, _b in self.shapes:
                     rbase.append(r)
                     r += int(ne) * int(a)
-                sign = self.sign
+                sign = src.sign
                 if on_device:
                     from .kernel import _put
 
@@ -935,17 +974,19 @@ class ScatterPattern(KeepAlive):
                 # (the scatter reads the compact map from here on: see LEAN)
                 self.release_slot()
             else:
-                slot, sign = self.slot, self.sign
+                slot, sign = src.slot, src.sign
                 if on_device:
-                    slot, _perm, sign = self._device_maps()
+                    slot, _perm, sign = src._device_maps()
                 got.update(slot=slot, sign=sign)
             self._fused[key] = got
         return got
 
-    def _data_device(self, element_matrices, zero_slots=None):
+    def _data_device(self, element_matrices, zero_slots=None, dtype=None):
         """The same reduction, on the device the element matrices live on.
 
         ``zero_slots`` is applied here, on the device, rather than to the host copy.
+        ``dtype`` is the precision of the sums where it is not to be the element
+        matrices' own: the entries are widened (or rounded) before they are added.
         """
         import jax.numpy as jnp
         from jax.ops import segment_sum
@@ -963,6 +1004,8 @@ class ScatterPattern(KeepAlive):
             flat = flat[perm]
         if sign is not None:
             flat = flat * sign
+        if dtype is not None and flat.dtype != dtype:
+            flat = flat.astype(dtype)
         if DETERMINISTIC:
             out = self._gather_sum(flat)
         else:
@@ -1057,11 +1100,22 @@ def get_pattern(test_space, trial_space, groups):
     building a pattern involves no communication, so a hit on one rank and a miss
     on another is harmless.  (A cache that wraps a collective cannot be keyed this
     way; see :class:`~hippymfem.common.parvector.Layout`.)
+
+    One pattern must not serve two sets of groups, though: the true-dof pattern
+    built on it is found or built per pattern, and building it is collective
+    (:func:`~hippymfem.fem.tdofassemble.get_tdof_pattern`).  A rank that holds no
+    element of the groups has none to key on, so there the list itself stands for
+    them: pass the batches' own ``groups``, one object for one set on every rank.
+    Keyed on the spaces alone, the second boundary term on a pair of spaces found
+    the first one's pattern on such a rank, which then skipped the construction the
+    other ranks were making.
     """
     test_space = as_space(test_space)
     trial_space = as_space(trial_space)
     objs = (test_space.fes, trial_space.fes) + tuple(groups)
-    pat = _PATTERN_CACHE.get(objs)
+    # (the address of the list is its identity while the pattern, which keeps it, lives)
+    extra = () if len(groups) else (id(groups),)
+    pat = _PATTERN_CACHE.get(objs, extra)
     if pat is None:
         pat = ScatterPattern(
             [group_tables(test_space, g) for g in groups],
@@ -1069,7 +1123,9 @@ def get_pattern(test_space, trial_space, groups):
             test_space=test_space, trial_space=trial_space,
         )
         pat.keep(test_space, trial_space, *groups)
-        _PATTERN_CACHE.put(objs, pat)
+        if extra:
+            pat.keep(groups)
+        _PATTERN_CACHE.put(objs, pat, extra)
     return pat
 
 

@@ -54,7 +54,8 @@ def write_paraview(basename, mesh, fields, cycle=0, time=0.0, order=None,
             maxorder = max(maxorder, space.order)
         else:
             gf = val
-            maxorder = max(maxorder, gf.ParFESpace().GetOrder(0))
+            # (not the order of element 0: a rank need not have one)
+            maxorder = max(maxorder, gf.ParFESpace().GetMaxElementOrder())
         gfs[key] = gf            # must outlive Save()
 
     pvd = mfem.ParaViewDataCollection(name, mesh)

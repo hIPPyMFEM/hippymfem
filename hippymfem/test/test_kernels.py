@@ -25,7 +25,7 @@ from hippymfem.fem.kernel import QuadratureKernel
 from hippymfem.fem.assemble import assemble_matrix, assemble_vector
 from hippymfem.fem.jaxops import div, inner, sym
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
-from hippymfem.common.parvector import ParVector
+from hippymfem.common.parvector import ParVector, allreduce_extreme
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.rank
@@ -38,6 +38,15 @@ def check(name, ok, detail=""):
         print("  [%s] %s %s" % ("ok  " if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILS.append(name)
+
+
+def largest(values):
+    """The largest of ``values``, and NaN where one of them is NaN.  Python's ``max`` keeps
+    the argument it has unless the next one compares greater, which a NaN never does:
+    ``max(0.0, nan)`` is 0.0, and a check ``max(...) < tol`` passes on a result that is
+    not a number anywhere but in the first place."""
+    values = [float(v) for v in values]
+    return float("nan") if any(v != v for v in values) else max(values)
 
 
 def relerr_op(A, B, template):
@@ -556,7 +565,7 @@ def test_host_batch():
                 ref = got
                 continue
             for a, b in zip(ref, got):
-                worst = max(worst, float(np.abs(a - b).max() / max(np.abs(a).max(), 1e-300)))
+                worst = largest([worst, float(np.abs(a - b).max() / max(np.abs(a).max(), 1e-300))])
     finally:
         kern.HOST_BATCH = saved
     ne = pmesh.GetNE()
@@ -645,8 +654,8 @@ def test_quadrature_hessian():
 
     def worst(ref, got):
         scale = max([float(np.abs(a).max()) for a in ref if a.size] + [1e-300])
-        return max([float(np.abs(a - b).max()) / scale
-                    for a, b in zip(ref, got) if a.size] + [0.0])
+        return largest([float(np.abs(a - b).max()) / scale
+                        for a, b in zip(ref, got) if a.size] + [0.0])
 
     saved = kern.HESSIAN_MODE
     try:
@@ -655,7 +664,7 @@ def test_quadrature_hessian():
             ref = blocks(K, loc)
             kern.set_hessian_mode("quadrature")
             got = blocks(K, loc)
-            err = COMM.allreduce(worst(ref, got), op=MPI.MAX)
+            err = allreduce_extreme(COMM, worst(ref, got), MPI.MAX)
             check("%s: the 9 blocks equal the element route's" % name, err <= 1e-13,
                   "(max rel %.1e)" % err)
             many = K.element_matrices_many(pairs, loc, (0.7,) if K.nparams else ())
@@ -672,15 +681,15 @@ def test_quadrature_hessian():
             errs = []
             for mode in ("element", "quadrature"):
                 kern.set_hessian_mode(mode)
-                errs.append(COMM.allreduce(worst(ref, blocks(K, loc)), op=MPI.MAX))
+                errs.append(allreduce_extreme(COMM, worst(ref, blocks(K, loc)), MPI.MAX))
         finally:
             kern.set_precision(old)
-        check("%s in fp32: both routes within 1e-5 of fp64" % name, max(errs) <= 1e-5,
+        check("%s in fp32: both routes within 1e-5 of fp64" % name, largest(errs) <= 1e-5,
               "(element %.1e, quadrature %.1e)" % tuple(errs))
 
         kern.set_hessian_mode("auto")
         got = blocks(K, loc)
-        err = COMM.allreduce(worst(ref, got), op=MPI.MAX)
+        err = allreduce_extreme(COMM, worst(ref, got), MPI.MAX)
         routes = set(K.group_kernels[0].hessian_route.values()) if K.group_kernels else set()
         chose = routes <= {"element", "quadrature"} and (bool(routes)
                                                         or not K.group_kernels)
@@ -976,11 +985,64 @@ def test_sliced_geometry():
                 got._geometry_sliced(slice_ne=slice_ne)
             for a in ("Jinv", "detJ", "X", "wdet"):
                 r, t = getattr(ref, a), getattr(got, a)
-                worst = max(worst, float(np.abs(r - t).max()
-                                         / max(np.abs(r).max(), 1e-300)))
-    worst = COMM.allreduce(worst, op=MPI.MAX)
+                worst = largest([worst, float(np.abs(r - t).max()
+                                              / max(np.abs(r).max(), 1e-300))])
+    worst = allreduce_extreme(COMM, worst, MPI.MAX)
     check("sliced geometry matches MFEM's batched factors", worst < 1e-12,
           "(straight and curved, worst rel %.1e)" % worst)
+
+
+def test_vertex_rule_geometry():
+    """The geometry of the rule at the vertices (``elementbatch.VERTEX_RULE``), by MFEM's
+    batched call and in slices, on quadrilaterals and hexahedra that are no parallelograms
+    or parallelepipeds: point ``q`` of that rule is vertex ``q`` of the element, with the
+    Jacobian and the weight of MFEM's element transformation there.
+
+    MFEM's batched call returns the points of a square or a cube in the order of a tensor
+    grid, which is not the order of the vertices: taken as they come, the third and fourth
+    points (and the seventh and eighth) get each other's coordinates, Jacobian and weight.
+    A mesh of parallelepipeds shows it in the coordinates alone.
+    """
+    from hippymfem.common.parvector import host_sync
+    from hippymfem.fem.elementbatch import VERTEX_RULE, ElementGroup
+
+    errs = {"batched": [], "sliced": []}
+    for serial in (mfem.Mesh.MakeCartesian2D(max(3, NP), 3, mfem.Element.QUADRILATERAL),
+                   mfem.Mesh.MakeCartesian3D(max(2, NP), 2, 2, mfem.Element.HEXAHEDRON)):
+        dim = serial.Dimension()
+        other = [(d + 1) % dim for d in range(dim)]
+        for v in serial.GetVertexArray():                # every rank moves the same vertices
+            v[:dim] = v[:dim] + 0.05 * np.sin(3.0 * v[:dim] + 2.0 * v[other])
+        pmesh = mfem.ParMesh(COMM, serial)
+        if not pmesh.GetNE():
+            continue
+        geom = pmesh.GetElementGeometry(0)
+        elems = np.arange(pmesh.GetNE())
+        groups = {
+            "batched": ElementGroup(pmesh, geom, elems, VERTEX_RULE, batched=True, sliced=False),
+            "sliced": ElementGroup(pmesh, geom, elems, VERTEX_RULE, batched=True, sliced=True)}
+        ir = groups["batched"].ir
+        nq = ir.GetNPoints()
+        V = np.asarray(pmesh.GetVertexArray(), dtype=np.float64)[:, :dim]
+        X = np.stack([V[pmesh.GetElementVertices(int(e))] for e in elems])
+        wdet, Jinv = np.zeros((elems.size, nq)), np.zeros((elems.size, nq, dim, dim))
+        for e in elems:
+            T = pmesh.GetElementTransformation(int(e))
+            for q in range(nq):
+                T.SetIntPoint(ir.IntPoint(q))
+                Jm = T.Jacobian()
+                host_sync(Jm)
+                Jinv[e, q] = np.linalg.inv(Jm.GetDataArray().reshape(dim, dim, order="F"))
+                wdet[e, q] = ir.IntPoint(q).weight * abs(T.Weight())
+        for route, g in groups.items():
+            for got, ref in ((g.X, X), (g.full_Jinv(), Jinv), (g.wdet, wdet)):
+                errs[route].append(float(np.abs(got - ref).max() / np.abs(ref).max()))
+    # (a difference that is not a number compares false, and fails)
+    ok = COMM.allreduce(all(e < 1e-12 for e in errs["batched"] + errs["sliced"]), op=MPI.LAND)
+    worst = {route: allreduce_extreme(COMM, largest(e + [0.0]), MPI.MAX) for route, e in errs.items()}
+    check("the rule at the vertices: the geometry of each point is that of its vertex", ok,
+          "(quadrilaterals and hexahedra, worst rel %.1e by MFEM's batched factors, %.1e in "
+          "slices)" % (worst["batched"], worst["sliced"]))
 
 
 def test_affine_geometry():
@@ -1018,7 +1080,7 @@ def test_affine_geometry():
 
     def worst(ref, got):
         scale = max([float(np.abs(a).max()) for a in ref if a.size] + [1e-300])
-        return max([float(np.abs(a - b).max()) / scale for a, b in zip(ref, got) if a.size] + [0.0])
+        return largest([float(np.abs(a - b).max()) / scale for a, b in zip(ref, got) if a.size] + [0.0])
 
     saved = (eb.AFFINE_GEOMETRY, kern.HESSIAN_MODE)
     try:
@@ -1049,8 +1111,8 @@ def test_affine_geometry():
                             [np.asarray(a) for a in K1.element_matrices(ADJOINT, STATE, loc1)])
             finally:
                 kern.set_precision(old)
-            err = COMM.allreduce(max(errs), op=MPI.MAX)
-            e32 = COMM.allreduce(e32, op=MPI.MAX)
+            err = allreduce_extreme(COMM, largest(errs), MPI.MAX)
+            e32 = allreduce_extreme(COMM, e32, MPI.MAX)
             check("%s: the element vectors and matrices are those of the full geometry" % kind,
                   err <= 1e-13 and e32 <= 5e-6,
                   "(rel %.1e by the element route, %.1e by the quadrature route; %.1e with "
@@ -1064,6 +1126,123 @@ def test_affine_geometry():
     finally:
         eb.AFFINE_GEOMETRY = saved[0]
         kern.set_hessian_mode(saved[1])
+
+
+def test_affine_geometry_split():
+    """The compact geometry of an affine group (``elementbatch.AFFINE_GEOMETRY``) in a
+    split batch, all of it on the kernels' device and with the coordinates left on the
+    host, as a card with a budget keeps it (``GroupKernel._kept_on_device``): the
+    element vectors and matrices of the unsplit batch, joined and chunk by chunk.
+
+    A split affine group keeps on a card the arrays that are no more than a third of
+    the stream limit, the inverse Jacobians and the weights, and leaves the coordinates
+    on the host, from where a chunk loop takes its slices: every chunk then pairs
+    slices of device arrays with a slice of a host array.  The density reads ``x``, so
+    a slice or a pairing that is off shows in the arrays.  Where the kernels' device
+    reports no budget (the host) a stand-in reports one for the decision; the placement
+    and the chunk loops that follow from it are the kernel's own.
+    """
+    from hippymfem.fem import elementbatch as eb
+    from hippymfem.fem import kernel as kern
+
+    class Budget:
+        """A device that reports a budget."""
+
+        def __init__(self, limit):
+            self.limit = limit
+
+        def memory_stats(self):
+            return {"bytes_limit": self.limit}
+
+    pairs = ((ADJOINT, STATE), (ADJOINT, PARAMETER), (PARAMETER, PARAMETER))
+    saved = (eb.AFFINE_GEOMETRY, kern.ELEMENT_CHUNK, kern.GEOMETRY_STREAM_FRACTION)
+    try:
+        eb.AFFINE_GEOMETRY = True
+        n = 4
+        while n ** 3 < 8 * NP:                  # several elements on every rank
+            n += 1
+        pmesh = make_mesh("hex", n)
+        Vu, Vm = FunctionSpace.H1(pmesh, 2), FunctionSpace.H1(pmesh, 1)
+        batches = MeshBatches(pmesh, 6)
+        K = QuadratureKernel(
+            lambda u, m, p, x: jnp.exp(m.val) * inner(u.grad, p.grad) + x[0] * u.val * p.val,
+            [Vu, Vm, Vu], batches)
+        vecs = [Vu.vector(), Vm.vector(), Vu.vector()]
+        hp.parRandom.set_seed(3)
+        for v in vecs:
+            hp.parRandom.normal(1.0, v)
+        loc = [Vu.local_values(vecs[0]), Vm.local_values(vecs[1]), Vu.local_values(vecs[2])]
+        gk = K.group_kernels[0]
+        g, d = gk.group, kern.device()
+
+        def reset(chunk, fraction):
+            kern.ELEMENT_CHUNK, kern.GEOMETRY_STREAM_FRACTION = chunk, fraction
+            for k in K.group_kernels:
+                k._cache.clear()
+                k._chunk.clear()
+                k._dev.clear()
+
+        def arrays():
+            out = [np.asarray(a) for a in K.element_vectors(ADJOINT, loc)]
+            out += [np.asarray(a) for a in K.element_vectors(PARAMETER, loc)]
+            for ij in pairs:
+                out += [np.asarray(a) for a in K.element_matrices(*ij, loc)]
+            for ij in pairs:                    # chunk by chunk, joined here
+                parts = {}
+                for gi, _a, _b, arr in K.element_matrix_chunks(*ij, loc):
+                    parts.setdefault(gi, []).append(np.asarray(arr))
+                out += [np.concatenate(parts[gi]) for gi in sorted(parts)]
+            return out
+
+        def worst(ref, got):
+            scale = max([float(np.abs(a).max()) for a in ref if a.size] + [1e-300])
+            return largest([float(np.abs(a - b).max()) / scale
+                            for a, b in zip(ref, got) if a.size] + [0.0])
+
+        try:
+            limit = (d.memory_stats() or {}).get("bytes_limit")
+        except Exception:                                        # noqa: BLE001
+            limit = None
+        card = d if limit else Budget(2 ** 30)
+        # a stream limit of which the weights are less than a third and the coordinates more
+        fraction = 1.5 * (g.wdet.nbytes + g.X.nbytes) / (limit or card.limit)
+        chunk = max(1, COMM.allreduce(int(g.ne), op=MPI.MIN) // 3)
+
+        reset(0, 0.0)
+        whole = arrays()
+        kern.GEOMETRY_STREAM_FRACTION = fraction
+        unsplit = gk._kept_on_device(card)
+        reset(chunk, 0.0)
+        split = arrays()
+        never = gk._kept_on_device(card)
+        reset(chunk, fraction)
+        kept = gk._kept_on_device(card)
+        if card is not d:
+            decide = gk._kept_on_device
+            gk._kept_on_device = lambda dev: decide(card)
+        try:
+            partial = arrays()
+            placed = gk._dev[d][1]
+        finally:
+            if card is not d:
+                del gk._kept_on_device
+        where = (g.affine and gk.will_chunk() and kept == ("Jinv", "wdet")
+                 and placed is not None and [z is None for z in placed] == [False, False, True]
+                 and unsplit is None and never is None)
+        check("a split affine group keeps its inverse Jacobians and weights on a card and "
+              "leaves the coordinates on the host",
+              COMM.allreduce(bool(where), op=MPI.LAND),
+              "(kept %s of %s; %s when the batch is whole, %s when nothing is streamed)"
+              % (kept, gk._geo_names, unsplit, never))
+        e_split = allreduce_extreme(COMM, worst(whole, split), MPI.MAX)
+        e_host = allreduce_extreme(COMM, worst(split, partial), MPI.MAX)
+        check("the split batch gives the element vectors and matrices of the whole one, and "
+              "the same with the coordinates on the host",
+              e_split <= 1e-13 and e_host == 0.0,
+              "(chunks of %d: rel %.1e to the whole batch; %.1e between the two placements)"
+              % (chunk, e_split, e_host))
+    finally:
+        eb.AFFINE_GEOMETRY, kern.ELEMENT_CHUNK, kern.GEOMETRY_STREAM_FRACTION = saved
 
 
 def test_mixed_geometry():
@@ -1088,6 +1267,16 @@ def test_mixed_geometry():
     ngroups = COMM.allreduce(len(batches.groups), op=MPI.MAX)
     check("mixed mesh has both geometries", ngeo == 2,
           "(up to %d element groups on a rank)" % ngroups)
+    # The coordinates of the quadrature points, which a density that reads x is handed: on
+    # a mesh of two kinds the geometry is made element by element, and its points have to
+    # be the points (they were an array that nothing had written).  Moments of the unit
+    # square, which the rule integrates exactly.
+    got = np.array([sum(float((g.wdet * f(g.X[:, :, 0], g.X[:, :, 1])).sum()) for g in batches.groups)
+                    for f in (lambda x, y: x, lambda x, y: y, lambda x, y: x * y, lambda x, y: x * x)])
+    got = COMM.allreduce(got, op=MPI.SUM)
+    e = float(np.abs(got - np.array([0.5, 0.5, 0.25, 1.0 / 3.0])).max())
+    check("mixed mesh: the points of the rule are where the elements are", e < 1e-12,
+          "(the integrals of x, y, x y and x^2 over the square, worst %.1e)" % e)
 
     def varf(u, m, p, x):
         return inner(u.grad, p.grad)
@@ -1165,7 +1354,9 @@ if __name__ == "__main__":
     if RANK == 0:
         print("quadrature geometry")
     test_sliced_geometry()
+    test_vertex_rule_geometry()
     test_affine_geometry()
+    test_affine_geometry_split()
     if RANK == 0:
         print("host chunk planning")
     test_host_chunk_budget()
