@@ -226,6 +226,53 @@ def mantle_levels(h):
     return np.array(out)
 
 
+_NODE_KEYS = None
+
+
+def _node_keys_loop():
+    """The lines of :meth:`BallMesh.node_keys` as a loop over the elements, compiled by
+    numba at its first use: the level and the lattice indices of an element's vertices
+    from their positions, as :meth:`BallMesh.vertex_key` reads them, then the nodes' by
+    the weights, and the keys.  The ranks of a run may take different routes, one above
+    the size from which this one is used and one below, so its keys have to be those of
+    the numpy lines exactly."""
+    global _NODE_KEYS
+    if _NODE_KEYS is None:
+        import numba
+
+        @numba.njit(parallel=True)
+        def loop(qv, Wt, s0, n, L, m, top, key, boundary, block):
+            ne, nq = key.shape
+            for bi in numba.prange((ne + block - 1) // block):
+                c = np.empty((4, 8))                              # level, I, J, K of the vertices
+                t = np.empty((4, nq))                             # and of the nodes, before rounding
+                for e in range(bi * block, min(ne, (bi + 1) * block)):
+                    for v in range(8):
+                        x, y, z = qv[e, v, 0], qv[e, v, 1], qv[e, v, 2]
+                        s = max(abs(x), abs(y), abs(z))
+                        lev = max(np.rint((s - s0) / (1.0 - s0) * L), 0.0)
+                        if s <= s0 * (1.0 + 1e-12):
+                            lev = 0.0
+                        scale = s0 if lev == 0.0 else s
+                        c[0, v] = lev
+                        c[1, v] = np.rint((x / scale + 1.0) * 0.5 * n)
+                        c[2, v] = np.rint((y / scale + 1.0) * 0.5 * n)
+                        c[3, v] = np.rint((z / scale + 1.0) * 0.5 * n)
+                    for d in range(4):
+                        t[d, :] = 0.0
+                        for v in range(8):
+                            for q in range(nq):
+                                t[d, q] += c[d, v] * Wt[v, q]
+                    for q in range(nq):
+                        level = np.int64(np.rint(t[0, q]))
+                        boundary[e, q] = level == top
+                        key[e, q] = ((level * m + np.int64(np.rint(t[1, q]))) * m
+                                     + np.int64(np.rint(t[2, q]))) * m + np.int64(np.rint(t[3, q]))
+
+        _NODE_KEYS = loop
+    return _NODE_KEYS
+
+
 class BallMesh:
     """A conforming hexahedral mesh of the Earth in 13 warped cubes.
 
@@ -361,16 +408,36 @@ class BallMesh:
         trilinear interpolant of those of its element's vertices, which is exact: an
         element is a unit cube of the lattice (in a layer, the cube of a cell of the
         cubed sphere and of the layer's two levels).
+
+        In numpy on one core the keys of a rank's eight million elements take 40 s.
+        Where the library would compile a host loop of that size (numba is there, and
+        there are 2^24 keys or more: :func:`hippymfem.fem.patternbuild.wanted`), the
+        elements are taken by a compiled loop in the threads of this rank, which gives
+        the same keys in a second or two after as long a compilation.
         """
         f = 2 ** int(refine)
         n, L, p = self.n * f, self.nlev * f, int(order)
         m = p * n + 1
 
         def keys(qv, W, block=1 << 20):
+            from hippymfem.fem import patternbuild
+
             ne, nq = qv.shape[0], W.shape[0]
             key = np.empty((ne, nq), dtype=np.int64)
             boundary = np.empty((ne, nq), dtype=bool)
             Wt = np.ascontiguousarray(p * W.T)
+            if patternbuild.wanted(key.size):
+                import numba
+
+                loop = _node_keys_loop()
+                old = numba.get_num_threads()
+                numba.set_num_threads(min(patternbuild.threads(), numba.config.NUMBA_NUM_THREADS))
+                try:
+                    loop(np.ascontiguousarray(qv, dtype=np.float64), Wt, self.S0, n, L, m, p * L,
+                         key, boundary, 4096)
+                finally:
+                    numba.set_num_threads(old)
+                return key, boundary
             for a in range(0, ne, block):
                 b = min(a + block, ne)
                 comps = self.decode_key(self.vertex_key(qv[a:b].reshape(-1, 3), refine), refine)
@@ -477,14 +544,22 @@ class BallMesh:
         import mfem.par as mfem
 
         verts, hexes, attrs, bdr = self.build()
-        mesh = mfem.Mesh(3, verts.shape[0], hexes.shape[0], bdr.shape[0], 3)
-        for v in verts.tolist():
-            mesh.AddVertex(v[0], v[1], v[2])
-        for h, a in zip(hexes.tolist(), attrs.tolist()):
-            mesh.AddHex(h, a)
-        for b in bdr.tolist():
-            mesh.AddBdrQuad(b, 1)
-        mesh.FinalizeHexMesh(1, 0, False)
+
+        # MFEM takes the mesh as arrays in one call; a call for every vertex and element
+        # from Python lists gives the same mesh three times more slowly (2.8 s at
+        # n = 64).  The arrays are MFEM's own, filled through their numpy views.
+        def array(x, kind):
+            a = kind(int(x.size))
+            a.GetDataArray()[:] = x.reshape(-1)
+            return a
+
+        vv, hh, aa, bb = (array(verts, mfem.Vector), array(hexes, mfem.intArray),
+                          array(attrs, mfem.intArray), array(bdr, mfem.intArray))
+        ba = array(np.ones(bdr.shape[0], dtype=np.int32), mfem.intArray)
+        mesh = mfem.Mesh(vv.GetData(), verts.shape[0], hh.GetData(), mfem.Geometry.CUBE, aa.GetData(),
+                         hexes.shape[0], bb.GetData(), mfem.Geometry.SQUARE, ba.GetData(), bdr.shape[0], 3, 3)
+        mesh.Finalize(False, False)
+        mesh._keep_vertices = vv                     # the mesh refers to them, it holds no copy
         return mesh, hexes, verts
 
     def partition(self, verts, hexes, nparts):

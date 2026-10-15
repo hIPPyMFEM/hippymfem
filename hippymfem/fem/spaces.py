@@ -272,7 +272,7 @@ class FunctionSpace(KeepAlive):
             coeff = _ScalarPy(fn) if self.vdim == 1 else _VectorPy(fn, self.vdim)
             gf.ProjectCoefficient(coeff)
             return self.from_gridfunction(gf, v)   # gf and coeff are done with here
-        X = self._node_coordinates()                # (nldof_scalar, sdim)
+        X = self._node_coordinates().copy()         # (nldof_scalar, sdim); ``fn`` may write
         vals = _evaluate_at(fn, X, self.vdim)       # (n,) or (n, vdim)
         gf = mfem.ParGridFunction(self.fes)
         host_readwrite(gf)                          # the write must be seen (see coordinates)
@@ -294,25 +294,77 @@ class FunctionSpace(KeepAlive):
     def _node_coordinates(self):
         """Physical coordinates of every local scalar dof, ``(nldof, sdim)``.
 
-        One element transformation per element (its reference nodes mapped in one
-        call) rather than one Python callback per node and coordinate: at P2 on
-        hexahedra that is 3 SWIG calls per element instead of 81.
+        On a mesh of one kind of element (not a NURBS mesh, whose elements each have
+        shape functions of their own) the reference nodes of all the elements are
+        mapped at once: an element's map is the sum of its points (the mesh's nodes,
+        or its vertices) times the map's shape functions, taken here in the order of
+        MFEM's ``IsoparametricTransformation::Transform`` and for the elements in
+        their order, so every coordinate is the one a call an element gave, to the
+        last bit (an MFEM compiled with fused multiply-adds may round a product that
+        is not exact otherwise).  That call (3 SWIG calls an element) took 7 s for
+        660 thousand hexahedra, and an application asks several times: the array is
+        kept, read only, until MFEM counts a change of the mesh or of its nodes, or
+        the vertices of a mesh without nodes are other numbers (MFEM does not count
+        ``SetVertices`` and ``MoveVertices``).  Nodes written in place are not seen
+        before ``mesh.NodesUpdated()``, which is MFEM's own rule.
         """
         fes, mesh, sdim = self.fes, self.mesh, self.sdim
+        seq = (mesh.GetSequence(), mesh.GetNodesSequence())
+        points = mesh.GetNodes()
+        if points is None:
+            # the vertices as MFEM hands them, all of one coordinate and then all
+            # of the next: the layout of nodes that are ordered by nodes.  MFEM does
+            # not count their moves, so the kept array is known by them as well
+            # (24 bytes a vertex)
+            points = mfem.Vector()
+            mesh.GetVertices(points)
+            seq += (points.GetDataArray().tobytes(),)
+        if getattr(self, "_nodes", (None, None))[0] == seq:
+            return self._nodes[1]
         nl = fes.GetNDofs()
         X = np.zeros((nl, sdim))
-        from .elementbatch import _element_dofs
+        from .elementbatch import _basis_tables, _element_dofs
 
         ne = mesh.GetNE()
         if ne:
             nd = fes.GetFE(0).GetDof()
             dofs, _ = _element_dofs(fes, np.arange(ne), 1, nd)
+        if ne and mesh.GetNumGeometries(mesh.Dimension()) == 1 and mesh.NURBSext is None:
+            fen = mesh.GetElementTransformation(0).GetFE()
+            nn = fen.GetDof()
+            # S[j, k]: the k-th shape function of the map at the j-th reference node
+            S, _ = _basis_tables(fen, fes.GetFE(0).GetNodes(), mesh.Dimension(), nn)
+            if mesh.GetNodes() is None:
+                vert, attr = mfem.intArray(), mfem.intArray()
+                mesh.GetElementData(mesh.GetElementGeometry(0), vert, attr)
+                pdofs = vert.GetDataArray().reshape(ne, 1, nn) + (
+                    mesh.GetNV() * np.arange(sdim))[None, :, None]
+                pdofs = pdofs.reshape(ne, sdim * nn)
+            else:
+                pdofs, _ = _element_dofs(points.FESpace(), np.arange(ne), sdim, nn)
+            host_sync(points)
+            xall = points.GetDataArray()                # a view: ``points`` has to stay
+            m = max(1, 2 ** 17 // (nd * sdim))          # a megabyte of sums a slice
+            for a in range(0, ne, m):
+                b = min(a + m, ne)
+                # one row a point of the element, so that the loops below run over the
+                # elements of the slice and not over three coordinates
+                x = xall[pdofs[a:b]].reshape(b - a, sdim, nn).transpose(2, 0, 1)
+                x = np.ascontiguousarray(x).reshape(nn, (b - a) * sdim)
+                acc = np.zeros((nd, x.shape[1]))
+                for k in range(nn):
+                    acc += S[:, k, None] * x[k]
+                # a node of several elements takes the last one's, as it did in the loop
+                X[dofs[a:b]] = acc.reshape(nd, b - a, sdim).transpose(1, 0, 2)
+        elif ne:
             pm = mfem.DenseMatrix()
             for e in range(ne):
                 fe = fes.GetFE(e)
                 tr = mesh.GetElementTransformation(e)
                 tr.Transform(fe.GetNodes(), pm)     # (sdim, nd)
                 X[dofs[e], :] = np.asarray(pm.GetDataArray()).reshape(sdim, -1).T[:, :sdim]
+        X.setflags(write=False)
+        self._nodes = (seq, X)
         return X
 
     def coordinates(self):

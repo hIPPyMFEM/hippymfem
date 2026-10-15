@@ -124,20 +124,46 @@ mpirun -n 16 ../../tools/mpirun_pinned.sh python scale.py --res 2 --nz 8 --start
 python scale.py --res 4 --nz 4 --solver columns --forcing --no-derivatives
 mpirun -n 16 ../../tools/mpirun_pinned.sh python scale.py --res 2 --nz 8 --refine 1 --solver columns --forcing \
     --no-derivatives --start-from out/s4
+# a size whose solve fits no job: the same work at every size, timed on every rank, without a solve
+mpirun -n 16 ../../tools/mpirun_pinned.sh python scale.py --res 2 --nz 8 --refine 1 --solver columns --measure --out out/m.json
 ```
 
 `antarctica.py fetch` and `cache` need `netCDF4`, `rasterio` and `pyshp` to read the
 datasets, and `fetch` a connection to the internet, which on a cluster is the login
 node's.  The direct solver needs `cupy`, `nvmath-python` and `nvidia-cudss-cu12`, the
-matrix-free one `cupy` (and cuDSS on one rank); `--solver scipy` runs the small meshes on
-the host.  A 20 km inversion takes an 80 GB card; the products and the posterior of the
-five-layer one at 10 km ran on such cards too, with half the card for JAX
+matrix-free one `cupy` (and on one rank cuDSS where it is installed); `--solver scipy` runs
+the small meshes on the host.  A 20 km inversion takes an 80 GB card; the products and the
+posterior of the five-layer one at 10 km ran on such cards too, with half the card for JAX
 (`HIPPYMFEM_GPU_MEM_FRACTION=0.52`).
+
+`scale.py --measure` (with `--solver columns`) times a residual, the preconditioner's
+set-up, a product with the Jacobian and an application of the preconditioner, each once and
+`--repeats` times more, and `--krylov-its` Krylov iterations whatever the residual does
+(the set-up is repeated after them: with many layers it is the longest part, and a job that
+ends in it has the rest), and writes every rank's own seconds as the minimum, the mean and
+the maximum over the ranks, with the sizes and the memory of a rank; `--krylov-count` adds
+the iterations of one solve to `--rtol`.  The state is the solution of `--start-from`, or
+without it the shallow-ice velocity of the grid, which takes no solve (a solve there takes
+more iterations than at a solution: 18 where the Newton steps of the same 80 km mesh take
+11 to 14).  Its timers wait for the card, so that the seconds of
+a part are that part's own.
+
+On a cluster, `ICESHEET_DATA` names another folder than `data/` for the datasets and the
+grids (a scratch file system, a copy on every node of a job); `scale.py` on several ranks
+reads its grid on the first one and has to find it there.  On several ranks each compiles
+CuPy's kernels in a folder of its own, a copy of the one that `CUPY_CACHE_DIR` names
+(`~/.cupy/kernel_cache` without it), and two of them return there what is new: with the
+variable set to a folder of the node or of a scratch file system, nothing is read from the
+home directory or written to it.
 
 Both solvers are written for NVIDIA cards: the direct one is cuDSS, and the matrix-free
 one does its solves on the columns, its probing and its patches with CuPy.  On the cards
-of another vendor the direct solver does not exist, and the matrix-free one needs a CuPy
-built for them (for AMD cards, CuPy's ROCm build), which has not been tried.
+of another vendor the direct solver does not exist; the matrix-free one runs on AMD's
+with CuPy's ROCm build (`cupy-rocm-7-0` 14.2 beside JAX's ROCm plugin, on MI250X; CuPy
+then wants `ROCM_HOME`), the two handing each other their arrays as on NVIDIA's: the
+synthetic problem at 160 km (`run.py --res 32 --nz 2 --solver columns --stages data,map`)
+finds its MAP point in 9 Gauss-Newton iterations there, and the Scale section has the
+solver's times.
 
 ## Results
 
@@ -397,6 +423,64 @@ bed and its neighbours up to 600 times too stiff, and the Krylov count grows wit
 lines themselves, inverted on patches of 3 x 3 columns of pressure nodes, brings 23 and 31.
 The count still grows with the mesh in the solves above: 15 to 20 iterations a step at
 20 km, 34 to 75 at 5 km and 79 at 2.5 km, all to 1e-6.
+
+**On AMD cards, to 4096 GPUs of Frontier** (MI250X; a rank has one of a card's two GPUs;
+`--solver columns`).  Two parts of the solver were slow on these cards alone and are
+written otherwise now.  The dot products of the Krylov vectors went through the card's
+BLAS, and AMD's takes one thread a row for a few long rows: 170 ms for 4 to 40 rows of
+4.7 million unknowns on an MI210, more than the rest of an iteration; as sums over
+stretches of 1024 entries they take 0.3 to 2 ms (`ColumnStokes.dots`).  And the probing of the Schur
+complement takes the levels of a colour several at a time, since most of a product is
+the pass over the element matrices of `B` and the launches of the solves on the columns.
+At 24 levels and 4.7 million unknowns on one GPU a set-up went from 11.5 to 5.4 s and a
+Krylov iteration from 0.60 to 0.23 s; the forward solve of the 160 km mesh refined three
+times (20 km cells, 24 levels, 18.5 million unknowns) takes 196 s on 4 GPUs, 23 Newton
+steps, where 198 s had held the first 8 (the run ended there on the launch queue's fault).
+
+`scale.py --measure` times the same work at every size on every rank's clock, at the
+shallow-ice state.  `--res R --nz 3 --refine 3` on 4 (32/R)^2 ranks gives every rank
+about 7 500 columns of 24 layers and 4.6 million unknowns (one rank: `--res 32 --nz 6
+--refine 2`):
+
+| GPUs | cells | unknowns | set-up of the preconditioner | product with the Jacobian | Krylov iteration | inner iterations | with `--coarse-maxit 4` | Krylov iterations of a solve |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 40 km | 4 672 380 | 5.4 s | 0.061 s | 0.228 s | 1.0 | | 17 |
+| 4 | 20 km | 18 505 260 | 5.7 s | 0.064 s | 0.267 s | 3.5 | | 23 |
+| 16 | 10 km | 73 839 464 | 6.0 s | 0.066 s | 0.300 s | 5.3 | 0.283 s | 34 (35) |
+| 64 | 5 km | 295 733 316 | 6.2 s | 0.066 s | 0.343 s | 8.7 | 0.284 s | 70 (70) |
+| 256 | 2.5 km | 1 179 866 104 | 6.4 s | 0.066 s | 0.402 s | 13.2 | 0.286 s | 257 (251) |
+| 1024 | 1.25 km | 4 699 239 648 | 6.4 s | 0.066 s | 0.439 s | 16.0 | | |
+| 4096 | 0.625 km | 18 927 600 204 | 6.8 s | 0.066 s | 0.488 s | 18.9 | 0.289 s | |
+
+What a rank computes on its card holds: the element passes of an iteration take 0.173 s
+on one GPU and 0.182 s on 4096 (95 %), a product 93 %, the set-up 80 % (0.15 s of the
+1.4 s it loses were the probing's batches in these runs: 13 levels fitted a product on 1,
+4, 16 and 1024 ranks and 12 on 64, 256 and 4096, where a colour then took a third product
+for its last level; such a level now goes with the product before it).  What does not is
+the collapsed problem, solved on the host by conjugate gradients with an incomplete
+factorization of every rank's part: one inner iteration on one rank, 19 on 4096, and the
+iteration at 47 % of one GPU's.  With four inner iterations at most (`--coarse-maxit 4`)
+a solve takes the same outer iterations (the last column, in parentheses) and an iteration
+0.289 s on 4096 GPUs, 79 %; a whole forward solve on 8 GPUs is the same step for step
+with 20, 4 and 2 of them.  Algebraic multigrid in the factorization's place (`--coarse
+amg`) took more inner iterations and four times the time on 4 and 8 GPUs.  The outer
+iterations grow as the cells narrow, as said above: 257 from this state at 2.5 km.  At
+1.25 and 0.625 km no solve was run to its end: twenty iterations take the residual down by
+0.25 and 0.06 % there (7.5 % at 2.5 km, 94 % at 5 km), which is not on the way to 1e-6
+within the 300 that are allowed; this state is harder than a solution (79 iterations at
+2.5 km above).
+
+With 88 layers (`--nz 11`; one rank: `--res 32 --nz 22 --refine 2`) a rank has 16.7
+million unknowns, and 4096 of them 68 330 755 212, the mesh of the 1.09 billion above
+refined twice more: a set-up takes 125 s on one GPU, 131 s on 64 and 133 s on 4096, a
+Krylov iteration (four inner iterations at most) 0.72, 0.79 and 0.80 s, a product 0.21
+and 0.22 s; a rank holds 25 GiB of its card in CuPy and 8 in JAX.  The probing is 124 of
+those 133 s: at 88 levels few of them fit a product, and its cost is in the dense
+columns it carries, 1.7 kB an element and level.
+
+The exchanges of the solver go through host memory also where MPI could take the cards'
+own (they are a megabyte each, and from CuPy's arrays with Cray MPICH's GPU support runs
+hung now and then on 8, 256 and 1024 ranks).
 
 **The flux at a given friction depends on the mesh.**  At the friction of these runs it is
 4412, 5588, 10 295 and 11 266 Gt/a on the 40, 20, 10 and 5 km grids with 4 layers, 11 346 with

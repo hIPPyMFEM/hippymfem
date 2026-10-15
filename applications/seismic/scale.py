@@ -17,6 +17,33 @@ With ``--check`` the three are tied together by the identity
 the size, the number of ranks and the precision of the geometric factors.
 
     mpirun -n 4 python scale.py --n 32 --refine 1 --steps 50 --out scale.json
+
+The times of a sweep, per step (in the record: ``sweeps``):
+
+* ``ms_per_step``: rank 0's clock over the steps.  The ranks advance together, so it
+  is the step's time on all of them, and the one the unknown-updates are counted with.
+* ``rank_own_ms_per_step``: a rank's time outside MPI, as minimum, mean and maximum
+  over the ranks.  The maximum belongs to the rank the others wait for; with the
+  least time of the exchange it makes up the step.  ``rank_element_ms_per_step`` is
+  the part of it a rank waits for its device at the element work (the update of the
+  step before is finished there too), ``rank_copy_ms_per_step`` the part it brings
+  the values it sends from the device to the host.  A single rank takes its step in
+  one call and has neither wait: both are zero there.  So is the second where the
+  exchange goes from card to card.
+* ``rank_exchange_ms_per_step``: a rank's time inside MPI, the same three.  The
+  minimum is the exchange itself, on the rank that arrives last; the maximum, which
+  is also ``exchange_ms_per_step``, adds the lead of the fastest rank on the slowest.
+* ``warmup_seconds``: the three steps a sweep is compiled on, the compiling included.
+
+``neighbours`` and ``sent_values`` are the ranks a rank exchanges with and the values
+it sends them a field a step, again as minimum, mean and maximum over the ranks.
+
+Three switches of the propagator, read from the environment, bear on these times
+(``sem.py`` says why): ``HIPPYMFEM_DEVICE_MPI``, with which the exchange goes from card
+to card and nothing is brought to the host (``auto``: where Cray MPICH runs with its GPU
+support); ``HIPPYMFEM_SEM_PIECE``, the MiB of the pieces in which a rank's values come
+from its device otherwise (``0``: in one array); and ``HIPPYMFEM_SEM_PUT=1``, with which
+what a step hands to its compiled calls is on the device before the call.
 """
 
 import argparse
@@ -56,7 +83,13 @@ def parse(argv=None):
                    help="take the geometry from MFEM's curved mesh on the host instead of the analytic map on the device")
     p.add_argument("--forward-only", action="store_true",
                    help="time the forward sweep alone, and keep nothing for the others on the device")
-    p.add_argument("--dt-iters", type=int, default=40)
+    p.add_argument("--dt-iters", type=int, default=40,
+                   help="stiffness products of the power iteration that estimates the stability limit of the time "
+                        "step; the estimate comes down to the limit, and more slowly on a refined mesh")
+    p.add_argument("--dt-limit", type=float, default=0.0,
+                   help="the stability limit in s, handed in instead of estimated (0: estimate it): the \"stable dt\" "
+                        "of a run on the same mesh, or half that of the mesh refined once less (the half is 0.3 to "
+                        "0.5 %% too large at n = 8 and 16, which --cfl covers)")
     p.add_argument("--out", default="")
     args = p.parse_args(argv)
     if args.check and args.forward_only:
@@ -117,7 +150,7 @@ def main(argv=None):
         col = sem.Collocation(Vu, mapped=(Vm, sem.vertex_coordinates(pmesh), bm.warp_jax()))
         aux = earth.prem_aux()
     t0 = lap("geometry", t0)
-    # dt = 0 for now: the stability limit is estimated below, with --dt-iters
+    # dt = 0 for now: the stability limit is estimated below, with --dt-iters, or handed in
     eng = sem.SpectralWave(
         Vu, Vm, density, aux=aux, col=col, cfl=args.cfl, dt=0.0,
         dtype=jnp.float32 if args.float32 else jnp.float64,
@@ -128,8 +161,11 @@ def main(argv=None):
     t0 = lap("engine", t0)
     eng.set_parameter(Vm.vector())
     t0 = lap("coefficients", t0)
-    dt_lim = eng.stable_dt(iters=args.dt_iters)
-    t0 = lap("stable dt", t0)
+    if args.dt_limit > 0.0:
+        dt_lim = args.dt_limit
+    else:
+        dt_lim = eng.stable_dt(iters=args.dt_iters)
+        t0 = lap("stable dt", t0)
     ne, nd, nm = int(pmesh.GetGlobalNE()), int(eng.global_size), int(Vm.GlobalTrueVSize())
     nfull = int(np.ceil(args.T / (args.cfl * dt_lim)))
     whole = args.steps <= 0
@@ -157,20 +193,52 @@ def main(argv=None):
     say("seismic scale: n = %d (refine %d), order %d: %d elements, %d wave unknowns, %d parameters; %d ranks, %s, %s%s%s"
         % (args.n, args.refine, args.order, ne, nd, nm, comm.size, hm.fem.kernel.device(),
            "fp32" if args.float32 else "fp64", ", geometry fp32" if args.geometry_float32 else "",
-           ", numbered by keys" if args.keys else ""))
+           ", unknowns by keys, in the elements' order" if args.keys else ""))
     say("  setup: " + ", ".join("%s %.1f s" % kv for kv in T.items()))
-    say("  stable dt %.5f s, dt %.5f s: %d steps for %.0f s; %d shared unknowns (%.2f %% of all); volume error %.1e"
-        % (dt_lim, eng.dt, nfull, args.T, iface, 100.0 * iface / max(nd, 1),
+    say("  stable dt %.5f s%s, dt %.5f s: %d steps for %.0f s; %d shared unknowns (%.2f %% of all); volume error %.1e"
+        % (dt_lim, " (handed in)" if args.dt_limit > 0.0 else "", eng.dt, nfull, args.T, iface, 100.0 * iface / max(nd, 1),
            abs(eng.volume / (4.0 / 3.0 * np.pi * earth.R_EARTH ** 3) - 1.0)))
+
+    def over_ranks(x):
+        """Minimum, mean and maximum over the ranks of each of the numbers ``x`` a rank
+        holds, a row each (MPI's own reductions, on buffers)."""
+        x = np.array(x, dtype=np.float64)
+        lo, hi, tot = np.empty_like(x), np.empty_like(x), np.empty_like(x)
+        comm.Allreduce(x, lo, op=MPI.MIN)
+        comm.Allreduce(x, hi, op=MPI.MAX)
+        comm.Allreduce(x, tot, op=MPI.SUM)
+        return np.stack([lo, tot / comm.size, hi], axis=1)
+
+    # what a rank exchanges at a step: its neighbours, and the values it sends them a field
+    links = over_ranks([len(eng.iface.neighbors), sum(p.size for p in eng.iface.pos.values())])
+    say("  neighbours of a rank: %d to %d (%.1f on average); values a rank sends a field a step: %d at most "
+        "(%.1f MB), %d on average" % (links[0, 0], links[0, 2], links[0, 1], links[1, 2],
+                                      1e-6 * links[1, 2] * (4 if args.float32 else 8), links[1, 1]))
+
+    def clocks():
+        return np.array([eng.t_wave, eng.t_exchange, eng.t_element, eng.t_copy])
 
     def timed(fn):
         comm.Barrier()
-        w0, e0 = eng.t_wave, eng.t_exchange
+        c0 = clocks()
         t0 = time.perf_counter()
         out = fn()
         comm.Barrier()
         dt_ = time.perf_counter() - t0
-        return out, dt_, eng.t_wave - w0, comm.allreduce(eng.t_exchange - e0, op=MPI.MAX)
+        w, x, e, c = clocks() - c0
+        # over the ranks: a rank's time outside MPI, inside it, waiting for the element
+        # work, bringing the values it sends to the host
+        tr = over_ranks([w - x, x, e, c])
+        return out, dt_, w, tr[1, 2], tr
+
+    def by_rank(r, tr, warm):
+        """Add to a sweep's record ``r`` what the ranks' own clocks say, and print it."""
+        ms = 1e3 * tr / N
+        r.update(rank_own_ms_per_step=ms[0].tolist(), rank_exchange_ms_per_step=ms[1].tolist(),
+                 rank_element_ms_per_step=ms[2].tolist(), rank_copy_ms_per_step=ms[3].tolist(), warmup_seconds=warm)
+        say("      a rank, least / mean / most over the ranks, ms/step: outside MPI %.2f / %.2f / %.2f (waiting for "
+            "the element work %.2f / %.2f / %.2f, values to the host %.2f / %.2f / %.2f), in MPI %.2f / %.2f / %.2f; "
+            "compiled on 3 steps in %.1f s" % (*ms[0], *ms[2], *ms[3], *ms[1], warm))
 
     def finish(res, extra):
         dev = hm.fem.kernel.device()
@@ -192,6 +260,7 @@ def main(argv=None):
                 "host %.1f GiB per rank at most" % (max(peaks), limit, sum(peaks), max(rss) if rss else 0.0))
         out = dict(args=vars(args), elements=ne, wave_dofs=nd, parameters=nm, ranks=comm.size,
                    device=str(dev), dt_limit=dt_lim, dt=eng.dt, steps_per_window=nfull, shared_dofs=iface,
+                   neighbours=links[0].tolist(), sent_values=links[1].tolist(),
                    setup_seconds=T, sweeps=res, device_peak_gib=peaks, device_limit_gib=limit, host_rss_gib=rss,
                    seconds=time.time() - t_all, whole_window=whole, **(extra or {}))
         if args.out and rank0:
@@ -203,12 +272,13 @@ def main(argv=None):
 
     res = {}
     # every sweep is compiled on a few steps before it is timed
-    eng.forward(limit=3)
-    y, tt, tw, tx = timed(eng.forward)
+    warm = timed(lambda: eng.forward(limit=3))[1]
+    y, tt, tw, tx, tr = timed(eng.forward)
     res["forward"] = dict(fields=1, seconds=tt, ms_per_step=1e3 * tw / N, exchange_ms_per_step=1e3 * tx / N,
                           dof_updates_per_s=nd * N / tw)
     say("  forward (1 field):            %8.2f ms/step (%5.2f in the exchange), %7.2f G unknown-updates/s; "
         "%.0f s per %.0f s solve" % (1e3 * tw / N, 1e3 * tx / N, 1e-9 * nd * N / tw, tw / N * nfull, args.T))
+    by_rank(res["forward"], tr, warm)
     nb = args.directions
     if args.forward_only:
         return finish(res, None)
@@ -220,21 +290,23 @@ def main(argv=None):
         d.array[:] *= 0.01
         dms.append(d)
     final = eng.final_state()
-    eng.incremental(dms, limit=3)
-    dy, tt, tw, tx = timed(lambda: eng.incremental(dms))
+    warm = timed(lambda: eng.incremental(dms, limit=3))[1]
+    dy, tt, tw, tx, tr = timed(lambda: eng.incremental(dms))
     res["incremental"] = dict(fields=1 + nb, seconds=tt, ms_per_step=1e3 * tw / N,
                               exchange_ms_per_step=1e3 * tx / N, dof_updates_per_s=(1 + nb) * nd * N / tw)
     say("  incremental forward (%d fields): %6.2f ms/step (%5.2f in the exchange), %7.2f G unknown-updates/s"
         % (1 + nb, 1e3 * tw / N, 1e3 * tx / N, 1e-9 * (1 + nb) * nd * N / tw))
+    by_rank(res["incremental"], tr, warm)
     rng = np.random.default_rng(5)
     q = rng.standard_normal((nb, N + 1, rec.shape[0]))
     q[:, 0] = 0.0
-    eng.adjoint(q, final=final, limit=3)
-    g, tt, tw, tx = timed(lambda: eng.adjoint(q, final=final))
+    warm = timed(lambda: eng.adjoint(q, final=final, limit=3))[1]
+    g, tt, tw, tx, tr = timed(lambda: eng.adjoint(q, final=final))
     res["adjoint"] = dict(fields=1 + nb, seconds=tt, ms_per_step=1e3 * tw / N,
                           exchange_ms_per_step=1e3 * tx / N, dof_updates_per_s=(1 + nb) * nd * N / tw)
     say("  backward sweep (%d fields):      %6.2f ms/step (%5.2f in the exchange), %7.2f G unknown-updates/s"
         % (1 + nb, 1e3 * tw / N, 1e3 * tx / N, 1e-9 * (1 + nb) * nd * N / tw))
+    by_rank(res["adjoint"], tr, warm)
     per_hess = (res["incremental"]["ms_per_step"] + res["adjoint"]["ms_per_step"]) * 1e-3 * nfull
     per_grad = (res["forward"]["ms_per_step"] + res["adjoint"]["ms_per_step"]) * 1e-3 * nfull
     say("  one Gauss-Newton Hessian action on %d direction%s over %.0f s: %s%.0f s; a gradient: %s%.0f s"

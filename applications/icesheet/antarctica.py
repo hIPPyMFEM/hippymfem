@@ -36,7 +36,9 @@ import sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "data")
+#: the folder of the datasets and of the grids made from them: ``data`` beside this file, or
+#: the one ``ICESHEET_DATA`` names (a scratch file system, a copy on every node of a job)
+DATA = os.environ.get("ICESHEET_DATA") or os.path.join(HERE, "data")
 ALBMAP_URL = "https://store.pangaea.de/Publications/LeBrocq_et_al_2010/ALBMAPv1.nc.zip"
 ITSLIVE_URL = ("https://its-live-data.s3.amazonaws.com/velocity_mosaic/landsat/v00.0/static/cog/"
                "ANT_G0120_0000_%s_10_percent_overview.tif")
@@ -305,17 +307,26 @@ class ModelGrid:
                "edge_S", "edge_E", "edge_N", "edge_W", "uobs", "uobs_err", "ufill")
 
     @classmethod
-    def load(cls, r, folder=DATA):
+    def load(cls, r, folder=DATA, comm=None):
         """The grid of factor ``r`` from ``grid_r<r>.npz`` in ``folder`` (made from the raw
-        data the first time, where netCDF4 and rasterio are installed)."""
+        data the first time, where netCDF4 and rasterio are installed).  With the communicator
+        ``comm`` of a run on several ranks the first rank reads the file and sends the grid to
+        the others, and the file has to be there: 4096 ranks do not read 139 MB each from one
+        file system, nor try each to make the grid."""
         path = os.path.join(folder, "grid_r%d.npz" % r)
-        if not os.path.exists(path) or "ufill" not in np.load(path).files:
+        if comm is not None and comm.size > 1:
+            z = comm.bcast(dict(np.load(path)) if comm.rank == 0 and os.path.exists(path) else None)
+            if z is None or "ufill" not in z:
+                raise FileNotFoundError("no grid_r%d.npz in %s (the folder that ICESHEET_DATA names, or data beside "
+                                        "antarctica.py): python antarctica.py cache makes the grids" % (r, folder))
+        elif not os.path.exists(path) or "ufill" not in np.load(path).files:
             g = cls(r, vel=load_velocity(), fill=load_measures())
             np.savez(path, r=r, ny=g.ny, nx=g.nx, h=g.h,
                      **{k: getattr(g, k) for k in cls._FIELDS},
                      **{"marine_" + k: v for k, v in g.marine.items()})
             return g
-        z = np.load(path)
+        else:
+            z = np.load(path)
         g = cls.__new__(cls)
         g.r, g.ny, g.nx, g.h = int(z["r"]), int(z["ny"]), int(z["nx"]), float(z["h"])
         for k in cls._FIELDS:
@@ -455,41 +466,46 @@ class Columns:
 
     def mesh3d(self):
         """The serial MFEM mesh (hexahedra)."""
-        import mfem.par as mfem
-
-        V, E = self.vertices(), self.hexes()
         F, A = self.boundary()
-        m = mfem.Mesh(3, V.shape[0], E.shape[0], F.shape[0], 3)
-        for v in V:
-            m.AddVertex(*v)
-        for e in E:
-            m.AddHex(*[int(t) for t in e], 1)
-        for f, a in zip(F, A):
-            m.AddBdrQuad(*[int(t) for t in f], int(a))
-        m.FinalizeHexMesh(1, 1, True)
-        return m
+        return _mesh(3, self.vertices(), self.hexes(), F, A)
 
     def mesh2d(self):
         """The serial MFEM mesh of the footprint (quadrilaterals, the parameter's mesh),
         with the margin edges as its boundary (attribute 1)."""
-        import mfem.par as mfem
+        q, g = self.quads, self.grid
+        cJ, cI = self.cell_JI[:, 0], self.cell_JI[:, 1]
+        # the margin edges are the sides the grid marks, taken as boundary() takes the margin
+        # faces: they are the sides that only one cell has, in the order in which counting
+        # the cells of every side met them (a dictionary, four Python steps a cell)
+        bnd = []
+        for a, b, side in ((0, 1, "S"), (1, 2, "E"), (2, 3, "N"), (3, 0, "W")):
+            edge = getattr(g, "edge_" + side)[cJ, cI]
+            bnd.append(np.column_stack((q[edge, a], q[edge, b])))
+        bnd = np.vstack(bnd)
+        return _mesh(2, np.column_stack((self.xy, np.zeros(self.n2))), q, bnd, np.ones(len(bnd), dtype=int))
 
-        q = self.quads
-        edges = {}
-        for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):
-            for u, v in zip(q[:, a], q[:, b]):
-                key = (min(u, v), max(u, v))
-                edges[key] = edges.get(key, 0) + 1
-        bnd = [k for k, c in edges.items() if c == 1]
-        m = mfem.Mesh(2, self.n2, len(q), len(bnd), 2)
-        for v in self.xy:
-            m.AddVertex(float(v[0]), float(v[1]))
-        for e in q:
-            m.AddQuad(*[int(t) for t in e], 1)
-        for u, v in bnd:
-            m.AddBdrSegment(int(u), int(v), 1)
-        m.FinalizeQuadMesh(1, 1, True)
-        return m
+
+def _mesh(dim, V, E, F, A):
+    """The serial MFEM mesh of hexahedra (``dim`` 3) or quadrilaterals (2) from whole arrays:
+    the vertices ``V`` (three coordinates each), the elements ``E`` (attribute 1) and the
+    boundary elements ``F`` with their attributes ``A``.  A call a vertex, an element and a
+    face from Python took 5 microseconds a hexahedron: 27 s for the 5 km grid with 11 layers,
+    on every rank."""
+    import mfem.par as mfem
+
+    def ints(a):
+        out = mfem.intArray(int(a.size))
+        out.GetDataArray()[:] = a.ravel()
+        return out
+
+    geom = (mfem.Geometry.CUBE, mfem.Geometry.SQUARE) if dim == 3 else (mfem.Geometry.SQUARE, mfem.Geometry.SEGMENT)
+    xyz = mfem.Vector(np.ascontiguousarray(V, dtype=float).ravel())
+    e, ea, f, fa = ints(E), ints(np.ones(len(E), dtype=int)), ints(F), ints(A)
+    m = mfem.Mesh(xyz.GetData(), len(V), e.GetData(), geom[0], ea.GetData(), len(E),
+                  f.GetData(), geom[1], fa.GetData(), len(F), dim, dim)
+    m.Finalize(False, True)             # the checks of orientation of FinalizeHexMesh and FinalizeQuadMesh
+    m._keep_vertices = xyz              # MFEM copies the elements and reads the vertices where they are
+    return m
 
 
 if __name__ == "__main__":

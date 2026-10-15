@@ -1,0 +1,7 @@
+# the paper's section and wavelet and the original Marmousi (python marmousi.py fetch);
+# no slash: on a cluster the folder is a link to a scratch file system
+data
+# runs, records and figures stay local
+out/
+results/
+__pycache__/

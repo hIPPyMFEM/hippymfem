@@ -13,6 +13,8 @@ Newton), then one adjoint solve and one Gauss-Newton Hessian action, with timing
     # more levels: from the solution with fewer, interpolated along the columns (a few Newton steps)
     mpirun -n 64 tools/mpirun_pinned.sh python scale.py --res 1 --nz 4 --no-derivatives --save-state s4
     mpirun -n 64 tools/mpirun_pinned.sh python scale.py --res 1 --nz 8 --start-from s4 --out y.json
+    # a size whose solve fits no job: the same work at every size, timed on every rank, without a solve
+    mpirun -n 64 tools/mpirun_pinned.sh python scale.py --res 1 --nz 4 --refine 1 --solver columns --measure --out z.json
 
 The friction is the one built from the driving stress and the observed speed (the truth
 of ``run.py``'s synthetic problem).  ``--solver dd``, on any number of ranks, one GPU each:
@@ -74,6 +76,134 @@ def column_interpolate(Xc, Vc, Xf, order):
     return out
 
 
+def measure(pb, u, p_, m3, a, rec, write, say):
+    """What a job of a few minutes can time of the solver without a matrix, the same work at
+    every size, at the state ``(u, p_)``: a residual, the preconditioner's set-up, a product
+    with the Jacobian and an application of the preconditioner, each once (the kernels are
+    compiled then) and ``a.repeats`` times more, and ``a.krylov_its`` Krylov iterations
+    whatever the residual does; the set-up is repeated after them, the longest part last.
+    Every rank's own seconds, sizes and memory go into ``rec`` as the minimum, the mean and
+    the maximum over the ranks, and ``rec`` is written after every part: a job that ends
+    early leaves what it had."""
+    import resource
+
+    from mpi4py import MPI
+    from hippymfem.fem.kernel import device
+    import matrixfree
+
+    S, comm, R, N = pb.solver, pb.comm, a.repeats, a.krylov_its
+    cp = S.cp
+    mine = {}                                 # this rank's numbers by (group, name), the same names on every rank
+
+    def clock(name, fn, parts=(), n=1, per=1):
+        """This rank's seconds of a call of ``fn`` (the mean of ``n``) and of the solver's
+        ``parts`` in it; with ``per``, of one of so many iterations of a call."""
+        before, t = dict(S.times), 0.0
+        for _ in range(n):
+            comm.Barrier()                    # the ranks start together: a rank's seconds are its own work
+            t0 = time.time()
+            out = fn()
+            S.settle()
+            t += time.time() - t0
+        mine["seconds", name] = t / (n * per)
+        for k in parts:
+            mine["seconds", name + "_" + k] = (S.times[k] - before[k]) / (n * per)
+        return out
+
+    def save():
+        ms, pool = device().memory_stats() or {}, cp.get_default_memory_pool()
+        for k, v in (("jax", ms.get("bytes_in_use", 0)), ("jax_peak", ms.get("peak_bytes_in_use", 0)),
+                     ("jax_limit", ms.get("bytes_limit", 0)), ("cupy", pool.used_bytes()), ("cupy_pool", pool.total_bytes()),
+                     ("cupy_setup", S.pool_peak), ("host_peak", 1024 * resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)):
+            mine["memory_gib", k] = v / 2.0 ** 30
+        # MPI's own reductions, on buffers
+        v = np.array(list(mine.values()), dtype=np.float64)
+        lo, hi, tot = np.empty_like(v), np.empty_like(v), np.empty_like(v)
+        comm.Allreduce(v, lo, op=MPI.MIN)
+        comm.Allreduce(v, hi, op=MPI.MAX)
+        comm.Allreduce(v, tot, op=MPI.SUM)
+        for i, (group, name) in enumerate(mine):
+            rec.setdefault(group, {})[name] = dict(min=float(lo[i]), mean=float(tot[i]) / comm.size, max=float(hi[i]))
+        write(rec)
+
+    def told(name, parts=()):
+        d = rec["seconds"]
+        return "%s %.3g s (%.3g to %.3g over the ranks)%s" % (
+            name.replace("_", " "), d[name]["mean"], d[name]["min"], d[name]["max"],
+            ": " + ", ".join("%s %.3g" % (k, d[name + "_" + k]["mean"]) for k in parts) if parts else "")
+
+    for k, v in (("elements", pb.ne), ("unknowns", pb.nv + pb.np), ("columns", S.ncell),
+                 ("neighbours", len(set(S.cu.send) | set(S.cu.recv)))):
+        mine["rank", k] = v
+    rec.update(layers=(S.cu.L - 1) // pb.order, pressure_levels=S.cq.L)
+    clock("residual_first", lambda: pb.residual(u, p_, m3))
+    ru, rp = clock("residual", lambda: pb.residual(u, p_, m3), n=R)
+    rec["residual_norm"] = float(np.sqrt(ru.inner(ru) + rp.inner(rp)))
+    save()
+    say("measure at %s (residual %.6e): %s; %s" % (rec["state"], rec["residual_norm"], told("residual_first"), told("residual")))
+    # the right-hand side of the linear solves: a misfit-like source (the velocity against 0.9 of
+    # itself, as for the gradient of a whole run), in the solver's layouts
+    rhs = pb.generate_state()
+    rhs.array[:pb.nv] = 0.1 * u.array
+    ba = cp.asarray(np.asarray(rhs.array))
+    b = cp.concatenate([S.to_layout_u(ba[:pb.nv]), S.to_layout_p(ba[pb.nv:])])
+
+    def setup():
+        S.factorizations = 0                  # the patches anew in every set-up that is timed, whatever --schur-every
+        pb._factorize(pb.linearization(u, p_, m3))
+        S.coarse(b[:S.nu])                    # hypre factorizes the collapsed matrix in its first solve
+
+    parts = ("blocks", "collapsed", "probe", "coarse", "exchange")
+    clock("setup_first", setup, parts)
+    save()
+    say("measure: " + told("setup_first", parts))
+    clock("apply_first", lambda: S.apply(b))
+    clock("apply", lambda: S.apply(b), ("exchange",), R)
+    save()
+    say("measure: %s; %s" % (told("apply_first"), told("apply", ("exchange",))))
+    parts = ("passes", "columns", "coarse", "schur", "exchange")
+    clock("precondition_first", lambda: S.precondition(b))
+    nc = len(S.coarse_its)
+    clock("precondition", lambda: S.precondition(b), parts, R)
+    rec["precondition"] = dict(coarse_iterations=float(np.mean(S.coarse_its[nc:])))
+    save()
+    say("measure: %s; %s" % (told("precondition_first"), told("precondition", parts)))
+    S.rtol, S.maxit, maxit = 0.0, 1, S.maxit
+    clock("krylov_first", lambda: S.fgmres(b))            # one iteration: what the Krylov method alone compiles
+    matrixfree._return_kernels(comm, S._kernel_folders)   # as after the first solve of a run: the next job has them
+    S.maxit, nc = N, len(S.coarse_its)
+    parts = ("passes", "columns", "coarse", "schur", "orthogonalization", "exchange")
+    x, its, rel = clock("iteration", lambda: S.fgmres(b), parts, per=N)
+    save()
+    d = rec["seconds"]
+    # the exchanges are counted in the parts they serve as well; the rest: the product with B, the least squares
+    shares = {k: d["iteration_" + k]["mean"] / d["iteration"]["mean"] for k in parts}
+    shares["rest"] = 1.0 - sum(v for k, v in shares.items() if k != "exchange")
+    rec["krylov"] = dict(iterations=int(its), residual=float(rel), coarse_iterations=float(np.mean(S.coarse_its[nc:])),
+                         shares=shares)
+    write(rec)
+    say("measure: %d Krylov iterations, %s (%.1f iterations a collapsed solve)"
+        % (its, told("iteration", parts), rec["krylov"]["coarse_iterations"]))
+    # the set-up again only now: with many layers it is minutes (750 probing products of 2225 vectors and 7500
+    # inverses of 801 x 801 a rank at 88), and a job that ends in it has left the products and the iterations in its record
+    parts = ("blocks", "collapsed", "probe", "coarse", "exchange")
+    clock("setup", setup, parts, R)
+    save()
+    say("measure: " + told("setup", parts))
+    S.rtol, S.maxit = a.rtol, maxit
+    if a.krylov_count:
+        x, its, rel = S.fgmres(b)
+        rec["solve"] = dict(rtol=a.rtol, iterations=int(its), residual=float(rel))
+        say("measure: a solve to %.1e from the same state takes %d Krylov iterations (%.2e of the first residual)"
+            % (a.rtol, its, rel))
+    rec["solver"] = S.describe()
+    save()
+    d = rec["memory_gib"]
+    say("measure: memory of a rank at the most, GiB: JAX %.2f of %.2f it may take, CuPy %.2f in a set-up and %.2f in its "
+        "pool now, host %.2f" % (d["jax_peak"]["max"], d["jax_limit"]["max"], d["cupy_setup"]["max"], d["cupy_pool"]["max"],
+                                 d["host_peak"]["max"]))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=" ".join(__doc__.split("\n\n")[0].split()))
     p.add_argument("--res", type=int, default=4, help="grid cell = 5 km x res")
@@ -95,11 +225,13 @@ def main(argv=None):
                    help="columns: the Chebyshev steps take down the spectrum from its top to 1 / this of it")
     p.add_argument("--coarse-maxit", type=int, default=20, help="columns: iterations of a solve of the collapsed problem at most")
     p.add_argument("--coarse-rtol", type=float, default=1e-2, help="columns: tolerance of a solve of the collapsed problem")
-    p.add_argument("--coarse", choices=("ilu", "direct"), default="ilu",
-                   help="columns: the collapsed problem by conjugate gradients with an incomplete factorization on "
-                        "the host, or (one rank) by a factorization on the card")
+    p.add_argument("--coarse", choices=("ilu", "amg", "direct"), default="ilu",
+                   help="columns: the collapsed problem by conjugate gradients with an incomplete factorization of "
+                        "every rank's part or with algebraic multigrid, on the host, or (one rank) by a factorization "
+                        "on the card")
     p.add_argument("--schur-every", type=int, default=1,
-                   help="columns: the patches of the Schur complement made anew at every this many Newton steps")
+                   help="columns: the patches of the Schur complement made anew at every this many Newton steps "
+                        "(--measure makes them in every set-up it times)")
     p.add_argument("--good-step", type=float, default=1.0,
                    help="a whole Newton step is taken without trying shorter ones if it leaves this much of the residual "
                         "or less (1: backtracking as usual)")
@@ -111,9 +243,27 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=0,
                    help="time only this many Newton steps from rest (sizes where the whole solve does not fit a "
                         "job): the Jacobian, the factorizations, the solve")
+    p.add_argument("--measure", action="store_true",
+                   help="columns: time the same work at any size and stop: a residual, the preconditioner's set-up, a "
+                        "product with the Jacobian, an application of the preconditioner and --krylov-its Krylov "
+                        "iterations, on every rank's clock; at the solution of --start-from, or without it at the "
+                        "shallow-ice velocity of the grid, which takes no solve")
+    p.add_argument("--krylov-its", type=int, default=10,
+                   help="measure: the Krylov iterations that are timed (after one that compiles), whatever the "
+                        "residual does")
+    p.add_argument("--repeats", type=int, default=3,
+                   help="measure: the residual, the set-up, the product and the preconditioner are each timed once "
+                        "(the kernels are compiled then) and this many times more, the set-up after the Krylov "
+                        "iterations (the longest part last)")
+    p.add_argument("--krylov-count", action="store_true",
+                   help="measure: one solve to --rtol from the same state as well, for its count of Krylov iterations")
     p.add_argument("--checkpoint", default=None,
-                   help="a folder: the forward solve saves its iterate there after every Newton step and continues "
-                        "from the one that is there (a solve longer than a job)")
+                   help="a folder: the forward solve saves its iterate there when it stops at --time-limit or "
+                        "--time-budget (after them: the job needs the time of that write, one file a rank, beyond "
+                        "them) and when it ends, and continues from the one that is there (a solve longer than a job)")
+    p.add_argument("--checkpoint-every", type=int, default=0,
+                   help="with --checkpoint: the iterate is saved after every this many Newton steps as well (1: after "
+                        "each, for a job that may end without notice; one file a rank each time)")
     p.add_argument("--save-state", default=None,
                    help="a folder: the solution, with the positions of its nodes, one file per rank")
     p.add_argument("--start-from", default=None,
@@ -136,6 +286,17 @@ def main(argv=None):
     comm = MPI.COMM_WORLD
     rank0 = comm.rank == 0
     T0 = time.time()
+    # what the command line cannot have: one line from one rank, not a traceback from each
+    if a.solver in ("dd", "cudss") and not st.have_cudss():
+        raise SystemExit("--solver %s factorizes with NVIDIA's cuDSS, which is not installed here (nvmath-python): "
+                         "--solver columns runs without it" % a.solver if rank0 else 1)
+    if a.solver == "columns" and a.coarse == "direct" and (comm.size > 1 or not st.have_cudss()):
+        raise SystemExit("--coarse direct factorizes the collapsed problem with NVIDIA's cuDSS on one rank (%s): "
+                         "--coarse ilu runs anywhere" % ("%d ranks here" % comm.size if comm.size > 1 else
+                                                         "nvmath-python is not installed here") if rank0 else 1)
+    if a.measure and (a.solver != "columns" or a.steps or a.checkpoint or a.save_state or min(a.repeats, a.krylov_its) < 1):
+        raise SystemExit("--measure goes with --solver columns, without --steps, --checkpoint or --save-state (it solves "
+                         "nothing), and with --repeats and --krylov-its of 1 at least" if rank0 else 1)
 
     def say(*x):
         if rank0:
@@ -186,7 +347,7 @@ def main(argv=None):
             raise SystemExit("the solution in %s is on a mesh refined %d times, this one %d" % (a.start_from, saved_refine, a.refine))
     carried = bool(a.start_from) and not resumed and a.refine > 0 and saved_refine == 0
     t0 = time.time()
-    grid = an.ModelGrid.load(a.res)
+    grid = an.ModelGrid.load(a.res, comm=comm)
     cols = an.Columns(grid, a.nz)
     pb = st.IceSheet(cols, comm, refine=a.refine, solver=None, verbose=rank0,
                      partition="columns" if a.solver in ("dd", "columns") else "metis",
@@ -198,7 +359,7 @@ def main(argv=None):
         import matrixfree
         pb.solver = matrixfree.ColumnStokes(pb, rtol=a.rtol, forcing=a.forcing, restart=a.restart, coarse_maxit=a.coarse_maxit,
                                             coarse_rtol=a.coarse_rtol, schur_every=a.schur_every, sweeps=a.sweeps,
-                                            smooth_range=a.smooth_range, coarse=a.coarse)
+                                            smooth_range=a.smooth_range, coarse=a.coarse, wait=a.measure)
     else:
         pb.solver = st.BlockFGMRES(pb, rtol=a.rtol)
     pb.good_step = a.good_step
@@ -231,7 +392,7 @@ def main(argv=None):
             t0 = time.time()
             ru, rp = pb.residual(u, p_, m3, 1e-2)
             t1 = time.time()
-            J = pb.jacobian(u, p_, m3, 1e-2)
+            J = pb.linearization(u, p_, m3, 1e-2)             # the state itself for a solver without a matrix
             t2 = time.time()
             pb._factorize(J)
             t3 = time.time()
@@ -295,10 +456,31 @@ def main(argv=None):
         say("forward: starting from the solution in %s (%d levels there), interpolated along the columns%s"
             % (a.start_from, comm.bcast(nz0 if rank0 else None), " and through the refinement" if carried else ""))
         del X2, X1, u0, p0, s0
+    if a.measure:
+        if a.start_from:
+            u, p_ = pb.split(pb._state0)
+        else:
+            # on the columns of the solver's layouts and their levels, which a mesh of columns spaces
+            # equally: no node is asked for its place (a loop over the elements in the library)
+            S, h = pb.solver, grid.h / 2 ** a.refine
+            u, p_ = pb.Vv.vector(), pb.Vs.vector()
+
+            def state(c, step):
+                xy = np.column_stack((grid.xn[0] + step * c.ix[:c.nco], grid.yn[0] + step * c.iy[:c.nco]))
+                return pb.shallow_ice(xy, np.linspace(0.0, 1.0, c.L), logf)
+
+            U = np.ascontiguousarray(state(S.cu, h / pb.order)[0].transpose(1, 2, 0))        # (columns, levels, 3)
+            u.array[:] = S.cp.asnumpy(S.from_layout_u(S.cp.asarray(U.ravel())))
+            p_.array[:] = S.cp.asnumpy(S.from_layout_p(S.cp.asarray(state(S.cq, h)[1].ravel())))
+        rec = dict(args=vars(a), sizes=sz, unknowns=unknowns, grid_km=grid.h, setup_s=t_setup,
+                   state="the solution in %s" % a.start_from if a.start_from else "shallow ice")
+        measure(pb, u, p_, pb.to_bed(m), a, rec, write, say)
+        say("done in %.1f s" % (time.time() - T0))
+        return 0
     deadline = T0 + a.time_limit if a.time_limit else None
     if a.checkpoint:
         pb.set_checkpoint(a.checkpoint, deadline, warm=bool(a.start_from),
-                          budget_end=T0 + a.time_budget if a.time_budget else None)
+                          budget_end=T0 + a.time_budget if a.time_budget else None, every=a.checkpoint_every)
     t0 = time.time()
     try:
         pb.solveFwd(x[STATE], x)

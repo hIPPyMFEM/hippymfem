@@ -99,6 +99,8 @@ python exact_samples.py out/exact 16 10 1 $SIZE
 
 # throughput of the three sweeps at any size, with the adjoint identity
 mpirun -n 4 ../../tools/mpirun_pinned.sh python scale.py --n 96 --steps 40 --check
+# the same on a refined mesh with the time step's limit handed in: half that of the mesh before (0.4999 s at --n 64)
+mpirun -n 8 ../../tools/mpirun_pinned.sh python scale.py --n 64 --refine 1 --steps 40 --check --dt-limit 0.2499
 ```
 
 `run.py --help` lists the options.  A run saves its fields in an order that does not
@@ -107,8 +109,15 @@ with the options that define the problem as they were (it says which differ).  O
 exception: the products of a single-pass low rank belong to their random directions,
 which change with the number of ranks, and are taken again when that number changed.
 
+`scale.py --help` says what each time it prints and records is (the step, and over the
+ranks a rank's own work and its exchange) and names the switches of the exchange:
+`HIPPYMFEM_DEVICE_MPI` (from card to card, where the MPI library takes device memory),
+`HIPPYMFEM_SEM_PIECE` and `HIPPYMFEM_SEM_PUT`.
+
 Nothing in the application belongs to one GPU vendor: the propagator is JAX, the mesh and
-the prior are MFEM and hypre.  It has been run on NVIDIA cards.  `earth.py fetch` needs a
+the prior are MFEM and hypre.  It has been run on NVIDIA cards and on AMD's (MI250X:
+the small complete run above in 126 s on one of their GPUs, and `scale.py` to 4096 of
+them, the last table below).  `earth.py fetch` needs a
 connection to the internet, which on a cluster is the login node's.
 
 ## Results
@@ -190,3 +199,44 @@ inversion driver numbers it through MFEM and stops there.  The complete solve on
 billion unknowns was made for an animation, by a driver that is not in this folder: it
 kept the field on the surface and on three planes, and continued from a checkpoint where
 a job was shorter than the solve.
+
+**Weak scaling on Frontier** (AMD MI250X; a rank has one of a card's two GPUs, 64 GiB).
+`scale.py --n 64 --keys --steps 100 --check` with `--refine 1, 2, 3, 4, 5` on 1, 8, 64, 512
+and 4096 ranks is the paper's mesh refined: 7 798 784 elements and 211 million unknowns on
+every rank, whatever their number.  Milliseconds a time step of the three sweeps (one
+field forward; two fields forward, as an incremental solve; two fields backward, as an
+adjoint solve), in double precision:
+
+| GPUs | elements | unknowns | forward | two fields forward | two fields backward | of one GPU |
+|---:|---:|---:|---:|---:|---:|---|
+| 1 | 7 798 784 | 211 011 037 | 154.1 | 184.9 | 193.8 | |
+| 8 | 62 390 272 | 1 686 309 817 | 154.4 | 184.3 | 193.2 | 99.8, 100.3, 100.3 % |
+| 64 | 499 122 176 | 13 483 382 641 | 153.6 | 183.4 | 192.2 | 100.4, 100.8, 100.8 % |
+| 512 | 3 992 977 408 | 107 838 713 569 | 153.8 | 185.0 | 193.6 | 100.2, 99.9, 100.1 % |
+| 4096 | 31 943 819 264 | 862 596 390 337 | 154.6 | 186.3 | 194.9 | 99.7, 99.2, 99.4 % |
+
+The first row is the mean of eight one-rank runs side by side on the GPUs of one node
+(they differ by 0.2 %).  On 4096 the forward sweep makes 5.6e12 unknown-updates a second;
+a rank's own time is 147.4 to 153.4 ms and its time in MPI 1.3 to 7.3 ms (the fastest
+waits there for the slowest); the adjoint identity holds to 1.9e-15; a rank holds 46.1 GiB
+on its card and 26 GiB on the host; the run takes 152 s, 92 of them the set-up (mesh,
+keys, coefficients, time step, sources).  In single precision `--n 80 --float32` holds
+15 462 400 elements and 418 million unknowns a rank: 140.8 ms a forward step on one GPU
+and 140.5 on 4096, where it is 63 333 990 400 elements and 1 710 194 718 145 unknowns
+(1.2e13 unknown-updates a second; the two-field sweeps 251.4 and 259.5 ms, 98.3 and
+98.5 % of one GPU; the identity to 1.6e-6; 47.9 GiB of a card).
+
+Three things made the series flat, none of them particular to these cards.  The exchange
+goes from card to card where MPI takes device memory (`HIPPYMFEM_DEVICE_MPI`; on
+Frontier, Cray MPICH with `MPICH_GPU_SUPPORT_ENABLED=1` and its `libmpi_gtl_hsa` loaded,
+and `ROCPROFILER_REGISTER_ENABLED=0` in the job's environment, which the library
+otherwise sets itself):
+through host arrays a step paid 9 ms from 64 ranks on (22 MB to the host, through MPI
+and back to the card), 56 ms with two fields on 512, and the series stood at 91 and 76 %
+there; with the host's arrays kept and the fields' own precision on the wire that way
+now pays 11 and 29 ms and has 93 and 86 %.  A rank's unknowns are numbered in the order its elements meet them
+(`sem.first_touch`), not in the order of their keys: 4.5 % less on one GPU, and the ranks
+of 512, whose pieces of the mesh lie differently across the keys, no longer 6 % apart
+(the series was at 96 to 97 % before it).  And the search for the elements of the sources
+and receivers ends where round-off ends it: with elements of a few kilometres its fixed
+bound lost points, and a run on 512 or 4096 ranks stopped there after its whole set-up.

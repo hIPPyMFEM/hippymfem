@@ -45,8 +45,8 @@ from mpi4py import MPI
 
 import hippymfem as hm
 from hippymfem.common.linalg import scipy_to_hypre
-from hippymfem.common.parvector import ParVector
-from hippymfem.fem.kernel import _chunk_slices
+from hippymfem.common.parvector import ParVector, allreduce
+from hippymfem.fem.kernel import _chunk_slices, device
 
 U, P, M, B, V, Q = range(6)
 
@@ -116,10 +116,14 @@ class NodeColumns:
     p2t, t2p : the true dof at every owned place, and the place of every true dof
     ix, iy : ``(ncl,)``, the columns on the lattice of the footprint (in units of ``step``)
     gcol : ``(ncl,)``, the global number of every column held
+    times, settle : the seconds of the exchanges, and a wait for the card before they are read:
+        the solver that takes the columns puts its own in their place (its seconds, to which
+        the exchanges add theirs, and :meth:`ColumnStokes.settle`)
     """
 
     def __init__(self, space, comm, origin, step, cp):
         self.comm, self.cp = comm, cp
+        self.times, self.settle = {"exchange": 0.0}, lambda: None
         fes = space.fes
         X = space._node_coordinates()
         nl = X.shape[0]
@@ -189,7 +193,13 @@ class NodeColumns:
     # ------------------------------------------------------------- exchange
     def _swap(self, a, src, dst, tag, add):
         cp, comm = self.cp, self.comm
+        self.settle()                         # what the card still owes is not the exchange's
+        t0 = time.time()
         tail = a.shape[1:]
+        # through host memory also where MPI could take the cards' own: these rims are a
+        # megabyte, and with Cray MPICH's GPU support an exchange from CuPy's arrays hung now
+        # and then (on 8, 256 and 1024 ranks).  Why was not found out (a guess: device memory
+        # that CuPy's pool had given back and taken again at the same address)
         bufs = {r: np.empty((int(idx.size),) + tail, dtype=a.dtype) for r, idx in dst.items()}
         reqs = [comm.Irecv(b, source=r, tag=tag) for r, b in bufs.items()]
         out = [(r, cp.asnumpy(a[idx])) for r, idx in src.items()]
@@ -200,6 +210,8 @@ class NodeColumns:
                 a[dst[r]] += cp.asarray(b)
             else:
                 a[dst[r]] = cp.asarray(b)
+        self.settle()
+        self.times["exchange"] += time.time() - t0
         return a
 
     def fill(self, a):
@@ -244,17 +256,19 @@ class ColumnBlocks:
             self.sinv[:, k] = cp.linalg.inv(diag[:, k] - self.g[:, k - 1] @ low[:, k - 1].transpose(0, 2, 1))
 
     def solve(self, r):
-        """``D^{-1} r`` for ``r`` of shape ``(columns, L, 3)``."""
+        """``D^{-1} r`` for ``r`` of shape ``(columns, L, 3)``, or ``(columns, L, 3, k)`` for
+        ``k`` right-hand sides at once."""
         cp, nb, L = self.cp, self.nb, self.L
-        y = cp.zeros((self.nc, 2 * nb, 3))
+        tail = r.shape[3:]
+        y = cp.zeros((self.nc, 2 * nb, 3) + tail)
         y[:, :L] = r
-        y = y.reshape(self.nc, nb, 6, 1)
+        y = y.reshape((self.nc, nb, 6) + (tail or (1,)))
         for k in range(1, nb):
             y[:, k] -= self.g[:, k - 1] @ y[:, k - 1]
         y[:, nb - 1] = self.sinv[:, nb - 1] @ y[:, nb - 1]
         for k in range(nb - 2, -1, -1):
             y[:, k] = self.sinv[:, k] @ (y[:, k] - self.low[:, k].transpose(0, 2, 1) @ y[:, k + 1])
-        return y.reshape(self.nc, 2 * nb, 3)[:, :L]
+        return y.reshape((self.nc, 2 * nb, 3) + tail)[:, :L]
 
 
 def _kernels(gk, volume):
@@ -306,6 +320,8 @@ class ColumnStokes:
     sweeps, smooth_range : Chebyshev steps of the solves on the columns before and after the
         collapsed problem, and the part of the spectrum they take down (see ``smooth``)
     patch_bytes : device memory for the patches of the Schur complement inverted at a time
+    probe_bytes : device memory for the products that probe the Schur complement taken at a
+        time (the levels of a colour go through the element matrices of ``B`` together)
     schur_every : the patches are made anew at every ``schur_every``-th linearization point
         (they change with the viscosity, slowly once Newton's method is converging)
     coarse_rtol, coarse_maxit : of the conjugate gradients on the collapsed problem
@@ -314,16 +330,25 @@ class ColumnStokes:
     chunk : elements in one launch of a pass
     forcing, rtol_loose : in a Newton solve, the tolerance of the linear solves chosen step by
         step between ``rtol_loose`` and ``rtol`` (the adjoint and incremental solves use ``rtol``)
+    wait : the timers of the parts (``times``) are read once the card has done what it was
+        given (a measurement: a call returns before the card has finished, and its seconds
+        would be counted with the part that waits for it next)
     """
 
     matrix_free = True
 
     def __init__(self, problem, rtol=1e-6, maxit=300, restart=40, damping=0.6, sweeps=1, smooth_range=30.0, patch_bytes=2e9, schur_every=1,
                  coarse_rtol=1e-2, coarse_maxit=20, coarse="ilu", coarse_fill=1, chunk=65536, verbose=None,
-                 forcing=False, rtol_loose=1e-2):
+                 forcing=False, rtol_loose=1e-2, probe_bytes=4e9, wait=False):
         self._kernel_folders = _private_kernel_cache(problem.comm)
         import cupy as cp
 
+        # CuPy takes the first card it sees and the kernels the one of the rank's place on its
+        # node: on a rank that sees several, the arrays the two hand each other are on two cards
+        if not allreduce(problem.comm, bool(_jax(cp.zeros(1)).device == device()), MPI.LAND):
+            raise RuntimeError("CuPy and the element kernels are not on one GPU on every rank (here CuPy on GPU %d, the "
+                               "kernels on %s): a rank has to see one GPU only (srun --gpus-per-task=1 --gpu-bind=closest, "
+                               "or mpirun through tools/mpirun_pinned.sh)" % (cp.cuda.Device().id, device()))
         t0 = time.time()
         self.cp = cp
         pb = self.pb = problem
@@ -341,10 +366,14 @@ class ColumnStokes:
         self.chunk = int(chunk)
         self.verbose = pb.verbose if verbose is None else (verbose and comm.rank == 0)
         self.iterations, self.coarse_its, self.probes = [], [], 0
-        self.block_dtype, self.patch_bytes = cp.float32, float(patch_bytes)
+        self.block_dtype, self.patch_bytes, self.probe_bytes = cp.float32, float(patch_bytes), float(probe_bytes)
+        self._rowdot = cp.ReductionKernel("T x, T y", "T z", "x * y", "a + b", "z = a", "0", "rowdot")
         self.Be, self.pmid, self.factorizations, self.schur_every = None, None, 0, max(1, int(schur_every))
         self.times = {"setup": 0.0, "solve": 0.0, "blocks": 0.0, "collapsed": 0.0, "probe": 0.0,
-                      "passes": 0.0, "coarse": 0.0, "schur": 0.0, "columns": 0.0}
+                      "passes": 0.0, "coarse": 0.0, "schur": 0.0, "columns": 0.0, "exchange": 0.0,
+                      "orthogonalization": 0.0}
+        #: with ``wait``: the most that CuPy's pool held at the end of a set-up, bytes
+        self.wait, self.pool_peak = bool(wait), 0
         if pb.Vv.fes.GetOrdering() != mfem.Ordering.byNODES:
             raise NotImplementedError("the velocity's dofs have to be ordered by component")
         g = pb.columns.grid
@@ -354,6 +383,9 @@ class ColumnStokes:
         self.cu = NodeColumns(self.Vq, comm, origin, step / pb.order, cp)
         self.cq = NodeColumns(pb.Vs, comm, origin, step, cp)
         cu, cq = self.cu, self.cq
+        # their exchanges are timed with the solver's parts, and wait for the card as these do
+        cu.times = cq.times = self.times
+        cu.settle = cq.settle = self.settle
         self.nu, self.npr = cu.nco * cu.L * 3, cq.nco * cq.L
         if self.nu != pb.nv or self.npr != pb.np:
             raise RuntimeError("the columns do not hold the problem's unknowns")
@@ -375,6 +407,12 @@ class ColumnStokes:
         self._check_layout()
         self.t_init = time.time() - t0
         self.times["setup"] += self.t_init
+
+    def settle(self):
+        """With ``wait``: until the card has done all it was given, so that the timer read next
+        holds the seconds of its own part."""
+        if self.wait:
+            self.cp.cuda.Device().synchronize()
 
     # ------------------------------------------------------------ structure
     def _structure(self, edofs, bedofs):
@@ -470,16 +508,17 @@ class ColumnStokes:
         return a[self.cq.t2p_g]
 
     def _local_u(self, xu):
+        # (a second axis of ``xu``, here and in what the probing calls, is several vectors at once)
         cp, c = self.cp, self.cu
-        a = cp.empty((c.ncl, c.L, 3))
-        a[:c.nco] = xu.reshape(c.nco, c.L, 3)
-        return c.fill(a).ravel()
+        a = cp.empty((c.ncl, c.L, 3) + xu.shape[1:])
+        a[:c.nco] = xu.reshape((c.nco, c.L, 3) + xu.shape[1:])
+        return c.fill(a).reshape((-1,) + xu.shape[1:])
 
     def _local_p(self, xp):
         cp, c = self.cp, self.cq
-        a = cp.empty((c.ncl, c.L))
-        a[:c.nco] = xp.reshape(c.nco, c.L)
-        return c.fill(a).ravel()
+        a = cp.empty((c.ncl, c.L) + xp.shape[1:])
+        a[:c.nco] = xp.reshape((c.nco, c.L) + xp.shape[1:])
+        return c.fill(a).reshape((-1,) + xp.shape[1:])
 
     def _owned_u(self, y):
         c = self.cu
@@ -524,6 +563,7 @@ class ColumnStokes:
         for kb, gk, d, e in zip(self.bk, self.bgk, self.bdofs, self.beu):
             yu, = self._run(kb["velocity"], gk, d, (ju[e],), (), [(yu, e)])
         out = self.cp.concatenate([self._owned_u(yu), self._owned_p(yp)])
+        self.settle()
         self.times["passes"] += time.time() - t0
         return out
 
@@ -531,6 +571,7 @@ class ColumnStokes:
         t0 = time.time()
         ju = _jax(self._local_u(xu))
         out = self._owned_u(self._velocity_local(ju, jnp.zeros_like(ju)))
+        self.settle()
         self.times["passes"] += time.time() - t0
         return out
 
@@ -592,6 +633,7 @@ class ColumnStokes:
         band = None                                           # the factors hold what is needed of it
         if self.sweeps > 1:
             self.lmax = self._largest()
+        self.settle()
         t_blocks = time.time() - t0
         self.times["blocks"] += t_blocks
         # --- the collapsed problem
@@ -607,7 +649,10 @@ class ColumnStokes:
         if self.pmid is None or self.factorizations % self.schur_every == 0:
             self._probe()
         self.factorizations += 1
+        self.settle()
         self.times["probe"] += time.time() - t0
+        if self.wait:
+            self.pool_peak = max(self.pool_peak, cp.get_default_memory_pool().total_bytes())
         cp.get_default_memory_pool().free_all_blocks()
         self.times["setup"] += time.time() - t_all
         if self.verbose:
@@ -700,7 +745,8 @@ class ColumnStokes:
     def columns_solve(self, r):
         t0 = time.time()
         cu = self.cu
-        out = self.columns.solve(r.reshape(cu.nco, cu.L, 3)).ravel()
+        out = self.columns.solve(r.reshape((cu.nco, cu.L, 3) + r.shape[1:])).reshape((-1,) + r.shape[1:])
+        self.settle()
         self.times["columns"] += time.time() - t0
         return out
 
@@ -770,22 +816,25 @@ class ColumnStokes:
         import cupyx
 
         cp, cq = self.cp, self.cq
+        tail = xu.shape[1:]
         xe = self._local_u(xu)[self.eu_c].astype(cp.float32)
-        ye = cp.matmul(self.Be, xe[:, :, None])[:, :, 0].astype(cp.float64)
-        a = cp.zeros(cq.ncl * cq.L)
+        ye = cp.matmul(self.Be, xe.reshape(xe.shape[:2] + (-1,))).reshape(xe.shape[:1] + (-1,) + tail).astype(cp.float64)
+        a = cp.zeros((cq.ncl * cq.L,) + tail)
         cupyx.scatter_add(a, self.ep_c, ye)
-        return cq.reduce(a.reshape(cq.ncl, cq.L))[:cq.nco].ravel()
+        return cq.reduce(a.reshape((cq.ncl, cq.L) + tail))[:cq.nco].reshape((-1,) + tail)
 
     def fast_Bt(self, xp):
         """``B^T x`` with the stored element matrices."""
         import cupyx
 
         cp, cu = self.cp, self.cu
+        tail = xp.shape[1:]
         xe = self._local_p(xp)[self.ep_c].astype(cp.float32)
-        ye = cp.matmul(self.Be.transpose(0, 2, 1), xe[:, :, None])[:, :, 0].astype(cp.float64)
-        a = cp.zeros(cu.ncl * cu.L * 3)
+        ye = cp.matmul(self.Be.transpose(0, 2, 1), xe.reshape(xe.shape[:2] + (-1,)))
+        ye = ye.reshape(xe.shape[:1] + (-1,) + tail).astype(cp.float64)
+        a = cp.zeros((cu.ncl * cu.L * 3,) + tail)
         cupyx.scatter_add(a, self.eu_c, ye)
-        return cu.reduce(a.reshape(cu.ncl, cu.L, 3))[:cu.nco].ravel()
+        return cu.reduce(a.reshape((cu.ncl, cu.L, 3) + tail))[:cu.nco].reshape((-1,) + tail)
 
     def schur(self, q):
         """``B D^{-1} B^T q``: the Schur complement of the columns."""
@@ -830,16 +879,28 @@ class ColumnStokes:
             self._patches()
         blocks = cp.zeros((cq.ncl + 1, 25, L, L), dtype=self.block_dtype)      # the last: no column
         rows = cp.arange(cq.nco)
+        # several levels of a colour in one product: most of a product's time is the pass
+        # over the element matrices of B and the launches of the solves on the columns, and
+        # both serve every vector of a product (about 1.7 kB an element and vector meanwhile).
+        # As many on every rank, by the rank with the most elements: the ranks exchange the
+        # rims of their columns inside a product
+        nk = max(1, min(L, int(self.probe_bytes // (1700 * max(allreduce(self.comm, self.ne, MPI.MAX), 1)))))
+        # one product less where that takes a tenth more memory at the most: 25 levels at 12 a
+        # product are products of 13 and 12, not of 12, 12 and 1
+        products = -(-L // nk)
+        if products > 1 and -(-L // (products - 1)) <= 1.1 * nk:
+            nk = -(-L // (products - 1))
         for c in range(25):
             if not self.has_colour[c]:
                 continue
             sel = self.colour == c
-            for k in range(L):
-                q = cp.zeros((cq.nco, L))
-                q[sel, k] = 1.0
-                y = self.schur(q.ravel()).reshape(cq.nco, L)
-                blocks[rows, self.slot[c], :, k] = y.astype(blocks.dtype)
-                self.probes += 1
+            for k in range(0, L, nk):
+                ks = cp.arange(k, min(k + nk, L))
+                q = cp.zeros((cq.nco, L, ks.size))
+                q[:, ks, cp.arange(ks.size)] = sel[:, None]
+                y = self.schur(q.reshape(-1, ks.size)).reshape(cq.nco, L, ks.size)
+                blocks[rows, self.slot[c], :, k:k + ks.size] = y.astype(blocks.dtype)
+                self.probes += int(ks.size)
         cq.fill(blocks[:cq.ncl])
         # the patches, a few thousand at a time
         P9 = 9 * L
@@ -872,11 +933,30 @@ class ColumnStokes:
         a[:cq.nco] = r.reshape(cq.nco, cq.L)
         cq.fill(a[:cq.ncl])
         z = (self.pmid @ a[self.nbr].reshape(cq.nco, 9 * cq.L, 1).astype(self.pmid.dtype)).reshape(-1)
+        self.settle()
         self.times["schur"] += time.time() - t0
         return z.astype(cp.float64)
 
+    def dots(self, V, w):
+        """The dot products of the rows of ``V`` (a few, each as long as ``w``) with ``w``, this
+        rank's part: sums over stretches of 1024 entries, then the sum of those.
+
+        ``V @ w`` is one call of the card's BLAS, and AMD's takes one thread a row for it:
+        170 ms for 4 to 40 rows of 4.7 million unknowns on an MI210 (0.37 s of an iteration's
+        0.60 on an MI250X), which was more than the rest of a Krylov iteration.  In two stages every stretch has a thread: 0.3 to 2 ms
+        (and a product of two vectors 0.2 ms where ``a @ b`` takes 8)."""
+        B = 1024
+        k, n = V.shape
+        main = n - n % B
+        h = self.cp.zeros(k)
+        if main:
+            h += self._rowdot(V[:, :main].reshape(k, -1, B), w[:main].reshape(1, -1, B), axis=2).sum(axis=1)
+        if main < n:
+            h += self._rowdot(V[:, main:], w[None, main:], axis=1)
+        return h
+
     def dot(self, a, b):
-        return self.comm.allreduce(float(a @ b))
+        return allreduce(self.comm, float(self.dots(a[None, :], b)[0]))
 
     def precondition(self, r):
         zu = self.velocity(r[:self.nu])
@@ -913,12 +993,18 @@ class ColumnStokes:
                 z = self.precondition(Vb[k])
                 Zb[k] = z
                 w = self.apply(z)
+                t0 = time.time()
+                h = np.empty(k + 1)
                 for _ in range(2):
-                    h = comm.allreduce(cp.asnumpy(Vb[:k + 1] @ w))
+                    # MPI's own reduction, on a buffer: mpi4py's allreduce pickles the array and
+                    # sends it up and down a tree of the ranks, rank by rank
+                    comm.Allreduce(cp.asnumpy(self.dots(Vb[:k + 1], w)), h)
                     w -= cp.asarray(h) @ Vb[:k + 1]
                     H[:k + 1, k] += h
                 H[k + 1, k] = np.sqrt(self.dot(w, w))
                 Vb[k + 1] = w / H[k + 1, k]
+                self.settle()
+                self.times["orthogonalization"] += time.time() - t0
                 total += 1
                 y, *_ = np.linalg.lstsq(H[:k + 2, :k + 1], gvec[:k + 2], rcond=None)
                 rel = float(np.linalg.norm(H[:k + 2, :k + 1] @ y - gvec[:k + 2])) / bnorm

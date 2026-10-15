@@ -186,7 +186,7 @@ class Run:
         if a.solver == "columns":
             import matrixfree
             self.pb.solver = matrixfree.ColumnStokes(self.pb, rtol=a.krylov_rtol, forcing=True, restart=80,
-                                                     coarse="direct" if self.comm.size == 1 else "ilu")
+                                                     coarse="direct" if self.comm.size == 1 and st.have_cudss() else "ilu")
         self.pb.forward_rtol = a.forward_rtol
         self.fhalf = a.friction_order == 2                # the friction has dofs half way between the grid's nodes
         self.sizes = dict(self.pb.summary(), grid=self.grid.summary())

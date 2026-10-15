@@ -187,6 +187,11 @@ class SeismicModel(hm.Model):
         :math:`J_y^{\\top} W^{\\top} (W y - d)/\\sigma^2` as a parameter dual vector."""
         self.n_adj_solve += 1
         st = x[STATE]
+        if self._lin is not None and self._lin.final is not st.final:
+            # the point of the last Hessian actions belongs to another forward field: its
+            # two states would stay on the device through this sweep, the one that holds
+            # the most there (the solver sets its point again once this gradient is known)
+            self._lin.final = None
         self.engine.set_parameter(st.m)
         q = self.data.apply_transpose(self._residual(st.y)) / self.noise_std
         out.g = self.engine.adjoint(q[None], final=st.final)[0]
@@ -228,6 +233,10 @@ class SeismicModel(hm.Model):
         if self._lin is None:
             raise RuntimeError("setPointForHessianEvaluations has not been called")
         self.engine.set_parameter(self._lin.m)
+        if self._lin.final is None:
+            # given up for a gradient at another point (solveAdj): propagate again
+            self.engine.forward()
+            self._lin.final = self.engine.final_state()
         return self._lin
 
     def applyC(self, dm, out):

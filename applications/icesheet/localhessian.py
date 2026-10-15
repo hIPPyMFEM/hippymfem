@@ -44,8 +44,10 @@ import scipy.sparse as sp
 
 
 def lattice(xy, origin, step):
-    """The integer coordinates of dofs on their lattice of spacing ``step``."""
-    return np.rint((np.asarray(xy)[:, :2] - np.asarray(origin)) / step).astype(np.int64)
+    """The integer coordinates of dofs on their lattice of spacing ``step``, in as many
+    dimensions as ``origin`` has (two for the bed of an ice sheet, three for a volume)."""
+    origin = np.asarray(origin)
+    return np.rint((np.asarray(xy)[:, :origin.size] - origin) / step).astype(np.int64)
 
 
 def spacing(reach, step):
@@ -53,15 +55,22 @@ def spacing(reach, step):
     return max(2, int(np.ceil(2.0 * reach / step - 1e-9)))
 
 
-def comb_products(apply_block, IJ, s, chunk=256, log=None, only=None, late=None):
-    """``H`` times each of the ``s^2`` combs (or those numbered ``only``): ``(n, combs)``
+def comb_products(apply_block, IJ, s, chunk=256, log=None, only=None, late=None, stride=1, anchor=0):
+    """``H`` times each of the ``s^d`` combs (or those numbered ``only``): ``(n, combs)``
     float32 in their order, each dof's comb, and how many were done (``late()`` true ends
-    the loop early)."""
-    n = IJ.shape[0]
-    color = (IJ[:, 0] % s) * s + (IJ[:, 1] % s)
-    which = np.arange(s * s) if only is None else np.asarray(only)
+    the loop early).
+
+    The teeth are the nodes ``anchor + stride * i``, every node by default; the comb of a
+    tooth is ``i mod s`` in each of the ``d`` dimensions, and a node between the teeth has
+    no comb (-1).  With a stride the columns read off the products are those of a lattice
+    of sample points, which is what the point spread function method interpolates
+    (``applications/marmousi/psf.py``)."""
+    n, d = IJ.shape
+    q, r = np.divmod(IJ - np.asarray(anchor), stride)
+    color = np.where((r == 0).all(axis=1), np.ravel_multi_index(tuple((q % s).T), (s,) * d), -1)
+    which = np.arange(s ** d) if only is None else np.asarray(only)
     HM = np.zeros((n, which.size), dtype=np.float32)
-    place = -np.ones(s * s, dtype=np.int64)
+    place = -np.ones(s ** d + 1, dtype=np.int64)        # one entry more: the one a node of no comb reads
     place[which] = np.arange(which.size)
     rows = np.arange(n)
     t0 = time.time()

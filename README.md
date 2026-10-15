@@ -205,8 +205,13 @@ at their size and beyond: [`seismic/`](applications/seismic/), the wave speed of
 from seismograms (Bui-Thanh et al., SC12), an explicitly stepped wave equation with a forward
 solve on 24.2 billion unknowns, and [`icesheet/`](applications/icesheet/), the friction under
 the Antarctic ice sheet from the velocity of its surface (Isaac et al., J. Comput. Phys.
-2015), a full Stokes problem with a forward solve on 1.09 billion unknowns.  Both fetch their
-data on first use, and the ice sheet needs CuPy beside the library; their READMEs say how
+2015), a full Stokes problem with a forward solve on 1.09 billion unknowns.  A third follows
+a method rather than a size: [`marmousi/`](applications/marmousi/), the wave speed under a sea
+bed from the shots of a survey over the Marmousi model, extended to three dimensions (Hu et
+al., arXiv:2507.10804), with the misfit Hessian approximated by point spread functions, which
+are built from products with combs of impulses, as the ice sheet's sparse Hessian is, and
+applied by Fourier transforms on the GPUs.  All three fetch their data with a command of their
+own before a first run, and the ice sheet needs CuPy beside the library; their READMEs say how
 they are run.
 
 ## Cross-validation against hIPPYlibx

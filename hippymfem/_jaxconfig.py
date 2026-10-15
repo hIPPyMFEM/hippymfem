@@ -161,6 +161,35 @@ if "rocm" in os.environ["JAX_PLATFORMS"] and "command_buffer" not in os.environ.
     # client starts, which is after this point even if jax was imported first.
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "")
                                + " --xla_gpu_enable_command_buffer=").strip()
+#: Why ROCPROFILER_REGISTER_ENABLED=0 may have come too late: it was not in the environment,
+#: and the cards' runtime may have been started before this import.  ``None`` otherwise.
+PROFILER_LATE = None
+if "rocm" in os.environ["JAX_PLATFORMS"]:
+    # JAX's ROCm plugin is linked with AMD's profiler library (librocprofiler-sdk), and the
+    # runtime, finding that library in the process, hands it every kernel launch on its
+    # way to the card whether or not anything is being profiled.  That layer does not
+    # survive a full launch queue (ROC_AQL_QUEUE_SIZE packets, 16384 unless told): with
+    # more launches pending than the queue holds the process ends in a segmentation fault
+    # inside libhsa-runtime64, or the queue aborts with "The AQL packet is malformed"
+    # (ROCm 7.2.0, on MI210 and MI250X).  JAX hands launches over without waiting, so a
+    # loop of compiled calls whose results nothing reads gets there: forty time steps of a
+    # hundred element chunks each did every time, a loop of assemblies now and then, by
+    # how fast the card drained the queue (a suite that ended in a segmentation fault once
+    # in fifteen runs).  Without the profiler's layer the runtime waits for room itself.
+    # ROCPROFILER_REGISTER_ENABLED=1 in the environment keeps the layer, for a run under
+    # AMD's profiler.  Each library of the runtime (HSA, HIP) reads the variable when it
+    # registers with librocprofiler-register, which is at its first use and not when it is
+    # loaded: after this point, unless the card was used before this module was imported.
+    # MPI_Init of an MPI library with GPU support does that (Cray MPICH with
+    # MPICH_GPU_SUPPORT_ENABLED=1 calls hsa_init there) where mpi4py is imported before
+    # hippymfem, as applications/icesheet/scale.py has it; CuPy or a jax that has computed
+    # would.  Such a program has to have the variable in its environment (PROFILER_LATE).
+    if ("ROCPROFILER_REGISTER_ENABLED" not in os.environ and "mpi4py.MPI" in sys.modules
+            and os.environ.get("MPICH_GPU_SUPPORT_ENABLED", "0") == "1"):
+        PROFILER_LATE = ("mpi4py was imported before hippymfem with MPICH_GPU_SUPPORT_ENABLED=1: "
+                         "MPI_Init has started the cards' runtime, which read "
+                         "ROCPROFILER_REGISTER_ENABLED then; set it to 0 in the job's environment")
+    os.environ.setdefault("ROCPROFILER_REGISTER_ENABLED", "0")
 
 
 #: The GPU ids this process could use before :func:`_pin_visible_device` narrowed the

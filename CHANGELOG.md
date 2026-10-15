@@ -21,6 +21,91 @@
   (`earth.py fetch`, `antarctica.py fetch`); their READMEs have the commands, the
   results and what was checked.  They are not part of the continuous integration, which
   has neither their data nor a GPU.
+- **A third application: the Marmousi model in three dimensions with a point spread
+  function Hessian.**  `applications/marmousi/` takes the inversion of Hu, Alger, Nammour
+  and Ghattas (arXiv:2507.10804, 2025) from the paper's two-dimensional section to a box
+  of 9.2 x 2.4 x 2.4 km: acoustic waves with absorbing faces on the seismic application's
+  propagator, the wave speed's offset trilinear on the elements as the unknown, the
+  library's bi-Laplacian prior as a stencil on that lattice, and the misfit Hessian
+  approximated by the paper's point spread functions, read off products with combs of
+  unit vectors (the ice sheet's `localhessian.comb_products`, extended to steps, anchors
+  and any dimension) and applied as a product-convolution by Fourier transforms of small
+  boxes on the GPUs, with a halo from the neighbouring ranks and no global transform.
+  `(H~ + R)^-1` is the initial inverse Hessian of the driver's L-BFGS, the preconditioner
+  of `ReducedSpaceNewtonCG` and the Laplace approximation that `gpCNKernel` proposes from.
+  On a small case where the data dominate the prior, L-BFGS with it reaches a gradient of
+  1e-4 of the first in 95 to 111 propagations of all shots, where L-BFGS without a
+  preconditioner has 1.1e-4 after 310 and with the prior needs 353.  `run.py` runs the
+  inversion in stages that resume (a farm of shots, or one box cut into blocks);
+  `scale.py` times the sweeps and the operator at any size.  The README has the commands,
+  the results.  `--psf-amplitude` scales the operator by the Hessian's local size, estimated
+  from products with white vectors, and `--inner-precondition levels` preconditions the
+  inner solve by a factor whose symbol follows the window from node to node (about 60
+  iterations where the prior's takes 750): with both, L-BFGS reaches 1e-6 of the first
+  gradient in 204 propagations and 425 s on 32 GPUs, where without a preconditioner it has
+  1.1e-4 after 310 propagations and 617 s.
+- **The seismic propagator for boxes** (`applications/seismic/sem.py`, defaults unchanged
+  for the globe): first-order absorbing faces whose forward boundary values are kept for
+  the backward sweep, a stiffness applied through slices of a 3D array of the unknowns on
+  a mesh of equal bricks (0.097 ms a step a million unknowns on an MI250X GCD, 7.5 times
+  the globe's kernel), shots as matrices of source amplitudes so that nothing is compiled
+  from one shot to the next, and the exchange of a step behind its update
+  (`HIPPYMFEM_SEM_OVERLAP`, `auto` by default where the exchange goes from GPU memory to
+  GPU memory and a rank holds at least 16 million unknowns times the fields): the same
+  bits as before, and on 512 GPUs of Frontier 93 to 95 % of one GPU's step for cubes of
+  192 million unknowns a rank and 99 to 100 % for columns (88 to 93 % and 95 to 98 %
+  without it).  The globe of the seismic application on 8 GPUs takes the same 154 ms a
+  step with it, and 1 % less with two fields.
+- **The two applications on AMD cards, and their weak scaling to 4096 GPUs of Frontier**
+  (MI250X; a rank has one of a card's two GPUs).  The seismic propagator is JAX and ran
+  there once the fault of the launch queue below was cured.  The ice sheet's solver
+  without a matrix (`--solver columns`) runs with CuPy's ROCm build beside JAX; its two
+  solvers that factorize need cuDSS and have no counterpart there.
+  `seismic/scale.py --n 64 --keys` with one refinement more for eight times the ranks has
+  7 798 784 elements and 211 million unknowns on every rank: on 4096 ranks, 862 596 390 337
+  unknowns in double precision, a forward step takes 154.6 ms and the two-field sweeps of
+  a Hessian action 186.3 and 194.9 ms, 99.7, 99.2 and 99.4 % of one GPU (the mean of eight
+  one-rank runs on the GPUs of a node), with the adjoint identity to 1.9e-15; in single
+  precision at `--n 80`, 1 710 194 718 145 unknowns, 140.5 ms, 100.2 %.
+  `icesheet/scale.py --measure` with `--res R --nz 3 --refine 3` on 4 (32/R)^2 ranks has
+  7 500 columns of 24 layers and 4.6 million unknowns on every rank: on 4096 ranks,
+  18 927 600 204 unknowns, a product with the Jacobian takes 0.066 s (93 % of one GPU),
+  the preconditioner's set-up 6.6 to 6.8 s (80 %), a Krylov iteration 0.488 s (47 %: the
+  collapsed problem's conjugate gradients on the host take 19 iterations where they take
+  one on one rank) and 0.289 s with `--coarse-maxit 4` (79 %), which leaves the outer
+  iterations of a solve as they are (70 and 70 on 64 ranks, 251 against 257 on 256).
+  With 88 layers 68 330 755 212 unknowns take 0.80 s an iteration, 90 % of one GPU, and
+  133 s a set-up.  A solve to 1e-6 from the same state takes 17, 23, 34, 70 and 257
+  Krylov iterations at 40, 20, 10, 5 and 2.5 km: the limit the application's README
+  names, measured further.  Both READMEs have the tables.
+- **The seismic propagator's exchange from card to card** (`HIPPYMFEM_DEVICE_MPI`,
+  `sem.DEVICE_MPI`, `Interface.swap_device`, `SpectralWave._swap_device`).  The values a
+  rank shares are gathered on its card, and MPI is handed the addresses of that array and
+  of a device array kept for the neighbours' (JAX's `unsafe_buffer_pointer`), where the
+  library knows device memory: `auto` takes Cray MPICH's `MPICH_GPU_SUPPORT_ENABLED=1`,
+  which it does not start with unless its transport library for the cards is loaded.  On
+  Frontier 22 MB a rank to 2 to 12 neighbours take 0.6 to 1.3 ms so, on one node and
+  between two, against 3.5 ms in MPI and 3.6 ms back to the card through host arrays,
+  after the 3.6 ms a run takes to bring them to the host; a step of 211 million unknowns a
+  rank on 512 GPUs takes 153.8 ms in the place of 165.0 (one field) and 185.0 in the place
+  of 213.8 (two).  With that library loaded the cards' runtime is started by `MPI_Init`: a
+  program that imports mpi4py before hippymfem has to have the setting of the entry on the
+  launch queue under Fixed in its environment (`_jaxconfig.PROFILER_LATE` says when it
+  came too late).  The ice sheet's solver keeps its exchanges on the host (a megabyte
+  each): from CuPy's arrays runs with that MPI hung now and then on 8, 256 and 1024 ranks,
+  and why was not found out.
+- **`icesheet/scale.py --measure`**: what a job of a few minutes can time of the solver
+  without a matrix, the same work at every size and with every rank's own clock (the
+  minimum, the mean and the maximum over the ranks in the record): a residual, the
+  preconditioner's set-up with its parts, a product with the Jacobian, an application of
+  the preconditioner, `--krylov-its` Krylov iterations whatever the residual does, and
+  with `--krylov-count` the iterations of one solve; at the solution of `--start-from` or
+  at the shallow-ice state of the grid (`IceSheet.shallow_ice`), which takes no solve.
+  Its timers wait for the card (`ColumnStokes(wait=True)`, `settle`), and the solver's
+  record has the seconds of its exchanges and of its orthogonalization.  `ICESHEET_DATA`
+  names the folder of the grids (rank 0 reads and broadcasts; a missing grid is an error,
+  not a rebuild on every rank), `--coarse amg` and `--checkpoint-every` are new options,
+  and CuPy and the element kernels are checked to be on one card when the solver is built.
 - **The blocks of a linearization point in the single-precision hypre**
   (`HIPPYMFEM_SINGLE_BLOCKS=1`, `single_blocks`; `fem.tdofassemble.SINGLE_BLOCKS`,
   `PDEVariationalProblem._single_blocks`, `singlesolve.SingleParMatrix.keep_transpose`).
@@ -687,6 +772,63 @@
 
 ### Changed
 
+- **The seismic propagator numbers a rank's unknowns in the order its elements meet them**
+  (`sem.first_touch`, with `--keys`), not in the order of their keys.  The gather and
+  the scatter of every step read and write the unknowns of neighbouring elements, and
+  the elements of a refined mesh come in an order that keeps neighbours together.  On an
+  MI250X a step of 211 million unknowns takes 154.1 ms in the place of 161.3 (two fields
+  184.9 for 196.4); numbered at random a step of 27 million takes twice as long (22 and
+  44 ms on an MI210).  The
+  ranks of a run, whose pieces of the mesh lie differently across the keys, also differ
+  less: on 512 GPUs a rank's own time was 157.6 to 167.0 ms and is 146.9 to 152.6, which
+  took the weak scaling there from 96 to 100 % of one GPU.  Results are the same numbers
+  in another order (the receivers' extreme and the shared unknowns of every size are
+  unchanged, and the adjoint identity holds to round-off as before).
+- **The seismic application's set-up and its exchange through the host.**  The 64 keys of
+  each element come from a compiled loop where the library would use one (40 s a rank at
+  7.8 million elements became 4); the search for the elements of the sources and
+  receivers looks at the rank's own box first and then at one coordinate (29 s became
+  4); the coarse mesh is handed to MFEM as arrays; `scale.py --dt-limit` takes the
+  stability limit from a run before.  The set-up of a run of 211 million unknowns a rank
+  on 512 GPUs takes 70 s where it took 141.  Through host arrays the
+  receives are posted before the element work, into arrays that are kept, in the fields'
+  own precision, and what a rank sends comes from its card in pieces of 16 MiB
+  (`HIPPYMFEM_SEM_PIECE`; glibc maps new memory for every array above 32 MiB): the
+  two-field sweeps on 512 GPUs take 213.8 and 222.7 ms where they took 256.7 and 266.0
+  (11 ms of that is the numbering of the entry above).
+  The mass perturbations and the fold of the backward sweep are computed a piece of
+  elements at a time, the power iteration of the stable step stays in the fields'
+  precision, and `SeismicModel` gives up the final states of a linearization point it has
+  left.  `scale.py` prints and records, over the ranks, a rank's own time, its wait for
+  the element work, its copies and its time in MPI, with the neighbours and the values
+  sent.
+- **The ice sheet's solver without a matrix on AMD cards** (`matrixfree.ColumnStokes.dots`,
+  `_probe`, `probe_bytes`).  The two classical Gram-Schmidt passes of FGMRES multiplied
+  the Krylov vectors with the new one through the card's BLAS, and hipBLAS takes a thread
+  a row for a few long rows: 170 ms for 4 to 40 rows of 4.7 million, 8 ms for one dot
+  product (on an MI210; on an MI250X the change took 0.37 s off an iteration).  Sums
+  over stretches of 1024 entries by one reduction kernel, then the sum of those, take 0.3
+  to 2 ms and 0.2 ms, on any card.  The probing of the Schur complement
+  takes several levels of a colour in one product (as many as `probe_bytes` allow, the
+  same number on every rank): the pass over the element matrices of `B` and the launches
+  of the solves on the columns serve them all.  At 24 levels and 4.7 million unknowns on
+  one MI250X GPU a set-up takes 5.4 s in the place of 11.5 and a Krylov iteration 0.23 s
+  in the place of 0.60, with the Krylov counts of a forward solve unchanged step by
+  step; at 88 levels the probing is still 124 of a set-up's 133 s.  The reductions of an
+  iteration are MPI's own.
+- **The ice sheet's set-up** (`antarctica.Columns.mesh3d`, `mesh2d`;
+  `IceSheet._footprint_map`, `set_checkpoint`; and in the library
+  `FunctionSpace._node_coordinates`, `BoundaryGroup._build`).  The serial meshes are
+  handed to MFEM as arrays (27 s became 4 at 5.3 million hexahedra); the footprint is cut
+  as the columns are and its map to the bed is made from the rank's own nodes, where every
+  rank had gathered and sorted every footprint node of the mesh (495 MB to each of 4096
+  ranks); the coordinates of a space's nodes are one product for all elements and are kept
+  by the space until the mesh moves (identical to the last bit, 6 to 11 times faster, and
+  computed once a space however often they are asked for); the inverses and the normals of
+  a group of boundary faces are taken for all points at once; a checkpointed solve writes
+  its iterate when it stops or ends, not after every Newton step (`--checkpoint-every` for
+  more).  The set-up of a problem of 4.6 million unknowns a rank takes 10 s where it took
+  27, and 25 s on 4096 ranks.
 - **The Newton benchmark takes the small geometric levels to host memory and the prior's
   cycles over the meshes by default** (`bench_newton_device.py --pmg-h-host`, `--prior-h`).
   For a mesh built by cuts (`--h-levels`) the solvers' `pmg_h_host` is 5000 and the prior's
@@ -964,6 +1106,42 @@
 
 ### Fixed
 
+- **On AMD cards a program that queued more kernel launches than the runtime's queue holds
+  ended in a segmentation fault** (`_jaxconfig`: `ROCPROFILER_REGISTER_ENABLED=0` unless
+  the environment says otherwise).  JAX's ROCm plugin is linked with AMD's profiler
+  library, and the runtime, finding it in the process, hands it every launch on its way
+  to the card whether or not anything is profiled.  That layer does not survive a full
+  launch queue (16 384 packets): the process falls inside `libhsa-runtime64`, or the
+  queue aborts with "The AQL packet is malformed".  JAX hands launches over without
+  waiting, so a loop of compiled calls whose results nothing reads gets there: forty
+  time steps of the seismic propagator on one rank did every time (3 of 3 runs on an
+  MI210; with the setting 3 of 3 pass, at the same speed), and this was the fault that
+  ended `test_gpu` on one rank now and then (5 of 82 runs before; none of 52 with the
+  setting, none of 52 with a queue of 2^20 packets, which only moves the limit).  Without
+  the profiler's layer the runtime waits for room in its queue.  The runtime reads the
+  variable at its first use: a program whose MPI starts it in `MPI_Init` (Cray MPICH with
+  its GPU support) and that imports mpi4py before hippymfem has to have the variable in
+  its environment, and `_jaxconfig.PROFILER_LATE` says so then.
+- **The seismic propagator lost sources and receivers on fine meshes, and the copies of
+  an unknown shared by three or more ranks drifted apart** (`sem.locate`, `_merge_fn`).
+  The Newton iteration that finds a point's element stopped only below 1e-13 in
+  reference units, which round-off does not reach in elements of a few kilometres: with
+  the paper's mesh refined four and five times (512 and 4096 ranks) 2 and about 20 of
+  110 points were left without an element and the run stopped after its whole set-up.
+  It now also ends when the increment, already below 1e-8, has stopped falling.  And XLA
+  rewrote the sum of the sharers' values so that a rank third or later among them added
+  its own first: such copies differed in their last bits and, the field never being
+  exchanged, drifted (5e-10 of the field in double precision after 16 000 steps on
+  made-up ranks, 16 % in single).  An optimization barrier holds the order.  And a point
+  near a cut between ranks went to the lowest rank that found it within the search's
+  tolerance of 2 % of an element, also where another rank held the element it lies in:
+  on three made-up ranks two of 105 receivers were read 1.1 % of an element from their
+  place.  A point now goes to the rank whose element it is least outside of, which is the
+  element one rank alone gives it.
+- **`icesheet/scale.py --steps` with `--solver columns` handed the solver a matrix**, and
+  `misfit_hessian_sqrt_block` imported CuPy where it needed none; `run.py` on one rank
+  asks for the factorization of the collapsed problem on the card only where cuDSS is
+  installed, and `--solver dd` or `cudss` without it ends in one line.
 - **A matrix assembled chunk by chunk on a mesh of several kinds of element was wrong**
   (`fem.pattern.ScatterPattern._fused_maps`, `_array_order`).  Where the kinds of element
   of a mesh interleave (triangles among quadrilaterals) a pattern keeps its slots in the

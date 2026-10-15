@@ -199,11 +199,17 @@ class IceSheet(PDEProblem):
         if partition == "columns" and comm.size > 1:
             # whole columns on a rank: the strong vertical coupling of a thin ice sheet
             # then stays inside a subdomain (see BlockJacobiCuDSS)
-            part = mfem.intArray(np.tile(column_partition(columns, comm.size), columns.nz).tolist())
+            cut = column_partition(columns, comm.size)
+            part = mfem.intArray(np.tile(cut, columns.nz).tolist())
             self.mesh = mfem.ParMesh(comm, columns.mesh3d(), part.GetData())    # PyMFEM wants the pointer
+            # the footprint cut as the columns are: a rank then holds the footprint node under
+            # each of its bed nodes, and the map between them (_footprint_map) asks nothing of
+            # the ranks that are not its neighbours
+            part = mfem.intArray(cut.tolist())
+            self.mesh2 = mfem.ParMesh(comm, columns.mesh2d(), part.GetData())
         else:
             self.mesh = mfem.ParMesh(comm, columns.mesh3d())
-        self.mesh2 = mfem.ParMesh(comm, columns.mesh2d())
+            self.mesh2 = mfem.ParMesh(comm, columns.mesh2d())
         if on_mesh is not None:
             on_mesh(self.mesh, 0)             # the mesh of the columns, before it is refined
         for k in range(refine):
@@ -258,8 +264,9 @@ class IceSheet(PDEProblem):
         self.t_setup = time.time() - t0
 
     # -------------------------------------------------------------- geometry
-    def column_fields(self, xy):
-        """Bilinear interpolation of the grid's node fields at points ``(n, 2)`` (km)."""
+    def column_fields(self, xy, more=None):
+        """Bilinear interpolation of the grid's node fields at points ``(n, 2)`` (km), and of the
+        node fields of the dictionary ``more`` with them."""
         g = self.columns.grid
         fx = (xy[:, 0] - g.xn[0]) / g.h
         fy = (xy[:, 1] - g.yn[0]) / g.h
@@ -274,7 +281,8 @@ class IceSheet(PDEProblem):
             num = sum(wi * a[ji] * used[ji] for wi, ji in zip(w, c))
             den = sum(wi * used[ji] for wi, ji in zip(w, c))
             return num / np.maximum(den, 1e-12)
-        return {k: interp(getattr(g, k)) for k in ("s", "b", "Ts", "acc", "ghf")}
+        fields = dict({k: getattr(g, k) for k in ("s", "b", "Ts", "acc", "ghf")}, **(more or {}))
+        return {k: interp(a) for k, a in fields.items()}
 
     def rate_coefficient(self, xyz):
         """``B = A(T)^{-1/n}`` (MPa a^{1/n}) at points, ``T`` from the column model."""
@@ -290,6 +298,28 @@ class IceSheet(PDEProblem):
         T = np.minimum(T, -an.BETA_CC * Hm * (1.0 - zeta))
         return an.rate_factor(T) ** (-1.0 / GLEN)
 
+    def shallow_ice(self, xy, zeta, logf):
+        """The velocity ``(3, columns, levels)`` (km/a) and the pressure ``(columns, levels)``
+        (MPa) of the shallow-ice approximation on the columns at ``xy`` (``(columns, 2)``, km),
+        at the heights ``zeta`` of the thickness above the bed: the ice slides at its driving
+        stress over the friction ``exp(logf)`` (at the grid's nodes) and shears under it by
+        Glen's law with the rate factor of the bed; the pressure is the weight of the ice above.
+        Not a solution: a state with the strain rates of one, which takes no solve and is the
+        same function on every mesh (``scale.py --measure`` linearizes there)."""
+        g = self.columns.grid
+        # the slope of the surface at the grid's nodes from the ice alone: across a margin the
+        # surface would fall to zero within a cell, so a node there takes its neighbour's slope
+        s = np.where(g.node_used, g.s, np.nan)
+        f = self.column_fields(xy, {"sx": an._fill_nan(np.gradient(s, g.h, axis=1)),
+                                    "sy": an._fill_nan(np.gradient(s, g.h, axis=0)), "logf": logf})
+        H = np.maximum(f["s"] - f["b"], an.H_MIN / 1e3)
+        tau = -an.RHO_G * H * np.stack((f["sx"], f["sy"]))                 # the driving stress
+        A = self.rate_coefficient(np.column_stack((xy, f["b"]))) ** -GLEN
+        shear = 2.0 * A / (GLEN + 1.0) * np.hypot(*tau) ** (GLEN - 1.0) * H
+        u = np.zeros((3, xy.shape[0], zeta.size))
+        u[:2] = tau[:, :, None] * (np.exp(-f["logf"])[:, None] + shear[:, None] * (1.0 - (1.0 - zeta) ** (GLEN + 1.0)))
+        return u, an.RHO_G * H[:, None] * (1.0 - zeta)
+
     def _footprint_map(self):
         """The parallel matrix copying a footprint field onto the bed nodes of its 3D space."""
         comm = self.comm
@@ -299,11 +329,16 @@ class IceSheet(PDEProblem):
         def keys(xy):
             k = np.rint((xy - np.array([g.xn[0], g.yn[0]])) / step).astype(np.int64)
             return k[:, 0] * 10 ** 7 + k[:, 1]
-        x2 = self.Vm.coordinates()
-        off2 = self.Vm.fes.GetMyTDofOffset()
-        k2 = keys(x2)
-        allk = np.concatenate(comm.allgather(k2))
-        allg = np.concatenate(comm.allgather(off2 + np.arange(k2.size, dtype=np.int64)))
+        Vm = self.Vm
+        off2, n2 = Vm.fes.GetMyTDofOffset(), Vm.fes.GetTrueVSize()
+        # the footprint nodes this rank holds, its own and on its rim its neighbours', with
+        # their global numbers, which the prolongation brings as it brings values (as
+        # matrixfree.NodeColumns numbers its lines): where the footprint is cut as the
+        # columns are, the node under every bed node of the rank is one of them
+        v = Vm.vector()
+        v.array[:] = off2 + np.arange(n2, dtype=np.float64)
+        allg = np.rint(Vm.local_values(v)).astype(np.int64)
+        allk = keys(Vm._node_coordinates())
         order = np.argsort(allk)
         allk, allg = allk[order], allg[order]
         marker = mfem.intArray([1 if a == an.Columns.BED else 0
@@ -313,15 +348,29 @@ class IceSheet(PDEProblem):
         bed = np.asarray(ess.ToList(), dtype=np.int64)
         x3 = self.Vf.coordinates()
         kb = keys(x3[bed, :2])
-        pos = np.searchsorted(allk, kb)
-        if bed.size and (np.any(pos >= allk.size) or np.any(allk[np.minimum(pos, allk.size - 1)] != kb)):
+
+        def under(allk):
+            """Where the bed nodes' keys are in ``allk``, and whether every one of them is there."""
+            pos = np.minimum(np.searchsorted(allk, kb), max(allk.size - 1, 0))
+            return pos, bool(not bed.size or (allk.size and np.all(allk[pos] == kb)))
+        pos, found = under(allk)
+        if not comm.allreduce(found, op=MPI.LAND):
+            # the footprint is cut apart from the columns (partition="metis" on several ranks):
+            # every footprint node of every rank on every rank, 16 bytes each
+            k2 = keys(Vm.coordinates())
+            allk = np.concatenate(comm.allgather(k2))
+            allg = np.concatenate(comm.allgather(off2 + np.arange(n2, dtype=np.int64)))
+            order = np.argsort(allk)
+            allk, allg = allk[order], allg[order]
+            pos, found = under(allk)
+        if not found:
             raise RuntimeError("a bed node has no footprint node under it")
         import scipy.sparse as sp
 
         n3 = self.Vf.fes.GetTrueVSize()
         csr = sp.csr_matrix((np.ones(bed.size), (bed, allg[pos])), shape=(n3, int(self.Vm.fes.GlobalTrueVSize())))
         self.bed_tdofs = bed
-        return scipy_to_hypre(csr, col_starts=np.array([off2, off2 + k2.size]))
+        return scipy_to_hypre(csr, col_starts=np.array([off2, off2 + n2]))
 
     def to_bed(self, m2, out=None):
         """The footprint field ``m2`` on its 3D space (the bed's nodes; zero elsewhere)."""
@@ -438,16 +487,22 @@ class IceSheet(PDEProblem):
         self.counters["solve_s"] += time.time() - t0
 
     # ------------------------------------------------------------- forward
-    def set_checkpoint(self, folder, deadline=None, warm=False, budget_end=None):
-        """Save the iterate of a forward solve from rest in ``folder`` after every Newton
-        step and continue from the one that is there, for a solve longer than a job;
+    def set_checkpoint(self, folder, deadline=None, warm=False, budget_end=None, every=0):
+        """Save the iterate of a forward solve from rest in ``folder`` when the solve stops
+        (at its deadline, at its budget, or because Newton's method gives up) and when it
+        ends, and continue from the one that is there, for a solve longer than a job;
         ``deadline`` (a ``time.time()`` value): raise ``ForwardStopped`` after the first
         step that ends later.  The checkpoint is one array per rank, so the next job has
         to run on as many ranks (the partition by columns is the same then).  ``warm``:
         for a solve started from a given state (:meth:`start_from`) as well, which every
         job of the run has to be given again.  ``budget_end`` (a ``time.time()`` value):
-        a Newton step is not started if, judged by the last one, it would end after it."""
-        self._ck = dict(folder=folder, deadline=deadline, slot=1, warm=warm, budget_end=budget_end)
+        a Newton step is not started if, judged by the last one, it would end after it.
+        The iterate is written once the solve has stopped, after the deadline or the
+        budget: the job needs the time of that write beyond them (no step before it has
+        measured it).  ``every``: save the iterate after every so many Newton steps as
+        well (1: after each, for a job that may end without notice; the array of a rank
+        with 660 thousand elements is 133 MB, and 4096 of them are 547 GB a step)."""
+        self._ck = dict(folder=folder, deadline=deadline, slot=1, warm=warm, budget_end=budget_end, every=int(every))
         if self.comm.rank == 0:
             os.makedirs(folder, exist_ok=True)
         self.comm.Barrier()
@@ -577,6 +632,7 @@ class IceSheet(PDEProblem):
             floors = [1e-1, 1e-2, 1e-3, 1e-4]
             stages = ([f * f for f in floors if f * f > self.eps2] if continuation else []) + [self.eps2]
         its, first, r0_first, t_before, rn_resume, last_step = 0, 0, None, 0.0, None, None
+        unsaved = None                        # the record of an iterate that is not in the checkpoint yet
         floor = self.floor_rtol * self.rest_residual(m3)
         ck = self._ck if self._state0 is None or (self._ck or {}).get("warm") else None
         if ck is not None:
@@ -619,6 +675,8 @@ class IceSheet(PDEProblem):
                 if rn <= max((rtol if final else 1e-3) * r0, floor):
                     break
                 if patience is not None and k >= patience and rn > 0.1 * r0:
+                    if unsaved is not None:
+                        self._ck_write(u, p, **unsaved)
                     raise RuntimeError("Newton made no headway in %d iterations" % k)
                 if ck is not None and ck.get("budget_end") is not None and last_step is not None:
                     # the step ahead judged by the last one, its solve longer by the digits a
@@ -628,6 +686,8 @@ class IceSheet(PDEProblem):
                         more = max(1.0, np.log(self.solver.rtol) / np.log(last_step["rtol"]))
                     need = last_step["setup"] + 1.25 * more * last_step["solve"] + last_step["rest"]
                     if self.comm.bcast(time.time() + need > ck["budget_end"] if self.comm.rank == 0 else None, root=0):
+                        if unsaved is not None:
+                            self._ck_write(u, p, **unsaved)
                         raise ForwardStopped("stopped after %d Newton steps, in stage %d of %d (the next would not end "
                                              "within the job)" % (its, si + 1, len(stages)))
                 f0, s0 = self.counters["factor_s"], self.counters["solve_s"]
@@ -666,11 +726,19 @@ class IceSheet(PDEProblem):
                 its += 1
                 self.counters["newton"] += 1
                 if ck is not None:
-                    self._ck_write(u, p, done=False, stages=stages, stage=si, r0=float(r0), newton=its,
+                    # the iterate is written where the solve stops (here, or before its next step)
+                    # and after every ``every`` steps where that was asked for: a file a rank
+                    # after each step was 547 GB a step on 4096 ranks
+                    unsaved = dict(done=False, stages=stages, stage=si, r0=float(r0), newton=its,
                                    seconds=t_before + time.time() - t0, jobs=jobs, rn_last=float(rn))
+                    if ck.get("every") and its % ck["every"] == 0:
+                        self._ck_write(u, p, **unsaved)
+                        unsaved = None
                     # rank 0's clock: every rank stops at the same step
                     if getattr(self.solver, "timed_out", False) or self.comm.bcast(
                             ck["deadline"] is not None and time.time() > ck["deadline"] if self.comm.rank == 0 else None, root=0):
+                        if unsaved is not None:
+                            self._ck_write(u, p, **unsaved)
                         raise ForwardStopped("stopped after %d Newton steps, in stage %d of %d"
                                              % (its, si + 1, len(stages)))
                 last_step = dict(setup=self.counters["factor_s"] - f0, solve=self.counters["solve_s"] - s0,
@@ -678,6 +746,8 @@ class IceSheet(PDEProblem):
                 last_step["rest"] = time.time() - t_step - last_step["setup"] - last_step["solve"]
             else:
                 if final:
+                    if unsaved is not None:
+                        self._ck_write(u, p, **unsaved)
                     raise RuntimeError("Newton did not converge in %d iterations" % max_iter)
         self.join(u, p, state)
         self._state0 = state.copy()
@@ -803,8 +873,6 @@ class IceSheet(PDEProblem):
         """``C^T J^{-1} B^T W^{1/2} Z`` for white columns ``Z`` (``(n_data, k)``, numpy): vectors whose
         covariance is the Gauss-Newton misfit Hessian, by one block solve each (the right-hand
         sides of posterior samples that do not need a factor of the Hessian)."""
-        import cupy as cp
-
         if batch is None:
             batch = max(4, min(64, int(2.4e8 // (self.nv + self.np))))
         lin = self._lin
@@ -825,6 +893,8 @@ class IceSheet(PDEProblem):
                 out[:, k] = Cs.T @ np.asarray(sol.array[:self.nv])
                 self.counters["incremental"] += 1
             return out
+        import cupy as cp                     # the block solves alone: the branch above needs none
+
         for a in range(0, Z.shape[1], batch):
             cols = slice(a, min(a + batch, Z.shape[1]))
             R = np.zeros((n, Z[:, cols].shape[1]))
@@ -883,6 +953,15 @@ class IceSheet(PDEProblem):
 
 
 # --------------------------------------------------------- linear solvers
+def have_cudss():
+    """Whether NVIDIA's cuDSS can be had here, through nvmath-python (``gpu_direct.py``).  On
+    the cards of another vendor it cannot: the solver there is ``matrixfree.py``, with its
+    collapsed problem on the host."""
+    import importlib.util
+
+    return importlib.util.find_spec("nvmath") is not None
+
+
 class BlockFGMRES:
     """FGMRES on the monolithic Jacobian, right-preconditioned by the block lower
     triangular ``[[A, 0], [B, -S]]^{-1}``: for the velocity block, every rank's diagonal
