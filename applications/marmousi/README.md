@@ -556,7 +556,8 @@ every rank waits at each inner product for the slowest block.
 
 **What has not been run.**  `--psf-amplitude` and `--inner-precondition levels` have run as
 a farm on 32 GPUs and, three L-BFGS iterations, decomposed on 8 (the same iterates as one
-GPU to 3e-12), not on more ranks.
+GPU to 3e-12); the factor of `levels` is checked on 1 to 8 ranks of threads on a host (its
+products and six iterations of the solve against one rank), not on more real ranks.
 On Frontier: the stages `post` and `chain`, the Gauss-Newton-CG solver and a MAP point of
 the paper's box; `post` and the chains have run on one GPU of the small case and on a host,
 the Gauss-Newton-CG solver on a host.  None of the runs used the high-pass filter, the
