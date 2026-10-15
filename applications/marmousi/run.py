@@ -143,6 +143,11 @@ def parse(argv=None):
                         "Gaussian of this width in nodes across and a third of it in depth), the kernels "
                         "of S from the responses divided by a at both ends (0: no amplitude; needs "
                         "--psf-check 1 at least)")
+    g.add_argument("--psf-weight", type=float, default=1.0,
+                   help="the weight of H~ against the prior in the operator H~ + R that preconditions L-BFGS "
+                        "(the objective is not changed): below one a damped Gauss-Newton inverse, which holds "
+                        "back the steps where the data say little and the misfit is far from its quadratic "
+                        "model")
     g.add_argument("--inner-precondition", choices=("prior", "symbol", "split", "levels", "none"), default="prior",
                    help="preconditioner of the conjugate gradients on the operator plus the prior")
     g.add_argument("--inner-rtol", type=float, default=1e-6, help="their relative residual")
@@ -161,6 +166,15 @@ def parse(argv=None):
     g.add_argument("--first-step", type=float, default=100.0,
                    help="L-BFGS: the most its first trial step may change the speed, m/s (there is no "
                         "pair yet to take a scale from)")
+    g.add_argument("--start-from", default=None, metavar="TAG",
+                   help="a new MAP solve starts from the last point of the solve TAG of this folder (from the "
+                        "initial model without it); with --precondition psf its operator is built at that point, "
+                        "from products of the Hessian there: plain L-BFGS through the strongly nonlinear first "
+                        "iterations, the point spread functions where the misfit is nearer its quadratic model")
+    g.add_argument("--max-step", type=float, default=0.0,
+                   help="L-BFGS: the most a trial step may change the speed, m/s, at every iteration (0: only "
+                        "the first is bounded, by --first-step).  A preconditioned direction far from the data "
+                        "can ask for steps that leave the region where the misfit is near its quadratic model")
     g.add_argument("--max-backtrack", type=int, default=10, help="halvings of a step in a line search")
     g.add_argument("--cg-max", type=int, default=50, help="newton: conjugate gradient iterations a step")
     g.add_argument("--lazy-gradient", action="store_true",
@@ -197,8 +211,8 @@ def parse(argv=None):
 #: same when a run is continued
 RUN_ONLY = ("out", "stages", "layout", "time_limit", "verify_shots", "batch", "history", "psf_step",
             "psf_rho", "psf_rho_g", "psf_teeth", "psf_filter", "psf_eta", "psf_blur", "psf_weights",
-            "psf_check", "psf_amplitude", "inner_precondition", "inner_rtol", "inner_maxit", "map_solver", "precondition",
-            "tag", "max_iter", "rtol", "memory", "first_step", "max_backtrack", "cg_max", "lazy_gradient",
+            "psf_check", "psf_amplitude", "psf_weight", "inner_precondition", "inner_rtol", "inner_maxit", "map_solver", "precondition",
+            "tag", "max_iter", "rtol", "memory", "first_step", "max_step", "start_from", "max_backtrack", "cg_max", "lazy_gradient",
             "samples", "var_samples", "post_check", "chain_kernels", "chain_steps", "chain_s", "pcn_s")
 
 
@@ -473,8 +487,9 @@ class Run:
         a = self.args
         blur = 0.25 * kern.rho_g if a.psf_blur is None else a.psf_blur
         amp = self.amplitude()
-        return psf.PSFOperator(halo, kern, window=self.W if amp is None else self.W * amp,
-                               eta=a.psf_eta if eta is None else eta, blur_sigma=blur)
+        # --psf-weight w: H~ = W a S S^T a W times w, as the taper times the square root of w
+        win = (self.W if amp is None else self.W * amp) * float(np.sqrt(a.psf_weight))
+        return psf.PSFOperator(halo, kern, window=win, eta=a.psf_eta if eta is None else eta, blur_sigma=blur)
 
     def approximate_hessian(self, op, precondition=None):
         """``H~ + R`` with its solve, on the lattice and as an operator of the library."""
@@ -893,8 +908,20 @@ def start_hessian(R):
     return R.approximate_hessian(R.operator(kern, halo))
 
 
+def point_hessian(R, m, tag):
+    """``H~ + R`` at the last point ``m`` of the solve ``tag``, from products of the Hessian
+    there with the combs (taken once and kept in the folder, as the stage post does)."""
+    got = psf_products(R, m, "psf_%s_%s" % (tag, R.psf_key()), 0)
+    if got is None:
+        raise SystemExit("marmousi: the time limit came during the comb products at the point of %s" % tag)
+    sample, halos, responses, _, _ = got
+    kern, halo = R.kernels(responses, sample, halos)
+    return R.approximate_hessian(R.operator(kern, halo))
+
+
 def stage_map(R, data):
-    """The MAP point, from the prior's mean (the initial model)."""
+    """The MAP point, from the prior's mean (the initial model), or from the last point of
+    the solve ``--start-from``."""
     a = R.args
     name = "map_" + a.tag
     if R.have(name + ".json"):
@@ -902,8 +929,20 @@ def stage_map(R, data):
         if hist["solver"] != a.map_solver or hist["precondition"] != a.precondition:
             raise SystemExit("marmousi: %s in %s is a solve by %s with %s; give another --tag"
                              % (name, a.out, hist["solver"], hist["precondition"]))
-    hess = start_hessian(R) if a.precondition == "psf" else None
-    return (map_lbfgs if a.map_solver == "lbfgs" else map_newton)(R, name, hess, data)
+    start = None
+    if a.start_from:
+        if a.map_solver != "lbfgs":
+            raise SystemExit("marmousi: --start-from is for --map-solver lbfgs")
+        if not R.have("map_%s.npy" % a.start_from):
+            raise SystemExit("marmousi: --start-from %s: no such solve in %s" % (a.start_from, a.out))
+        start = R.lmap.from_lattice(R.load("map_%s.npy" % a.start_from))
+    if a.precondition != "psf":
+        hess = None
+    else:
+        hess = start_hessian(R) if start is None else point_hessian(R, start, a.start_from)
+    if a.map_solver == "lbfgs":
+        return map_lbfgs(R, name, hess, data, start)
+    return map_newton(R, name, hess, data)
 
 
 def _ended(hist, max_iter):
@@ -940,7 +979,7 @@ def _map_report(R, name, hist, x, data, t0):
              last["sweeps"], time.time() - t0))
 
 
-def map_lbfgs(R, name, hess, data):
+def map_lbfgs(R, name, hess, data, start=None):
     """L-BFGS from the library's pieces (its two-loop recursion with Powell's damping, its
     backtracking line search), the loop here: for a record and a checkpoint of every
     iteration, a time limit, and the reference code's rescaling of the initial inverse
@@ -982,7 +1021,7 @@ def map_lbfgs(R, name, hess, data):
     else:
         if R.root:
             os.makedirs(R.path(pairs), exist_ok=True)
-        x[PARAMETER] = prior.mean.copy()
+        x[PARAMETER] = prior.mean.copy() if start is None else start.copy()
         model.solveFwd(x[STATE], x)
         it, fresh = 0, True
     cost = model.cost(x)
@@ -1074,6 +1113,11 @@ def map_lbfgs(R, name, hess, data):
                 mhat.scale(scale)
             else:
                 alpha = min(1.0, scale)
+        if a.max_step > 0.0:
+            # every trial step moves the speed by --max-step at most
+            big = R.greatest(np.abs(model.offset(mhat)).max())
+            if alpha * big > a.max_step:
+                alpha = a.max_step / big
         mg_old.assign(mg)
         m_old.assign(x[PARAMETER])
         gdm = mg.inner(mhat)

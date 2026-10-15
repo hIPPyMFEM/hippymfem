@@ -43,7 +43,12 @@
   inner solve by a factor whose symbol follows the window from node to node (about 60
   iterations where the prior's takes 750): with both, L-BFGS reaches 1e-6 of the first
   gradient in 204 propagations and 425 s on 32 GPUs, where without a preconditioner it
-  takes 852 propagations and 1544 s.
+  takes 852 propagations and 1544 s.  With the data of the true model everywhere on the
+  paper's box (138 GPUs), where the windowed unknown cannot explain all of them, plain
+  L-BFGS in single precision with the time step at 0.95 of its bound reaches its best model
+  1.76 times sooner than in double precision with the default step, and the point spread
+  function preconditioner does not help; `--max-step`, `--start-from` and `--psf-weight`
+  are the driver's options that were tried for it.
 - **The seismic propagator for boxes** (`applications/seismic/sem.py`, defaults unchanged
   for the globe): first-order absorbing faces whose forward boundary values are kept for
   the backward sweep, a stiffness applied through slices of a 3D array of the unknowns on

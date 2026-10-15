@@ -478,6 +478,40 @@ sweep of a shot takes 4.1 s and the data of all shots 11 s; the products with th
 four check vectors 60 s; `(H0 u, v) = (H0 v, u)` holds to 1.0e-14.  No MAP point has been
 computed at this size.
 
+**A more realistic setting.**  The paper's box again, with the data of the true speed
+everywhere (`--full-truth`: also in the margins and the water, where the window keeps the
+unknown from following it, as in the paper), noise 0.05 of the data, a prior of 100 m/s over
+200 m.  The data now hold arrivals that no point the unknown can reach explains: plain L-BFGS
+passes its best model, 0.47 of the initial model's distance from the truth, after about 50
+iterations, and then the misfit goes on falling while the model error rises again (0.82
+after 164 iterations).  With noise 0.15, near what is left unexplained, the same: 0.48 after
+40 iterations, 0.74 after 138.  A good stopping point matters more here than the last digits
+of the gradient.
+
+What it costs on 138 GPUs (a shot a GPU), plain L-BFGS to its best model:
+
+| | a point (every shot propagated, misfit and gradient) | to the best model error |
+|---|---:|---:|
+| double precision, the time step at 0.8 of its bound (the defaults) | 14.2 s | 0.468 in 729 s |
+| `--float32` | 10.2 s | 0.468 in 526 s |
+| `--float32 --cfl 0.95` | 8.6 s | 0.467 in 414 s |
+
+The waves are 93 % of a point; single precision and a time step closer to the bound (which
+is the stability limit itself; trial points are clipped below the speed it is made for) take
+1.76 times less time to the same model.  `--lazy-gradient` costs time here (17.8 s a point):
+plain L-BFGS hardly backtracks, and a kept point is then propagated twice.
+
+The point spread function preconditioner, which helps where the data fit the
+parametrization, does not help here.  Built at the initial model it lowers the misfit faster
+and moves the model away from the truth (model error 1.9 after two iterations, 2.6 after 23);
+the same with a bound on every step (`--max-step 100`), when it takes over from 30 plain
+iterations (`--start-from`: 0.51 to 1.23), and when damped (`--psf-weight 0.01` and `0.001`,
+the operator's weight against the prior: at best 0.78).  The error goes deep, where the data
+say little: 350 to 670 m/s root mean square between 1.5 and 2.1 km against 100 to 220 m/s for
+plain L-BFGS.  A Gauss-Newton inverse amplifies the directions the data hardly constrain,
+and the residual that no model explains drives them; plain L-BFGS, whose steps follow the
+gradient, leaves them alone.
+
 **Weak scaling of the sweeps.**  `scale.py --check --overlap-both` gives every rank the same
 block and times the three sweeps (one field forward; two fields forward, as a Hessian
 product's incremental solve; two fields backward, as an adjoint solve) over 100 steps, with
