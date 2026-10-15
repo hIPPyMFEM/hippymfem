@@ -517,6 +517,21 @@ small load the exchange is not small (12 million unknowns a rank: 1.26 ms a step
 and 1.54 to 1.58 on eight), which is why a box that one GPU holds is not cut and its shots
 are shared out.
 
+**What the changes are worth on 4096 GPUs**, in one place (milliseconds; a sweep's step for
+192 million wave unknowns a rank, the lattice's products for its points a rank):
+
+| | before: the first series (job 5669854) | after: the final code (job 5680295) |
+|---|---|---|
+| forward, incremental, backward step | 21.38 / 56.80 / 64.64 ms, 87.3 / 90.9 / 92.2 % of one GPU | 20.10 / 54.50 / 62.52 ms, 92.8 / 94.6 / 95.5 % |
+| the same run with the exchange between the halves of the step | | 21.46 / 56.80 / 64.64 ms, 87.0 / 90.8 / 92.4 % |
+| a product with `H~` | 237.8 ms at most for 14.0 million points a rank: 17.0 ns a point | 98.8 ms for 7.2 million: 13.7 ns a point |
+| an iteration of the solve with the prior's preconditioner | 301.5 ms: 21.5 ns a point | 123.7 ms: 17.2 ns a point |
+
+The sweeps' gain is the exchange behind the update, measured both ways in one run; the
+lattice's is the tiles left out and the products compiled whole (the two series have
+different loads a rank, so the lattice's rows compare time a point, not fractions of one
+GPU).
+
 **The operator and the solve with `H~ + R`**, on the same blocks (7.2 million lattice points
 a rank, sample points 16 apart, kernels of radius 8), milliseconds:
 
