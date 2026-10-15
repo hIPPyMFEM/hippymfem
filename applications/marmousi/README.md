@@ -274,6 +274,11 @@ mpirun -n 32 ../../tools/mpirun_pinned.sh python run.py $T --out out/t --stages 
     --inner-precondition levels --inner-rtol 1e-3
 mpirun -n 32 ../../tools/mpirun_pinned.sh python run.py $T --out out/t --stages map --precondition none
 
+# pictures in three dimensions: the pressure of one shot on three planes (one GPU, a minute), then the model
+# in perspective, a turn around it and the shot as animations (NumPy, Matplotlib and Pillow)
+python movies.py record out/movie
+python movies.py draw out/movie
+
 # the box cut into the ranks' blocks in the place of the shots shared out
 mpirun -n 8 ../../tools/mpirun_pinned.sh python run.py $S --out out/blocks --layout decomposed --stages data,verify,psf
 
@@ -389,7 +394,7 @@ solves at which the gradient passes each power of ten of the first:
 
 | `--precondition` | 1e-1 | 1e-2 | 1e-3 | 1e-4 | 1e-5 | at the end | cost above the least after 100 solves |
 |---|---:|---:|---:|---:|---:|---|---:|
-| `none` | 8 | 27 | 87 | | | 1.1e-4 after 310 solves (300 iterations), 617 s | 94 |
+| `none` | 8 | 27 | 87 | 312 | 588 | 9.8e-7 after 852 solves (831 iterations), 1544 s | 94 |
 | `prior` | 25 | 84 | 208 | 353 | | 4.9e-5 after 389 solves (300 iterations), 702 s | 535 |
 | `psf`, mask of radius 2, `--psf-eta 0` | 12 | 28 | 63 | 111 | 165 | 2.0e-6 after 203 solves, 1501 s (its time limit) | 1 |
 | the same, `--inner-rtol 1e-3` | 12 | 28 | 60 | 109 | 166 | 3.1e-6 after 190 solves, 901 s (its time limit) | 1 |
@@ -400,8 +405,8 @@ solves at which the gradient passes each power of ten of the first:
 
 *The second table's solves without a preconditioner, with the prior, and with the operator as in its last row (`--psf-amplitude 2 --inner-precondition levels --inner-rtol 1e-3`), by `python figures.py FOLDER --only convergence`.*
 
-The point spread functions halve the solves to 1e-3 against no preconditioner and reach
-1e-4 and 1e-5 where neither of the others does in 300 iterations; the prior alone is the
+The point spread functions take a third of the solves of no preconditioner to 1e-4 and a
+quarter to 1e-6 (204 against 852, the latter from a second run of 1000 iterations at most); the prior alone is the
 worst, as in the paper (465 steps against 333 without one and 231 with the point spread
 functions there).  The first steps are the exception: to 1e-1 L-BFGS without a
 preconditioner takes 8 solves and with the operator 12.  Two choices made that difference,
@@ -418,7 +423,7 @@ at 5 ms each on the first rank's GPU, against 2 s for the sweeps of a solve on 3
 
 | `--precondition` | 1e-2 | 1e-3 | 1e-4 | 1e-5 |
 |---|---:|---:|---:|---:|
-| `none` | 58 | 175 | not in 617 | |
+| `none` | 53 | 160 | 566 | 1065 |
 | `prior` | 154 | 376 | 636 | not in 702 |
 | `psf`, `--inner-rtol 1e-3` | 132 | 278 | 510 | 782 |
 | the same with `--psf-amplitude 2` | 132 | 272 | 486 | 737 |
@@ -427,7 +432,9 @@ at 5 ms each on the first rank's GPU, against 2 s for the sweeps of a solve on 3
 
 With the inner solve's preconditioner `levels` (below) the operator is as fast as no
 preconditioner to 1e-2 and faster from there on: 1e-3 in 114 s where L-BFGS without one takes
-175 and with the prior 376, and 1e-6 in 425 s, which neither of them reaches.
+160 and with the prior 376, 1e-4 in 214 s against 566 and 636, and 1e-6 in 425 s against
+1544 s without a preconditioner.  (The row of `none` is from its second run, to 1000
+iterations; its first, to 300, took 58 and 175 s to 1e-2 and 1e-3.)
 
 What the operator still gets wrong, measured on the steps of these solves (the pairs of
 steps and gradient differences that L-BFGS keeps): its size.  It holds 0.4 of the Hessian's
@@ -457,6 +464,14 @@ node by hats in its own `u`, so the inverse follows the window from node to node
 57 iterations with the window, about 60 an L-BFGS iteration in the runs above against 750
 with the prior's, and is symmetric and positive by construction.
 
+![The true, the initial and the estimated wave speed of the small case on two sections and a map, in perspective](model3d.png)
+
+*The small case in three dimensions: the speed of the data, the initial model and the MAP
+point of the last row of the table (`--psf-amplitude 2 --inner-precondition levels`) on the
+section along the line through a source, the section across it and a map 0.8 km down
+(`python movies.py draw OUT --folder FOLDER --tag TAG`).  `movies.py` also makes animations:
+a turn around the model and the pressure of one shot crossing the three planes.*
+
 **The paper's box** (423 936 elements of 50 m, 11 626 825 wave unknowns, 444 185
 parameters; 138 shots of 2987 steps, 2208 receivers), a shot a GPU on 138 GPUs.  A forward
 sweep of a shot takes 4.1 s and the data of all shots 11 s; the products with the comb and
@@ -477,7 +492,7 @@ million wave unknowns, five absorbing faces; milliseconds a step and percent of 
 | 32 | 6 125 917 825 | 19.70 / 53.45 / 61.85 | 94.7 / 96.5 / 96.6 | 20.22 / 54.39 / 62.11 | 92.3 / 94.8 / 96.2 |
 | 64 | 12 246 522 625 | 20.13 / 54.58 / 62.57 | 92.7 / 94.5 / 95.4 | 20.74 / 55.56 / 63.17 | 90.0 / 92.8 / 94.5 |
 | 512 | 97 908 438 529 | 20.05 / 54.37 / 62.59 | 93.1 / 94.9 / 95.4 | 21.16 / 56.39 / 64.23 | 88.2 / 91.5 / 93.0 |
-| 4096 | 783 012 621 313 | | | 21.38 / 56.80 / 64.64 | 87.3 / 90.9 / 92.2 |
+| 4096 | 783 012 621 313 | 20.10 / 54.50 / 62.52 | 92.8 / 94.6 / 95.5 | 21.46 / 56.80 / 64.64 | 87.0 / 90.8 / 92.4 |
 
 Columns from the top to the bottom of the box (`--cells 384,384,48 --grid P,Q,1`), as many
 elements, 6 % faster a step than cubes on one GPU (17.60, 49.27, 57.46 ms):
@@ -495,9 +510,9 @@ adjoint identity holds to round-off in every run.  What the series loses is the 
 slowest GPUs' own work set the pace (18.4 to 19.5 ms).  Behind the update the exchange costs
 what the extra rows of the step cost, about half a millisecond on eight GPUs, so the
 default (`HIPPYMFEM_SEM_OVERLAP=auto`) takes it only where the exchange goes from GPU memory
-to GPU memory and a rank holds at least 16 million unknowns times the fields.  The 4096 row
-is the step before this change; on 4096 GPUs the forward sweep makes 3.7e13 unknown-updates
-a second, and the set-up of mesh, names and propagator takes 122 s (60 s on one GPU).  At a
+to GPU memory and a rank holds at least 16 million unknowns times the fields.  On 4096 GPUs
+the forward sweep makes 3.9e13 unknown-updates a second with the exchange behind the update,
+and the first series' set-up of mesh, names and propagator took 122 s (60 s on one GPU).  At a
 small load the exchange is not small (12 million unknowns a rank: 1.26 ms a step on one GPU
 and 1.54 to 1.58 on eight), which is why a box that one GPU holds is not cut and its shots
 are shared out.
@@ -512,6 +527,7 @@ a rank, sample points 16 apart, kernels of radius 8), milliseconds:
 | 32 | 227 673 985 | 94.4 | 93.6 % | 110.6 | 86.2 % |
 | 64 | 454 756 609 | 95.9 | 92.1 % | 114.6 | 83.1 % |
 | 512 | 3 630 961 153 | 97.6 | 90.5 % | 119.8 | 79.5 % |
+| 4096 | 29 019 350 017 | 98.8 | 89.4 % | 123.7 | 77.0 % |
 
 In columns on 512 GPUs the product takes 94.3 ms and the iteration 109.9.  In a product a
 rank waits only for its neighbours (two exchanges of a halo of 8 points, 4 to 8 ms); in an iteration of the solve it also waits at three inner products for every other

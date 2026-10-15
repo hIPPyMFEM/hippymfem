@@ -42,8 +42,8 @@
   from products with white vectors, and `--inner-precondition levels` preconditions the
   inner solve by a factor whose symbol follows the window from node to node (about 60
   iterations where the prior's takes 750): with both, L-BFGS reaches 1e-6 of the first
-  gradient in 204 propagations and 425 s on 32 GPUs, where without a preconditioner it has
-  1.1e-4 after 310 propagations and 617 s.
+  gradient in 204 propagations and 425 s on 32 GPUs, where without a preconditioner it
+  takes 852 propagations and 1544 s.
 - **The seismic propagator for boxes** (`applications/seismic/sem.py`, defaults unchanged
   for the globe): first-order absorbing faces whose forward boundary values are kept for
   the backward sweep, a stiffness applied through slices of a 3D array of the unknowns on
@@ -52,9 +52,9 @@
   from one shot to the next, and the exchange of a step behind its update
   (`HIPPYMFEM_SEM_OVERLAP`, `auto` by default where the exchange goes from GPU memory to
   GPU memory and a rank holds at least 16 million unknowns times the fields): the same
-  bits as before, and on 512 GPUs of Frontier 93 to 95 % of one GPU's step for cubes of
-  192 million unknowns a rank and 99 to 100 % for columns (88 to 93 % and 95 to 98 %
-  without it).  The globe of the seismic application on 8 GPUs takes the same 154 ms a
+  bits as before, and on 4096 GPUs of Frontier (783 billion unknowns) 93 to 96 % of one
+  GPU's step for cubes of 192 million unknowns a rank (87 to 92 % without it), on 512 GPUs
+  99 to 100 % for columns (95 to 98 %).  The globe of the seismic application on 8 GPUs takes the same 154 ms a
   step with it, and 1 % less with two fields.
 - **The two applications on AMD cards, and their weak scaling to 4096 GPUs of Frontier**
   (MI250X; a rank has one of a card's two GPUs).  The seismic propagator is JAX and ran
