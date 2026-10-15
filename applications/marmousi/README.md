@@ -522,8 +522,8 @@ are shared out.
 
 | | before: the first series (job 5669854) | after: the final code (job 5680295) |
 |---|---|---|
-| forward, incremental, backward step | 21.38 / 56.80 / 64.64 ms, 87.3 / 90.9 / 92.2 % of one GPU | 20.10 / 54.50 / 62.52 ms, 92.8 / 94.6 / 95.5 % |
-| the same run with the exchange between the halves of the step | | 21.46 / 56.80 / 64.64 ms, 87.0 / 90.8 / 92.4 % |
+| forward, incremental, backward step | 21.38 / 56.80 / 64.64 ms, 87.3 / 90.9 / 92.2 % of one GPU | 20.10 / 54.50 / 62.52 ms, 92.8 / 94.6 / 95.5 %; a second run (job 5680557): 20.02 / 54.61 / 62.54 ms, 93.2 / 94.4 / 95.5 % |
+| the same runs with the exchange between the halves of the step | | 21.46 / 56.80 / 64.64 ms, 87.0 / 90.8 / 92.4 %; the second: 21.69 / 57.34 / 64.74 ms, 86.0 / 90.0 / 92.2 % |
 | a product with `H~`, 14.0 million points a rank: one GPU, 4096 | 229.8, 237.8 ms at most: 96.6 % | 167.2, 184.3 ms: 90.7 % |
 | an iteration of the solve with the prior's preconditioner, the same | 246.0, 301.5 ms: 81.6 % | 178.7, 233.5 ms: 76.5 % |
 
