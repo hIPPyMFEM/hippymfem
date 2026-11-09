@@ -446,7 +446,10 @@ def test_forward_uq():
     Ha, Hb = Vm.vector(), Vm.vector()
     H.mult(a, Ha)
     H.mult(b, Hb)
-    s = abs(Ha.inner(b) - Hb.inner(a)) / max(abs(Ha.inner(b)), 1e-300)
+    # (against |Ha| |b|, which bounds both products: <Ha, b> itself is small for random
+    # vectors, and with single-precision solves the quotient by it was 5e-4 on 3 ranks)
+    s = (abs(Ha.inner(b) - Hb.inner(a))
+         / max(Ha.norm("l2") * b.norm("l2"), Hb.norm("l2") * a.norm("l2"), 1e-300))
     check("QoI Hessian symmetric", s < action_tolerance(1e-9), "(%.2e)" % s)
 
     # Taylor approximation and its analytic moments

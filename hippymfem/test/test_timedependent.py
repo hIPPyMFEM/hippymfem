@@ -17,6 +17,7 @@ import mfem.par as mfem
 import jax.numpy as jnp
 
 import hippymfem as hm
+from hippymfem.common.parvector import host_sync
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
 
 COMM = MPI.COMM_WORLD
@@ -672,7 +673,9 @@ def test_td_boundary_density():
     lf.AddDomainIntegrator(mfem.DomainLFIntegrator(mfem.ConstantCoefficient(1.0)))
     lf.Assemble()
     hv = lf.ParallelAssemble()
-    w = np.array(hv.GetDataArray(), dtype=np.float64)     # copy: the view dangles
+    # (host_sync: with MFEM on a GPU the vector is assembled there, and its host view
+    # holds stale values until it is copied back)
+    w = np.array(host_sync(hv).GetDataArray(), dtype=np.float64)     # copy: the view dangles
     del hv
 
     def mass(vec):

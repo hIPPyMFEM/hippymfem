@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import hippymfem as hp
 from hippymfem.fem import assemble as asm
 from hippymfem.test import reference_assembly as ref
+from hippymfem.test._device import roundoff, same
 from hippymfem.fem import csrassemble as csr
 from hippymfem.fem import parmat
 from hippymfem.fem.csrassemble import clear_pattern_cache, get_pattern
@@ -192,7 +193,9 @@ def test_sortfree_pattern():
                     got[mode] = (P.nnz, np.asarray(P.indptr).copy(),
                                  np.asarray(P.indices).copy(), np.asarray(P.slot).copy())
                     T = TrueDofPattern(P, tst, trl)
-                    rm = getattr(T, "_rm", None) or ()
+                    # (the row-major arrays, asked for: the copying route builds them
+                    # at construction, the lean one on first use)
+                    rm = T._rowmajor()
                     tdof[mode] = ([getattr(T, c) for c in tdof_counts],
                                   [np.asarray(getattr(T, c)).copy() for c in tdof_arrays]
                                   + [None if x is None else np.asarray(x).copy() for x in rm])
@@ -311,18 +314,20 @@ def test_blocks_identical():
             scale = max(float(np.abs(D1).max()), 1e-300)
             err = float(np.abs(D1 - D2).max()) / scale
             worst = max(worst, err)
-            if err != 0.0:
+            if not same(err):
                 bad.append("%s %.2e" % (name, err))
         for var in (STATE, PARAMETER, ADJOINT):
             vecs = K.element_vectors(var, loc)
             v1, v2 = both_backends(lambda a: a.assemble_vector(
                 spaces[var], batches.groups, vecs, NE))
             d = np.concatenate(COMM.allgather(v1.array - v2.array))
-            if np.abs(d).max() != 0.0:
+            vs = max(float(np.abs(np.concatenate(COMM.allgather(v1.array))).max()), 1e-300)
+            if not same(np.abs(d).max(), vs):
                 bad.append("vector %d %.2e" % (var, np.abs(d).max()))
         check("%s order %d/%d: all blocks identical" % (kind, order, morder),
               not bad, "" if not bad else "differs: " + ", ".join(bad))
-    check("worst difference over all blocks is exactly zero", worst == 0.0,
+    check("worst difference over all blocks is exactly zero (to round-off on a GPU)",
+          same(worst),
           "(%.3e)" % worst)
 
 
@@ -503,7 +508,7 @@ def test_partial_boundary_elimination():
         Vu, Vu, b.groups, mats, NE, test_ess=bc.ess_tdof, diag_policy="one"))
     D1, D2 = to_dense(A1, COMM), to_dense(A2, COMM)
     e = float(np.abs(D1 - D2).max()) / max(float(np.abs(D1).max()), 1e-300)
-    check("partial-boundary elimination matches the callback route", e == 0.0,
+    check("partial-boundary elimination matches the callback route", same(e),
           "(%.3e)" % e)
 
     # a transpose walks the parallel structure the damage would corrupt
@@ -517,7 +522,7 @@ def test_partial_boundary_elimination():
     DT = to_dense(At, COMM)
     sym = float(np.abs(DT - D2.T).max()) / max(float(np.abs(D2).max()), 1e-300)
     check("transposing the eliminated matrix works and is exact",
-          np.isfinite(y.norm("l2")) and sym == 0.0,
+          np.isfinite(y.norm("l2")) and same(sym),
           "(||A^T 1|| = %.6f, transpose error %.3e)" % (y.norm("l2"), sym))
 
 
@@ -556,7 +561,7 @@ def test_folded_elimination():
                     csr.set_fold_elimination(old)
             d = float(np.abs(got[True] - got[False]).max())
             check("folded == eliminated (%s %s order %d)" % (kind, name, order),
-                  d == 0.0, "(%.3e)" % d)
+                  same(d, float(np.abs(got[True]).max())), "(%.3e)" % d)
 
 
 def test_shared_hessian_pass():
@@ -1327,8 +1332,9 @@ def test_release_linearization_on_move():
     for name in ("A", "C", "Wum", "Wmm"):
         a = values(getattr(keep, name))
         b = values(getattr(rel, name))
-        worst = largest([worst, float(np.abs(a - b).max())])
-    check("the next point's blocks are identical", worst == 0.0, "(%.3e)" % worst)
+        scale = max(float(np.abs(a).max()), 1e-300)
+        worst = largest([worst, float(np.abs(a - b).max()) / scale])
+    check("the next point's blocks are identical", same(worst), "(rel %.3e)" % worst)
 
 
 def test_triple_product():
@@ -1432,8 +1438,8 @@ def test_parmat_routes():
                 return out
             a, c = both_parmat(one)
             d = float(np.abs(a - c).max())
-            check("%s %s: %s identical both ways" % (kind, order, tag), d == 0.0,
-                  "(%.3e)" % d)
+            check("%s %s: %s identical both ways" % (kind, order, tag),
+                  same(d, float(np.abs(a).max())), "(%.3e)" % d)
 
         # repeated assemblies, and the pattern they share, must survive the route
         def repeat():
@@ -1456,7 +1462,7 @@ def test_parmat_routes():
         check("%s %s: pattern indices survive the aliasing constructor" % (kind, order), ic)
         worst = largest(float(np.abs(x - da[0]).max()) for x in da + dc)
         check("%s %s: three assemblies agree across both constructors" % (kind, order),
-              worst == 0.0, "(%.3e)" % worst)
+              same(worst, float(np.abs(da[0]).max())), "(%.3e)" % worst)
 
 
 def test_tdof_route():
@@ -1476,7 +1482,7 @@ def test_tdof_route():
     """
     if RANK == 0:
         print("true-dof route vs triple product")
-    tol = 0.0 if COMM.size == 1 else 1e-13
+    tol = max(0.0 if COMM.size == 1 else 1e-13, roundoff())
 
     def under(mode, fn):
         old = csr.set_parmat_mode(mode)
@@ -1527,7 +1533,7 @@ def test_tdof_route():
         check("%s %s: pattern indices survive the true-dof route" % (kind, order), intact)
         worst = largest(float(np.abs(x - outs[0]).max()) for x in outs)
         check("%s %s: repeated true-dof assemblies identical" % (kind, order),
-              worst == 0.0, "(%.3e)" % worst)
+              same(worst, float(np.abs(outs[0]).max())), "(%.3e)" % worst)
 
 
 def test_rank_without_elements_of_a_block():

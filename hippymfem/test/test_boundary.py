@@ -43,6 +43,7 @@ from hippymfem.fem.boundary import (
 )
 from hippymfem.fem.spaces import FunctionSpace
 from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
+from hippymfem.test._device import same
 
 COMM = MPI.COMM_WORLD
 RANK = COMM.rank
@@ -396,7 +397,8 @@ def test_prescribed_flux():
     Af = to_dense(flux._block(ADJOINT, STATE, x, test_ess=ess), COMM)
     Ap = to_dense(plain._block(ADJOINT, STATE, x, test_ess=ess), COMM)
     Ar = to_dense(robin._block(ADJOINT, STATE, x, test_ess=ess), COMM)
-    check("the Jacobian with the flux is the volume term's, exactly", float(np.abs(Af - Ap).max()) == 0.0)
+    check("the Jacobian with the flux is the volume term's, exactly",
+          same(float(np.abs(Af - Ap).max()), float(np.abs(Ap).max())))
     check("and the Robin term still changes it", float(np.abs(Ar - Ap).max()) > 1e-3)
 
     # the flux is in the residual: the difference is MFEM's boundary linear form

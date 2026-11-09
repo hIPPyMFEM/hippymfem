@@ -5,6 +5,7 @@
 #   ./run_tests.sh 1 2 4        # and on 2 and 4 ranks
 #   PHASES=test_kernels ./run_tests.sh 4     # one suite only
 #   HIPPYMFEM_CUDA_PYMFEM=/path/to/cuda/site-packages ./run_tests.sh 1 2   # + hypre on the device
+#   DEVICE_SUITES=1 HIPPYMFEM_CUDA_PYMFEM=... ./run_tests.sh 1 2  # + every suite on the GPU
 PY="${PY:-python}"   # the interpreter that has PyMFEM: PY=/path/to/python ./run_tests.sh
 cd "$(dirname "$0")"
 PHASES="${PHASES:-test_vectors test_kernels test_solves test_modeling test_optimization test_timedependent test_uq test_assembly test_solvers test_boundary test_facets test_vectorfe test_nb}"
@@ -50,6 +51,26 @@ if [ -n "$HIPPYMFEM_CUDA_PYMFEM" ]; then
     run_suite test_device test_device $n "|nothing to test" \
       PYTHONPATH="$HIPPYMFEM_CUDA_PYMFEM${PYTHONPATH:+:$PYTHONPATH}" HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1
   done
+fi
+# DEVICE_SUITES=1 runs every suite once more as a GPU user runs a script: the element
+# kernels and hypre on the card (HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1), with
+# the GPU build of PyMFEM named in HIPPYMFEM_CUDA_PYMFEM and one card a rank.  Checks
+# that compare two routes for identical results allow round-off there
+# (hippymfem/test/_device.py).  On a card that other jobs share, the slower suites can
+# pass the 40-minute limit on two ranks.
+if [ -n "$DEVICE_SUITES" ] && [ "$DEVICE_SUITES" != "0" ]; then
+  if [ -z "$HIPPYMFEM_CUDA_PYMFEM" ]; then
+    echo "=== DEVICE_SUITES needs HIPPYMFEM_CUDA_PYMFEM, the site-packages of the GPU build of PyMFEM"
+    status=1
+  else
+    WRAP=tools/mpirun_pinned.sh
+    for n in $RANKS; do
+      for ph in $PHASES; do
+        run_suite "$ph (GPU)" $ph $n "|skipped:" \
+          PYTHONPATH="$HIPPYMFEM_CUDA_PYMFEM${PYTHONPATH:+:$PYTHONPATH}" HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1
+      done
+    done
+  fi
 fi
 if [ $status -eq 0 ]; then echo "ALL SUITES PASSED"; else echo "SOME SUITES FAILED"; fi
 exit $status

@@ -13,7 +13,8 @@ from mpi4py import MPI
 import mfem.par as mfem
 
 import hippymfem as hp
-from hippymfem.common.parvector import ParVector, allreduce_extreme
+from hippymfem.common.parvector import ParVector, allreduce_extreme, host_sync, host_write
+from hippymfem.test._device import same
 from hippymfem.algorithms.multivector import MultiVector, MatMvMult, MvDSmatMult
 
 COMM = MPI.COMM_WORLD
@@ -138,13 +139,17 @@ def test_partition_matches_mfem():
     hp.parRandom.normal(1.0, x)
     M.Mult(x.hypre, y.hypre)
 
+    # (host_write and host_sync: with MFEM on a GPU, M.Mult reads and writes device
+    # memory, and a raw view of a vector is only its host copy)
     xm = mfem.HypreParVector(M, 1)
     ym = mfem.HypreParVector(M, 0)
-    xm.GetDataArray()[:] = x.array
+    host_write(xm).GetDataArray()[:] = x.array
     M.Mult(xm, ym)
-    err = np.abs(ym.GetDataArray() - y.array).max() if y.local_size else 0.0
+    err = np.abs(host_sync(ym).GetDataArray() - y.array).max() if y.local_size else 0.0
     err = allreduce_extreme(COMM, err, MPI.MAX)
-    check("HypreParMatrix.Mult agrees on our partition", err == 0.0, "(err=%g)" % err)
+    ymax = allreduce_extreme(COMM, float(np.abs(y.array).max()) if y.local_size else 0.0,
+                             MPI.MAX)
+    check("HypreParMatrix.Mult agrees on our partition", same(err, ymax), "(err=%g)" % err)
 
     # Our offsets must equal MFEM's true-dof offsets: for every locally owned
     # dof, global tdof number == offset + local tdof number.
@@ -225,10 +230,10 @@ def test_operators():
     mop = hp.MFEMOperator(op, A.Height())
     xv = mfem.Vector(A.Height())
     yv = mfem.Vector(A.Height())
-    xv.GetDataArray()[:] = x.array
+    host_write(xv).GetDataArray()[:] = x.array
     mop.Mult(xv, yv)
     check("MFEMOperator adapter",
-          np.abs(yv.GetDataArray() - z.array).max() < 1e-14 if z.local_size else True)
+          np.abs(host_sync(yv).GetDataArray() - z.array).max() < 1e-14 if z.local_size else True)
 
 
 def test_multivector():
@@ -397,9 +402,13 @@ def test_device_auto_without_gpu():
     if RANK == 0:
         # PALS_ is how Slurm tells HPE Cray's PMI that srun launched it: left in, the
         # child takes itself for a rank of this step and waits in MPI_Init for the others
+        # HIPPYMFEM_HYPRE_DEVICE and HIPPYMFEM_HYPRE_SINGLE go too: a suite run with
+        # hypre on the GPU would otherwise have the child ask MFEM for a device it
+        # cannot see, which MFEM answers with an abort
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_",
-                                    "PALS_"))}
+                                    "PALS_"))
+               and k not in ("HIPPYMFEM_HYPRE_DEVICE", "HIPPYMFEM_HYPRE_SINGLE")}
         env.update(HIPPYMFEM_DEVICE="auto", CUDA_VISIBLE_DEVICES="",
                    ROCR_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
         code = ("import hippymfem\nfrom hippymfem.fem import kernel\n"

@@ -741,6 +741,18 @@ def test_host_chunk_budget():
     ne = pmesh.GetNE()
     gk = K.group_kernels[0]
     d = kern.device()
+    if getattr(d, "platform", "cpu") != "cpu":
+        # The host's planner is what this tests.  With the kernels on a card the budget
+        # is the card's free memory, which HOST_MEM_FRACTION does not touch, so the
+        # first two checks are asked of JAX's host device instead.
+        import jax
+
+        try:
+            d = jax.devices("cpu")[0]
+        except RuntimeError:
+            if RANK == 0:
+                print("  skipped: the kernels run on a card and JAX has no host device")
+            return
 
     def forget():
         for g in K.group_kernels:
