@@ -631,6 +631,15 @@ def _test_config_profiles():
     check("with one named, gpu asks for mixed precision and single-precision tangents",
           env.get("HIPPYMFEM_PRECISION") == "mixed" and env.get("HIPPYMFEM_AD_WORKING_SET") == "8")
     check("the default profile changes nothing", cfg.apply_profile_env("default", {}) == {})
+    # an entry asked for under a variable that is set to a spelling of off is not applied
+    cfg.PROFILES["_cond"] = ("a test", {"HIPPYMFEM_PMG_H": ("3", "HIPPYMFEM_HYPRE_DEVICE")})
+    try:
+        got_off = cfg.apply_profile_env("_cond", {"HIPPYMFEM_HYPRE_DEVICE": "0"})
+        got_on = cfg.apply_profile_env("_cond", {"HIPPYMFEM_HYPRE_DEVICE": "1"})
+    finally:
+        del cfg.PROFILES["_cond"]
+    check("an entry for a variable that is set to 0 is not applied, one for a variable set to 1 is",
+          got_off == {} and got_on == {"HIPPYMFEM_PMG_H": "3"}, "(%r, %r)" % (got_off, got_on))
     try:
         cfg.apply_profile_env("fastest", {})
         refused = False

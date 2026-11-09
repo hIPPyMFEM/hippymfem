@@ -515,6 +515,14 @@ def _profile(name):
     return key, PROFILES[key][1]
 
 
+def _condition_holds(env, need):
+    """Whether the variable ``need`` that a profile's entry ``(value, need)`` asks for is
+    set: not empty, and not a spelling of off (``HIPPYMFEM_HYPRE_DEVICE=0`` is hypre on
+    the host, not on the device).  A path, as in ``HIPPYMFEM_HYPRE_SINGLE``, is set."""
+    v = str(env.get(need, "") or "").strip().lower()
+    return v != "" and v not in FLAG_FALSE
+
+
 def apply_profile_env(name=None, environ=None):
     """Fill in the environment variables of a profile (default: ``HIPPYMFEM_PROFILE``) that
     ``environ`` (default ``os.environ``) leaves unset or empty, and return them.  ``import
@@ -526,7 +534,7 @@ def apply_profile_env(name=None, environ=None):
         need = None
         if isinstance(val, tuple):
             val, need = val
-        if env.get(var, "") != "" or (need and not env.get(need, "")):
+        if env.get(var, "") != "" or (need and not _condition_holds(env, need)):
             continue
         env[var] = val
         out[var] = val
@@ -603,7 +611,7 @@ class Config(object):
             need = None
             if isinstance(val, tuple):
                 val, need = val
-            if need and not os.environ.get(need, ""):
+            if need and not _condition_holds(os.environ, need):
                 continue
             if var in EXPLICIT or (os.environ.get(var, "") != "" and var not in PROFILE_SET):
                 continue                         # set by the user: an explicit setting wins
