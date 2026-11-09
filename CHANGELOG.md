@@ -1329,6 +1329,12 @@
   CUDA, whatever backend a test fakes, and not where the manager is already gone. MFEM
   stops the process on a second `Destroy`, as a first version of this change showed in
   `test_solvers`.
+- **Columns named alone were eliminated on one route only.** `assemble_matrix(V, V, ...,
+  trial_ess=ess)` with the same space on both sides and `symmetric` at its default
+  eliminates those columns on the folded route. MFEM's route
+  (`HIPPYMFEM_FOLD_ELIMINATION=0`, or a diagonal policy of `"keep"`) took the symmetric
+  branch, which eliminates by `test_ess`, and returned the matrix untouched
+  (`elimination._eliminate`; `test_assembly.test_trial_ess_only_both_routes`).
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

@@ -84,13 +84,15 @@ def _eliminate(A, test_space, trial_space, test_ess, trial_ess, diag_policy,
     rank has no essential dofs, so it hides on small rank counts and segfaults on
     large ones.
     """
-    if same:
+    if same and (test_ess is not None or trial_ess is None):
         ess = test_ess
         # Branch on whether the caller asked for elimination at all, which every
         # rank decides alike, and NEVER on ess.Size(): with essential conditions on
         # part of the boundary some ranks own none, and skipping the collective
         # EliminateRowsCols on those ranks while the others call it desynchronizes
         # the job (unnoticed on a few ranks, a segfault on more).
+        # (Only columns named, on the same space: the columns alone, below, as the
+        # folded route has it.  This branch returned the matrix untouched there.)
         if ess is None:
             return A
         idx = np.asarray(ess.ToList(), dtype=np.int64)

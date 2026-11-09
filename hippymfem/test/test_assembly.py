@@ -1959,6 +1959,48 @@ def test_coordinates_after_moving_nodes():
           % (moved, proj, verts, worst))
 
 
+
+def test_trial_ess_only_both_routes():
+    """``assemble_matrix(V, V, ..., trial_ess=ess)``: only the columns named, on the same
+    space, with ``symmetric`` at its default.  The folded route eliminates those columns;
+    MFEM's route (``HIPPYMFEM_FOLD_ELIMINATION=0``) took the symmetric branch, which
+    eliminates by ``test_ess``, and returned the matrix untouched."""
+    from hippymfem.fem import elimination
+    from hippymfem.fem import pattern as pat
+
+    if RANK == 0:
+        print("columns eliminated alone, on both routes")
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(5, 5, mfem.Element.QUADRILATERAL))
+    V, Vm = FunctionSpace.H1(pm, 1), FunctionSpace.H1(pm, 1)
+    b = MeshBatches(pm, 4, COMM)
+    K = QuadratureKernel(lambda u, m, p, x: jnp.dot(u.grad, p.grad) + u.val * p.val,
+                         [V, Vm, V], b)
+    loc = [V.local_values(V.vector()), Vm.local_values(Vm.vector()), V.local_values(V.vector())]
+    mats = [np.asarray(a) for a in K.element_matrices(ADJOINT, STATE, loc)]
+    bdr = mfem.intArray(pm.bdr_attributes.Max())
+    bdr.Assign(1)
+    ess = mfem.intArray()
+    V.fes.GetEssentialTrueDofs(bdr, ess)
+    saved = elimination.FOLD_ELIMINATION
+    dense = {}
+    try:
+        for fold in (True, False):
+            elimination.set_fold_elimination(fold)
+            pat.clear_pattern_cache()
+            A = asm.assemble_matrix(V, V, b.groups, mats, pm.GetNE(), trial_ess=ess)
+            dense[fold] = to_dense(A, COMM)
+    finally:
+        elimination.set_fold_elimination(saved)
+        pat.clear_pattern_cache()
+    gess = np.concatenate(COMM.allgather(np.asarray(ess.ToList(), dtype=np.int64)
+                                         + V.fes.GetMyTDofOffset()))
+    diff = float(np.abs(dense[True] - dense[False]).max())
+    cols = float(np.abs(dense[False][:, gess]).max()) if gess.size else 0.0
+    check("columns named alone are eliminated alike on the folded route and on MFEM's",
+          diff < 1e-14 and cols == 0.0,
+          "(routes differ by %.1e; MFEM's route leaves %.1e in those columns)" % (diff, cols))
+
+
 def test_box_mesh():
     """``hm.box_mesh``: every rank builds its part of the n^3 cube from a coarse mesh, the
     elements of the lattice of ``MakeCartesian3D`` with the same boundary faces, and the
@@ -2024,6 +2066,7 @@ def main():
     test_triple_product()
     test_coordinates_and_project()
     test_coordinates_after_moving_nodes()
+    test_trial_ess_only_both_routes()
     test_fused_scatter()
     test_split_and_whole_ranks()
     test_auto_route_from_a_run()
