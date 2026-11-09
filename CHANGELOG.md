@@ -1288,6 +1288,14 @@
   forward solve gave up, as a `ValueError` that a line search does not take for a failed
   trial. It is now read with `config.env_choice`, as the other settings of the environment
   are, and stops `import hippymfem` (checked by `test_vectors` in a fresh interpreter).
+- **`FunctionSpace.coordinates()` and `project()` missed nodes moved in place.** The
+  coordinates of the dofs are kept between calls, until MFEM counts a change. MFEM does
+  not count nodes written in place before `mesh.NodesUpdated()`, so a curved mesh moved
+  that way gave the old coordinates. The key of the kept array now holds a fingerprint
+  of the nodes: the exclusive or of their 64-bit words and their sum, one pass over them
+  (0.02 s for 400 MB). The vertices of a mesh without nodes were already part of the key.
+  Before the array was kept, such a move was seen at once, and it is again
+  (`test_assembly.test_coordinates_after_moving_nodes`).
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

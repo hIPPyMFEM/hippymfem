@@ -1929,6 +1929,36 @@ def test_coordinates_and_project():
           "(max abs diff %.1e)" % worst)
 
 
+def test_coordinates_after_moving_nodes():
+    """``coordinates()`` and ``project`` see the nodes of a curved mesh moved in place,
+    without ``mesh.NodesUpdated()`` (they are kept between calls, and MFEM does not count
+    such a move), and the vertices of a mesh without nodes moved by ``MoveVertices``."""
+    from hippymfem.common.parvector import host_readwrite
+
+    if RANK == 0:
+        print("dof coordinates after the mesh is moved in place")
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.QUADRILATERAL))
+    pm.SetCurvature(2)                           # nodes ordered by components: x, y, x, y
+    V = FunctionSpace.H1(pm, 1)
+    x0 = V.coordinates()[:, 0].copy()
+    nodes = pm.GetNodes()
+    host_readwrite(nodes)
+    nodes.GetDataArray()[0::2] += 1.0
+    moved = float(np.abs(V.coordinates()[:, 0] - x0 - 1.0).max()) if x0.size else 0.0
+    proj = (float(np.abs(V.project(lambda x: x[..., 0]).array - x0 - 1.0).max())
+            if x0.size else 0.0)
+    pm2 = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.QUADRILATERAL))
+    V2 = FunctionSpace.H1(pm2, 1)
+    y0 = V2.coordinates()[:, 0].copy()
+    nv = pm2.GetNV()
+    pm2.MoveVertices(mfem.Vector(np.concatenate([np.ones(nv), np.zeros(nv)])))
+    verts = float(np.abs(V2.coordinates()[:, 0] - y0 - 1.0).max()) if y0.size else 0.0
+    worst = allreduce_extreme(COMM, max(moved, proj, verts), MPI.MAX)
+    check("coordinates and project after the nodes or vertices are moved in place",
+          worst < 1e-12, "(nodes %.1e, project %.1e, vertices %.1e on rank 0; worst %.1e)"
+          % (moved, proj, verts, worst))
+
+
 def test_box_mesh():
     """``hm.box_mesh``: every rank builds its part of the n^3 cube from a coarse mesh, the
     elements of the lattice of ``MakeCartesian3D`` with the same boundary faces, and the
@@ -1993,6 +2023,7 @@ def main():
     test_element_chunking()
     test_triple_product()
     test_coordinates_and_project()
+    test_coordinates_after_moving_nodes()
     test_fused_scatter()
     test_split_and_whole_ranks()
     test_auto_route_from_a_run()

@@ -304,9 +304,12 @@ class FunctionSpace(KeepAlive):
         is not exact otherwise).  That call (3 SWIG calls an element) took 7 s for
         660 thousand hexahedra, and an application asks several times: the array is
         kept, read only, until MFEM counts a change of the mesh or of its nodes, or
-        the vertices of a mesh without nodes are other numbers (MFEM does not count
-        ``SetVertices`` and ``MoveVertices``).  Nodes written in place are not seen
-        before ``mesh.NodesUpdated()``, which is MFEM's own rule.
+        the points of the map are other numbers.  MFEM counts neither ``SetVertices``
+        and ``MoveVertices`` on a mesh without nodes nor nodes written in place before
+        ``mesh.NodesUpdated()``: the vertices are therefore part of the key, and a
+        fingerprint of the nodes (:func:`_fingerprint`, one pass over them, 0.02 s
+        for 400 MB of nodes where the array takes seconds).  Before the array was kept,
+        a move in place was seen at once, and it still is.
         """
         fes, mesh, sdim = self.fes, self.mesh, self.sdim
         seq = (mesh.GetSequence(), mesh.GetNodesSequence())
@@ -319,6 +322,9 @@ class FunctionSpace(KeepAlive):
             points = mfem.Vector()
             mesh.GetVertices(points)
             seq += (points.GetDataArray().tobytes(),)
+        else:
+            host_sync(points)
+            seq += (_fingerprint(points.GetDataArray()),)
         if getattr(self, "_nodes", (None, None))[0] == seq:
             return self._nodes[1]
         nl = fes.GetNDofs()
@@ -386,6 +392,15 @@ class FunctionSpace(KeepAlive):
             gf.GetDataArray()[:] = X[:, d]
             out[:, d] = self.from_gridfunction(gf, tmp).array
         return out
+
+
+def _fingerprint(values):
+    """A fingerprint of an array of doubles that a change of any one entry alters: the
+    exclusive or of its 64-bit words, with the sum beside it.  One pass over memory."""
+    a = np.ascontiguousarray(values, dtype=np.float64).reshape(-1)
+    if not a.size:
+        return (0, 0.0)
+    return (int(np.bitwise_xor.reduce(a.view(np.uint64))), float(a.sum()))
 
 
 def _evaluate_at(fn, X, vdim):
