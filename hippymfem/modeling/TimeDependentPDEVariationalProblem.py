@@ -40,19 +40,20 @@ the :math:`B^{\!\top}` term being exactly where reverse-in-time coupling comes
 from.  The second-order blocks are accumulated step by step, each step writing
 into the two time levels it touches.
 
-**Operators are built once per trajectory: one per step, or one for all steps
-when they do not change in time.**  A step Jacobian that is linear in :math:`u_n`
-with coefficients independent of :math:`t` (implicit Euler for a linear PDE, the
-common case) is the same matrix at every step.  Nothing here assumes that: the
-first two steps are assembled and compared through a random matrix-vector
-product, and when they agree one :math:`A`, one :math:`A^{\!\top}`, one :math:`B`
-and one solver with its multigrid hierarchy serve the whole march.  Otherwise
-every step keeps its own, built once at the linearization point.  Either way no
-operator is assembled or a hierarchy set up inside a solve loop, where a step-wise
-implementation would set BoomerAMG up once per step inside every Newton iteration
-of the forward solve and every CG iteration of the incremental solves.  The blocks
-of a linearization point come from one differentiation pass per step rather than
-one per block.
+**Operators are built once per trajectory, and steps that agree share them.**  A
+step Jacobian that is linear in :math:`u_n` with coefficients independent of
+:math:`t` (implicit Euler for a linear PDE, the common case) is the same matrix at
+every step.  Nothing here assumes that: every step is assembled and compared with
+the step before it through a random matrix-vector product, and a run of equal steps
+keeps one :math:`A`, one :math:`A^{\!\top}`, one :math:`B` and one solver with its
+multigrid hierarchy.  When all steps agree, one of each serves the whole march.
+Agreement at the first steps proves nothing about the later ones (a state at rest
+until a source switches on, a coefficient that changes in time), so every step is
+compared.  Either way no operator is assembled or a hierarchy set up inside a solve
+loop, where a step-wise implementation would set BoomerAMG up once per step inside
+every Newton iteration of the forward solve and every CG iteration of the
+incremental solves.  The blocks of a linearization point come from one
+differentiation pass per step rather than one per block.
 
 The trajectory lives in a :class:`~.timeDependentVector.TimeDependentVector`; the
 time and step size reach the kernel as traced scalars, so the compiled kernels
@@ -68,8 +69,8 @@ from ..fem.bcs import as_bcset
 from ..fem.elementbatch import default_quadrature_degree, get_batches
 from ..fem.spaces import as_space
 from .PDEProblem import PDEProblem
-from .PDEVariationalProblem import (_same, _set_operator_once, require_finite,
-                                    require_finite_arrays)
+from .PDEVariationalProblem import (_equivalent_spaces, _same, _set_operator_once,
+                                    require_finite, require_finite_arrays)
 from .timeDependentVector import TimeDependentVector
 from .variables import ADJOINT, NVAR, PARAMETER, STATE
 from ..common.random import Random
@@ -161,6 +162,13 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         #: see :attr:`~.PDEProblem.PDEProblem.spd_jacobian`
         self.spd_jacobian = bool(spd_jacobian)
         self.Vh = [as_space(v) for v in Vh]
+        # Equivalent state and adjoint spaces built separately are aliased, as in
+        # PDEVariationalProblem: the step blocks are eliminated as square blocks only
+        # when the row and column spaces are one object, and two copies of a space
+        # give a Jacobian with zeroed essential rows and no unit diagonal (singular).
+        if self.Vh[STATE] is not self.Vh[ADJOINT] and _equivalent_spaces(
+                self.Vh[STATE], self.Vh[ADJOINT]):
+            self.Vh[ADJOINT] = self.Vh[STATE]
         self.varf = varf_handler
         self.comm = self.Vh[STATE].comm
         self.mesh = self.Vh[STATE].mesh
@@ -214,8 +222,16 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         self.solver_fwd_inc = self.solver_adj_inc = None
         self.linearize_x = None
         self.gauss_newton_approx = False
+        #: Newton controls of a nonlinear step.  A step ends when its residual is below
+        #: ``max(rel_tolerance * ||r_0||, abs_tolerance)``, with ``r_0`` the residual at
+        #: the previous level, or when the Newton correction is below
+        #: ``step_tolerance`` of the state (``0``: the residual alone decides).  Near a
+        #: steady state ``r_0`` is the small change of one step, and the round-off of
+        #: a residual in large units can lie above that tolerance; the correction
+        #: measures the error of the state whatever the size of the residual.
         self.newton_parameters = {
             "rel_tolerance": 1e-10, "abs_tolerance": 1e-14,
+            "step_tolerance": 1e-12,
             "max_iter": 25, "print_level": -1,
         }
         self.n_calls = {"forward": 0, "adjoint": 0,
@@ -376,11 +392,11 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
     def solveFwd(self, out, x):
         """March the state forward, storing every level in ``out``.
 
-        For a residual linear in ``u_n`` the step Jacobian is assembled at the
-        first step and again at the second; when the two agree it serves every
-        later step and the forward solver keeps one hierarchy for the whole
-        march.  That Jacobian is also kept across forward solves at the same
-        parameter.
+        For a residual linear in ``u_n`` the step Jacobian of every step is
+        assembled and compared with the one the solver holds; a run of equal steps
+        keeps one matrix and one hierarchy.  A Jacobian that was the same at every
+        step of a march is kept across forward solves at the same parameter and then
+        serves every step without assembly.
         """
         self.n_calls["forward"] += 1
         m = x[PARAMETER]
@@ -395,18 +411,23 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         solver = self._get_solver("solver")
         prm = self.newton_parameters
         maxit = 1 if self.is_fwd_linear else int(prm["max_iter"])
+        step_tol = float(prm.get("step_tolerance", 0.0))
 
-        # A linear step: one Jacobian per parameter when it is time invariant.
-        # ``jac`` is (matrix, verdict) with verdict None (one step seen), True
-        # (the same at step two: reuse from here on) or False (varies: assemble).
-        jac = None
+        # A linear step: ``cached`` is the Jacobian of an earlier march at this
+        # parameter that was the same at every step.  Otherwise each step's Jacobian
+        # is compared with the previous one (``J_prev``), whose matrix and hierarchy
+        # are kept while they agree; agreement at one step says nothing about the
+        # next, so the comparison is made at every step.
+        cached = None
         if self.is_fwd_linear and self._fwd_jac is not None \
                 and _same(self._fwd_jac[0], m):
-            jac = (self._fwd_jac[1], True)
+            cached = self._fwd_jac[1]
         else:
             self._fwd_jac = None
             if self.is_fwd_linear:
                 self._release_operators("solver")
+        J_prev, invariant = None, True
+        Ju = self.Vh[ADJOINT].vector() if self.is_fwd_linear else None
 
         for k in range(1, self.nt):
             t = self.times[k]
@@ -418,20 +439,19 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                       prm["abs_tolerance"])
             converged = False
             for _ in range(maxit):
-                if jac is not None and jac[1]:
-                    J = jac[0]
+                if cached is not None:
+                    J = cached
                 else:
                     J = self._step_block(ADJ, NEW, u, u_old, m, p0, t,
                                          test_ess=self.bc0.ess_tdof,
                                          diag_policy="one")
                     if self.is_fwd_linear:
-                        if jac is None:
-                            jac = (J, None)
-                        elif jac[1] is None:
-                            same = self._same_operator(jac[0], J)
-                            if same:
-                                J = jac[0]                 # keep the first, drop this one
-                            jac = (jac[0], same)
+                        if J_prev is not None:
+                            if self._same_operator(J_prev, J):
+                                J = J_prev                 # keep the held one, drop this
+                            else:
+                                invariant = False
+                        J_prev = J
                 _set_operator_once(solver, J)
                 r.scale(-1.0)
                 solver.solve(du, r)
@@ -440,19 +460,31 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                 if r.norm("l2") < tol:
                     converged = True
                     break
+                if not self.is_fwd_linear and step_tol > 0.0:
+                    size = u.norm("linf")
+                    if size > 0.0 and du.norm("linf") <= step_tol * size:
+                        converged = True
+                        break
             if not converged and not self.is_fwd_linear:
                 raise RuntimeError(
                     "forward Newton did not converge at t = %g: ||r|| = %.3e "
                     "(started at %.3e)" % (t, r.norm("l2"), r0))
-            if self.is_fwd_linear and r.norm("l2") > max(1e-6 * max(r0, 1.0), 1e-8):
-                raise RuntimeError(
-                    "is_fwd_linear=True but one Newton step left ||r|| = %.3e at "
-                    "t = %g; the step residual is not linear in the new level"
-                    % (r.norm("l2"), t))
+            if self.is_fwd_linear:
+                # One step of a linear residual leaves the solver's tolerance and the
+                # round-off of the residual, whose scale is that of its terms, |J u|,
+                # and not the change of one step, r0, which vanishes at a steady state.
+                J.Mult(u.hypre, Ju.hypre)
+                self.bc0.zero(Ju)
+                scale = max(r0, Ju.norm("l2"), 1.0)
+                if r.norm("l2") > max(1e-6 * scale, 1e-8):
+                    raise RuntimeError(
+                        "is_fwd_linear=True but one Newton step left ||r|| = %.3e at "
+                        "t = %g; the step residual is not linear in the new level"
+                        % (r.norm("l2"), t))
             out.store(u, t)
             u_old.assign(u)
-        if jac is not None and jac[1]:
-            self._fwd_jac = (m.copy(), jac[0])
+        if self.is_fwd_linear and cached is None and J_prev is not None and invariant:
+            self._fwd_jac = (m.copy(), J_prev)
         return out
 
     def _initial_state(self, m):
@@ -477,21 +509,33 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
 
         Returns a dict holding, per block name, a list indexed by step: ``A``,
         ``At`` and ``B`` always, plus the blocks named in ``extra`` (``C`` and the
-        ``W`` blocks for a linearization point).  When the step operators do not
-        change in time the ``A``, ``At`` and ``B`` lists hold one shared matrix
-        each.  The comparison is made at the second step; a match there is taken
-        to hold for the whole march, which is what a time-invariant residual
-        guarantees and a time-varying one fails at the first opportunity.
+        ``W`` blocks for a linearization point).  Every step's ``A`` and ``B`` are
+        assembled and compared with the previous step's; a step that agrees keeps
+        the previous matrix object, so a run of equal steps shares one ``A``, one
+        ``At``, one ``B`` and (see ``_step_solver``) one solver.  ``invariant`` says
+        that all steps share step one's.  A match at one step is not taken to hold
+        for the next: a state at rest for the first steps, or a coefficient that
+        changes later, gives equal early steps and different later ones.
 
         The cache is reused while ``x`` is the point it was built for, so the
         adjoint solve and the linearization point that follows it share one
         assembly of ``A`` and ``B``; blocks it lacks are added in one pass per
         step.  The point is remembered as a copy of ``m`` and of the trajectory
-        (``nt`` vectors, small next to the ``9 nt`` matrices of a full point).
+        (``nt`` vectors, small next to the ``9 nt`` matrices of a full point).  The
+        ``W`` blocks are second derivatives weighted by the adjoint, so they are
+        also tied to a copy of the adjoint they were built with and rebuilt when
+        the adjoint changes at the same ``(u, m)`` (new data, or the adjoint of a
+        quantity of interest after that of the misfit); ``A``, ``B`` and ``C`` do
+        not depend on it.
         """
         extra = tuple(extra)
         tr = self._traj
         if tr is not None and self._point_matches(tr, x):
+            stale = [n for n in _HESSIAN_BLOCKS if n in tr]
+            if stale and not self._adjoint_matches(tr, x):
+                for n in stale:
+                    del tr[n]
+                tr["p"] = None
             missing = tuple(n for n in extra if n not in tr)
             if missing:
                 for n in missing:
@@ -499,34 +543,34 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                 for k in range(1, self.nt):
                     for n, M in self._step_blocks(missing, *self._at(x, k)).items():
                         tr[n][k] = M
+                if any(n in _HESSIAN_BLOCKS for n in missing):
+                    tr["p"] = self._adjoint_copy(x)
             return tr
         self._traj = None
         self._release_operators("solver_adj", "solver_fwd_inc", "solver_adj_inc")
         names = _FORWARD_BLOCKS + extra
         tr = {"m": x[PARAMETER].copy(), "u": x[STATE].copy(), "invariant": False,
-              "fwd_inc": [None] * self.nt, "adj_inc": [None] * self.nt}
+              "p": (self._adjoint_copy(x)
+                    if any(n in _HESSIAN_BLOCKS for n in extra) else None),
+              "fwd_inc": [None] * self.nt, "adj_inc": [None] * self.nt,
+              "solvers": {}}
         tr.update({n: [None] * self.nt for n in names + ("At",)})
-        invariant = None
         for k in range(1, self.nt):
-            want = names if not invariant else extra
-            blocks = self._step_blocks(want, *self._at(x, k)) if want else {}
-            if invariant is None and k >= 2:
-                invariant = (self._same_operator(tr["A"][1], blocks["A"])
-                             and self._same_operator(tr["B"][1], blocks["B"]))
-                if invariant:
-                    for n in _FORWARD_BLOCKS:
-                        blocks.pop(n)
+            blocks = self._step_blocks(names, *self._at(x, k))
+            if k >= 2:
+                for n in _FORWARD_BLOCKS:
+                    if self._same_operator(tr[n][k - 1], blocks[n]):
+                        blocks[n] = tr[n][k - 1]       # keep the previous, drop this
             for n, M in blocks.items():
                 tr[n][k] = M
-        tr["invariant"] = True if self.nt <= 2 else bool(invariant)
-        if tr["invariant"]:
-            A, B = tr["A"][1], tr["B"][1]
-            At = A.Transpose()
-            for k in range(1, self.nt):
-                tr["A"][k], tr["B"][k], tr["At"][k] = A, B, At
-        else:
-            for k in range(1, self.nt):
-                tr["At"][k] = tr["A"][k].Transpose()
+        tr["invariant"] = all(tr[n][k] is tr[n][1] for n in _FORWARD_BLOCKS
+                              for k in range(1, self.nt))
+        transposes = {}
+        for k in range(1, self.nt):
+            A = tr["A"][k]
+            if id(A) not in transposes:
+                transposes[id(A)] = A.Transpose()
+            tr["At"][k] = transposes[id(A)]
         self._traj = tr
         return tr
 
@@ -543,13 +587,28 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             return False
         return all(_same(v, w) for v, w in zip(tr["u"], x[STATE]))
 
+    @staticmethod
+    def _adjoint_of(x):
+        return x[ADJOINT] if len(x) > ADJOINT else None
+
+    def _adjoint_copy(self, x):
+        p = self._adjoint_of(x)
+        return None if p is None else p.copy()
+
+    def _adjoint_matches(self, tr, x):
+        """Whether the cached ``W`` blocks were built with this adjoint."""
+        p, q = self._adjoint_of(x), tr.get("p")
+        if p is None or q is None:
+            return p is None and q is None
+        return all(_same(v, w) for v, w in zip(q, p))
+
     def _step_solver(self, tr, kind, k):
         """The solver holding step ``k``'s operator; one for all steps when invariant.
 
         ``kind`` is ``"fwd_inc"`` or ``"adj_inc"``.  The user's solver attribute is
         the template: it takes the operator itself when one serves every step, and
-        is cloned per step otherwise, so that no ``set_operator`` (for BoomerAMG,
-        the expensive part) ever happens inside a solve loop.
+        is cloned once per distinct operator otherwise, so that no ``set_operator``
+        (for BoomerAMG, the expensive part) ever happens inside a solve loop.
         """
         attr = "solver_" + kind
         template = self._get_solver(attr)
@@ -559,8 +618,14 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             return template
         s = tr[kind][k]
         if s is None:
-            s = tr[kind][k] = self._clone_solver(template)
-            s.set_operator(op)
+            # steps that share an operator object share its solver, so a run of
+            # equal steps sets up one hierarchy
+            key = (kind, id(op))
+            s = tr["solvers"].get(key)
+            if s is None:
+                s = tr["solvers"][key] = self._clone_solver(template)
+                s.set_operator(op)
+            tr[kind][k] = s
         return s
 
     # ------------------------------------------------------------------ adjoint

@@ -389,6 +389,27 @@ class ElementGroup(KeepAlive):
         return SpaceTables(space, self)
 
 
+def apply_trial_transformation(mats, trial_tables, elements=None):
+    """``A T_trial``: the column side of MFEM's ``TransformDual``, for a row space
+    without a transformation.
+
+    A block with H1 or L2 rows and H(curl) columns of order two and higher on
+    simplices needs it as much as one with H(curl) on both sides; dropping it gives
+    the matrix in the reference basis of the columns.  ``elements``, a ``(start,
+    stop)`` pair, says that ``mats`` holds that stretch of the group's elements only
+    (a chunk), as for :meth:`SpaceTables.transform_dual_matrix`.
+    """
+    T = getattr(trial_tables, "T", None)
+    if T is None:
+        return mats
+    cut = slice(None) if elements is None else slice(int(elements[0]), int(elements[1]))
+    if isinstance(mats, np.ndarray):
+        return np.einsum("eil,elj->eij", mats, T[cut])
+    import jax.numpy as jnp
+
+    return jnp.einsum("eil,elj->eij", mats, trial_tables._dev_T()[cut])
+
+
 class SpaceTables(KeepAlive):
     """Basis tables and element dof maps of one space on one element group.
 
@@ -470,10 +491,12 @@ class SpaceTables(KeepAlive):
     def transform_dual_matrix(self, mats, trial_tables, elements=None):
         """Map element matrices from the reference dof basis to the global one.
 
-        A no-op for H1/L2, where the two coincide; H(curl) on simplices needs
-        MFEM's ``DofTransformation``.
+        Nothing to do on the rows for H1/L2, where the two coincide; the columns
+        still take the trial space's ``DofTransformation`` when it has one (H(curl)
+        of order two and higher on simplices).  ``elements``, a ``(start, stop)`` pair,
+        says that ``mats`` holds that stretch of the group's elements only (a chunk).
         """
-        return mats
+        return apply_trial_transformation(mats, trial_tables, elements)
 
     def transform_dual_vector(self, vecs):
         """Map element vectors from the reference dof basis to the global one."""
@@ -564,6 +587,16 @@ def clear_table_cache():
     _TABLE_CACHE.clear()
 
 
+def clear_batch_cache():
+    """Drop every cached :class:`MeshBatches` and their tables (after refinement).
+
+    The batches are cached on the mesh object, which a refinement in place keeps:
+    their element lists and geometry would describe the mesh before it.
+    """
+    _BATCH_CACHE.clear()
+    _TABLE_CACHE.clear()
+
+
 class MeshBatches(KeepAlive):
     """All element groups of a mesh for one quadrature degree, with table caching.
 
@@ -594,6 +627,13 @@ class MeshBatches(KeepAlive):
         self.ngeom = bin(kinds).count("1")
         batched = self.ngeom == 1
         sliced = self._sliced(mesh, geoms)
+        if (batched or sliced) and mesh.GetNodes() is None:
+            # Both paths build the nodal grid function of a mesh that has none
+            # (MFEM's GeometricFactors does it itself), which is collective on a
+            # ParMesh; a rank that owns no element has no group and never gets
+            # there, so the others would wait for it.  Done here on every rank;
+            # the decision is global, and so is whether the mesh has nodes.
+            mesh.EnsureNodes()
         self.groups = [
             ElementGroup(mesh, g, np.array(v, dtype=np.int64),
                          self.quadrature_degree, batched=batched, sliced=sliced)

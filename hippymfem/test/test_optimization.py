@@ -1104,6 +1104,47 @@ def test_cg_sampler():
           "(rel diff %.1e)" % d)
 
 
+def test_svd_rectangular():
+    """accuracyEnhancedSVD of a map from 40 to 12 numbers, the shape of a parameter to
+    observable map (its range vectors were allocated in the domain's layout)."""
+    from hippymfem.common.parvector import ParVector
+
+    rng = np.random.default_rng(3)
+    A = rng.normal(size=(12, 40)) @ np.diag(0.7 ** np.arange(40))
+
+    def _split(n):
+        q, r = divmod(n, NP)
+        return q + (1 if RANK < r else 0)
+
+    rng_t, dom_t = ParVector(COMM, _split(12)), ParVector(COMM, _split(40))
+
+    def apply(M, x, y):
+        full = np.concatenate(COMM.allgather(x.array))
+        lo, hi = y.owner_range
+        y.array[:] = (M @ full)[lo:hi]
+        return y
+
+    class Rect(Operator):
+        def init_vector(self, x, dim):
+            return init_vector_like(x, rng_t if dim == 0 else dom_t)
+
+        def mult(self, x, y):
+            return apply(A, x, y)
+
+        def multTranspose(self, x, y):
+            return apply(A.T, x, y)
+
+    Omega = hm.MultiVector(dom_t, 10)
+    Omega.data[:] = rng.normal(size=Omega.data.shape)
+    try:
+        U, sig, V = hm.accuracyEnhancedSVD(Rect(), Omega, 5, s=2)
+        ref = np.linalg.svd(A, compute_uv=False)[:5]
+        e = float(np.abs(np.asarray(sig) - ref).max() / ref[0])
+    except ValueError:
+        e = np.inf
+    check("randomized SVD of a rectangular operator", e < 1e-3, "(max rel err %.1e)" % e)
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -1125,6 +1166,7 @@ if __name__ == "__main__":
     test_map_recovers_smooth_truth()
     test_laplace_approximation()
     test_cg_sampler()
+    test_svd_rectangular()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

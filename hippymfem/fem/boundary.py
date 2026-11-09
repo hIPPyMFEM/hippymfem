@@ -43,7 +43,7 @@ import mfem.par as mfem
 from ..common.identitycache import IdentityCache
 from ..common.keepalive import KeepAlive
 from .spaces import as_space
-from .elementbatch import _element_dofs, group_tables
+from .elementbatch import _element_dofs, apply_trial_transformation, group_tables
 from .csrassemble import assemble_matrix_csr, assemble_vector_csr
 
 __all__ = [
@@ -170,14 +170,23 @@ class BoundaryGroup(KeepAlive):
                 w = ftr.Face.Weight()
                 self.wdet[a, q] = self.w[q] * w
                 self.detJ[a, q] = w
-                if sdim == dim:
+                if sdim == dim and dim > 1:
                     mfem.CalcOrtho(ftr.Face.Jacobian(), nor)
                     v = nor.GetDataArray()
                     self.nor[a, q] = v
                     nor2[a, q] = v.dot(v)
                 T1.SetIntPoint(eip)
                 self.h[a, q] = T1.Weight() / max(w, 1e-300)
-                Jac[a, q] = T1.Jacobian().GetDataArray().reshape(sdim, dim, order="F")
+                J = T1.Jacobian().GetDataArray().reshape(sdim, dim, order="F")
+                Jac[a, q] = J
+                if sdim == dim == 1:
+                    # A point face has no tangent: CalcOrtho would read its 1x0
+                    # Jacobian out of bounds.  The outward normal is -1 or +1 by the
+                    # end of the element the point is on, as in MFEM's DG
+                    # integrators, and flips for an element mapped the other way.
+                    self.nor[a, q, 0] = (2.0 * eip.x - 1.0) * (1.0 if J[0, 0] >= 0.0
+                                                              else -1.0)
+                    nor2[a, q] = 1.0
         self.Jinv[:] = np.linalg.inv(Jac) if sdim == dim else np.linalg.pinv(Jac)
         self.nor /= np.maximum(np.sqrt(nor2), 1e-300)[:, :, None]
 
@@ -274,7 +283,8 @@ class BoundarySpaceTables(KeepAlive):
         return ev
 
     def transform_dual_matrix(self, mats, trial_tables, elements=None):
-        return mats
+        # the columns may still carry a DofTransformation (see SpaceTables)
+        return apply_trial_transformation(mats, trial_tables, elements)
 
     def transform_dual_vector(self, vecs):
         return vecs

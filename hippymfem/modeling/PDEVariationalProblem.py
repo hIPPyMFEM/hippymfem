@@ -71,6 +71,16 @@ def set_share_hessian_pass(flag=True):
     return old
 
 
+def _same_mesh(a, b):
+    """Whether two mesh wrappers hold the same MFEM mesh."""
+    if a is b:
+        return True
+    try:
+        return int(a.this) == int(b.this)
+    except Exception:                                        # noqa: BLE001
+        return False
+
+
 def _equivalent_spaces(a, b):
     """Whether two spaces are the same space, built twice.
 
@@ -79,9 +89,10 @@ def _equivalent_spaces(a, b):
     """
     fa, fb = a.fes, b.fes
     try:
-        # ``fes.GetMesh()`` hands back a fresh wrapper every call, so the mesh is
-        # compared through the space object, which keeps the one it was built on.
-        return (a.mesh is b.mesh
+        # ``fes.GetParMesh()`` hands back a fresh wrapper every call, and a space
+        # adopted with ``FunctionSpace.wrap`` keeps such a wrapper, so the meshes are
+        # compared by the MFEM object underneath and not by the Python wrapper.
+        return (_same_mesh(a.mesh, b.mesh)
                 and fa.FEColl().Name() == fb.FEColl().Name()
                 and fa.GetVDim() == fb.GetVDim()
                 and fa.GetOrdering() == fb.GetOrdering()

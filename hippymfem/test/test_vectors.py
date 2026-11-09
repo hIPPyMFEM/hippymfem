@@ -893,6 +893,15 @@ def test_ensemble():
     Omega.data[:] = np.random.default_rng(12).standard_normal(Omega.data.shape)
     d1, U1 = hp.doublePassG(A, B, B, MultiVector(Omega), 6)
     d2, U2 = hp.doublePassG(A, B, B, MultiVector(Omega), 6, ensemble=COMM)
+    # B passed as Binv: an operator with both mult (B) and solve (B^-1) applies its
+    # solve, as an explicit Solver2Operator does (its mult was taken, and the
+    # eigenvalues came out off by up to 40%)
+    from hippymfem.common.operators import Solver2Operator
+
+    d3, _ = hp.doublePassG(A, B, Solver2Operator(B), MultiVector(Omega), 6)
+    err = allreduce_extreme(COMM, float(np.abs(d1 / d3 - 1.0).max()), MPI.MAX)
+    check("doublePassG takes solve from a Binv that has mult and solve", err < 1e-12,
+          "(%.2e)" % err)
     err = allreduce_extreme(COMM, float(np.abs(d2 / d1 - 1.0).max()), MPI.MAX)
     check("doublePassG divided among the ranks: eigenvalues", err < 1e-12, "(%.2e)" % err)
     err = allreduce_extreme(COMM, float(np.abs(U1.data - U2.data).max()), MPI.MAX)
@@ -900,6 +909,43 @@ def test_ensemble():
     spread = (allreduce_extreme(COMM, float(d2[0]), MPI.MAX)
               - allreduce_extreme(COMM, float(d2[0]), MPI.MIN))
     check("every rank returns the same eigenvalues", spread == 0.0, "(%.2e)" % spread)
+
+
+def test_sum_operator_rectangular():
+    """A sum of two rectangular operators: mult and then multTranspose (they shared one
+    scratch vector, sized for whichever came first)."""
+    from hippymfem.common.operators import Operator, SumOperator, init_vector_like
+
+    rng = np.random.default_rng(0)
+    M1, M2 = rng.normal(size=(5, 3)), rng.normal(size=(5, 3))
+    rng_t, dom_t = ParVector(MPI.COMM_SELF, 5), ParVector(MPI.COMM_SELF, 3)
+
+    class Dense(Operator):
+        def __init__(self, M):
+            self.M = M
+
+        def init_vector(self, x, dim):
+            return init_vector_like(x, rng_t if dim == 0 else dom_t)
+
+        def mult(self, x, y):
+            y.array[:] = self.M @ x.array
+            return y
+
+        def multTranspose(self, x, y):
+            y.array[:] = self.M.T @ x.array
+            return y
+
+    S = SumOperator(Dense(M1), Dense(M2))
+    x, y, z = S.generate_vector(1), S.generate_vector(0), S.generate_vector(1)
+    x.array[:] = 1.0
+    S.mult(x, y)
+    try:
+        S.multTranspose(y, z)
+        ok = (np.allclose(y.array, (M1 + M2) @ x.array)
+              and np.allclose(z.array, (M1 + M2).T @ y.array))
+    except ValueError:
+        ok = False
+    check("SumOperator of rectangular operators, both directions", bool(ok))
 
 
 if __name__ == "__main__":
@@ -924,6 +970,7 @@ if __name__ == "__main__":
     test_device_auto_without_gpu()
     test_give_up_checked_at_import()
     test_comgr_cache_of_the_node()
+    test_sum_operator_rectangular()
     if RANK == 0:
         print("-" * 70)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

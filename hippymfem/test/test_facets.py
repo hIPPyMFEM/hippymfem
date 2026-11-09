@@ -571,6 +571,33 @@ def test_facet_symmetry_check():
     check("the problem checks its facet density", warned == (RANK == 0))
 
 
+def test_several_face_geometries_refused():
+    """Wedges have triangular and quadrilateral faces, and one quadrature rule cannot
+    integrate both: the facet batches refuse such a mesh, on every rank."""
+    from hippymfem.fem.facets import FacetBatches
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(2, 2, 2, mfem.Element.WEDGE))
+    try:
+        FacetBatches(pm, 4, COMM)
+        refused = False
+    except NotImplementedError:
+        refused = True
+    check("interior faces of several geometries are refused", refused)
+
+
+def test_point_facet_normals_1d():
+    """On a 1D mesh an interior face is a point: the normal out of the minus element is
+    +1 at its right end (CalcOrtho read a 1x0 Jacobian and crashed)."""
+    from hippymfem.fem.facets import get_facet_batches
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian1D(4 * NP, 1.0))
+    g = get_facet_batches(pm, 2).groups[0]
+    ok = bool(np.all(g.nor[:, 0, 0] == np.where(g.eip1[:, 0, 0] > 0.5, 1.0, -1.0))) \
+        if g.ne else True
+    ok = COMM.allreduce(int(ok), op=MPI.MIN) == 1
+    check("normals of the interior points of a 1D mesh", ok)
+
+
 def main():
     test_facet_symmetry_check()
     test_sipg_against_mfem()
@@ -584,6 +611,8 @@ def main():
     test_dg_solve()
     test_dg_inverse_problem()
     test_facets_with_essential_bcs()
+    test_several_face_geometries_refused()
+    test_point_facet_normals_1d()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)

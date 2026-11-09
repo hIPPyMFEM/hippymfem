@@ -344,6 +344,12 @@ class _VectorBdr(mfem.VectorPyCoefficient):
     def __init__(self, fn, vdim):
         super(_VectorBdr, self).__init__(vdim)
         self.fn = fn
+        self.vdim = int(vdim)
 
     def EvalValue(self, x):
-        return np.asarray(self.fn(np.asarray(x)), dtype=np.float64)
+        # A callable that returns one number (the value of one component, or the same
+        # value in all) gives a 0-d array, which the SWIG director cannot copy into
+        # its vdim-sized vector: it terminates the process.  One number means the
+        # same value in every component, as for a constant.
+        v = np.asarray(self.fn(np.asarray(x)), dtype=np.float64)
+        return np.broadcast_to(v, (self.vdim,)).copy() if v.size == 1 else v

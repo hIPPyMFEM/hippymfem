@@ -128,9 +128,14 @@ class QuadratureSqrtPrecision(Operator):
             self._layout.append((off, n, gi))
             off += n
         self.noise_local_size = off
-        self._stride_max = max(
+        # The stride sets each element's block of random words and how far a draw
+        # advances the shared stream, so it must be the same on every rank: a rank
+        # with other element geometries (or none) would otherwise advance
+        # ``parRandom`` by a different amount, and every later draw that is meant
+        # to be identical on all ranks (the accept/reject of MCMC) would differ.
+        self._stride_max = self.comm.allreduce(max(
             [g.nq * self.ncomp * self.vdim for g in self.batches.groups] or [1]
-        )
+        ), op=MPI.MAX)
         self._global_ne = (mesh.GetGlobalNE() if hasattr(mesh, "GetGlobalNE")
                            else mesh.GetNE())
         # centroid keys are not contiguous: each element has its own stream offset
@@ -187,7 +192,10 @@ class QuadratureSqrtPrecision(Operator):
             packed = (packed << self._KEY_BITS) | q[:, d]
         keys = np.empty(ne, dtype=object)
         keys[:] = [int(k) for k in packed]
-        if ne and len(set(keys.tolist())) != ne:
+        # decided on every rank alike: a rank that raised alone would leave the
+        # others waiting in the next collective
+        collided = bool(ne) and len(set(keys.tolist())) != ne
+        if comm.allreduce(int(collided), op=MPI.MAX):
             raise RuntimeError(
                 "element centroids collided when quantized to %d bits per "
                 "dimension; the mesh has elements closer than one part in 2**%d "
@@ -810,11 +818,16 @@ class LaplacianPrior(_Prior):
         self.gamma = float(gamma)
         self.delta = float(delta)
 
-        self.M = assemble_native_matrix(self.Vh, [mfem.MassIntegrator()])
+        # a scalar integrator on a vector space assembles one component's block at
+        # most (a singular or wrong matrix), so the vector forms are used for vdim > 1
+        vec = self.Vh.vdim > 1
+        mass = mfem.VectorMassIntegrator if vec else mfem.MassIntegrator
+        diff = mfem.VectorDiffusionIntegrator if vec else mfem.DiffusionIntegrator
+        self.M = assemble_native_matrix(self.Vh, [mass()])
         self.R = assemble_native_matrix(
             self.Vh,
-            [mfem.DiffusionIntegrator(mfem.ConstantCoefficient(self.gamma)),
-             mfem.MassIntegrator(mfem.ConstantCoefficient(self.delta))],
+            [diff(mfem.ConstantCoefficient(self.gamma)),
+             mass(mfem.ConstantCoefficient(self.delta))],
         )
         self.keep(self.M, self.R)
         self.Msolver, self.Rsolver = _make_prior_solvers(
@@ -895,6 +908,21 @@ def BiLaplacianPrior(Vh, gamma, delta, Theta=None, mean=None, rel_tol=1e-12,
     Vh = as_space(Vh)
     gamma = float(gamma)
     delta = float(delta)
+    if Vh.vdim > 1:
+        # The scalar integrators below would assemble an operator whose action is
+        # NaN on a vector space.  The isotropic forms have vector counterparts; an
+        # anisotropic Theta on a vector space has none in MFEM's integrators.
+        if Theta is not None and not isinstance(Theta, numbers.Number):
+            raise NotImplementedError(
+                "BiLaplacianPrior with a tensor Theta on a vector space (vdim = %d) "
+                "is not supported; build the blocks with SqrtPrecisionPDE_Prior"
+                % Vh.vdim)
+        g = gamma * (1.0 if Theta is None else float(Theta))
+        prior = VectorBiLaplacianPrior(Vh, [g] * Vh.vdim, [delta] * Vh.vdim, mean,
+                                       rel_tol, max_iter, robin_bc, solver_type,
+                                       quadrature_degree)
+        prior.gamma = gamma
+        return prior
     keep = []
     if Theta is None:
         diff = mfem.DiffusionIntegrator(mfem.ConstantCoefficient(gamma))

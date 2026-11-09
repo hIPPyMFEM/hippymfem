@@ -1371,6 +1371,102 @@ def test_direct_transposes():
           "(%.1e, %.1e against %.0e; the matrices %s, %s)" % (ea, eb, tol, out["1"][3], out["1"][4]))
 
 
+def test_raw_spaces_aliased():
+    """Raw ParFiniteElementSpaces for the state and the adjoint, built separately over
+    one mesh, are recognized as one space (each wrap held a fresh mesh wrapper, the
+    spaces were not aliased, and the Jacobian came out singular)."""
+    pm = mesh2d(8)
+    fec_u, fec_m = mfem.H1_FECollection(1, 2), mfem.H1_FECollection(1, 2)
+    fes_u = mfem.ParFiniteElementSpace(pm, fec_u)
+    fes_p = mfem.ParFiniteElementSpace(pm, fec_u)
+    fes_m = mfem.ParFiniteElementSpace(pm, fec_m)
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * hm.inner(u.grad, p.grad) - p.val
+
+    bc = hm.DirichletBC(hm.FunctionSpace.wrap(fes_u), 0.0, bdr_attributes="all")
+    pde = hm.PDEVariationalProblem([fes_u, fes_m, fes_p], varf, bc, bc.homogeneous(),
+                                   is_fwd_linear=True)
+    check("separately built equivalent raw spaces are aliased",
+          pde.Vh[ADJOINT] is pde.Vh[STATE])
+    pde.solver = hm.LUSolver(COMM)
+    u = pde.generate_state()
+    try:
+        pde.solveFwd(u, [u, pde.generate_parameter(), None])
+        ok = u.norm("linf") > 0.0
+    except RuntimeError:
+        ok = False
+    check("forward solve on separately built raw spaces", bool(ok))
+
+
+def test_continuous_observation_bcs():
+    """``ContinuousStateObservation(bcs=...)`` removes the essential rows and columns:
+    its cost leaves the essential dofs out (they kept a unit diagonal and added half
+    their number to a cost of full-field data)."""
+    pm = mesh2d(16)
+    V = hm.FunctionSpace.H1(pm, 1)
+    bc = hm.DirichletBC(V, 0.0, bdr_attributes="all")
+    with_bc = hm.ContinuousStateObservation(V, bcs=bc, noise_variance=1.0)
+    no_bc = hm.ContinuousStateObservation(V, noise_variance=1.0)
+    d = V.vector()
+    d.set(1.0)
+    with_bc.d = d
+    u = V.vector()
+    r = u.copy().axpy(-1.0, d)
+    bc.zero(r)
+    ref = no_bc.cost([r, None, None])
+    got = with_bc.cost([u, None, None])
+    check("continuous observation with essential rows removed", abs(got - ref) < 1e-12 * ref,
+          "(%.6f vs %.6f)" % (got, ref))
+
+
+def test_mixed_mesh_noise_stream():
+    """On a mesh of two geometries the noise of a prior advances the shared random
+    stream by the same amount on every rank, so later draws meant to be identical on
+    all ranks (an MCMC accept or reject) stay so (each rank used its own stride)."""
+    from hippymfem.test.mixed_mesh import write_mixed_mesh
+
+    nn = max(8, 4 * NP)
+    path = "/tmp/_hippymfem_mixed_noise_n%d.mesh" % nn
+    if RANK == 0:
+        write_mixed_mesh(path, nn)
+    COMM.Barrier()
+    pm = mfem.ParMesh(COMM, mfem.Mesh(path, 1, 1))
+    V = hm.FunctionSpace.H1(pm, 1)
+    prior = hm.BiLaplacianPrior(V, 0.1, 1.0, solver_type="lu" if NP == 1 else "krylov")
+    hm.parRandom.set_seed(1)
+    prior.sample_noise(1.0)
+    u = hm.parRandom.scalar_uniform()
+    us = COMM.allgather(u)
+    check("the shared random stream stays in step on a mesh of two geometries",
+          max(us) == min(us), "(%s)" % us)
+
+
+def test_vector_space_priors():
+    """LaplacianPrior and BiLaplacianPrior on a vector space assemble the vector forms
+    (they assembled scalar integrators: a singular or wrong precision, or NaN)."""
+    pm = mesh2d(6)
+    V = hm.FunctionSpace.H1(pm, 1, vdim=2)
+    stype = "lu" if NP == 1 else "krylov"
+    lap = hm.LaplacianPrior(V, 1.0, 2.0, solver_type=stype)
+    Rref = hm.assemble_native_matrix(V, [mfem.VectorDiffusionIntegrator(mfem.ConstantCoefficient(1.0)),
+                                         mfem.VectorMassIntegrator(mfem.ConstantCoefficient(2.0))])
+    bil = hm.BiLaplacianPrior(V, 1.0, 2.0, solver_type=stype)
+    ref = hm.VectorBiLaplacianPrior(V, [1.0, 1.0], [2.0, 2.0], solver_type=stype)
+    hm.parRandom.set_seed(3)
+    x = V.vector()
+    hm.parRandom.normal(1.0, x)
+    y, yr = V.vector(), V.vector()
+    lap.Rmat.Mult(x.hypre, y.hypre)
+    Rref.Mult(x.hypre, yr.hypre)
+    e1 = y.copy().axpy(-1.0, yr).norm("l2") / yr.norm("l2")
+    bil.A.Mult(x.hypre, y.hypre)
+    ref.A.Mult(x.hypre, yr.hypre)
+    e2 = y.copy().axpy(-1.0, yr).norm("l2") / yr.norm("l2")
+    check("priors on a vector space use the vector forms", e1 < 1e-13 and e2 < 1e-13,
+          "(Laplacian %.1e, BiLaplacian %.1e)" % (e1, e2))
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -1399,6 +1495,10 @@ if __name__ == "__main__":
     test_hessian_properties()
     test_lumped_mass_prior()
     test_mixed_precision()
+    test_raw_spaces_aliased()
+    test_continuous_observation_bcs()
+    test_mixed_mesh_noise_stream()
+    test_vector_space_priors()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

@@ -19,6 +19,7 @@ import warnings
 import numpy as np
 from ..common.identitycache import IdentityCache
 from ..common.keepalive import KeepAlive
+from ..common.linalg import require_int32_count
 from ..common.parvector import _HYPRE_BIGINT, _HYPRE_INT
 from .elementbatch import group_tables
 from .spaces import as_space
@@ -645,6 +646,7 @@ class ScatterPattern(KeepAlive):
         indptr = np.zeros(self.nrow + 1, dtype=np.int64)
         np.cumsum(counts, out=indptr[1:])
         self.indices = np.ascontiguousarray(ucol).astype(_HYPRE_INT, copy=False)
+        require_int32_count(indptr[-1], "sparsity pattern")
         self.indptr = indptr.astype(np.int32)
         if PATTERN_TIMING:
             _say_phase("CSR + diagonal first", time.perf_counter() - t_csr, n)
@@ -796,7 +798,7 @@ class ScatterPattern(KeepAlive):
         geometry groups, the only case ``perm`` is set for.  The fused scatter slices
         a copy in the order of the element arrays there (:meth:`_array_order`).
         """
-        return self.perm is None and self.nnz > 0
+        return self.nnz > 0
 
     def _array_order(self):
         """This pattern for the fused scatter of a mesh of several geometries: a
@@ -1140,6 +1142,15 @@ def clear_pattern_cache():
     from .tdofassemble import clear_tdof_cache
 
     clear_tdof_cache()
+    # The element batches, their basis tables and the boundary batches are cached on
+    # the mesh and the spaces as well, objects a refinement in place keeps alive;
+    # left behind, they would hand the next assembly the elements and geometry of the
+    # mesh before it.
+    from .boundary import clear_boundary_cache
+    from .elementbatch import clear_batch_cache
+
+    clear_batch_cache()
+    clear_boundary_cache()
 
 
 class VectorPattern(KeepAlive):

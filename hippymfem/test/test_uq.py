@@ -256,6 +256,10 @@ def test_importance_sampling():
     spread = float((w.max() - w.min()) / w.mean())
     check("the weights are equal where the approximation is exact", spread < 1e-5,
           "(relative spread %.2e)" % spread)
+    # relative to the mean of nu the weights are 1 here, and not exp(-misfit), which
+    # is exactly zero for a realistic number of observations
+    check("the weights are taken relative to the mean of the approximation",
+          float(np.abs(w - 1.0).max()) < 1e-6, "(max |w - 1| %.1e)" % float(np.abs(w - 1.0).max()))
     sd = np.sqrt(np.diag(cov_ex))
     e = float(np.abs(tracer.mean() - mean_ex).max() / sd.max())
     check("the sample mean is the posterior mean", e < 0.2, "(%.3f of the largest std)" % e)
@@ -468,6 +472,15 @@ def test_forward_uq():
     # the Taylor model must reproduce the map at the expansion point
     check("Taylor model exact at the mean",
           abs(tay.eval(m0, order=2) - tay.q_bar) < 1e-10 * max(abs(tay.q_bar), 1.0))
+    # the low-rank model, the control variate below, agrees with the full one along a
+    # kept eigenvector: there the low-rank Hessian is exact
+    u0 = U[0].copy()
+    mu = m0.copy().axpy(1e-2, u0)
+    dfull = tay.eval(mu, order=2) - tay.eval(mu, order=1)
+    dlow = tay.eval_lowrank(mu, order=2) - tay.eval_lowrank(mu, order=1)
+    check("low-rank Taylor model exact along a kept eigenvector",
+          abs(dlow - dfull) < 1e-6 * max(abs(dfull), 1e-300),
+          "(%.3e vs %.3e)" % (dlow, dfull))
 
     # Monte Carlo with the Taylor control variate
     res = hm.varianceReductionMC(prior, p2q, tay, 150, order=2)
@@ -651,6 +664,33 @@ def test_variational_qoi():
           "(slope %.3f)" % hm.best_slope(e, eH))
 
 
+def test_posterior_sample_keeps_prior_sample():
+    """``post.sample(s_prior, s_post)`` takes ``s_prior`` as an input and leaves it as
+    it was (the prior mean was added to it, and a second call gave another sample)."""
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(8, 8, mfem.Element.TRIANGLE))
+    Vm = hm.FunctionSpace.H1(pm, 1)
+    mean = Vm.vector()
+    mean.set(2.0)
+    prior = hm.BiLaplacianPrior(Vm, 0.2, 2.0, mean=mean,
+                                solver_type="lu" if NP == 1 else "krylov")
+    U = hm.MultiVector(Vm.vector(), 2)
+    hm.parRandom.set_seed(1)
+    hm.parRandom.normal_multivector(1.0, U)
+    mapm = Vm.vector()
+    mapm.set(1.0)
+    post = hm.GaussianLRPosterior(prior, np.array([5.0, 1.0]), U, mean=mapm)
+    s_prior = Vm.vector()
+    prior.sample(prior.sample_noise(1.0), s_prior, add_mean=False)
+    before = s_prior.copy()
+    s1, s2 = Vm.vector(), Vm.vector()
+    post.sample(s_prior, s1)
+    post.sample(s_prior, s2)
+    d_in = s_prior.copy().axpy(-1.0, before).norm("linf")
+    d_out = s2.copy().axpy(-1.0, s1).norm("linf")
+    check("a posterior sample leaves the prior sample it is given", d_in == 0.0 and d_out == 0.0,
+          "(input changed by %.1e, samples differ by %.1e)" % (d_in, d_out))
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -667,6 +707,7 @@ if __name__ == "__main__":
     test_taylor_under_posterior()
     test_mass_functional()
     test_variational_qoi()
+    test_posterior_sample_keeps_prior_sample()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

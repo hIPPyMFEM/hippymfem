@@ -15,6 +15,7 @@ import numpy as np
 import mfem.par as mfem
 
 from ..common.linalg import own  # noqa: F401  (re-exported)
+from ..common.linalg import _local_diag, set_diagonal_entries
 from ..common.parvector import allreduce as _reduce, host_sync, to_numpy
 from .spaces import as_space
 from .csrassemble import assemble_matrix_csr, assemble_vector_csr
@@ -165,8 +166,21 @@ def assemble_native_matrix(space, integrators, bdr_integrators=(), ess=None,
             form.AddBoundaryIntegrator(it)
         form.Assemble()
         form.Finalize()
+        # FormSystemMatrix eliminates through HypreParMatrix::EliminateRowsCols, which
+        # leaves 1.0 on the diagonal whatever the form's DiagonalPolicy says (the
+        # policy only reaches the serial SparseMatrix path), so the other policies are
+        # applied to the eliminated matrix here, as fem.elimination does.
+        idx = keep = None
+        if ess is not None and diag_policy != "one":
+            idx = np.asarray(ess.ToList(), dtype=np.int64)
+            if diag_policy == "keep":
+                full = form.ParallelAssemble()
+                keep = _local_diag(full)[idx]
+                del full
         A = mfem.HypreParMatrix()
         form.FormSystemMatrix(ess if ess is not None else empty_ess(), A)
+        if idx is not None:
+            set_diagonal_entries(A, idx, 0.0 if diag_policy == "zero" else keep)
         return own(A, form, *integrators, *bdr_integrators)
 
     trial_space = as_space(trial_space)

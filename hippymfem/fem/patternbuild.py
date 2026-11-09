@@ -198,6 +198,10 @@ def build(rows, cols, nrow, ncol, diag_first, index_type, indptr_type=np.int32):
     idx_t = np.int32 if nnz <= np.iinfo(np.int32).max else np.intp
     if slot.dtype != idx_t:
         slot = slot.astype(idx_t)
+    if np.dtype(indptr_type).itemsize == 4 and nnz > np.iinfo(np.int32).max:
+        from ..common.linalg import require_int32_count
+
+        require_int32_count(nnz, "sparsity pattern")
     return (indptr.astype(indptr_type, copy=False), indices.astype(index_type, copy=False),
             slot, nnz)
 

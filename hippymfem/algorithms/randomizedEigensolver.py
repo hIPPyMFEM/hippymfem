@@ -176,10 +176,18 @@ def doublePassG(A, B, Binv, Omega, k, s=1, check=False, ensemble=None):
 
 
 def _as_operator(S):
-    """Accept either an operator (``mult``) or a solver (``solve``)."""
-    if hasattr(S, "mult"):
-        return S
-    return Solver2Operator(S)
+    """The action of :math:`B^{-1}` from ``Binv``: its ``solve`` when it has one, as in
+    hIPPYlib, else its ``mult``.
+
+    ``solve`` comes first because operators such as ``DiagonalOperator``,
+    ``LumpedMassSolver`` and ``LowRankOperator`` have both, with ``mult`` applying
+    :math:`B` itself: taking ``mult`` would apply :math:`B` where :math:`B^{-1}` is
+    meant.  An operator with ``mult`` alone (a ``Solver2Operator``, say) is taken to
+    apply :math:`B^{-1}`.
+    """
+    if hasattr(S, "solve"):
+        return Solver2Operator(S)
+    return S
 
 
 # ------------------------------------------------------------------- diagnostics

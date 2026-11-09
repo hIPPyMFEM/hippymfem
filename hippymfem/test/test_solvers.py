@@ -1784,6 +1784,64 @@ def test_benchmarks():
                                  else "the Jacobian came without the products"))
 
 
+def test_hypre_pcg_breakdown():
+    """hypre's PCG stops early when the matrix is not positive definite, with a count
+    below the limit: that is a failure, not a convergence (it was reported as one, and
+    an incremental or prior solve went on with a wrong vector)."""
+    from hippymfem.algorithms import linSolvers
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(16, 16, mfem.Element.TRIANGLE))
+    V = hp.FunctionSpace.H1(pm, 1)
+    A = hp.assemble_native_matrix(V, [mfem.DiffusionIntegrator(),
+                                      mfem.MassIntegrator(mfem.ConstantCoefficient(-200.0))])
+    hp.parRandom.set_seed(7)
+    b = V.vector()
+    hp.parRandom.normal(1.0, b)
+    old = linSolvers.set_hypre_pcg(True)
+    try:
+        s = hp.KrylovSolver(COMM, "cg", "amg")
+        s.parameters["max_iter"] = 200
+        s.parameters["error_on_nonconvergence"] = False
+        s.set_operator(A)
+        x = V.vector()
+        s.solve(x, b)
+        native = bool(getattr(s, "_native", False))
+        bad = s.converged
+        # and a positive definite system still converges on the same path
+        Apd = hp.assemble_native_matrix(V, [mfem.DiffusionIntegrator(), mfem.MassIntegrator()])
+        s2 = hp.KrylovSolver(COMM, "cg", "amg")
+        s2.set_operator(Apd)
+        s2.solve(x, b)
+        good = s2.converged
+    finally:
+        linSolvers.set_hypre_pcg(old)
+    check("hypre's PCG breaking off on an indefinite matrix is a failure",
+          native and not bad and good, "(native %s, indefinite %s, definite %s)"
+          % (native, bad, good))
+
+
+def test_systems_amg_ordering():
+    """BoomerAMG's systems mode is told the dof ordering of the space: byNODES, the
+    default here, was taken for interleaved, and the iterations ran into the hundreds."""
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(32, 32, mfem.Element.TRIANGLE))
+    V = hp.FunctionSpace.H1(pm, 2, vdim=2)
+    A = hp.assemble_native_matrix(V, [mfem.VectorDiffusionIntegrator(),
+                                      mfem.VectorMassIntegrator()])
+    hp.parRandom.set_seed(5)
+    b = V.vector()
+    hp.parRandom.normal(1.0, b)
+    s = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=2)
+    s.parameters["rel_tolerance"] = 1e-10
+    s.set_operator(A)
+    x = V.vector()
+    its = s.solve(x, b)
+    prior = hp.VectorBiLaplacianPrior(V, [0.1, 0.1], [1.0, 1.0])
+    prior.Asolver.solve(x, b)
+    its_prior = prior.Asolver.iterations
+    check("systems AMG on a vector space ordered by nodes", its < 30 and its_prior < 30,
+          "(%d and %d iterations)" % (its, its_prior))
+
+
 def main():
     test_gather()
     test_exact_solve()
@@ -1801,6 +1859,8 @@ def main():
     test_single_precision_solves()
     test_lumped_mass()
     test_transpose_solver()
+    test_hypre_pcg_breakdown()
+    test_systems_amg_ordering()
     test_petsc()
     test_benchmarks()
     COMM.Barrier()

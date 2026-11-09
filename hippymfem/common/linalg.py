@@ -220,6 +220,23 @@ def _local_diag(A):
     return out
 
 
+def require_int32_count(n, what, comm=None):
+    """Raise when a rank's count of nonzeros does not fit a 32-bit index.
+
+    hypre keeps the row pointers and local column indices of its CSR blocks as 32-bit
+    integers, and the patterns cast to ``int32`` for it; above ``2**31 - 1`` the cast
+    would wrap without a word and assemble a wrong matrix.  With ``comm`` the verdict
+    is reduced, so that every rank raises together.
+    """
+    over = int(n) > np.iinfo(np.int32).max
+    if comm is not None:
+        over = bool(comm.allreduce(int(over), op=MPI.MAX))
+    if over:
+        raise OverflowError(
+            "%s: %d nonzeros on a rank, more than the 2**31 - 1 that hypre's 32-bit "
+            "local indices hold; use more ranks" % (what, int(n)))
+
+
 def set_diagonal_entries(A, idx, value, report_missing=False):
     """Set ``A[i, i] = value`` for the local row indices in ``idx``, in place.
 

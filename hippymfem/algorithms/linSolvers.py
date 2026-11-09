@@ -775,10 +775,14 @@ class KrylovSolver(_SolverBase):
             # ranks: one that judged its own part would raise alone.
             self.converged = False
         if not self.converged and self.parameters["error_on_nonconvergence"]:
+            why = ""
+            if native and self.iterations < int(self.parameters["max_iter"]):
+                why = (": hypre's PCG broke off (the matrix or the preconditioner is "
+                       "not positive definite)")
             raise RuntimeError(
-                "%s(%s) failed to converge in %d iterations (final rel. norm %.3e)"
+                "%s(%s) failed to converge in %d iterations (final rel. norm %.3e)%s"
                 % (self.method, self.precond_type, self.iterations,
-                   final if final is not None else solver.GetFinalRelNorm())
+                   final if final is not None else solver.GetFinalRelNorm(), why)
             )
         return self.iterations
 

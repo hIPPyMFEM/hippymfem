@@ -55,6 +55,7 @@ class TaylorApproximationQoi:
         self.d = None
         self.U = None
         self.H = None
+        self.B = None
 
     # -------------------------------------------------------------- factorize
     def computeLowRankFactorization(self, Omega, k=None, s=1, check=False):
@@ -84,6 +85,7 @@ class TaylorApproximationQoi:
             B = self.distribution.Hlr
             Binv = Solver2Operator(B)
         self.d, self.U = doublePassG(self.H, B, Binv, Omega, k, s=s, check=check)
+        self.B = B
         return self.d, self.U
 
     def _require(self):
@@ -117,7 +119,7 @@ class TaylorApproximationQoi:
 
     # ------------------------------------------------------------------ eval
     def eval(self, m, order=2):
-        """Evaluate the Taylor model at a realization ``m``."""
+        """Evaluate the Taylor model at a realization ``m``, with the full Hessian."""
         self._require()
         dm = m.copy().axpy(-1.0, self.x_bar[PARAMETER])
         q = self.q_bar + self.g_bar.inner(dm)
@@ -127,3 +129,24 @@ class TaylorApproximationQoi:
             return q + 0.5 * self.H.inner(dm, dm)
         raise ValueError("order must be 1 or 2")
 
+    def eval_lowrank(self, m, order=2):
+        r"""The Taylor model with the low-rank Hessian of the factorization,
+        :math:`\bar q + \bar g^{\top}\delta m
+        + \tfrac12\sum_i d_i (u_i^{\top} B\,\delta m)^2`.
+
+        Its mean under the distribution is exactly :meth:`expectedValue`, which
+        :meth:`eval` with the full Hessian matches only when every eigenvalue that
+        counts was kept; a control variate needs that.  It costs one product with
+        ``B`` instead of the two PDE solves of a Hessian action.
+        """
+        self._require()
+        dm = m.copy().axpy(-1.0, self.x_bar[PARAMETER])
+        q = self.q_bar + self.g_bar.inner(dm)
+        if order == 1:
+            return q
+        if order == 2:
+            Bdm = self.p2qoimap.generate_vector(PARAMETER)
+            self.B.mult(dm, Bdm)
+            c = np.asarray(self.U.dot_v(Bdm), dtype=np.float64)
+            return q + 0.5 * float(np.sum(np.asarray(self.d) * c * c))
+        raise ValueError("order must be 1 or 2")

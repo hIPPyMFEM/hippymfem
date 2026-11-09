@@ -620,6 +620,96 @@ def test_chunked_dof_transformation():
     check("the split assembly is the unsplit one", worst < 1e-13, "(rel %.2e)" % worst)
 
 
+def test_h1_rows_nd_columns():
+    """A block with H1 rows and H(curl) columns of order two on tetrahedra, whose
+    columns carry a DofTransformation: it must be the transpose of the block with the
+    roles swapped, which MFEM's MixedVectorGradientIntegrator gives."""
+    E, PHI, V, PSI = 0, 1, 2, 3
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(2, 2, 2, mfem.Element.TETRAHEDRON))
+    Ve, Vp = FunctionSpace.ND(pm, 2), FunctionSpace.H1(pm, 2)
+    b = MeshBatches(pm, 8, COMM)
+
+    def density(e, phi, v, psi, x):
+        return (jnp.dot(e.curl, v.curl) + jnp.dot(phi.grad, v.val)
+                + jnp.dot(e.val, psi.grad))
+
+    spaces = [Ve, Vp, Ve, Vp]
+    K = QuadratureKernel(density, spaces, b)
+    zero = [sp.local_values(sp.vector()) for sp in spaces]
+    G = to_dense(assemble_matrix(spaces[PSI], spaces[E], b.groups,
+                                 K.element_matrices(PSI, E, zero), pm.GetNE()), COMM)
+    form = mfem.ParMixedBilinearForm(Vp.fes, Ve.fes)
+    integ = mfem.MixedVectorGradientIntegrator()
+    integ.SetIntRule(b.groups[0].ir)
+    form.AddDomainIntegrator(integ)
+    form.Assemble()
+    form.Finalize()
+    ref = to_dense(form.ParallelAssemble(), COMM)
+    e = np.abs(G - ref.T).max() / max(np.abs(ref).max(), 1e-300)
+    check("H1 rows with H(curl) columns of order two take the column transformation",
+          e < 1e-13, "(rel err %.1e)" % e)
+
+
+def test_chunked_dof_transformation_comm():
+    """A split element batch of an H(curl) space with DofTransformations: each chunk
+    takes its own elements' transformation (the whole group's was applied to a chunk)."""
+    from hippymfem.fem import kernel as kern
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(3, 3, 3, mfem.Element.TETRAHEDRON))
+    V, Vm = FunctionSpace.ND(pm, 2), FunctionSpace.H1(pm, 1)
+    b = MeshBatches(pm, 6, COMM)
+    K = QuadratureKernel(lambda u, m, p, x: jnp.dot(u.curl, p.curl) + jnp.dot(u.val, p.val),
+                         [V, Vm, V], b)
+    loc = [V.local_values(V.vector()), Vm.local_values(Vm.vector()),
+           V.local_values(V.vector())]
+    A0 = to_dense(assemble_matrix(V, V, b.groups, K.element_matrices(2, 0, loc),
+                                  pm.GetNE()), COMM)
+    old = kern.ELEMENT_CHUNK
+    try:
+        kern.ELEMENT_CHUNK = 64
+        for gk in K.group_kernels:
+            gk._chunk.clear()
+        A1 = to_dense(assemble_matrix(V, V, b.groups,
+                                      K.element_matrices_or_chunks(2, 0, loc, comm=COMM),
+                                      pm.GetNE()), COMM)
+        e = np.abs(A1 - A0).max() / np.abs(A0).max()
+    except ValueError:
+        e = np.inf
+    finally:
+        kern.ELEMENT_CHUNK = old
+        for gk in K.group_kernels:
+            gk._chunk.clear()
+    check("chunked assembly with DofTransformations", e < 1e-13, "(rel diff %.1e)" % e)
+
+
+def test_project_vector_elements():
+    """Projection onto H(curl) and H(div), whose fields have sdim components although
+    the space has vdim 1 (a scalar coefficient made MFEM abort)."""
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.QUADRILATERAL))
+    ok = True
+    for fam in ("ND", "RT"):
+        V = getattr(FunctionSpace, fam)(pm, 1)
+        v = V.project(lambda x: np.array([x[1], -x[0]]))
+        ok = ok and np.isfinite(v.norm("l2")) and v.norm("l2") > 0.0
+    check("projection onto H(curl) and H(div)", bool(ok))
+
+
+def test_vector_bc_scalar_callable():
+    """A callable boundary value that returns one number on a vector space, for one
+    component or for all (the coefficient handed MFEM a 0-d array and the process was
+    terminated)."""
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.QUADRILATERAL))
+    V = FunctionSpace.H1(pm, 1, vdim=2)
+    ok = True
+    for comp in (0, 1, None):
+        kw = {} if comp is None else {"component": comp}
+        bc = hp.DirichletBC(V, lambda x: 1.0 + x[0], "all", **kw)
+        v = V.vector()
+        bc.apply(v)
+        ok = ok and np.isfinite(v.norm("l2")) and v.norm("linf") > 0.0
+    check("callable boundary values that return one number on a vector space", bool(ok))
+
+
 def main():
     test_vs_mfem()
     test_coefficient_and_derivatives()
@@ -629,6 +719,10 @@ def main():
     test_mixed_formulation_blocks()
     test_poroelasticity_blocks()
     test_chunked_dof_transformation()
+    test_h1_rows_nd_columns()
+    test_chunked_dof_transformation_comm()
+    test_project_vector_elements()
+    test_vector_bc_scalar_callable()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)

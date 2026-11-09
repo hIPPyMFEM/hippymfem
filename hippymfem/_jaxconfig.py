@@ -59,6 +59,13 @@ def _want_gpu():
     return v in ("gpu", "cuda", "rocm", "gpu:0")
 
 
+def _platforms_want_gpu():
+    """True when ``JAX_PLATFORMS`` names an accelerator, the other documented way of
+    asking for GPU element kernels."""
+    p = (os.environ.get("JAX_PLATFORMS") or "").lower()
+    return any(name in p for name in ("cuda", "rocm", "gpu"))
+
+
 _AUTO_GPU = None
 
 
@@ -421,11 +428,14 @@ if _want_gpu():
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(_mem_fraction()))
     if env_flag("HIPPYMFEM_PIN_GPU", True):
         PINNED_DEVICE = _pin_visible_device()
-elif (env_flag("HIPPYMFEM_PIN_GPU", True)
+elif (not _platforms_want_gpu()
+      and env_flag("HIPPYMFEM_PIN_GPU", True)
       and not any(v in os.environ for v in _VISIBLE_VARS) and not hypre_on_device()
       and not any(m in sys.modules for m in ("mpi4py.MPI", "mfem._par.mfem", "mfem.par"))):
     # A run that asked for no device holds none: the platform list keeps JAX off the
-    # cards, and this hides them from everything else.  It must precede the first CUDA
+    # cards, and this hides them from everything else.  A device asked for through
+    # JAX_PLATFORMS instead of HIPPYMFEM_DEVICE is a request too, and hiding the cards
+    # from it would leave JAX with none to open.  It must precede the first CUDA
     # call, and MPI_Init counts (it opens no context but fixes the visible list), so it
     # is skipped once mpi4py or MFEM is imported; tools/mpirun_pinned.sh applies the
     # same rule at the launcher.  An explicit visible-device list is honored.  AMD's
@@ -486,4 +496,4 @@ def platforms():
 
 def gpu_requested():
     """True when the environment asked for GPU element kernels."""
-    return _want_gpu() or "cuda" in (platforms() or "") or "gpu" in (platforms() or "")
+    return _want_gpu() or _platforms_want_gpu()

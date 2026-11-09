@@ -739,6 +739,186 @@ def test_td_boundary_density():
           "(max err %.2e vs scale %.2e)" % (eH.max(), scaleH))
 
 
+def _td_solvers(pde):
+    for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+        if NP == 1:
+            setattr(pde, a, hm.LUSolver(COMM))
+        else:
+            sv = hm.KrylovSolver(COMM, "gmres", "amg")
+            sv.parameters["rel_tolerance"] = 1e-13
+            setattr(pde, a, sv)
+
+
+def test_operators_compared_at_every_step():
+    """The step operators are compared at every step, not only at the second.
+
+    A linear residual whose coefficient switches after the second step has equal
+    first steps and different later ones.  A march that took the first match for the
+    whole trajectory kept the first Jacobian, and the gradient was off by more than
+    half; with ``is_fwd_linear=True`` the forward solve raised as if the residual
+    were nonlinear.
+    """
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(8, 8, mfem.Element.TRIANGLE))
+    Vu = hm.FunctionSpace.H1(pmesh, 1)
+
+    def varf(u, u_old, m, p, x, t, dt_):
+        k = jnp.where(t > 0.1, 3.0, 1.0)
+        return ((u.val - u_old.val) / dt_ * p.val
+                + k * jnp.exp(m.val) * hm.inner(u.grad, p.grad) - 5.0 * p.val)
+
+    bc = hm.DirichletBC(Vu, 0.0, bdr_attributes="all")
+    m0 = Vu.project(lambda x: 0.2 * np.cos(np.pi * x[0]))
+    rng = np.random.default_rng(9)
+    xobs = rng.uniform(0.15, 0.85, size=(30, 2))
+    def setup(linear):
+        pde = hm.TimeDependentPDEVariationalProblem(
+            [Vu, Vu, Vu], varf, bc, bc.homogeneous(), Vu.vector(), 0.0, 0.2, 0.04,
+            is_fwd_linear=linear)
+        _td_solvers(pde)
+        B = hm.assemblePointwiseObservation(Vu, xobs)
+        misfits = [None] + [hm.DiscreteStateObservation(B, B.createVecLeft(), 1e-4)
+                            for _ in range(1, pde.nt)]
+        for k in range(1, pde.nt):
+            misfits[k].d.set(0.05)
+        prior = hm.BiLaplacianPrior(Vu, 1.0, 4.0,
+                                    solver_type="lu" if NP == 1 else "krylov")
+        return pde, hm.Model(pde, prior, hm.MisfitTD(misfits, pde.times))
+
+    pde, model = setup(False)
+    x = model.generate_vector()
+    x[PARAMETER] = m0.copy()
+    model.solveFwd(x[STATE], x)
+    model.solveAdj(x[ADJOINT], x)
+    g = Vu.vector()
+    model.evalGradientParameter(x, g, misfit_only=True)
+    check("operators that change after step two are not judged invariant",
+          not pde._traj["invariant"])
+    # central difference of the misfit along a smooth direction
+    h = Vu.project(lambda x: np.sin(np.pi * x[0]) * np.sin(np.pi * x[1]))
+    eps = 1e-4
+
+    def misfit(mv):
+        xx = model.generate_vector()
+        xx[PARAMETER] = mv
+        model.solveFwd(xx[STATE], xx)
+        return model.cost(xx)[2]
+
+    fd = (misfit(m0.copy().axpy(eps, h)) - misfit(m0.copy().axpy(-eps, h))) / (2 * eps)
+    err = abs(fd - g.inner(h)) / max(abs(fd), 1e-300)
+    check("gradient with a coefficient that switches after step two", err < 1e-5,
+          "(rel. err %.2e)" % err)
+
+    pde_l, model_l = setup(True)
+    xl = model_l.generate_vector()
+    xl[PARAMETER] = m0.copy()
+    try:
+        model_l.solveFwd(xl[STATE], xl)
+        d = max(x[STATE][k].copy().axpy(-1.0, xl[STATE][k]).norm("linf")
+                for k in range(1, pde.nt))
+        ok, detail = d < 1e-9, "(%.2e)" % d
+    except RuntimeError as e:
+        ok, detail = False, str(e)[:80]
+    check("is_fwd_linear march equals the Newton march", ok, detail)
+
+
+def test_w_blocks_follow_the_adjoint():
+    """The W blocks are rebuilt when the adjoint changes at the same (u, m).
+
+    They are second derivatives weighted by the adjoint; kept on (u, m) alone they
+    stayed contracted with the old adjoint after new data, and the Hessian action
+    was wrong by its whole size.
+    """
+    pmesh, Vu, Vm, pde = build_quasilinear(nx=8, nt=4)
+    rng = np.random.default_rng(3)
+    B = hm.assemblePointwiseObservation(Vu, rng.uniform(0.15, 0.85, size=(20, 2)))
+    misfits = [None] + [hm.DiscreteStateObservation(B, B.createVecLeft(), 1e-4)
+                        for _ in range(1, pde.nt)]
+    for k in range(1, pde.nt):
+        misfits[k].d.set(0.05)
+    prior = hm.BiLaplacianPrior(Vm, 1.0, 4.0, solver_type="lu" if NP == 1 else "krylov")
+    model = hm.Model(pde, prior, hm.MisfitTD(misfits, pde.times))
+    m0 = Vm.project(lambda x: 0.2 * np.cos(np.pi * x[0]))
+    dm = Vm.project(lambda x: np.sin(np.pi * x[0]) * np.sin(np.pi * x[1]))
+
+    def action():
+        x = model.generate_vector()
+        x[PARAMETER] = m0.copy()
+        model.solveFwd(x[STATE], x)
+        model.solveAdj(x[ADJOINT], x)
+        model.setPointForHessianEvaluations(x)
+        o = Vm.vector()
+        hm.ReducedHessian(model, misfit_only=True).mult(dm, o)
+        return o
+
+    action()
+    for k in range(1, pde.nt):
+        misfits[k].d.scale(3.0)
+    kept = action()                     # same (u, m), new adjoint
+    pde.release_linearization_point()
+    fresh = action()
+    d = kept.copy().axpy(-1.0, fresh).norm("l2") / fresh.norm("l2")
+    check("W blocks rebuilt for a new adjoint at the same point", d < 1e-10,
+          "(rel. diff %.2e)" % d)
+
+
+def test_steady_state_in_large_units():
+    """A nonlinear march that reaches a steady state, with the residual in large units.
+
+    The tolerance of a step is relative to the residual at the previous level, which
+    vanishes at a steady state, and the round-off of a residual scaled by 1e6 lies
+    above it; the step ends on the size of the Newton correction instead.
+    """
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(8, 8, mfem.Element.TRIANGLE))
+    Vu = hm.FunctionSpace.H1(pmesh, 1)
+
+    def varf(u, u_old, m, p, x, t, dt_):
+        return 1e6 * ((u.val - u_old.val) / dt_ * p.val
+                      + (1.0 + u.val ** 2) * hm.inner(u.grad, p.grad)
+                      + jnp.exp(m.val) * u.val * p.val - 5.0 * p.val)
+
+    bc = hm.DirichletBC(Vu, 0.0, bdr_attributes="all")
+    pde = hm.TimeDependentPDEVariationalProblem(
+        [Vu, Vu, Vu], varf, bc, bc.homogeneous(), Vu.vector(), 0.0, 8.0, 1.0)
+    _td_solvers(pde)
+    u = pde.generate_state()
+    try:
+        pde.solveFwd(u, [u, Vu.vector(), None])
+        ok, detail = True, "(final level %.6f)" % u[pde.nt - 1].norm("linf")
+    except RuntimeError as e:
+        ok, detail = False, str(e)[:90]
+    check("march to a steady state with the residual in large units", ok, detail)
+
+
+def test_separately_built_adjoint_space():
+    """An adjoint space built separately from an equivalent state space is aliased.
+
+    Two copies of one space made the step Jacobian a non-square block to the
+    elimination, with zeroed essential rows and no unit diagonal: a singular matrix.
+    """
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(6, 6, mfem.Element.TRIANGLE))
+    Vu = hm.FunctionSpace.H1(pmesh, 1)
+    Vp = hm.FunctionSpace.H1(pmesh, 1)
+
+    def varf(u, u_old, m, p, x, t, dt_):
+        return ((u.val - u_old.val) / dt_ * p.val
+                + jnp.exp(m.val) * hm.inner(u.grad, p.grad) - p.val)
+
+    bc = hm.DirichletBC(Vu, 0.0, bdr_attributes="all")
+    pde = hm.TimeDependentPDEVariationalProblem(
+        [Vu, Vu, Vp], varf, bc, bc.homogeneous(), Vu.vector(), 0.0, 0.1, 0.05,
+        is_fwd_linear=True)
+    check("equivalent adjoint space aliased to the state space",
+          pde.Vh[ADJOINT] is pde.Vh[STATE])
+    _td_solvers(pde)
+    u = pde.generate_state()
+    try:
+        pde.solveFwd(u, [u, Vu.vector(), None])
+        ok = u[pde.nt - 1].norm("linf") > 0.0
+    except RuntimeError:
+        ok = False
+    check("forward solve with a separately built adjoint space", ok)
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -752,6 +932,10 @@ if __name__ == "__main__":
     test_scalar_parameters_integrate()
     test_td_boundary_density()
     test_initial_density()
+    test_operators_compared_at_every_step()
+    test_w_blocks_follow_the_adjoint()
+    test_steady_state_in_large_units()
+    test_separately_built_adjoint_space()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

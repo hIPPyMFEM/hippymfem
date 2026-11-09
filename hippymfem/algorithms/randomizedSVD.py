@@ -11,6 +11,7 @@ much of the parameter the data can see.
 
 import numpy as np
 
+from ..common.operators import make_vector
 from .multivector import MatMvMult, MatMvTranspmult, MultiVector, MvDSmatMult
 
 
@@ -27,7 +28,9 @@ def accuracyEnhancedSVD(A, Omega, k, s=1, check=False):
     if nvec < k:
         raise ValueError("Omega needs at least k = %d columns, has %d" % (k, nvec))
 
-    Ybar = MultiVector(Omega[0], nvec)
+    # Ybar lives in the range of A, which for a map such as parameter to
+    # observables is not the domain that Omega lives in
+    Ybar = MultiVector(make_vector(A, 0), nvec)
     Q = MultiVector(Omega)
     Q.orthogonalize()
     for _ in range(s):

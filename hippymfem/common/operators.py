@@ -230,27 +230,30 @@ class SumOperator(Operator):
         self.A, self.B = A, B
         self.alpha, self.beta = alpha, beta
         self.keep(A, B)
-        self._tmp = None
+        # one scratch vector per side: ``mult`` needs one in the range, and
+        # ``multTranspose`` one in the domain, which differ for a non-square sum
+        self._tmp_range = None
+        self._tmp_domain = None
 
     def init_vector(self, x, dim):
         return self.A.init_vector(x, dim)
 
     def mult(self, x, y):
-        if self._tmp is None:
-            self._tmp = self.A.generate_vector(0)
+        if self._tmp_range is None:
+            self._tmp_range = self.A.generate_vector(0)
         self.A.mult(x, y)
         y.scale(self.alpha)
-        self.B.mult(x, self._tmp)
-        y.axpy(self.beta, self._tmp)
+        self.B.mult(x, self._tmp_range)
+        y.axpy(self.beta, self._tmp_range)
         return y
 
     def multTranspose(self, x, y):
-        if self._tmp is None:
-            self._tmp = self.A.generate_vector(1)
+        if self._tmp_domain is None:
+            self._tmp_domain = self.A.generate_vector(1)
         self.A.multTranspose(x, y)
         y.scale(self.alpha)
-        self.B.multTranspose(x, self._tmp)
-        y.axpy(self.beta, self._tmp)
+        self.B.multTranspose(x, self._tmp_domain)
+        y.axpy(self.beta, self._tmp_domain)
         return y
 
 

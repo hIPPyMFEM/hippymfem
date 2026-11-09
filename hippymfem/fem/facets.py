@@ -40,10 +40,12 @@ import numpy as np
 from typing import NamedTuple
 
 import mfem.par as mfem
+from mpi4py import MPI
 
 from ..common.identitycache import IdentityCache
 from ..common.keepalive import KeepAlive
-from .elementbatch import _element_dofs, default_quadrature_degree
+from .elementbatch import (_element_dofs, _mesh_comm, apply_trial_transformation,
+                           default_quadrature_degree)
 from .spaces import as_space
 
 
@@ -303,7 +305,7 @@ class InteriorFacetGroup(KeepAlive):
                 ftr.Face.SetIntPoint(ip)
                 w = ftr.Face.Weight()
                 self.wdet[a, q] = self.w[q] * w
-                if sdim == dim:
+                if sdim == dim and dim > 1:
                     mfem.CalcOrtho(ftr.Face.Jacobian(), nor)
                     v = nor.GetDataArray().copy()
                     self.nor[a, q] = v / max(np.linalg.norm(v), 1e-300)
@@ -320,6 +322,11 @@ class InteriorFacetGroup(KeepAlive):
                     self.Jinv[a, q, side] = (np.linalg.inv(J) if sdim == dim
                                              else np.linalg.pinv(J))
                     self.h[a, q, side] = T.Weight() / max(w, 1e-300)
+                    if side == 0 and sdim == dim == 1:
+                        # a point face: the normal out of the minus element, by the
+                        # end of it the point is on (see BoundaryGroup), not CalcOrtho
+                        self.nor[a, q, 0] = ((2.0 * eip.x - 1.0)
+                                             * (1.0 if J[0, 0] >= 0.0 else -1.0))
 
     def make_tables(self, space):
         """Cached :class:`FacetSpaceTables` for ``space`` on this group."""
@@ -470,8 +477,9 @@ class FacetSpaceTables(KeepAlive):
         return jnp.take(arr, e, axis=0) * s
 
     def transform_dual_matrix(self, mats, trial_tables, elements=None):
-        """No reference-to-global map: the facet kernels cover H1 and L2 spaces."""
-        return mats
+        """No reference-to-global map on the rows: the facet kernels cover H1 and L2
+        spaces; a column space with a ``DofTransformation`` still takes it."""
+        return apply_trial_transformation(mats, trial_tables, elements)
 
     def transform_dual_vector(self, vecs):
         return vecs
@@ -484,8 +492,11 @@ class FacetSpaceTables(KeepAlive):
 class FacetBatches(KeepAlive):
     """The interior faces of a mesh, in the shape the group kernels take.
 
-    One group: interior faces of a conforming mesh share a geometry, and the dof count
-    is the element's.  Built like :class:`~.boundary.BoundaryBatches` so that
+    One group, with one face geometry: its quadrature rule and reference points serve
+    every face.  A mesh whose interior faces have more than one geometry (wedges and
+    pyramids, which have triangular and quadrilateral faces, or tetrahedra next to
+    hexahedra) is refused, since the one rule would integrate the other faces wrongly.
+    Built like :class:`~.boundary.BoundaryBatches` so that
     :class:`~hippymfem.fem.kernel.QuadratureKernel` takes either without noticing.
     """
 
@@ -493,8 +504,28 @@ class FacetBatches(KeepAlive):
         self.mesh = mesh
         self.quadrature_degree = int(quadrature_degree)
         self.groups = [InteriorFacetGroup(mesh, self.quadrature_degree)]
+        self._check_one_geometry(comm if comm is not None else _mesh_comm(mesh))
         self._tables = IdentityCache()
         self.keep(mesh)
+
+    def _check_one_geometry(self, comm):
+        """Raise on every rank alike when the interior faces have several geometries."""
+        mesh, mask, k = self.mesh, 0, 0
+        for f, _, _, shared in self.groups[0].faces:
+            if shared:
+                f = mesh.GetSharedFace(k)
+                k += 1
+            mask |= 1 << int(mesh.GetFaceGeometry(f))
+        mask = comm.allreduce(mask, op=MPI.BOR)
+        if bin(mask).count("1") > 1:
+            names = [n for g, n in ((0, "point"), (1, "segment"), (2, "triangle"),
+                                    (3, "square"))
+                     if mask & (1 << g)] or [str(mask)]
+            raise NotImplementedError(
+                "interior facet densities need one face geometry, and this mesh has "
+                "interior faces of several (%s): one quadrature rule would integrate "
+                "some of them wrongly.  Use a mesh of tetrahedra or of hexahedra."
+                % ", ".join(names))
 
     def tables(self, space):
         """Cached :class:`FacetSpaceTables` for ``space``, one per group."""

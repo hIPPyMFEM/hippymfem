@@ -44,7 +44,13 @@ def varianceReductionMC(prior, p2qoimap, taylor_qoi, nsamples, order=2,
         u.zero() if hasattr(u, "zero") else None
         p2qoimap.solveFwd(u, [u, m, None])
         q[i] = p2qoimap.eval([u, m, None])
-        qtay[i] = taylor_qoi.eval(m, order=order)
+        # The control variate must be the model whose mean is subtracted below:
+        # expectedValue is that of the low-rank Hessian, and the full Hessian of
+        # eval() would leave a bias of half the dropped eigenvalues that no number of
+        # samples removes (and that reduced_stderr does not show).
+        qtay[i] = (taylor_qoi.eval_lowrank(m, order=order)
+                   if hasattr(taylor_qoi, "eval_lowrank") else
+                   taylor_qoi.eval(m, order=order))
         if verbose and comm.rank == 0 and (i + 1) % max(nsamples // 10, 1) == 0:
             print("  sample %d/%d: Q = %.6e, Q_taylor = %.6e"
                   % (i + 1, nsamples, q[i], qtay[i]), flush=True)

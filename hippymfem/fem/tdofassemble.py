@@ -47,7 +47,7 @@ from mpi4py import MPI
 import mfem.par as mfem
 
 from ..common.identitycache import IdentityCache
-from ..common.linalg import own
+from ..common.linalg import own, require_int32_count
 from ..common.parvector import _HYPRE_BIGINT, bigint_array, bigint_view
 from ..config import env_choice, env_flag
 from . import pattern as _pattern, patternbuild
@@ -446,6 +446,12 @@ class TrueDofPattern:
                 tslot = tslot.astype(want)
         self.tslot = tslot
         self.nnz_t, self.nsend, self.nrecv = nnz_t, nsend, nrecv
+        # The blocks' row pointers and local columns are 32-bit (hypre's), and a count
+        # above that wraps in the casts and assembles a wrong matrix.  Checked here,
+        # where both routes have their counts, so that every rank reduces the verdict
+        # at the same place and raises together.
+        require_int32_count(max(self.nnz_diag, nnz_t - self.nnz_diag),
+                            "true-dof matrix block", comm)
         # Whether *any* rank exchanges, agreed by all of them: skipping the
         # ``Alltoallv`` when *this* rank has nothing to send or receive would be a
         # collective behind a rank-local condition (a rank without boundary elements

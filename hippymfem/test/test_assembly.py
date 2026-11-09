@@ -2051,6 +2051,155 @@ def test_box_mesh():
           "and finds one for levels by default", got == [True, True], "(%r)" % (got,))
 
 
+def test_fused_scatter_mixed_mesh():
+    """Chunked (fused) scatter on a mesh of two geometries, whose element groups are
+    not in mesh order: the pattern keeps its slots in mesh order (``perm``), and the
+    fused maps must be in group order, as the chunks are."""
+    pm = make_mesh("mixed", 8)
+    Vu, Vm = FunctionSpace.H1(pm, 2), FunctionSpace.H1(pm, 1)
+    batches = MeshBatches(pm, 6, COMM)
+    K = QuadratureKernel(lambda u, m, p, x: jnp.exp(m.val) * jnp.dot(u.grad, p.grad)
+                         + u.val * p.val, [Vu, Vm, Vu], batches)
+    hp.parRandom.set_seed(31)
+    mv = Vm.vector()
+    hp.parRandom.normal(0.3, mv)
+    loc = [Vu.local_values(Vu.vector()), Vm.local_values(mv), Vu.local_values(Vu.vector())]
+    whole = [np.asarray(w) for w in K.element_matrices(ADJOINT, STATE, loc)]
+    A1 = asm.assemble_matrix(Vu, Vu, batches.groups, whole, pm.GetNE())
+    old = kernel_mod.ELEMENT_CHUNK
+    try:
+        kernel_mod.ELEMENT_CHUNK = 5
+        for gk in K.group_kernels:
+            gk._chunk.clear()
+        thunk = K.element_matrices_or_chunks(ADJOINT, STATE, loc, comm=COMM)
+        A2 = asm.assemble_matrix(Vu, Vu, batches.groups, thunk, pm.GetNE())
+    finally:
+        kernel_mod.ELEMENT_CHUNK = old
+        for gk in K.group_kernels:
+            gk._chunk.clear()
+    x = Vu.vector()
+    hp.parRandom.normal(1.0, x)
+    y1, y2 = Vu.vector(), Vu.vector()
+    A1.Mult(x.hypre, y1.hypre)
+    A2.Mult(x.hypre, y2.hypre)
+    e = y2.axpy(-1.0, y1).norm("l2") / y1.norm("l2")
+    check("chunked scatter on a mesh of two geometries", callable(thunk) and e < 1e-13,
+          "(rel diff %.1e)" % e)
+
+
+def test_native_diag_policy():
+    """``assemble_native_matrix`` honors ``diag_policy`` on the eliminated rows, which
+    the parallel FormSystemMatrix ignores (it always leaves 1.0)."""
+    pm = make_mesh("tri", 6)
+    V = FunctionSpace.H1(pm, 1)
+    bc = hp.DirichletBC(V, 0.0, bdr_attributes="all")
+    from hippymfem.fem.bcs import as_bcset
+
+    ess = as_bcset(bc, V).ess_tdof
+    idx = np.asarray(ess.ToList(), dtype=np.int64)
+    full = asm.assemble_native_matrix(V, [mfem.MassIntegrator()])
+    d_full = _local_diag(full)
+    ok = True
+    for policy, want in (("one", np.ones(idx.size)), ("zero", np.zeros(idx.size)),
+                         ("keep", d_full[idx])):
+        A = asm.assemble_native_matrix(V, [mfem.MassIntegrator()], ess=ess,
+                                       diag_policy=policy)
+        got = _local_diag(A)[idx]
+        ok = ok and bool(np.allclose(got, want, rtol=1e-14, atol=0.0))
+    ok = COMM.allreduce(int(ok), op=MPI.MIN) == 1
+    check("native assembly writes the diagonal policy on essential rows", ok)
+
+
+def test_empty_rank_batches():
+    """A rank that owns no element still takes part in building the mesh nodes, which
+    the geometric factors need and which is collective (it hung)."""
+    m = mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.QUADRILATERAL)
+    part = mfem.intArray([0] * m.GetNE())
+    pm = mfem.ParMesh(COMM, m, part.GetData())
+    b = MeshBatches(pm, 4, COMM)
+    tot = COMM.allreduce(sum(g.ne for g in b.groups))
+    check("element batches with a rank that owns no element", tot == 16, "(%d)" % tot)
+
+
+def test_project_mixed_geometries():
+    """Projection onto a nodal space of a mesh with two geometries on one rank (the
+    dof count differs between triangles and quadrilaterals)."""
+    pm = make_mesh("mixed", 8)
+    V = FunctionSpace.H1(pm, 2)
+    v = V.project(lambda x: 1.0 + x[0] + 2.0 * x[1])
+    X = V.coordinates()
+    want = 1.0 + X[:, 0] + 2.0 * X[:, 1]
+    e = COMM.allreduce(float(np.abs(v.array - want).max()) if want.size else 0.0,
+                       op=MPI.MAX)
+    check("projection on a mesh of two geometries", e < 1e-12, "(%.1e)" % e)
+
+
+def test_refinement_clears_batches():
+    """``clear_pattern_cache`` after a refinement in place also drops the element
+    batches, whose element lists would describe the coarse mesh."""
+    from hippymfem.fem.elementbatch import get_batches
+
+    pm = make_mesh("quad", 4)
+    V = FunctionSpace.H1(pm, 1)
+    get_batches(pm, 4)
+    pm.UniformRefinement()
+    V.fes.Update()
+    clear_pattern_cache()
+    b = get_batches(pm, 4)
+    n = COMM.allreduce(sum(g.ne for g in b.groups))
+    check("element batches follow a refinement", n == 64, "(%d elements)" % n)
+
+
+def test_rank_dependent_chunking():
+    """Ranks that disagree on whether their element batch fits (an unbalanced
+    partition and a small memory budget) still take the same assembly path: the
+    finiteness check sat on different sides of the collectives and the solve hung."""
+    m = mfem.Mesh.MakeCartesian2D(24, 24, mfem.Element.TRIANGLE)
+    ne = m.GetNE()
+    part = mfem.intArray([0 if (e < 0.8 * ne or NP == 1) else 1 + e % (NP - 1)
+                          for e in range(ne)])
+    pm = mfem.ParMesh(COMM, m, part.GetData())
+    Vu, Vm = FunctionSpace.H1(pm, 1), FunctionSpace.H1(pm, 1)
+    bc = hp.DirichletBC(Vu, lambda x: x[1], bdr_attributes=[1, 3])
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * jnp.dot(u.grad, p.grad) - 1.0 * p.val
+
+    pde = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                   is_fwd_linear=True)
+    pde.solver = hp.KrylovSolver(COMM, "cg", "amg")
+    pde.solver.parameters["rel_tolerance"] = 1e-12
+    old = kernel_mod.HOST_MEM_FRACTION
+    try:
+        # chunk on the rank with most elements only
+        big = pm.GetNE() == COMM.allreduce(pm.GetNE(), op=MPI.MAX)
+        kernel_mod.HOST_MEM_FRACTION = 1e-9 if big else old
+        for gk in pde.kernel.group_kernels:
+            gk._chunk.clear()
+        u = pde.generate_state()
+        pde.solveFwd(u, [u, Vm.project(lambda x: 0.3 * x[0]), None])
+        ok = np.isfinite(u.norm("l2"))
+    finally:
+        kernel_mod.HOST_MEM_FRACTION = old
+        for gk in pde.kernel.group_kernels:
+            gk._chunk.clear()
+    check("forward solve when only some ranks chunk", bool(ok))
+
+
+def test_l2_integral_map_refused():
+    """An L2 space with the INTEGRAL map type is refused: the element kernels use the
+    reference shapes as the physical ones, true only for VALUE-mapped elements."""
+    pm = make_mesh("quad", 2)
+    fec = mfem.L2_FECollection(1, 2, mfem.BasisType.GaussLegendre,
+                               mfem.FiniteElement.INTEGRAL)
+    try:
+        FunctionSpace(pm, fec)
+        refused = False
+    except NotImplementedError:
+        refused = True
+    check("an INTEGRAL-mapped L2 space is refused", refused)
+
+
 def main():
     test_blocks_identical()
     test_sortfree_pattern()
@@ -2084,6 +2233,13 @@ def main():
     test_operator_reset_frees()
     test_no_gpu_context()
     test_box_mesh()
+    test_fused_scatter_mixed_mesh()
+    test_native_diag_policy()
+    test_empty_rank_batches()
+    test_project_mixed_geometries()
+    test_refinement_clears_batches()
+    test_rank_dependent_chunking()
+    test_l2_integral_map_refused()
     test_speed()
     COMM.Barrier()
     if RANK == 0:

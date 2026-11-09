@@ -35,7 +35,7 @@ import math
 from ..common.operators import make_vector
 from ..common.parameterList import ParameterList
 from ..common.random import parRandom
-from ..modeling.variables import PARAMETER
+from ..modeling.variables import PARAMETER, STATE
 
 
 class _KernelBase:
@@ -229,9 +229,16 @@ class ISKernel(_KernelBase):
     r"""Importance sampling from the Laplace approximation.
 
     Proposals are independent draws from ``nu``, and each carries the weight
-    :math:`\exp(-\delta(m))`.  The chain is not Markov: every "step" is accepted
-    and the weight is what corrects the approximation, so the usual acceptance
-    rate is meaningless and always reported as 1.
+    :math:`\exp(-(\delta(m) - \delta(\bar m)))`, with :math:`\bar m` the mean of
+    ``nu``; ``log_weight`` holds :math:`-\delta(m)` itself.  The factor
+    :math:`\exp(\delta(\bar m))` common to all draws is left out of ``weight``
+    because :math:`\delta` is about the misfit at the MAP point, half the number of
+    observations, and :math:`\exp(-\delta)` is exactly zero beyond about 745: every
+    weight of a realistic problem would be 0 and a self-normalized estimate 0/0.
+    Self-normalized estimates do not depend on the factor.  :math:`\delta(\bar m)`
+    costs one forward solve, at the first draw.  The chain is not Markov: every "step"
+    is accepted and the weight is what corrects the approximation, so the usual
+    acceptance rate is meaningless and always reported as 1.
     """
 
     def __init__(self, model, nu):
@@ -242,6 +249,17 @@ class ISKernel(_KernelBase):
         self._w = model.generate_vector(PARAMETER)
         self._w_prior = model.generate_vector(PARAMETER)
         self._tmp = model.generate_vector(PARAMETER)
+        self._delta_ref = None
+
+    def delta_reference(self):
+        r""":math:`\delta` at the mean of ``nu``, where its quadratic term vanishes."""
+        if self._delta_ref is None:
+            m = self.nu.mean
+            u = self.model.generate_vector(STATE)
+            self.model.solveFwd(u, [u, m, None])
+            self._delta_ref = (self.model.cost([u, m, None])[2]
+                               + self.prior.cost(m))
+        return self._delta_ref
 
     def name(self):
         return "IS"
@@ -261,7 +279,10 @@ class ISKernel(_KernelBase):
         proposed.m.assign(self.proposal(current))
         self.init_sample(proposed)
         current.assign(proposed)
-        current.weight = math.exp(-self.delta(proposed))
+        d = self.delta(proposed)
+        x = self.delta_reference() - d
+        current.log_weight = -d
+        current.weight = math.exp(x) if x < 709.0 else float("inf")
         return 1
 
     def consume_random(self):

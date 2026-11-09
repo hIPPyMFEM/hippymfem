@@ -146,14 +146,19 @@ class GaussianLRPosterior(KeepAlive):
             s_post = self.mean.duplicate() if self.mean is not None else self.prior.mean.duplicate()
         if s_prior is None and noise is None:
             noise = self.prior.sample_noise(1.0, rng=rng)
-        if noise is not None:
+        drawn = noise is not None
+        if drawn:
             if s_prior is None:
                 s_prior = self.prior.mean.duplicate()
             self._sample_given_white_noise(noise, s_prior, s_post)
         else:
             self._sample_given_prior(s_prior, s_post)
         if add_mean and self.mean is not None:
-            s_prior.axpy(1.0, self.prior.mean)
+            # A prior sample drawn here is returned with the prior mean, as hIPPYlib
+            # does in its three-argument form; one the caller passed in is an input
+            # and is left as it was, so that it can be used again.
+            if drawn:
+                s_prior.axpy(1.0, self.prior.mean)
             s_post.axpy(1.0, self.mean)
         return s_post
 

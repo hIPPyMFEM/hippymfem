@@ -1977,18 +1977,27 @@ class QuadratureKernel:
     def will_chunk(self, weight=1):
         return any(gk.will_chunk(weight) for gk in self.group_kernels)
 
-    def element_matrices_or_chunks(self, i, j, local_arrays, params=(), consistent=None):
+    def element_matrices_or_chunks(self, i, j, local_arrays, params=(), consistent=None,
+                                   comm=None):
         """The arrays when the batch fits whole, a chunk thunk when it does not.
 
         Bit-identical to :meth:`element_matrices` in the first case, and in the
         second the splitting has already cost that, so the fused scatter is free.
+        With ``comm`` the choice is made once for all ranks: the two results take
+        different paths through the assembly, with their collectives in different
+        places, and ranks with different element counts may judge differently.
         """
         # Asked at the weight of the pass that follows, the slot pass over ``j``, which
         # plans its chunk and remembers a retry's at that weight: asked at weight 1, a
         # batch that fits at 1 and not at the slot's (1.3 for the columns of a quadratic
         # state beside a linear parameter) was handed over whole, and its pass then
         # split it and joined the chunks, the array that the chunk thunk is there to avoid.
-        if any(gk.will_chunk(gk._slot_weight(j)) for gk in self.group_kernels):
+        chunk = any(gk.will_chunk(gk._slot_weight(j)) for gk in self.group_kernels)
+        if comm is not None:
+            from mpi4py import MPI
+
+            chunk = bool(comm.allreduce(int(chunk), op=MPI.MAX))
+        if chunk:
             return lambda: self.element_matrix_chunks(i, j, local_arrays, params,
                                                       consistent=consistent)
         return self.element_matrices(i, j, local_arrays, params, consistent=consistent)

@@ -1752,6 +1752,96 @@
   warm-starts has a relative tolerance smaller still, so it ran its 30 iterations and
   failed, every trial of the line search with it, and Newton-CG stopped at its sixth step
   with "Forward solve failed during backtracking". The application asks for 1e-13 now.
+- **The operators of a time-dependent problem are compared at every step.** A trajectory
+  and a linear forward solve compared the operators of the first two steps and, when they
+  agreed, used the first step's for the whole march. Equal first steps say nothing about
+  the later ones: with a coefficient that changes after the second step, or a state at
+  rest until a source switches on, the adjoint, the gradient and the Hessian action used
+  the wrong operators, and a linear forward solve raised as if its residual were
+  nonlinear. The guide asked such problems to set `INVARIANCE_PROBE_TOL = -1`. Every
+  step's `A` and `B` are now assembled and compared with the step before, and steps that
+  agree share one matrix, one transpose and one solver with its hierarchy, as before. A
+  problem whose operators do not change in time pays for this with an assembly at every
+  step of a trajectory and of a linear forward solve at a new parameter, where it stopped
+  after the second: the advection-diffusion application at 96^2 with 48 steps took 90 s
+  instead of 73 s on one rank, with the same results.
+- **The `W` blocks of a time-dependent problem follow the adjoint.** They are second
+  derivatives weighted by the adjoint, but they were kept as long as the state and the
+  parameter did not change: after new data, or for the adjoint of a quantity of interest
+  after that of the misfit, the Hessian action used the old adjoint. They are rebuilt now
+  when the adjoint changes.
+- **`assemble_native_matrix` applies `diag_policy`.** MFEM's parallel `FormSystemMatrix`
+  leaves 1 on the diagonal of the eliminated rows whatever the form's policy says, so
+  `"zero"` and `"keep"` gave a unit diagonal. `ContinuousStateObservation(bcs=...)` then
+  added half the number of essential dofs to its cost.
+- **`LaplacianPrior` and `BiLaplacianPrior` on a vector space** assembled scalar
+  integrators, which give a wrong precision. The first uses the vector integrators now;
+  the second hands an isotropic prior to `VectorBiLaplacianPrior`, and raises for a tensor
+  `Theta`, which MFEM's vector integrators do not take.
+- **The randomized eigensolvers apply `Binv` by its `solve`.** They took `mult` when an
+  object had both, and `DiagonalOperator`, `LumpedMassSolver` and `LowRankOperator` apply
+  `B` itself by `mult`, so the eigenvalues were wrong. `solve` comes first now, as in
+  hIPPYlib.
+- **Element matrices with H1 or L2 rows and H(curl) columns** of order two and higher on
+  simplices left out the columns' `DofTransformation`, which gave the block in the
+  reference basis of the columns. A chunked assembly with such a transformation raised;
+  each chunk takes its own elements' transformation now.
+- **The random stream on a mesh of several element geometries.** Each rank computed the
+  stride of a prior's noise from its own elements, so ranks advanced the shared stream by
+  different amounts, and draws meant to be equal on every rank (the accept or reject of
+  MCMC) were not. The stride is the largest over the ranks now.
+- **`varianceReductionMC` was biased.** Its control variate was the Taylor model with the
+  full Hessian, while the mean it subtracted was that of the low-rank Hessian: the
+  estimate kept a bias of half the dropped eigenvalues, which more samples do not remove
+  and the reported standard error does not show. The control variate is now
+  `TaylorApproximationQoi.eval_lowrank`, whose mean is exactly `expectedValue`.
+- **The weights of importance sampling are taken relative to the mean of the
+  approximation.** `ISKernel` set the weight to `exp(-delta)`, and `delta` is about the
+  misfit at the MAP point, which is half the number of observations: beyond about 745 the
+  weight is exactly zero, so every weight of a realistic problem was 0 and a
+  self-normalized estimate 0/0. The weight is now `exp(delta(mean) - delta)`, at the cost
+  of one forward solve at the first draw, and the new `log_weight` holds `-delta`.
+  Self-normalized estimates do not change.
+- **`GaussianLRPosterior.sample(s_prior, s_post)` leaves `s_prior` as it is.** It added the
+  prior mean to it, so a second call with the same vector gave another sample. A prior
+  sample that the method draws itself is still returned with the prior mean, as in
+  hIPPYlib.
+- Three hangs: ranks that disagreed on whether their element batch fits took different
+  assembly paths, with their collectives in different places (`element_matrices_or_chunks`
+  takes a `comm` now and decides for all ranks, and `PDEVariationalProblem` passes it); a
+  rank that owns no element did not take part in building the mesh nodes, which is
+  collective; and a rank with no element but true dofs of its own raised in the true-dof
+  exchange. The check for colliding element centroids in a prior's noise also raised on
+  the ranks that saw the collision only.
+- Equivalent state and adjoint spaces built separately (two `ParFiniteElementSpace` of one
+  mesh, or spaces adopted with `FunctionSpace.wrap`) were not recognized as one, and the
+  step Jacobian of a time-dependent problem came out singular. They are aliased now, and
+  meshes are compared by the MFEM object.
+- A nonlinear time-dependent step with its residual in large units failed near a steady
+  state, where the residual of the previous level, to which its tolerance is relative,
+  vanishes. A step also ends now when the Newton correction is below
+  `newton_parameters["step_tolerance"]` (1e-12) of the state, as in the stationary class,
+  and the linearity check of a linear step is relative to `|J u|`.
+- The boundary and interior facet normals of a 1D mesh read a 1x0 Jacobian and crashed. A
+  point face has the normal -1 or +1 by the end of the element it is on.
+- A callable Dirichlet value that returns one number on a vector space ended the process;
+  one number means the same value in every component now.
+- `FunctionSpace.project` onto H(curl) and H(div) spaces made MFEM abort, and `project`
+  and `coordinates` failed on a rank that holds elements of two geometries.
+- `JAX_PLATFORMS=cuda` (or `rocm`) without `HIPPYMFEM_DEVICE` hid the GPUs from the run, so
+  JAX found none.
+- `SumOperator.multTranspose` of non-square operators used a scratch vector of the wrong
+  size, and `accuracyEnhancedSVD` of a non-square operator allocated its range vectors in
+  the domain.
+- `clear_pattern_cache` also clears the element batches, their basis tables and the
+  boundary batches now, which a mesh refined in place kept.
+- `HIPPYMFEM_DEVICE_BRIDGE` and `HIPPYMFEM_DEVICE_VECTORS` take `on` and `off`, `true` and
+  `false`, `yes` and `no`, as the other switches do.
+- Inputs that gave wrong results raise now: interior facet densities on a mesh whose
+  interior faces have several geometries (wedges and pyramids, or tetrahedra next to
+  hexahedra), which one quadrature rule integrated wrongly; an L2 space with the INTEGRAL
+  map type, which the element kernels integrated as a VALUE-mapped one; and a rank whose
+  matrix has more than 2^31 - 1 nonzeros, where the 32-bit indices of hypre wrapped.
 
 ## Version 0.1.0, released on September 21, 2026
 

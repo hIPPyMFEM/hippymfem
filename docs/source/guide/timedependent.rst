@@ -77,16 +77,20 @@ its Jacobian across calls at the same parameter.
 
 The common case of a step Jacobian that does not change in time (a linear PDE
 with coefficients independent of ``t`` and a fixed ``dt``) is detected rather
-than assumed: the operators of the first two steps are compared through their
-action on a random vector, and when they agree one matrix, one transpose and one
-solver with its hierarchy serve the whole march.  Otherwise every step keeps its
-own, cloned from the solver you set (``solver_fwd_inc``, ``solver_adj_inc``;
-``solver_adj`` defaults to a clone of ``solver``).  On the 16-step
-advection-diffusion test problem this takes a forward or adjoint solve from 16
-BoomerAMG setups to one, and a Hessian action from 32 to none.  The comparison
-tolerance is ``TimeDependentPDEVariationalProblem.INVARIANCE_PROBE_TOL``
-(``1e-13``); a problem whose Jacobian changes only after the second step must set
-it to ``-1`` to force per-step operators.
+than assumed: the operators of every step are compared with those of the step
+before through their action on a random vector, and steps that agree share one
+matrix, one transpose and one solver with its hierarchy.  When all steps agree,
+one of each serves the whole march.  A step that differs gets its own, cloned
+from the solver you set (``solver_fwd_inc``, ``solver_adj_inc``; ``solver_adj``
+defaults to a clone of ``solver``).  On the 16-step advection-diffusion test
+problem this takes a forward or adjoint solve from 16 BoomerAMG setups to one,
+and a Hessian action from 32 to none.  The comparison needs the operators of
+every step, because equal first steps say nothing about the later ones (a state
+at rest until a source switches on, a coefficient that changes in time): they
+are assembled at every step of a trajectory, and at every step of a linear
+forward solve at a new parameter.  The comparison tolerance is
+``TimeDependentPDEVariationalProblem.INVARIANCE_PROBE_TOL`` (``1e-13``); ``-1``
+treats every step as different.
 
 Scalar parameters
 -----------------

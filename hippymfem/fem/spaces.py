@@ -107,6 +107,15 @@ class FunctionSpace(KeepAlive):
                 "hIPPyMFEM element kernels support H1, L2, ND (H(curl)) and RT "
                 "(H(div)) collections; got %r." % name
             )
+        # The scalar tables use the reference shape functions as the physical ones,
+        # which holds for VALUE-mapped elements only.  An L2 collection with the
+        # INTEGRAL map type ("L2Int_...") scales its shapes by the element Jacobian,
+        # and would be integrated as if it did not.  Decided from the name, which
+        # every rank sees alike, so that all of them refuse it together.
+        if name.startswith("L2Int"):
+            raise NotImplementedError(
+                "L2 collections with the INTEGRAL map type (%r) are not supported by "
+                "the element kernels; use the default VALUE map type." % name)
 
     # ------------------------------------------------------------- properties
     @property
@@ -269,7 +278,12 @@ class FunctionSpace(KeepAlive):
         """
         if not self.is_nodal:
             gf = mfem.ParGridFunction(self.fes)
-            coeff = _ScalarPy(fn) if self.vdim == 1 else _VectorPy(fn, self.vdim)
+            if self.fec.Name().startswith(("ND", "RT")):
+                # vector-valued elements with vdim 1: the field has sdim components,
+                # and a scalar coefficient makes MFEM abort
+                coeff = _VectorPy(fn, self.sdim)
+            else:
+                coeff = _ScalarPy(fn) if self.vdim == 1 else _VectorPy(fn, self.vdim)
             gf.ProjectCoefficient(coeff)
             return self.from_gridfunction(gf, v)   # gf and coeff are done with here
         X = self._node_coordinates().copy()         # (nldof_scalar, sdim); ``fn`` may write
@@ -332,10 +346,9 @@ class FunctionSpace(KeepAlive):
         from .elementbatch import _basis_tables, _element_dofs
 
         ne = mesh.GetNE()
-        if ne:
+        if ne and mesh.GetNumGeometries(mesh.Dimension()) == 1 and mesh.NURBSext is None:
             nd = fes.GetFE(0).GetDof()
             dofs, _ = _element_dofs(fes, np.arange(ne), 1, nd)
-        if ne and mesh.GetNumGeometries(mesh.Dimension()) == 1 and mesh.NURBSext is None:
             fen = mesh.GetElementTransformation(0).GetFE()
             nn = fen.GetDof()
             # S[j, k]: the k-th shape function of the map at the j-th reference node
@@ -363,12 +376,18 @@ class FunctionSpace(KeepAlive):
                 # a node of several elements takes the last one's, as it did in the loop
                 X[dofs[a:b]] = acc.reshape(nd, b - a, sdim).transpose(1, 0, 2)
         elif ne:
+            # elements of different geometries (triangles and quadrilaterals on one
+            # rank) have different dof counts, so the dof table is taken per count
+            nds = np.array([fes.GetFE(e).GetDof() for e in range(ne)])
             pm = mfem.DenseMatrix()
-            for e in range(ne):
-                fe = fes.GetFE(e)
-                tr = mesh.GetElementTransformation(e)
-                tr.Transform(fe.GetNodes(), pm)     # (sdim, nd)
-                X[dofs[e], :] = np.asarray(pm.GetDataArray()).reshape(sdim, -1).T[:, :sdim]
+            for nd in np.unique(nds):
+                els = np.flatnonzero(nds == nd)
+                dofs, _ = _element_dofs(fes, els, 1, int(nd))
+                for a, e in enumerate(els):
+                    fe = fes.GetFE(int(e))
+                    tr = mesh.GetElementTransformation(int(e))
+                    tr.Transform(fe.GetNodes(), pm)     # (sdim, nd)
+                    X[dofs[a], :] = np.asarray(pm.GetDataArray()).reshape(sdim, -1).T[:, :sdim]
         X.setflags(write=False)
         self._nodes = (seq, X)
         return X

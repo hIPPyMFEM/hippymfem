@@ -27,6 +27,7 @@ class SampleStruct:
         self.m = kernel.model.generate_vector(PARAMETER)
         self.cost = 0.0
         self.weight = 1.0
+        self.log_weight = 0.0
         if self.derivative_info >= 1:
             self.p = kernel.model.generate_vector(ADJOINT)
             self.g = kernel.model.generate_vector(PARAMETER)
@@ -41,6 +42,7 @@ class SampleStruct:
             raise ValueError("sample structures carry different derivative info")
         self.cost = other.cost
         self.weight = other.weight
+        self.log_weight = other.log_weight
         self.m.assign(other.m)
         _assign(self.u, other.u)
         if self.derivative_info >= 1:

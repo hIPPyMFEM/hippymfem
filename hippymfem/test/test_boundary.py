@@ -544,6 +544,44 @@ def test_streamed_pass_with_boundary():
           worst < K.matrix_tolerance(1e-12), "(worst rel %.1e)" % worst)
 
 
+def test_point_normals_1d():
+    """On a 1D mesh a boundary face is a point, which has no tangent for CalcOrtho (it
+    read a 1x0 Jacobian and crashed): the outward normal is -1 at the left end and +1
+    at the right end."""
+    from hippymfem.fem.boundary import get_boundary_batches
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian1D(8, 1.0))
+    bb = get_boundary_batches(pm, 2)
+    ok = True
+    for g in bb.groups:
+        X, nor = g.X[:, 0, 0], g.nor[:, 0, 0]
+        ok = ok and bool(np.all(np.where(X < 0.5, nor == -1.0, nor == 1.0)))
+    ok = COMM.allreduce(int(ok), op=MPI.MIN) == 1
+    check("outward normals at the ends of a 1D mesh", ok)
+
+
+def test_rank_without_boundary_elements_true_dofs():
+    """A rank that holds no boundary element of the attribute but owns true dofs on
+    that boundary takes part in the true-dof exchange (it raised on an empty list
+    while the other ranks waited)."""
+    from hippymfem.fem.boundary import BoundaryBatches, assemble_boundary_matrix
+
+    mesh = mfem.Mesh.MakeCartesian2D(4, 4, mfem.Element.TRIANGLE)
+    bottom = set()
+    for b in range(mesh.GetNBE()):
+        if mesh.GetBdrAttribute(b) == 1:
+            bottom.add(int(mesh.GetBdrFaceTransformations(b).Elem1No))
+    part = mfem.intArray([(NP - 1 if e in bottom else 0) for e in range(mesh.GetNE())])
+    pm = mfem.ParMesh(COMM, mesh, part.GetData())
+    V = FunctionSpace.H1(pm, 1)
+    bb = BoundaryBatches(pm, 2, bdr_attributes=[1], space=V)
+    mats = [np.ones((t.group.ne, t.nd_total, t.nd_total)) for t in bb.tables(V)]
+    A = assemble_boundary_matrix(V, V, bb.groups, mats)
+    n = COMM.allreduce(A.Height())
+    check("boundary block with a rank that has no boundary element", n == V.fes.GlobalTrueVSize(),
+          "(%d rows)" % n)
+
+
 def main():
     test_against_mfem()
     test_attribute_restriction()
@@ -553,6 +591,8 @@ def main():
     test_dirichlet_plus_robin()
     test_rank_without_boundary_elements()
     test_streamed_pass_with_boundary()
+    test_point_normals_1d()
+    test_rank_without_boundary_elements_true_dofs()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)
