@@ -7,6 +7,7 @@ and writes a JSON record with `--out`; `--help` lists the options. Run the GPU o
 | script | what it measures | where the numbers are |
 |---|---|---|
 | `bench_newton_device.py` | the stages and two Newton-CG steps of the 3D model problem, on GPUs or on the host | README ("How it scales"), GPU guide (both tables of "What to expect") |
+| `perf_check.py` | two Newton-CG steps at a few sizes against the baseline of the machine (`perf_baselines/`, written with `--record`): fails on a slowdown beyond the tolerance or another path | `.github/workflows/gpu.yml` |
 | `bench_newton_hippylibx.py` | the same problem solved by [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx); needs a dolfinx environment | README ("How it compares"), GPU guide |
 | `bench_laplace.py` | after the MAP point: the randomized eigensolver, posterior samples, pointwise variance and traces; `--ensemble` divides the vectors over the GPUs instead of the mesh | GPU guide ("The Laplace approximation on the cards") |
 | `bench_precision.py` | the three precisions of the element kernels (`fp64`, `mixed`, `fp32`): kernel and assembly times, the stages of an iteration, how far the state, the gradient and a Hessian action are from the double-precision ones, and a Newton-CG solve | GPU guide ("Single precision") |

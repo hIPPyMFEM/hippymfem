@@ -4,6 +4,15 @@
 
 ### Added
 
+- **A GPU workflow and a performance check.**  `benchmarks/perf_check.py` runs two
+  Newton-CG steps of the model problem at a few sizes and compares them with the baseline of
+  the machine (`benchmarks/perf_baselines/<machine>.json`, written with `--record`): a size
+  fails when it is more than 15 % slower, or when its Newton and CG counts or its cost
+  functional differ; a baseline recorded under another configuration (device, profile,
+  precision, solver settings) is refused.  `.github/workflows/gpu.yml` runs the suites and
+  that check on a self-hosted runner labelled `gpu` (on pushes to `main`, by hand and weekly;
+  never on pull requests), with the interpreter and the GPU build of PyMFEM named in
+  repository variables.
 - **Robustness on many ranks and a faster start.**  On more than one rank, `import
   hippymfem` wraps `sys.excepthook` so that one rank's uncaught exception prints its
   traceback and aborts every rank (`HIPPYMFEM_ABORT_ON_ERROR=0` keeps the old behavior):
