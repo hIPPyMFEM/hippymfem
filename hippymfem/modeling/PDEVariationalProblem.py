@@ -819,7 +819,34 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: such a trial ended the run, out of device memory); a forward solve outside a line
     #: search then fails where it would have been solved.  An adjoint solve is solved
     #: in double precision either way: it is at a point the line search accepted.
-    SINGLE_GIVE_UP = "double"
+    #: ``"auto"`` (the default since November 2026) does the first where a
+    #: double-precision Jacobian and its hierarchy fit beside what the device holds, on
+    #: every rank (:meth:`_double_fits`), and the second where they do not; with hypre
+    #: in host memory, or where the runtime does not say, it does the first.
+    SINGLE_GIVE_UP = os.environ.get("HIPPYMFEM_SINGLE_GIVE_UP", "").strip().lower() or "auto"
+    #: Bytes of the double-precision Jacobian and its hierarchy that ``"auto"`` counts for
+    #: each nonzero of the single-precision Jacobian: about 43 with quadratic hexahedra on
+    #: Frontier (36 GiB for some 0.9 billion nonzeros, 120^3 elements a GCD), with a margin.
+    GIVE_UP_BYTES_PER_NNZ = 50.0
+
+    def _device_free_bytes(self):
+        """Free bytes of this rank's GPU from its runtime, or ``None`` with hypre in host
+        memory or where the runtime does not answer (a hook the tests replace)."""
+        from .. import _jaxconfig
+
+        if not _jaxconfig.hypre_on_device():
+            return None
+        return _kernel._gpu_free_bytes()
+
+    def _double_fits(self, solver):
+        """Whether the double-precision Jacobian of :meth:`_solve_in_double` and its
+        hierarchy fit beside what the device holds now, on every rank: the decision of
+        ``SINGLE_GIVE_UP = "auto"``.  A collective, called where every rank gives up."""
+        A = getattr(solver, "A", None)
+        nnz = getattr(A, "nnz", None)
+        free = self._device_free_bytes()
+        fits = nnz is None or free is None or free >= self.GIVE_UP_BYTES_PER_NNZ * float(nnz)
+        return bool(self.comm.allreduce(int(fits), op=MPI.MIN))
 
     def _probe_symmetry(self, A, tol=None):
         """Whether the assembled Jacobian is symmetric, to round-off.
@@ -1147,12 +1174,20 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         if gave_up or (point is not None and self._refine_measured
                        and rn > max(factor * goal,
                                     max(worst, 100.0 * _kernel.residual_floor()) * r0)):
-            if self.SINGLE_GIVE_UP == "raise" and what == "forward":
-                # (on every rank: the solver's verdict and the norms are those of all)
+            mode = str(self.SINGLE_GIVE_UP).lower()
+            if mode not in ("auto", "double", "raise"):
+                raise ValueError("SINGLE_GIVE_UP must be \"auto\", \"double\" or \"raise\", "
+                                 "not %r" % (self.SINGLE_GIVE_UP,))
+            if what == "forward" and (mode == "raise" or (
+                    mode == "auto" and not self._double_fits(solver))):
+                # (on every rank: the solver's verdict and the norms are those of all, and
+                # _double_fits is reduced over them)
                 raise RuntimeError(
                     "single precision cannot carry this forward solve (%s), and "
-                    "SINGLE_GIVE_UP is \"raise\"" % (gave_up or "the refinement stopped at "
-                                                     "%.1e of its first residual" % (rn / r0)))
+                    "SINGLE_GIVE_UP is %r%s" % (gave_up or "the refinement stopped at "
+                                                "%.1e of its first residual" % (rn / r0),
+                                                self.SINGLE_GIVE_UP, "" if mode == "raise" else
+                                                ": a double-precision Jacobian does not fit"))
             _warn_stall(what, rn / r0, goal / r0,
                         self.symmetric_jacobian == "auto" and bool(self._symmetric_verdict),
                         gave_up)

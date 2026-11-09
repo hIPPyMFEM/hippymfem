@@ -51,6 +51,32 @@ def _module_assign(module, attr, cast):
     return put
 
 
+def _class_attr(module, cls, attr):
+    def get():
+        return getattr(getattr(importlib.import_module("hippymfem." + module), cls), attr)
+    get.module = "hippymfem." + module
+    return get
+
+
+def _class_assign(module, cls, attr, cast):
+    def put(value):
+        setattr(getattr(importlib.import_module("hippymfem." + module), cls), attr, cast(value))
+    return put
+
+
+def _single_amg_setter(value):
+    """``HIPPYMFEM_SINGLE_AMG``: kept in the environment and parsed again into the options of
+    the single-precision solves where that module is loaded (it reads them at import)."""
+    import sys
+
+    text = "" if value is None else str(value)
+    mod = sys.modules.get("hippymfem.algorithms.singlesolve")
+    if mod is not None:
+        options = mod.parse_amg_options(text)           # (refuses an unknown name first)
+        mod.AMG_OPTIONS = options
+    os.environ["HIPPYMFEM_SINGLE_AMG"] = text
+
+
 def _env_only(env, default=""):
     def get():
         return os.environ.get(env, default)
@@ -129,6 +155,10 @@ _KNOBS = [
     _Knob("node_gpus", "HIPPYMFEM_NODE_GPUS",
           "how many cards the node has, when the launcher hid all but one (set by mpirun_pinned.sh)",
           _env_only("HIPPYMFEM_NODE_GPUS", "(from the visible devices)"), when="import"),
+    _Knob("profile", "HIPPYMFEM_PROFILE",
+          "a named set of defaults that fills in what the environment leaves unset: default, "
+          "gpu, gpu-large (hm.config.profiles() describes them; hm.config.use_profile after import)",
+          lambda: _ACTIVE_PROFILE[0], when="import"),
     _Knob("petsc", "HIPPYMFEM_PETSC",
           "import petsc4py before PyMFEM so the PETSc solvers are available",
           lambda: _bool(os.environ.get("HIPPYMFEM_PETSC", "")), when="import"),
@@ -206,8 +236,8 @@ _KNOBS = [
     _Knob("affine_geometry", "HIPPYMFEM_AFFINE_GEOMETRY",
           "keep the inverse Jacobians of a group once an element where every element's map is "
           "affine (a sixty-fourth of the array with 64 points, and what is left of a large "
-          "group's geometry stays on the card); the element arrays change at round-off; for "
-          "the batches built afterwards",
+          "group's geometry stays on the card): on by default; the element arrays change at "
+          "round-off; for the batches built afterwards",
           _module_attr("fem.elementbatch", "AFFINE_GEOMETRY"),
           _module_assign("fem.elementbatch", "AFFINE_GEOMETRY", _bool)),
     _Knob("geometry_slice", "HIPPYMFEM_GEOMETRY_SLICE",
@@ -329,11 +359,98 @@ _KNOBS = [
           _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST", _int)),
     _Knob("single_blocks", "HIPPYMFEM_SINGLE_BLOCKS",
           "the blocks of a linearization point are matrices of the single-precision hypre where it is "
-          "loaded: two thirds of their memory, products to single precision",
+          "loaded (default): two thirds of their memory, products to single precision",
           _module_attr("fem.tdofassemble", "SINGLE_BLOCKS"),
           _module_assign("fem.tdofassemble", "SINGLE_BLOCKS", _bool)),
+    _Knob("single_amg", "HIPPYMFEM_SINGLE_AMG",
+          "BoomerAMG settings of the single-precision solves by hypre's names, such as "
+          "pmax=8,interp=18 (applied after HIPPYMFEM_AMG)",
+          _env_only("HIPPYMFEM_SINGLE_AMG", ""), _single_amg_setter),
+    _Knob("single_row_sums", "HIPPYMFEM_SINGLE_ROW_SUMS",
+          "a Jacobian of the single-precision hypre keeps the defect of its row sums for its solver "
+          "to add in every product (default; the rounding of a uniform mesh's rows adds up)",
+          _module_attr("fem.tdofassemble", "SINGLE_ROW_SUMS"),
+          _module_assign("fem.tdofassemble", "SINGLE_ROW_SUMS", _bool)),
+    _Knob("single_give_up", "HIPPYMFEM_SINGLE_GIVE_UP",
+          "a forward solve that single precision cannot carry: auto (default: solved again in "
+          "double precision where that Jacobian fits on the device, raised for the line search "
+          "to backtrack where it does not), double, or raise",
+          _class_attr("modeling.PDEVariationalProblem", "PDEVariationalProblem", "SINGLE_GIVE_UP"),
+          _class_assign("modeling.PDEVariationalProblem", "PDEVariationalProblem", "SINGLE_GIVE_UP",
+                        _choice("auto", "double", "raise"))),
 ]
 _BY_NAME = {k.name: k for k in _KNOBS}
+_BY_ENV = {k.env: k for k in _KNOBS}
+
+#: Named sets of defaults, by environment variable.  A profile fills in what the
+#: environment leaves unset, so an explicit setting always wins: ``HIPPYMFEM_PROFILE=<name>``
+#: before ``import hippymfem`` reaches every knob, the import-time ones included;
+#: ``hm.config.use_profile(name)`` afterwards sets the runtime ones.  A value given as
+#: ``(value, needs)`` is used only where the environment variable ``needs`` is set (mixed
+#: precision only with a single-precision hypre named).  What changes the discrete problem
+#: (a lumped prior mass) or belongs to a solver call (tolerances, Newton-CG parameters) is
+#: not in a profile: see the GPU guide's "Recommended settings".
+PROFILES = {
+    "default": ("the library's own defaults", {}),
+    "gpu": ("element Hessians at the quadrature points (faster on a GPU) and, where a "
+            "single-precision hypre is named in HIPPYMFEM_HYPRE_SINGLE, the Jacobians and their "
+            "solves in single precision with the chunk planner set for single-precision "
+            "tangents",
+            {"HIPPYMFEM_HESSIAN": "quadrature",
+             "HIPPYMFEM_PRECISION": ("mixed", "HIPPYMFEM_HYPRE_SINGLE"),
+             "HIPPYMFEM_AD_WORKING_SET": ("8", "HIPPYMFEM_HYPRE_SINGLE")}),
+    "gpu-large": ("'gpu' and the solver settings of the weak-scaling series on Frontier to 4096 "
+                  "GPUs: BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a "
+                  "row, in the single-precision solves the p-multigrid over up to seven meshes "
+                  "of a uniformly refined mesh (BoomerAMG where there are none) with its small "
+                  "levels in host memory, and the prior's cycles over the meshes; with a hypre "
+                  "built with tools/hypre-3.2.0-seqdevice.patch add seq_threshold=30000,"
+                  "redundant=1 to HIPPYMFEM_SINGLE_AMG",
+                  {"HIPPYMFEM_HESSIAN": "quadrature",
+                   "HIPPYMFEM_PRECISION": ("mixed", "HIPPYMFEM_HYPRE_SINGLE"),
+                   "HIPPYMFEM_AD_WORKING_SET": ("8", "HIPPYMFEM_HYPRE_SINGLE"),
+                   "HIPPYMFEM_AMG": "relax_wt=1.8,pmax=6",
+                   "HIPPYMFEM_SINGLE_AMG": "pmax=8,interp=18",
+                   "HIPPYMFEM_PMG": "1",
+                   "HIPPYMFEM_PMG_H": "7",
+                   "HIPPYMFEM_PMG_H_HOST": "5000",
+                   "HIPPYMFEM_PRIOR_H": "7"}),
+}
+#: The profile in force and the environment variables it set (``show`` marks them).
+_ACTIVE_PROFILE = ["default"]
+PROFILE_SET = {}
+
+
+def _profile(name):
+    key = str(name if name is not None else "default").strip().lower() or "default"
+    if key not in PROFILES:
+        raise ValueError("HIPPYMFEM_PROFILE must be one of %s, not %r"
+                         % (", ".join(sorted(PROFILES)), name))
+    return key, PROFILES[key][1]
+
+
+def apply_profile_env(name=None, environ=None):
+    """Fill in the environment variables of a profile (default: ``HIPPYMFEM_PROFILE``) that
+    ``environ`` (default ``os.environ``) leaves unset or empty, and return them.  ``import
+    hippymfem`` calls it first, before any module reads its variables."""
+    env = os.environ if environ is None else environ
+    key, values = _profile(env.get("HIPPYMFEM_PROFILE", "") if name is None else name)
+    out = {}
+    for var, val in values.items():
+        need = None
+        if isinstance(val, tuple):
+            val, need = val
+        if env.get(var, "") != "" or (need and not env.get(need, "")):
+            continue
+        env[var] = val
+        out[var] = val
+    if environ is None:
+        _ACTIVE_PROFILE[0] = key
+        PROFILE_SET.update(dict.fromkeys(out, key))
+    return out
+
+
+
 
 
 class Config(object):
@@ -380,6 +497,39 @@ class Config(object):
                 out[k.name] = "(unavailable: %s)" % exc
         return out
 
+    def profiles(self):
+        """``{name: description}`` of the named sets of defaults (:data:`PROFILES`)."""
+        return {k: v[0] for k, v in PROFILES.items()}
+
+    def use_profile(self, name):
+        """Apply a profile after ``import hippymfem``: each runtime knob it names that the
+        environment leaves unset (or that another profile set) takes its value; an
+        import-time knob is left as it is, with a warning, since it is read before.
+        Returns ``{knob: value}`` of what was set."""
+        import warnings
+
+        key, values = _profile(name)
+        out = {}
+        for var, val in values.items():
+            need = None
+            if isinstance(val, tuple):
+                val, need = val
+            if need and not os.environ.get(need, ""):
+                continue
+            if os.environ.get(var, "") != "" and var not in PROFILE_SET:
+                continue                         # set by the user: an explicit setting wins
+            knob = _BY_ENV.get(var)
+            if knob is None or knob.put is None or knob.when == "import":
+                warnings.warn("profile %r: %s is read at import; set HIPPYMFEM_PROFILE=%s "
+                              "before importing hippymfem" % (key, var, key), RuntimeWarning)
+                continue
+            knob.put(val)
+            os.environ[var] = str(val)
+            PROFILE_SET[var] = key
+            out[knob.name] = val
+        _ACTIVE_PROFILE[0] = key
+        return out
+
     def show(self, file=None, load=True):
         """Print every knob: value, its environment variable (marked when set), when it
         is read, and what it does.  Put the output in a bug report."""
@@ -389,7 +539,8 @@ class Config(object):
         out = file if file is not None else sys.stdout
         print("hippymfem configuration", file=out)
         for k in _KNOBS:
-            src = "env" if os.environ.get(k.env) not in (None, "") else "default"
+            src = ("profile %s" % PROFILE_SET[k.env] if k.env in PROFILE_SET
+                   else "env" if os.environ.get(k.env) not in (None, "") else "default")
             print("  %-24s = %-14r [%s, %s] %s" % (k.name, vals[k.name], src, k.when, k.doc),
                   file=out)
             print("  %-24s   %s" % ("", k.env), file=out)

@@ -29,6 +29,14 @@ Quick start::
                                    bc.homogeneous(), is_fwd_linear=True)
 """
 
+# A profile (HIPPYMFEM_PROFILE) fills in the environment variables it names before any
+# module of the library reads them; config.py itself imports nothing.
+from .config import apply_profile_env as _apply_profile_env
+
+_apply_profile_env()
+del _apply_profile_env
+
+
 from . import _jaxconfig          # noqa: F401  (must precede any jax import)
 from . import _petsc              # noqa: F401  (must precede any mfem import)
 from .version import __version__, version_info

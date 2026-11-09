@@ -59,10 +59,11 @@ KEEP_GEOMETRIC_FACTORS = os.environ.get(
 #: benchmark 59.8 s instead of 72.2 s; a rank holds 34.5 GiB of host memory instead of
 #: 41.9 GiB.  The inverse Jacobian kept is the mean over the points, which differ in
 #: their last digits where the map is affine, so the element arrays change at
-#: round-off: that is why it is not the default.  Set ``HIPPYMFEM_AFFINE_GEOMETRY=1``
-#: (for the batches built afterwards).
+#: round-off.  On by default since November 2026; ``HIPPYMFEM_AFFINE_GEOMETRY=0`` keeps
+#: one inverse Jacobian a quadrature point everywhere, as before (for the batches built
+#: afterwards).  A group with any element that is not affine keeps them all anyway.
 AFFINE_GEOMETRY = os.environ.get(
-    "HIPPYMFEM_AFFINE_GEOMETRY", "0").lower() in ("1", "yes", "true", "on")
+    "HIPPYMFEM_AFFINE_GEOMETRY", "1").lower() in ("1", "yes", "true", "on")
 
 #: How far the inverse Jacobians of an element may differ between its quadrature
 #: points, relative to their largest entry, for its map to count as affine.

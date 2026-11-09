@@ -118,8 +118,12 @@ def _unpin_buffers(addresses):
 #: accumulator twice as large for the duration of the assembly, and, where a device sums a
 #: batch of single-precision element matrices whole
 #: (:meth:`~hippymfem.fem.pattern.ScatterPattern.data`), their entries in double precision
-#: for the sum.  ``HIPPYMFEM_SINGLE_ROW_SUMS=1``.
-SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "0").lower() in (
+#: for the sum.  On by default since November 2026 (it acts only on Jacobians of the
+#: single-precision hypre): on a uniform mesh with a uniform coefficient the rounding of
+#: the rows adds up coherently, and without it the refined solves need more passes and
+#: the incremental solves lose accuracy as the mesh grows (from 64 GCDs on in the scaling
+#: series on Frontier).  ``HIPPYMFEM_SINGLE_ROW_SUMS=0`` switches it off.
+SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "1").lower() in (
     "1", "yes", "true", "on")
 
 
@@ -132,8 +136,11 @@ SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "0").lower() in (
 #: indices for the blocks of one pattern (``C`` and ``W_um``); with hypre on a device the
 #: two that are applied transposed keep their transposes in single precision as well.
 #: 120^3 quadratic hexahedra on a rank: 5.7 GiB of a card for ``C``, ``W_um`` and the two
-#: transposes in place of 9.7 GiB.
-SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "0").lower() in (
+#: transposes in place of 9.7 GiB.  On by default since November 2026, where the
+#: single-precision hypre is loaded (measured to 4096 GCDs: 1.6 % less time, 4.8 GiB more
+#: of a card free, the cost functional after two Newton steps the same to four digits);
+#: ``HIPPYMFEM_SINGLE_BLOCKS=0`` keeps the blocks in double precision.
+SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "1").lower() in (
     "1", "yes", "true", "on")
 
 

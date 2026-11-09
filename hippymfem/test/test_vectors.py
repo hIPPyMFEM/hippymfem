@@ -448,6 +448,79 @@ def test_comgr_cache_of_the_node():
     check("a directory that AMD_COMGR_CACHE_DIR names is kept", kept)
 
 
+def test_config_profiles():
+    """Profiles (``HIPPYMFEM_PROFILE``, ``hm.config.use_profile``) fill in what the
+    environment leaves unset: an explicit setting wins, mixed precision comes only with a
+    single-precision hypre named, an unknown name is refused, an import-time knob is left
+    with a warning after import, and ``show`` marks what a profile set."""
+    import io
+    import os
+    import warnings
+    from contextlib import redirect_stdout
+
+    import importlib
+
+    cfg = importlib.import_module("hippymfem.config")    # (the module; hp.config is its object)
+
+    env = {"HIPPYMFEM_AMG": "relax_wt=1.0"}
+    got = cfg.apply_profile_env("gpu-large", env)
+    check("gpu-large fills in the unset variables and leaves an explicit one",
+          env["HIPPYMFEM_AMG"] == "relax_wt=1.0" and env.get("HIPPYMFEM_PMG_H") == "7"
+          and env.get("HIPPYMFEM_PMG") == "1" and env.get("HIPPYMFEM_HESSIAN") == "quadrature"
+          and "HIPPYMFEM_AMG" not in got,
+          "(%r)" % (sorted(got),))
+    check("without a single-precision hypre named, no profile asks for mixed precision",
+          "HIPPYMFEM_PRECISION" not in env and "HIPPYMFEM_AD_WORKING_SET" not in env)
+    env = {"HIPPYMFEM_HYPRE_SINGLE": "/somewhere/libHYPRE_single.so"}
+    cfg.apply_profile_env("gpu", env)
+    check("with one named, gpu asks for mixed precision and single-precision tangents",
+          env.get("HIPPYMFEM_PRECISION") == "mixed" and env.get("HIPPYMFEM_AD_WORKING_SET") == "8")
+    check("the default profile changes nothing", cfg.apply_profile_env("default", {}) == {})
+    try:
+        cfg.apply_profile_env("fastest", {})
+        refused = False
+    except ValueError:
+        refused = True
+    check("an unknown profile is refused", refused)
+
+    # after import: a profile of this test's own, so the suite's kernels are not touched
+    names = ("HIPPYMFEM_PMG_H", "HIPPYMFEM_AMG", "HIPPYMFEM_GPU_MEM_FRACTION")
+    kept_env = {n: os.environ.get(n) for n in names}
+    kept_set, kept_active = dict(cfg.PROFILE_SET), list(cfg._ACTIVE_PROFILE)
+    cfg.PROFILES["_test"] = ("a test", {"HIPPYMFEM_PMG_H": "3", "HIPPYMFEM_AMG": "relax_wt=1.5",
+                                        "HIPPYMFEM_GPU_MEM_FRACTION": "0.5"})
+    try:
+        os.environ.pop("HIPPYMFEM_PMG_H", None)
+        os.environ.pop("HIPPYMFEM_GPU_MEM_FRACTION", None)     # (JAX read it at import)
+        os.environ["HIPPYMFEM_AMG"] = "relax_wt=1.0"            # the user's: kept
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            got = hp.config.use_profile("_test")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            hp.config.show(load=False)
+        line = [x for x in buf.getvalue().splitlines() if x.strip().startswith("pmg_h ")]
+        check("use_profile sets a runtime knob, keeps the user's, and leaves an import-time "
+              "one with a warning",
+              got == {"pmg_h": "3"} and int(hp.config.pmg_h) == 3
+              and os.environ["HIPPYMFEM_AMG"] == "relax_wt=1.0"
+              and "HIPPYMFEM_GPU_MEM_FRACTION" not in os.environ
+              and any("read at import" in str(x.message) for x in w),
+              "(%r, pmg_h %r)" % (got, hp.config.pmg_h))
+        check("show() marks what the profile set", bool(line) and "profile _test" in line[0],
+              "(%s)" % (line[0].strip()[:100] if line else "no line"))
+    finally:
+        del cfg.PROFILES["_test"]
+        for n, v in kept_env.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
+        cfg.PROFILE_SET.clear()
+        cfg.PROFILE_SET.update(kept_set)
+        cfg._ACTIVE_PROFILE[:] = kept_active
+
+
 def test_config_knobs():
     """Every knob of ``hm.config`` reads, and a written value arrives as the type it names.
 
@@ -595,6 +668,7 @@ if __name__ == "__main__":
     test_random_partition_independence()
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
+    test_config_profiles()
     test_device_auto_without_gpu()
     test_comgr_cache_of_the_node()
     if RANK == 0:

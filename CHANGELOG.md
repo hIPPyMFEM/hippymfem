@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Profiles: named sets of defaults** (`HIPPYMFEM_PROFILE=gpu|gpu-large` before `import
+  hippymfem`, or `hm.config.use_profile(name)` after it; `hm.config.profiles()` describes
+  them).  A profile fills in the environment variables it names that the environment leaves
+  unset, so an explicit setting always wins, and `hm.config.show()` marks what it set.
+  `gpu` takes the element Hessians at the quadrature points and, where a single-precision
+  hypre is named (`HIPPYMFEM_HYPRE_SINGLE`), the Jacobians and their solves in single
+  precision with the chunk planner set for single-precision tangents.  `gpu-large` adds the
+  solver settings of the weak-scaling series on Frontier to 4096 GPUs that run on any hypre:
+  BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a row, the p-multigrid
+  over up to seven meshes of a uniformly refined mesh with its small levels in host memory,
+  and the prior's cycles over the meshes (with `tools/hypre-3.2.0-seqdevice.patch`, add
+  `seq_threshold=30000,redundant=1` to `HIPPYMFEM_SINGLE_AMG`).  What changes the discrete
+  problem (a lumped prior mass) and what belongs to a solver call (tolerances, Newton-CG
+  parameters) is not in a profile.  New knobs `profile`, `single_amg`, `single_row_sums`,
+  `single_give_up`.
+
 - **Two applications that follow published inversions.**  `applications/seismic/` infers
   the wave speed of the Earth from seismograms, the problem of Bui-Thanh et al. (SC12,
   2012): the acoustic wave equation as a density at a point, continuous spectral
@@ -776,6 +792,22 @@
   tracer, steepest descent, and the lumped-mass and transpose solvers.
 
 ### Changed
+
+- **Defaults from the scaling work on Frontier.**  The compact geometry of affine element
+  groups (`HIPPYMFEM_AFFINE_GEOMETRY`) is on: one inverse Jacobian an element where every
+  element of a group is mapped affinely, which on a node of eight MI250X took two
+  Newton-CG steps at 120^3 elements a GCD from 62.0 to 51.3 s in double precision and
+  from 45.8 to 34.4 s in mixed precision, with 7 GiB less host memory a rank; the element
+  arrays change at round-off (`=0` for the arrays of before).  Where the single-precision
+  hypre is loaded, the Jacobian keeps the defect of its row sums
+  (`HIPPYMFEM_SINGLE_ROW_SUMS`; without it the refined solves needed more passes from 64
+  GCDs on) and the blocks of a linearization point are its matrices
+  (`HIPPYMFEM_SINGLE_BLOCKS`; 1.6 % less time on 4096 GCDs and 4.8 GiB more of a card
+  free).  A forward solve that single precision cannot carry is solved again in double
+  precision only where that Jacobian and its hierarchy fit on the device, and raised for
+  the line search to backtrack where they do not (`SINGLE_GIVE_UP = "auto"`,
+  `HIPPYMFEM_SINGLE_GIVE_UP`): the old default, `"double"`, ran a trial of 600^3 on 128
+  GCDs out of device memory.
 
 - **The seismic propagator numbers a rank's unknowns in the order its elements meet them**
   (`sem.first_touch`, with `--keys`), not in the order of their keys.  The gather and

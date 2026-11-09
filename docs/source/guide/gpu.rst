@@ -75,6 +75,20 @@ BiLaplacian prior, pointwise observations), its MAP point computed by Newton-CG 
 relative gradient norm of 1e-6.  ``applications/precision/model_subsurf_single.py`` does
 all of it.
 
+**Profiles.**  ``HIPPYMFEM_PROFILE=gpu``, set before ``import hippymfem``, takes the element
+Hessians at the quadrature points and, where ``HIPPYMFEM_HYPRE_SINGLE`` names a
+single-precision hypre, the Jacobians and their solves in single precision with the chunk
+planner set for single-precision tangents.  ``HIPPYMFEM_PROFILE=gpu-large`` adds the
+solver settings of the weak-scaling runs on Frontier (BoomerAMG with l1-Jacobi weight 1.8
+and six interpolation entries a row; in the single-precision solves the p-multigrid over
+up to seven meshes of a uniformly refined mesh, with its small levels in host memory; the
+prior's cycles over the meshes).  A profile fills in only what the environment leaves
+unset, and ``hm.config.show()`` marks what it set; ``hm.config.use_profile(name)`` applies
+the runtime part after import.  The tolerances and the Newton-CG parameters below remain
+the script's, as does a lumped prior mass, which changes the discrete problem.  The
+compact geometry of affine elements, and with a single-precision hypre the row sums kept
+and the blocks of a linearization point in single precision, are on without a profile.
+
 **The MAP point.**
 
 * The defaults need no change: the CG of a Newton step keeps its residuals orthogonal,

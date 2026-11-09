@@ -386,6 +386,19 @@ def run(check, COMM=MPI.COMM_WORLD):
             raised = str(e)
         finally:
             del pde.SINGLE_GIVE_UP             # (the class's default again)
+        # "auto", the default, raises as well where a double-precision Jacobian would not
+        # fit beside what the device holds: here made so by the hook of the free memory
+        auto_raised = ""
+        pde._device_free_bytes = lambda: 0
+        try:
+            pde.invalidate_jacobian()
+            pde._release_operators("solver", "solver_adj")
+            ua = pde.generate_state()
+            pde.solveFwd(ua, [ua, big, None])
+        except RuntimeError as e:
+            auto_raised = str(e)
+        finally:
+            del pde._device_free_bytes
     finally:
         singlesolve.AMG_OPTIONS = options
         pde.invalidate_jacobian()
@@ -396,7 +409,12 @@ def run(check, COMM=MPI.COMM_WORLD):
           "(the state against double precision %.1e; %s)" % (eu, said[said.find("failed"):] or "no error"))
     check("with SINGLE_GIVE_UP = \"raise\" that forward solve raises instead, on every rank",
           COMM.allreduce("cannot carry" in raised and "not positive definite" in raised, op=MPI.LAND)
-          and pde.SINGLE_GIVE_UP == "double", "(%s)" % (raised[:90] or "nothing raised"))
+          and pde.SINGLE_GIVE_UP == "auto", "(%s)" % (raised[:90] or "nothing raised"))
+    check("with SINGLE_GIVE_UP = \"auto\" (the default) it raises where a double-precision "
+          "Jacobian does not fit, on every rank, and falls back on double precision where it "
+          "does (above)",
+          COMM.allreduce("does not fit" in auto_raised, op=MPI.LAND),
+          "(%s)" % (auto_raised[:120] or "nothing raised"))
 
     _row_sums(check, COMM, pde, Vu, m, rhs, got)
     _pmg(check, COMM, pde, model, prior, pmesh, Vu, Vm, m, rhs, got)
