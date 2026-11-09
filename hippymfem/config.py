@@ -373,7 +373,7 @@ _KNOBS = [
           _env_only("HIPPYMFEM_PMG_H_HOST", "0"), _env_setter("HIPPYMFEM_PMG_H_HOST", _int)),
     _Knob("single_blocks", "HIPPYMFEM_SINGLE_BLOCKS",
           "the blocks of a linearization point are matrices of the single-precision hypre where it is "
-          "loaded (default): two thirds of their memory, products to single precision",
+          "loaded: two thirds of their memory, products to single precision (in gpu-large)",
           _module_attr("fem.tdofassemble", "SINGLE_BLOCKS"),
           _module_assign("fem.tdofassemble", "SINGLE_BLOCKS", _bool)),
     _Knob("single_amg", "HIPPYMFEM_SINGLE_AMG",
@@ -417,7 +417,9 @@ PROFILES = {
                   "GPUs: BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a "
                   "row, in the single-precision solves the p-multigrid over up to seven meshes "
                   "of a uniformly refined mesh (BoomerAMG where there are none) with its small "
-                  "levels in host memory, and the prior's cycles over the meshes; with a hypre "
+                  "levels in host memory, the prior's cycles over the meshes, and with a "
+                  "single-precision hypre the blocks of a linearization point in single "
+                  "precision; with a hypre "
                   "built with tools/hypre-3.2.0-seqdevice.patch add seq_threshold=30000,"
                   "redundant=1 to HIPPYMFEM_SINGLE_AMG",
                   {"HIPPYMFEM_HESSIAN": "quadrature",
@@ -428,7 +430,8 @@ PROFILES = {
                    "HIPPYMFEM_PMG": "1",
                    "HIPPYMFEM_PMG_H": "7",
                    "HIPPYMFEM_PMG_H_HOST": "5000",
-                   "HIPPYMFEM_PRIOR_H": "7"}),
+                   "HIPPYMFEM_PRIOR_H": "7",
+                   "HIPPYMFEM_SINGLE_BLOCKS": ("1", "HIPPYMFEM_HYPRE_SINGLE")}),
 }
 #: The profile in force and the environment variables it set (``show`` marks them).
 _ACTIVE_PROFILE = ["default"]

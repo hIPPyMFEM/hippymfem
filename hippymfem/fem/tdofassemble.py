@@ -136,11 +136,12 @@ SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "1").lower() in (
 #: indices for the blocks of one pattern (``C`` and ``W_um``); with hypre on a device the
 #: two that are applied transposed keep their transposes in single precision as well.
 #: 120^3 quadratic hexahedra on a rank: 5.7 GiB of a card for ``C``, ``W_um`` and the two
-#: transposes in place of 9.7 GiB.  On by default since November 2026, where the
-#: single-precision hypre is loaded (measured to 4096 GCDs: 1.6 % less time, 4.8 GiB more
-#: of a card free, the cost functional after two Newton steps the same to four digits);
-#: ``HIPPYMFEM_SINGLE_BLOCKS=0`` keeps the blocks in double precision.
-SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "1").lower() in (
+#: transposes in place of 9.7 GiB.  Measured to 4096 GCDs: 1.6 % less time, 4.8 GiB more of
+#: a card free, the cost functional after two Newton steps the same to four digits.  Not
+#: the default, since every identity of the blocks then holds to single precision only
+#: (``<C dm, dp> = <dm, C^T dp>``, a symmetric Hessian, matrix-free against assembled);
+#: the profile ``gpu-large`` sets it where a single-precision hypre is named.
+SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "0").lower() in (
     "1", "yes", "true", "on")
 
 

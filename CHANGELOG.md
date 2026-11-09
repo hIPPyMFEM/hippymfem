@@ -53,7 +53,8 @@
   solver settings of the weak-scaling series on Frontier to 4096 GPUs that run on any hypre:
   BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a row, the p-multigrid
   over up to seven meshes of a uniformly refined mesh with its small levels in host memory,
-  and the prior's cycles over the meshes (with `tools/hypre-3.2.0-seqdevice.patch`, add
+  the prior's cycles over the meshes, and with a single-precision hypre the blocks of a
+  linearization point in single precision (with `tools/hypre-3.2.0-seqdevice.patch`, add
   `seq_threshold=30000,redundant=1` to `HIPPYMFEM_SINGLE_AMG`).  What changes the discrete
   problem (a lumped prior mass) and what belongs to a solver call (tolerances, Newton-CG
   parameters) is not in a profile.  New knobs `profile`, `single_amg`, `single_row_sums`,
@@ -840,9 +841,9 @@
   arrays change at round-off (`=0` for the arrays of before).  Where the single-precision
   hypre is loaded, the Jacobian keeps the defect of its row sums
   (`HIPPYMFEM_SINGLE_ROW_SUMS`; without it the refined solves needed more passes from 64
-  GCDs on) and the blocks of a linearization point are its matrices
-  (`HIPPYMFEM_SINGLE_BLOCKS`; 1.6 % less time on 4096 GCDs and 4.8 GiB more of a card
-  free).  A forward solve that single precision cannot carry is solved again in double
+  GCDs on); the blocks of a linearization point as its matrices (`HIPPYMFEM_SINGLE_BLOCKS`;
+  1.6 % less time on 4096 GCDs and 4.8 GiB more of a card free) are in the profile
+  `gpu-large`, since their identities then hold to single precision only.  A forward solve that single precision cannot carry is solved again in double
   precision only where that Jacobian and its hierarchy fit on the device, and raised for
   the line search to backtrack where they do not (`SINGLE_GIVE_UP = "auto"`,
   `HIPPYMFEM_SINGLE_GIVE_UP`): the old default, `"double"`, ran a trial of 600^3 on 128

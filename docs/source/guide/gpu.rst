@@ -86,8 +86,9 @@ prior's cycles over the meshes).  A profile fills in only what the environment l
 unset, and ``hm.config.show()`` marks what it set; ``hm.config.use_profile(name)`` applies
 the runtime part after import.  The tolerances and the Newton-CG parameters below remain
 the script's, as does a lumped prior mass, which changes the discrete problem.  The
-compact geometry of affine elements, and with a single-precision hypre the row sums kept
-and the blocks of a linearization point in single precision, are on without a profile.
+compact geometry of affine elements, and with a single-precision hypre the row sums kept,
+are on without a profile; ``gpu-large`` also puts the blocks of a linearization point in
+single precision, whose identities then hold to single precision only.
 
 **The MAP point.**
 

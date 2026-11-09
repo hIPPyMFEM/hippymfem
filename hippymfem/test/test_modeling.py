@@ -796,6 +796,13 @@ def test_apply_ij_at():
                                        is_fwd_linear=False, **kw)
         x = [rand(Vh[0]), rand(Vh[1]), rand(Vh[2])]
         pde.setLinearizationPoint(x, gauss_newton_approx=False)
+        # (a Jacobian in the single-precision hypre, where that library is loaded: a
+        # symmetric one with CG, and since the GMRES of that library one that is not, as
+        # here; its products are single precision's)
+        import importlib
+
+        tol = (max(mtol, 1e-6) if importlib.import_module(
+            "hippymfem.modeling.PDEVariationalProblem")._is_single(pde.A) else mtol)
         worst = 0.0
         for i, j in pairs:
             d = rand(Vh[j])
@@ -804,7 +811,7 @@ def test_apply_ij_at():
             diff = got.copy()
             diff.axpy(-1.0, ref)
             worst = largest([worst, diff.norm("l2") / max(ref.norm("l2"), 1e-300)])
-        check("matrix-free = assembled, %s" % name, worst < mtol, "(rel %.1e)" % worst)
+        check("matrix-free = assembled, %s" % name, worst < tol, "(rel %.1e against %.0e)" % (worst, tol))
         # a linearization point with every block, or the parameter's, left to the
         # kernels gives the same products through apply_ij
         for gn in (False, True):

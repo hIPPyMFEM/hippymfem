@@ -288,12 +288,16 @@ def run(check, COMM=MPI.COMM_WORLD):
         pat.ScatterPattern.fused_begin = fused_begin
         try:
             for accumulate in (True, False):
+                # (the row sums, on by default, accumulate in double precision whatever
+                # SINGLE_ACCUMULATE says: off for this check of the accumulation itself)
                 old, td.SINGLE_ACCUMULATE = td.SINGLE_ACCUMULATE, accumulate
+                old_rs, td.SINGLE_ROW_SUMS = td.SINGLE_ROW_SUMS, False
                 try:
                     pde.invalidate_jacobian()
                     A, _ = pde._jacobian([got[True]["u"], m, None])
                 finally:
                     td.SINGLE_ACCUMULATE = old
+                    td.SINGLE_ROW_SUMS = old_rs
                 y = Vu.vector()
                 A.Mult(rhs.hypre, y.hypre)
                 products.append((type(A).__name__, y))
