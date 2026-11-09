@@ -30,11 +30,17 @@ jobs:
           env ${{ vars.HIPPYMFEM_GPU_ENV }} PY="${{ vars.HIPPYMFEM_GPU_PYTHON }}" \
             HIPPYMFEM_CUDA_PYMFEM="${{ vars.HIPPYMFEM_CUDA_PYMFEM }}" ./run_tests.sh 1 2
       - name: Performance against this machine's baseline
+        # perf_check exits with 2 when it has no record of this configuration to compare
+        # with: a warning on the run, not a failure, so that a new runner or a new
+        # setting can be recorded first (benchmarks/perf_check.py --record).
         run: |
-          if [ -f "benchmarks/perf_baselines/${{ runner.name }}.json" ]; then
-            env ${{ vars.HIPPYMFEM_GPU_ENV }} PYTHONPATH="${{ vars.HIPPYMFEM_CUDA_PYMFEM }}" \
-              HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 \
-              "${{ vars.HIPPYMFEM_GPU_PYTHON }}" benchmarks/perf_check.py --machine "${{ runner.name }}"
-          else
-            echo "no baseline for ${{ runner.name }}: record one with benchmarks/perf_check.py --record --machine ${{ runner.name }}"
+          set +e
+          env ${{ vars.HIPPYMFEM_GPU_ENV }} PYTHONPATH="${{ vars.HIPPYMFEM_CUDA_PYMFEM }}" \
+            HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 \
+            "${{ vars.HIPPYMFEM_GPU_PYTHON }}" benchmarks/perf_check.py --machine "${{ runner.name }}"
+          rc=$?
+          if [ $rc -eq 2 ]; then
+            echo "::warning title=No performance baseline::nothing recorded for ${{ runner.name }} in this configuration; record one with benchmarks/perf_check.py --record --machine ${{ runner.name }}"
+            exit 0
           fi
+          exit $rc

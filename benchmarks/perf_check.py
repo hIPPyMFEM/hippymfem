@@ -15,13 +15,20 @@ Newton or CG counts differ from it, or when the cost functional differs from it 
 1e-6 of its size (the same mesh, data and settings give the same path).  Faster is reported,
 not failed; record again to keep it.  The baseline is ``perf_baselines/<machine>.json``, the
 machine named by ``--machine``, ``HIPPYMFEM_PERF_MACHINE`` or the host name; a timing is
-the least of ``--repeat`` runs.
+the least of ``--repeat`` runs.  It holds one record per configuration and rank count, and
+``--record`` adds or replaces the one of this run.
 
 The runs are started by ``--launcher`` (default ``HIPPYMFEM_LAUNCHER`` or ``mpirun -n {ranks}``;
 on one rank without one, the interpreter itself), with the environment of this process:
 set the device there, as for the benchmark (``HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1``,
-a profile, the single-precision hypre).  The baseline records those variables, and a
-comparison under others is refused: it would compare two configurations.
+a profile, the single-precision hypre).  A record keeps the configuration it was made in:
+every ``HIPPYMFEM_*`` variable but those that only say where things are or what to print
+(:data:`NOT_CONFIG`), ``XLA_FLAGS``, and the options after ``--``.  A run is compared with
+the record of the same configuration only.
+
+Exit status: 0 when every size is within the tolerance on the recorded path, 1 when one is
+not, 2 when there is nothing to compare with (no baseline, or no record of this
+configuration and rank count), which a scheduled job can report without failing.
 """
 import argparse
 import json
@@ -34,10 +41,32 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench_newton_device.py")
-#: the environment that makes a configuration: a baseline is compared under the same only
-CONFIG_VARS = ("HIPPYMFEM_DEVICE", "HIPPYMFEM_HYPRE_DEVICE", "HIPPYMFEM_PROFILE", "HIPPYMFEM_PRECISION",
-               "HIPPYMFEM_HYPRE_SINGLE", "HIPPYMFEM_AMG", "HIPPYMFEM_SINGLE_AMG", "HIPPYMFEM_HESSIAN",
-               "HIPPYMFEM_PMG", "HIPPYMFEM_PMG_H", "HIPPYMFEM_AFFINE_GEOMETRY")
+#: ``HIPPYMFEM_*`` variables that say where things are, how a run is launched or what it
+#: prints, not what it computes: every other one is part of a record's configuration
+NOT_CONFIG = ("HIPPYMFEM_ABORT_ON_ERROR", "HIPPYMFEM_CUDA_PYMFEM", "HIPPYMFEM_GPU_ENV",
+              "HIPPYMFEM_GPU_PYTHON", "HIPPYMFEM_JAX_CACHE", "HIPPYMFEM_JAX_CACHE_MIN_SECONDS",
+              "HIPPYMFEM_LAUNCHER", "HIPPYMFEM_NODE_GPUS", "HIPPYMFEM_PERF_MACHINE",
+              "HIPPYMFEM_PATTERN_TIMING", "HIPPYMFEM_PMG_TIMERS", "HIPPYMFEM_PMG_TRACE",
+              "HIPPYMFEM_TEST_RANKS")
+#: the exit status when there is no record to compare with
+NO_RECORD = 2
+
+
+def configuration(bench_args):
+    """What makes a run comparable with a record: the variables that change what the
+    benchmark computes or how, and the benchmark's own options."""
+    env = {k: v for k, v in sorted(os.environ.items())
+           if (k.startswith("HIPPYMFEM_") and k not in NOT_CONFIG) or k == "XLA_FLAGS"}
+    return {"env": env, "bench_args": list(bench_args)}
+
+
+def records_of(base):
+    """The records of a baseline file; one written before records were kept per
+    configuration is a single record whose configuration matches nothing now."""
+    if "records" in base:
+        return list(base["records"])
+    return [{"ranks": base.get("ranks"), "config": {"legacy": base.get("config")},
+             "runs": base.get("runs", {})}]
 
 
 def run_bench(n, ranks, launcher, extra):
@@ -68,17 +97,25 @@ def main():
     ap.add_argument("bench_args", nargs="*", help="after --: options for bench_newton_device.py")
     args = ap.parse_args()
     sizes = [int(s) for s in args.sizes.split(",") if s.strip()]
-    config = {v: os.environ.get(v, "") for v in CONFIG_VARS}
+    if not sizes:
+        raise SystemExit("perf_check: --sizes names no size")
+    config = configuration(args.bench_args)
     path = os.path.join(args.baseline_dir, "%s.json" % args.machine)
+    records = []
+    if os.path.exists(path):
+        with open(path) as f:
+            records = records_of(json.load(f))
     base = None
     if not args.record:
-        if not os.path.exists(path):
-            raise SystemExit("perf_check: no baseline %s; run with --record first" % path)
-        with open(path) as f:
-            base = json.load(f)
-        if base.get("config") != config or base.get("ranks") != args.ranks:
-            raise SystemExit("perf_check: the baseline %s was recorded under %s on %s rank(s), this "
-                             "run is %s on %d" % (path, base.get("config"), base.get("ranks"), config, args.ranks))
+        if not records:
+            print("perf_check: no baseline %s; record one with --record" % path)
+            return NO_RECORD
+        mine = [r for r in records if r.get("config") == config and r.get("ranks") == args.ranks]
+        if not mine:
+            print("perf_check: %s has no record of this configuration on %d rank(s); it has %d "
+                  "other(s).  This run: %s" % (path, args.ranks, len(records), json.dumps(config)))
+            return NO_RECORD
+        base = mine[0]
     runs, failed = {}, []
     for n in sizes:
         best = None
@@ -108,9 +145,11 @@ def main():
             failed.append("%d^3" % n)
     if args.record:
         os.makedirs(args.baseline_dir, exist_ok=True)
+        kept = [r for r in records if not (r.get("config") == config and r.get("ranks") == args.ranks)]
+        kept.append({"ranks": args.ranks, "config": config, "runs": runs})
         with open(path, "w") as f:
-            json.dump({"machine": args.machine, "ranks": args.ranks, "config": config, "runs": runs}, f, indent=1)
-        print("perf_check: wrote %s" % path)
+            json.dump({"machine": args.machine, "records": kept}, f, indent=1)
+        print("perf_check: wrote %s (%d record(s))" % (path, len(kept)))
         return 0
     if failed:
         print("perf_check: FAILED at %s" % ", ".join(failed))
