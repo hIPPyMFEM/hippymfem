@@ -1296,6 +1296,18 @@
   (0.02 s for 400 MB). The vertices of a mesh without nodes were already part of the key.
   Before the array was kept, such a move was seen at once, and it is again
   (`test_assembly.test_coordinates_after_moving_nodes`).
+- **`KrylovSolver(fes=...)` with a `FunctionSpace`, and a systems ordering left unsaid.**
+  - Given one of the library's `FunctionSpace`s as `fes`, the solver raised
+    `AttributeError`: it asked the space for `GetOrdering`, which only MFEM's space has. A
+    `FunctionSpace` is now read through its MFEM space, for the ordering and for the
+    elasticity options.
+  - With `systems_dim` and neither `fes` nor `systems_bynodes`, the solver takes the
+    components one after another, as the library's spaces are ordered. On an interleaved
+    (`byVDIM`) space, BoomerAMG then pairs rows of different components, and a solve takes
+    15 to 50 times the iterations. That default stays, and a `RuntimeWarning` now says it
+    once. The library's own priors always name the ordering.
+
+  `test_solvers.test_systems_ordering` checks both.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

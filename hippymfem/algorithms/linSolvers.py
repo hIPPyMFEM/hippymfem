@@ -248,8 +248,16 @@ class KrylovSolver(_SolverBase):
         to pair the rows of one component: component after component
         (``mfem.Ordering.byNODES``, the ordering of this library's spaces unless another
         is asked for, and the default here), or interleaved (``byVDIM``: pass ``False``).
-        Taken from ``fes`` where that is given.
+        Taken from ``fes`` where that is given.  With ``systems_dim`` and neither of the
+        two, the default is taken and a warning says so once: on an interleaved space
+        BoomerAMG then pairs rows of different components, and a solve takes 15 to 50
+        times the iterations.
+    fes : FunctionSpace or mfem.ParFiniteElementSpace, optional
+        The space of the unknowns, for their ordering and for the elasticity options.
     """
+
+    #: whether the warning about an ordering left to the default has been given
+    _warned_ordering = False
 
     def __init__(self, comm, method="cg", precond="amg", systems_dim=None,
                  elasticity=False, fes=None, systems_bynodes=None):
@@ -262,12 +270,35 @@ class KrylovSolver(_SolverBase):
         self.systems_dim = systems_dim
         self.elasticity = elasticity
         self.fes = fes
+        space = self._mfem_space()
         if systems_bynodes is None:
-            systems_bynodes = fes is None or fes.GetOrdering() == mfem.Ordering.byNODES
+            if space is not None:
+                systems_bynodes = space.GetOrdering() == mfem.Ordering.byNODES
+            else:
+                systems_bynodes = True
+                if systems_dim and not KrylovSolver._warned_ordering:
+                    KrylovSolver._warned_ordering = True
+                    import warnings
+
+                    warnings.warn(
+                        "KrylovSolver(systems_dim=%d) without fes or systems_bynodes takes the "
+                        "components one after another (byNODES, the ordering of this library's "
+                        "spaces).  For an interleaved (byVDIM) space pass fes= or "
+                        "systems_bynodes=False: BoomerAMG would pair rows of different "
+                        "components." % int(systems_dim), RuntimeWarning, stacklevel=2)
         self.systems_bynodes = bool(systems_bynodes)
         self._solver = None
         self._pc = None
         self._template = None
+
+    def _mfem_space(self):
+        """MFEM's space of :attr:`fes`: a ``FunctionSpace``'s, or the one given (``None``
+        without one).  A ``FunctionSpace`` has no ``GetOrdering``, and passing one raised."""
+        fes = self.fes
+        if fes is None:
+            return None
+        inner = getattr(fes, "fes", None)
+        return inner if inner is not None else fes
 
     #: How hypre setup failures are handled.  MFEM's default aborts the whole job
     #: via ``MFEM_VERIFY``, which is wrong inside an optimizer: a line search
@@ -325,7 +356,7 @@ class KrylovSolver(_SolverBase):
                                      "that many times its nodes" % dim)
                 pc.SetSystemsOptions(dim, bynodes)
                 if self.elasticity:
-                    pc.SetElasticityOptions(self.fes)
+                    pc.SetElasticityOptions(self._mfem_space())
                 # (Before the solver's own settings, which follow.  With the components MFEM
                 # writes settings of its own, no aggressive levels and a strength threshold
                 # of 0.5 among them: written last, they took the place of amg_agg_levels,

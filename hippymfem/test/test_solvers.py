@@ -1190,6 +1190,31 @@ def test_systems_ordering():
           hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3).systems_bynodes
           and prior.Asolver.systems_dim == 3 and prior.Asolver.systems_bynodes
           and Vd.fes.GetOrdering() == mfem.Ordering.byNODES)
+    # a FunctionSpace for fes, as the library's spaces are handed around, is read as its MFEM
+    # space is (it raised AttributeError: a FunctionSpace has no GetOrdering)
+    via_space = []
+    for ordering in (mfem.Ordering.byNODES, mfem.Ordering.byVDIM):
+        Vo = hp.FunctionSpace.H1(mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(4, 4, 4, mfem.Element.HEXAHEDRON)),
+                                 1, vdim=3, ordering=ordering)
+        try:
+            via_space.append(hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, fes=Vo).systems_bynodes)
+        except Exception as e:                                       # noqa: BLE001
+            via_space.append(repr(e)[:70])
+    check("a FunctionSpace as fes gives the ordering of its MFEM space", via_space == [True, False],
+          "(%s)" % (via_space,))
+    # the default taken without a word of the space or the ordering is said, once
+    import warnings
+
+    hp.KrylovSolver._warned_ordering = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3)
+        hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3)
+        hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, systems_bynodes=True)
+        hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, fes=Vd)
+    said = [str(w.message) for w in caught if "systems_dim" in str(w.message)]
+    check("systems_dim without fes or systems_bynodes says once which ordering it takes",
+          len(said) == 1 and "byVDIM" in said[0], "(%d warnings)" % len(said))
     # the solver's own settings hold for a systems hierarchy: with the components MFEM writes a strength
     # threshold of its own (0.5), which used to come after them and take their place without a word
     import ctypes
