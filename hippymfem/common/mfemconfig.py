@@ -454,7 +454,10 @@ def _late_teardown():
     these are registered during the interpreter's finalization, after everything else:
     they run after every Python object is gone and before CUDA's teardown.  Afterwards
     MFEM's own destructors find the manager gone and the library finalized, and do
-    nothing.  A library without these symbols is left as it is."""
+    nothing.  A library without these symbols is left as it is.  A script that makes an
+    ``mfem.Device`` of its own beside :func:`configure_device` has it destroyed during
+    the finalization, after the check below, and MFEM then stops at the second
+    ``Destroy``: keep to the one Device that :func:`configure_device` makes."""
     import ctypes
 
     lib = _mfem_library()
