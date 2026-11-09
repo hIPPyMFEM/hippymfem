@@ -80,11 +80,11 @@ times, the memory per rank, and what they depend on.
 
 ## How it works
 
-<p align="center"><img src="docs/images/architecture.png" alt="The library as a flowchart: the user writes the prior and data, the mesh and spaces, the residual and the boundary and initial terms; hIPPyMFEM differentiates them into every Jacobian and Hessian block, assembles them into hypre matrices on the device, and runs Newton-CG, the Laplace posterior and the uncertainty stages on top" width="900"></p>
+<p align="center"><img src="docs/images/architecture.png" alt="The library as a flowchart: the user writes the prior and data, the mesh and spaces, the residual density and the boundary, interior-facet and initial densities; hIPPyMFEM differentiates them into the residual and every Jacobian and Hessian block, assembles them into hypre matrices on the device or the host, solves with CG or GMRES and AMG or p-multigrid in double or single precision, and runs Newton-CG, the Laplace approximation and uncertainty quantification on top; each Newton-CG iterate goes back to the element kernels" width="900"></p>
 
 You write the top row: the prior and the data, the mesh and the spaces, the residual as a
-weak form at one quadrature point, and the boundary and initial terms. Everything
-below it is generated or reused. No adjoint, Jacobian or Hessian block is written by hand,
+weak form at one quadrature point (of a steady problem or of one time step), and any
+boundary, interior-facet or initial densities. Everything below it is generated or reused. No adjoint, Jacobian or Hessian block is written by hand,
 and the same script runs on host cores or on GPUs.
 
 ## What is inside

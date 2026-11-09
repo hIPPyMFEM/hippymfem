@@ -1,0 +1,22 @@
+% The README's image, docs/images/architecture.png, drawn from the paper's Figure 1:
+% fig_architecture.tex here is a copy of the paper's figures/fig_architecture.tex, and
+% \archreadme adds the package names, two subtitles and a footer.  To redraw it:
+%   pdflatex architecture.tex
+%   pdftoppm -r 300 -png -singlefile architecture.pdf architecture
+\documentclass[border=10pt]{standalone}
+\usepackage[sfdefault,lining]{FiraSans}
+\usepackage[scale=0.86]{FiraMono}
+\usepackage[italic]{mathastext}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta}
+\def\archreadme{1}
+\def\archwidth{600pt}
+\def\archvscale{1.32}
+\def\archtitlefont{\small\bfseries}
+\def\archsubfont{\footnotesize}
+\def\archlabelfont{\small\bfseries}
+\def\archnotefont{\footnotesize\itshape}
+\def\archmodfont{\scriptsize\ttfamily}
+\begin{document}
+\input{fig_architecture.tex}
+\end{document}

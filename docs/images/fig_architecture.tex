@@ -1,0 +1,171 @@
+% Figure 1: how a computation with hIPPyMFEM is organized, in TikZ, so that it takes
+% the document's fonts and can be edited as text.  \input it inside a figure
+% environment; it needs \usepackage{tikz} and \usetikzlibrary{arrows.meta}.  The
+% layout follows \archwidth (\linewidth unless defined before), and the heights of its
+% rows \archvscale (1 for the fonts below).  The image of the library's README
+% (docs/images/architecture.png) is drawn from this file with \def\archreadme{1}, which
+% adds the package names, a few subtitles and a footer.
+\providecommand{\archreadme}{0}%
+\providecommand{\archwidth}{\linewidth}%
+\providecommand{\archvscale}{1}%
+\providecommand{\archtitlefont}{\footnotesize\bfseries}%
+\providecommand{\archsubfont}{\scriptsize}%
+\providecommand{\archlabelfont}{\footnotesize\bfseries}%
+\providecommand{\archnotefont}{\scriptsize\itshape}%
+\providecommand{\archmodfont}{\tiny\ttfamily}%
+\begingroup%
+\definecolor{archOlive}{HTML}{7A6A2A}%
+\definecolor{archGold}{HTML}{B3A369}%
+\definecolor{archNavy}{HTML}{003057}%
+\definecolor{archSlate}{HTML}{4A5A6A}%
+\definecolor{archGreen}{HTML}{2F6B45}%
+\definecolor{archText}{HTML}{1F2328}%
+\definecolor{archSub}{HTML}{4A4F55}%
+\definecolor{archFillA}{HTML}{F9F8F3}%
+\definecolor{archFillB}{HTML}{EBEEF2}%
+\definecolor{archFillC}{HTML}{F1F2F3}%
+\definecolor{archFillD}{HTML}{EEF3F0}%
+% a box's text: a title and, unless empty, a line or two under it, each a paragraph of
+% its own so that it takes the spacing of its own size
+\newcommand{\archbox}[2]{{\archtitlefont\color{archText}#1\par}%
+  \if\relax\detokenize{#2}\relax\else\vspace{0.6pt}{\archsubfont\color{archSub}#2\par}\fi}%
+% a band's label: its name and, in the README, the packages behind it
+\newcommand{\archlabel}[3]{{\archlabelfont\color{#1}#2\par}%
+  \if\relax\detokenize{#3}\relax\else\vspace{1pt}{\archmodfont\color{archSub}#3\par}\fi}%
+\begin{tikzpicture}[x=1pt, y=1pt, font=\sffamily, line cap=round, line join=round,
+    arr/.style={-{Stealth[length=4pt, width=3.6pt]}, line width=0.8pt},
+    box/.style={draw, line width=0.7pt, rounded corners=2.5pt, fill=white, align=flush center,
+      inner xsep=1.5pt, inner ysep=2pt, anchor=north},
+    lab/.style={anchor=east, align=flush right, inner sep=0pt},
+    band/.style={rounded corners=4.5pt, line width=0.5pt},
+    note/.style={font=\sffamily\archnotefont, inner sep=1.5pt}]
+  % ---- columns: a label column, four box columns in the bands, and the bar
+  \pgfmathsetmacro{\aW}{\archwidth}
+  \pgfmathsetmacro{\aL}{0.148*\aW}
+  \pgfmathsetmacro{\aBar}{0.030*\aW}
+  \pgfmathsetmacro{\aBandR}{\aW-\aBar-0.010*\aW}
+  \pgfmathsetmacro{\aPad}{0.011*\aW}
+  \pgfmathsetmacro{\aGap}{0.022*\aW}
+  \pgfmathsetmacro{\aC}{(\aBandR-\aL-2*\aPad-3*\aGap)/4}
+  \pgfmathsetmacro{\aTW}{\aC-3}
+  \pgfmathsetmacro{\aTWK}{2*\aC+\aGap-3}
+  \pgfmathsetmacro{\aLW}{\aL-7}
+  \pgfmathsetmacro{\xA}{\aL+\aPad+0.5*\aC}
+  \pgfmathsetmacro{\xB}{\xA+\aC+\aGap}
+  \pgfmathsetmacro{\xC}{\xB+\aC+\aGap}
+  \pgfmathsetmacro{\xD}{\xC+\aC+\aGap}
+  \pgfmathsetmacro{\xK}{0.5*(\xC+\xD)}
+  \pgfmathsetmacro{\xArr}{\xB+0.5*\aC+0.5*\aGap}
+  % ---- rows: band tops and bottoms, box heights
+  \pgfmathsetmacro{\vS}{\archvscale}
+  \pgfmathsetmacro{\vP}{4.5*\vS}
+  \pgfmathsetmacro{\hA}{31*\vS}  \pgfmathsetmacro{\hG}{21*\vS}  \pgfmathsetmacro{\hK}{30*\vS}
+  \pgfmathsetmacro{\hC}{33*\vS}
+  \pgfmathsetmacro{\hD}{(\archreadme==1 ? 32 : 25)*\vS}
+  \pgfmathsetmacro{\tA}{0}
+  \pgfmathsetmacro{\bA}{\tA-2*\vP-\hA}
+  \pgfmathsetmacro{\tB}{\bA-11*\vS}
+  \pgfmathsetmacro{\bB}{\tB-2*\vP-\hK}
+  \pgfmathsetmacro{\tC}{\bB-15*\vS}
+  \pgfmathsetmacro{\bC}{\tC-2*\vP-\hC}
+  \pgfmathsetmacro{\tD}{\bC-15*\vS}
+  \pgfmathsetmacro{\bD}{\tD-2*\vP-\hD}
+  % ---- bands and their labels
+  \foreach \Ta/\Ba/\Fa/\Da in {\tA/\bA/archFillA/archGold, \tB/\bB/archFillB/archNavy,
+                               \tC/\bC/archFillC/archSlate, \tD/\bD/archFillD/archGreen}{
+    \filldraw[band, fill=\Fa, draw=\Da!30] (\aL,\Ta) rectangle (\aBandR,\Ba);
+  }
+  \ifnum\archreadme=1
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tA+0.5*\bA)
+      {\archlabel{archOlive}{you write}{your Python script}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tB+0.5*\bB)
+      {\archlabel{archNavy}{differentiated}{hippymfem.fem}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tC+0.5*\bC)
+      {\archlabel{archSlate}{assembled\\and solved}{hippymfem.fem\\MFEM, hypre}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tD+0.5*\bD)
+      {\archlabel{archGreen}{inferred}{modeling, algorithms,\\forward\_uq, mcmc}};
+  \else
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tA+0.5*\bA)
+      {\archlabel{archOlive}{user input}{}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tB+0.5*\bB)
+      {\archlabel{archNavy}{differentiation}{}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tC+0.5*\bC)
+      {\archlabel{archSlate}{assembly\\and solvers}{}};
+    \node[lab, text width=\aLW pt] at (\aL-5,0.5*\tD+0.5*\bD)
+      {\archlabel{archGreen}{inference}{}};
+  \fi
+  % ---- the bar: what runs on GPUs or on CPUs
+  \filldraw[fill=archNavy, draw=archNavy, rounded corners=3pt]
+    (\aW-\aBar,\tB) rectangle (\aW,\bD);
+  \node[rotate=90, text=white, font=\sffamily\archlabelfont] at (\aW-0.5*\aBar,0.5*\tB+0.5*\bD)
+    {GPU or CPU};
+  % ---- user input
+  \node[box, draw=archGold, text width=\aTW pt, minimum height=\hA pt] (prior)
+    at (\xA,\tA-\vP) {\archbox{Prior and data}{prior, observations}};
+  \node[box, draw=archGold, text width=\aTW pt, minimum height=\hA pt] (mesh)
+    at (\xB,\tA-\vP) {\archbox{Mesh and spaces}{\ifnum\archreadme=1 MFEM: H1, L2,\\H(curl), H(div)\else MFEM objects\fi}};
+  \node[box, draw=archGold, text width=\aTW pt, minimum height=\hA pt] (res)
+    at (\xC,\tA-\vP) {\archbox{Residual density}{JAX function; steady,\\or one time step}};
+  \node[box, draw=archGold, text width=\aTW pt, minimum height=\hA pt] (oth)
+    at (\xD,\tA-\vP) {\archbox{Other densities}{boundary,\\interior-facet, initial}};
+  % ---- differentiation
+  \node[box, draw=archNavy, text width=\aTW pt, minimum height=\hG pt] (groups)
+    at (\xB,\tB-\vP) {\archbox{Element groups}{basis, geometry}};
+  \node[box, draw=archNavy, text width=\aTWK pt, minimum height=\hK pt] (kern)
+    at (\xK,\tB-\vP) {\archbox{Element kernels}{automatic differentiation of the densities}};
+  % ---- assembly and solvers
+  \node[box, draw=archSlate, text width=\aTW pt, minimum height=\hC pt] (asm)
+    at (\xB,\tC-\vP) {\archbox{Assembly}{direct scatter}};
+  \node[box, draw=archSlate, text width=\aTW pt, minimum height=\hC pt] (hyp)
+    at (\xC,\tC-\vP) {\archbox{hypre matrices}{GPU or CPU memory}};
+  \node[box, draw=archSlate, text width=\aTW pt, minimum height=\hC pt] (sol)
+    at (\xD,\tC-\vP) {\archbox{Linear solvers}{CG or GMRES;\\AMG or $p$-multigrid;\\double or single precision}};
+  % ---- inference
+  \node[box, draw=archGreen, text width=\aTW pt, minimum height=\hD pt] (cost)
+    at (\xA,\tD-\vP) {\archbox{Cost, gradient,\\Hessian action}{}};
+  \node[box, draw=archGreen, text width=\aTW pt, minimum height=\hD pt] (newt)
+    at (\xB,\tD-\vP) {\archbox{Newton-CG}{MAP point; CG with\\orthogonal residuals}};
+  \node[box, draw=archGreen, text width=\aTW pt, minimum height=\hD pt] (lap)
+    at (\xC,\tD-\vP) {\ifnum\archreadme=1 \archbox{Laplace\\approximation}{eigenpairs, samples}%
+      \else\archbox{Laplace\\approximation}{}\fi};
+  \node[box, draw=archGreen, text width=\aTW pt, minimum height=\hD pt] (uq)
+    at (\xD,\tD-\vP) {\ifnum\archreadme=1 \archbox{Uncertainty\\quantification}{predictions, MCMC}%
+      \else\archbox{Uncertainty\\quantification}{}\fi};
+  % ---- flow within the rows
+  \draw[arr, archNavy] (mesh.south) -- (groups.north);
+  \draw[arr, archNavy] (res.south) -- (res.south |- kern.north);
+  \draw[arr, archNavy] (oth.south) -- (oth.south |- kern.north);
+  \draw[arr, archNavy] (groups.east) -- (groups.east -| kern.west);
+  \draw[arr, archSlate] (asm.east) -- (hyp.west);
+  \draw[arr, archSlate] (hyp.east) -- (sol.west);
+  \draw[arr, archGreen] (cost.east) -- (newt.west);
+  \draw[arr, archGreen] (newt.east) -- (lap.west);
+  \draw[arr, archGreen] (lap.east) -- (uq.west);
+  % ---- from band to band
+  \draw[arr, archNavy] (\xArr,\bB) -- (\xArr,\tC)
+    node[note, midway, right, text=archSub, xshift=1pt]
+    {element vectors and matrices: residual, $A$, $C$, $W_{uu}$, $W_{um}$, $W_{mm}$};
+  \draw[arr, archSlate] (\xArr,\bC) -- (\xArr,\tD)
+    node[note, midway, right, text=archSub, xshift=1pt]
+    {forward, adjoint, and incremental solves};
+  % ---- the prior and the misfit go to the cost
+  \draw[arr, archOlive] (prior.south) -- (prior.south |- cost.north);
+  \node[note, rotate=90, anchor=north, text=archOlive] at (\xA+0.8,0.5*\bA+0.5*\tD)
+    {misfit and prior};
+  % ---- each Newton-CG iterate goes back to the element kernels
+  \pgfmathsetmacro{\xDash}{\xA+0.31*\aC}
+  \pgfmathsetmacro{\yDashLow}{\bC-7.5*\vS}
+  \pgfmathsetmacro{\yDashHigh}{\tB-\vP-\hG-0.5*(\hK-\hG)}
+  \coordinate (dashhigh) at (\xDash,\yDashHigh);
+  \draw[arr, archGreen, line width=0.75pt, dash pattern=on 2.6pt off 1.8pt]
+    (\xB-0.30*\aC,\tD-\vP) -- (\xB-0.30*\aC,\yDashLow) -- (\xDash,\yDashLow)
+    -- (dashhigh) -- (dashhigh -| kern.west);
+  \node[note, rotate=90, anchor=north, text=archGreen]
+    at (\xDash+0.8,0.5*\yDashLow+0.5*\yDashHigh) {new iterate $m$};
+  \ifnum\archreadme=1
+    \node[anchor=north, font=\sffamily\archsubfont, text=archSub] at (0.5*\aL+0.5*\aBandR,\bD-6*\vS)
+      {built on MFEM and PyMFEM \enspace$\cdot$\enspace hypre with BoomerAMG
+       \enspace$\cdot$\enspace JAX and XLA \enspace$\cdot$\enspace MPI through mpi4py};
+  \fi
+\end{tikzpicture}%
+\endgroup
