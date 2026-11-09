@@ -404,11 +404,14 @@ def test_device_auto_without_gpu():
         # child takes itself for a rank of this step and waits in MPI_Init for the others
         # HIPPYMFEM_HYPRE_DEVICE and HIPPYMFEM_HYPRE_SINGLE go too: a suite run with
         # hypre on the GPU would otherwise have the child ask MFEM for a device it
-        # cannot see, which MFEM answers with an abort
+        # cannot see, which MFEM answers with an abort.  So does JAX_PLATFORMS, which
+        # the import of this process set (to "rocm,cpu" in a GPU run, and JAX then
+        # refuses to start without a card): the child is to choose its own.
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_",
                                     "PALS_"))
-               and k not in ("HIPPYMFEM_HYPRE_DEVICE", "HIPPYMFEM_HYPRE_SINGLE")}
+               and k not in ("HIPPYMFEM_HYPRE_DEVICE", "HIPPYMFEM_HYPRE_SINGLE",
+                             "JAX_PLATFORMS")}
         env.update(HIPPYMFEM_DEVICE="auto", CUDA_VISIBLE_DEVICES="",
                    ROCR_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
         code = ("import hippymfem\nfrom hippymfem.fem import kernel\n"

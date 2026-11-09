@@ -1328,12 +1328,17 @@ def test_release_linearization_on_move():
             return np.asarray(y.array).copy()
         return to_dense(M, COMM)
 
-    worst = 0.0
+    # (measured against the largest entry of all four blocks: an entry of a block whose
+    # element contributions cancel is small beside its round-off, which comes from
+    # summands of the size of the Jacobian's; against its own block's largest entry the
+    # difference on a GPU was 1.7e-11)
+    diffs, scale = [], 1e-300
     for name in ("A", "C", "Wum", "Wmm"):
         a = values(getattr(keep, name))
         b = values(getattr(rel, name))
-        scale = max(float(np.abs(a).max()), 1e-300)
-        worst = largest([worst, float(np.abs(a - b).max()) / scale])
+        scale = max(scale, float(np.abs(a).max()))
+        diffs.append(float(np.abs(a - b).max()))
+    worst = largest(diffs) / scale
     check("the next point's blocks are identical", same(worst), "(rel %.3e)" % worst)
 
 
