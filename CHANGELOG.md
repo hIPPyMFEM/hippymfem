@@ -4,6 +4,14 @@
 
 ### Added
 
+- **The transposed blocks of a linearization point as matrices of their own.**  With hypre on
+  a device, `C^T` and `W_um^T`, which every CG iteration applies, are assembled from the
+  transposed element matrices of the same differentiation pass into a pattern of their own,
+  with the essential columns eliminated (`HIPPYMFEM_DIRECT_TRANSPOSES=auto|1|0`).  MFEM used to
+  form them at the first transposed product of each linearization point by sorting, which
+  asked the driver for 4.9 GiB a block at 120^3 quadratic hexahedra a GCD, kept 2.4 GiB, and
+  cost 1 to 2.4 % of two Newton-CG steps; on a host MFEM multiplies with a transpose without
+  forming it, and nothing changes there.  A problem with interior-facet terms keeps MFEM's.
 - **A GPU workflow and a performance check.**  `benchmarks/perf_check.py` runs two
   Newton-CG steps of the model problem at a few sizes and compares them with the baseline of
   the machine (`benchmarks/perf_baselines/<machine>.json`, written with `--record`): a size

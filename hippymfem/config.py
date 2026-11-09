@@ -207,6 +207,12 @@ _KNOBS = [
           "keep MFEM's GeometricFactors alive after the batches are built",
           _module_attr("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS"),
           _module_assign("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS", _bool)),
+    _Knob("direct_transposes", "HIPPYMFEM_DIRECT_TRANSPOSES",
+          "C^T and W_um^T assembled as matrices of their own from the transposed element matrices "
+          "instead of formed by MFEM at the first transposed product: auto (with hypre on a "
+          "device, default), 1, 0",
+          _module_attr("modeling.PDEVariationalProblem", "DIRECT_TRANSPOSES"),
+          _module_assign("modeling.PDEVariationalProblem", "DIRECT_TRANSPOSES", _choice("auto", "1", "0"))),
     _Knob("share_hessian", "HIPPYMFEM_SHARE_HESSIAN",
           "one differentiation pass for all blocks of a linearization point (default)",
           _module_attr("modeling.PDEVariationalProblem", "SHARE_HESSIAN_PASS"),

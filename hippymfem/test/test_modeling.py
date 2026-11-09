@@ -1298,6 +1298,60 @@ def test_mixed_precision():
           qasym == 0.0 and 1e-10 < qentry < 1e-5,
           "(asymmetry %.1e; from double precision %.1e)" % (qasym, qentry))
 
+
+def test_direct_transposes():
+    """``C^T`` and ``W_um^T`` assembled as matrices of their own from the transposed element
+    matrices (``PDEVariationalProblem.DIRECT_TRANSPOSES``) give the products of MFEM's
+    ``MultTranspose``, with the essential columns eliminated, and the same Hessian action."""
+    import importlib
+
+    pvp = importlib.import_module("hippymfem.modeling.PDEVariationalProblem")   # (the module)
+    from hippymfem.modeling.variables import ADJOINT, PARAMETER, STATE
+
+    pmesh = mesh2d(8)
+    Vu = hm.FunctionSpace.H1(pmesh, 2)
+    Vm = hm.FunctionSpace.H1(pmesh, 1)
+
+    def varf(u, m, p, x):
+        return (jnp.exp(m.val) * hm.inner(u.grad, p.grad) + u.val ** 3 * p.val
+                + m.val * u.val * p.val)
+
+    bc = hm.DirichletBC(Vu, lambda x: 2.0 + x[1], bdr_attributes=[1, 3])
+    pde = hm.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(), is_fwd_linear=False)
+    rng = hm.Random(seed=7)
+    x = [pde.generate_state(), Vm.vector(), pde.generate_state()]
+    for v in x:
+        rng.normal(0.3, v)
+    dm, du = Vm.vector(), pde.generate_state()
+    rng.normal(1.0, dm)
+    rng.normal(1.0, du)
+    saved = pvp.DIRECT_TRANSPOSES
+    out = {}
+    try:
+        for mode in ("0", "1"):
+            pvp.DIRECT_TRANSPOSES = mode
+            pde.setLinearizationPoint(x)
+            a, b, c = Vm.vector(), Vm.vector(), Vm.vector()
+            pde.apply_ij(PARAMETER, ADJOINT, du, a)       # C^T du
+            pde.apply_ij(PARAMETER, STATE, du, b)         # W_um^T du
+            pde.apply_ij(PARAMETER, PARAMETER, dm, c)
+            out[mode] = (a, b, c, pde.Ct is not None, pde.Wmu is not None,
+                         type(pde.C).__name__ == "SingleParMatrix")
+    finally:
+        pvp.DIRECT_TRANSPOSES = saved
+        pde.release_linearization_point()
+
+    def rel(u, v):
+        return u.copy().axpy(-1.0, v).norm("l2") / max(v.norm("l2"), 1e-300)
+
+    ea, eb = rel(out["1"][0], out["0"][0]), rel(out["1"][1], out["0"][1])
+    # (blocks of the single-precision hypre, where it is loaded: both products are its)
+    tol = 1e-6 if out["1"][5] else 1e-13
+    check("C^T and W_um^T assembled as matrices of their own give MultTranspose's products",
+          out["1"][3] and out["1"][4] and not out["0"][3] and ea < tol and eb < tol,
+          "(%.1e, %.1e against %.0e; the matrices %s, %s)" % (ea, eb, tol, out["1"][3], out["1"][4]))
+
+
 if __name__ == "__main__":
     mfem.Hypre.Init()
     if RANK == 0:
@@ -1318,6 +1372,7 @@ if __name__ == "__main__":
     test_model_verify()
     test_model_verify_nonlinear_inhomogeneous_bc()
     test_third_dir()
+    test_direct_transposes()
     test_apply_ij_at()
     test_require_finite()
     test_same_vectors()

@@ -49,6 +49,19 @@ from ..fem import kernel as _kernel
 #: one per block.  The blocks are bit-identical either way (for an element batch that
 #: is not split) and the shared pass is faster; ``HIPPYMFEM_SHARE_HESSIAN=0`` turns it
 #: off.
+#: Whether the two blocks that every CG iteration applies transposed, ``C^T`` and
+#: ``W_um^T``, are assembled as matrices of their own from the transposed element matrices of
+#: the same differentiation pass, rather than formed by MFEM at the first transposed product
+#: (``HypreParMatrix::MultTranspose``).  With hypre on a device MFEM forms each such
+#: transpose by sorting, which asked the driver for 4.9 GiB a block at 120^3 quadratic
+#: hexahedra a GCD (2.4 GiB of them kept), and cost 1 to 2.4 % of two Newton-CG steps; on a
+#: host MFEM multiplies with the transpose without forming it, and a second matrix would only
+#: take memory.  ``auto`` (default): with hypre on a device, ``1`` always, ``0`` never
+#: (``HIPPYMFEM_DIRECT_TRANSPOSES``).  A problem with interior-facet terms keeps MFEM's.
+DIRECT_TRANSPOSES = os.environ.get("HIPPYMFEM_DIRECT_TRANSPOSES", "auto").strip().lower() or "auto"
+if DIRECT_TRANSPOSES not in ("auto", "1", "0"):
+    raise ValueError("HIPPYMFEM_DIRECT_TRANSPOSES must be auto, 1 or 0, not %r" % DIRECT_TRANSPOSES)
+
 SHARE_HESSIAN_PASS = os.environ.get("HIPPYMFEM_SHARE_HESSIAN", "1").lower() not in (
     "0", "no", "false", "off")
 
@@ -77,6 +90,19 @@ def _equivalent_spaces(a, b):
                 and fa.GlobalTrueVSize() == fb.GlobalTrueVSize())
     except Exception:                                        # noqa: BLE001
         return False
+
+
+
+def _swap_element_axes(m):
+    """Element matrices with their rows and columns exchanged, ``(ne, a, b) -> (ne, b, a)``:
+    a numpy or a JAX array, or a list of them (one a group).  Lazy where it can be (JAX)."""
+    if isinstance(m, (list, tuple)):
+        return type(m)(_swap_element_axes(x) for x in m)
+    if isinstance(m, np.ndarray):
+        return np.swapaxes(m, -1, -2)
+    import jax.numpy as jnp
+
+    return jnp.swapaxes(m, -1, -2)
 
 
 class PDEVariationalProblem(PDEProblem, KeepAlive):
@@ -285,6 +311,9 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self.Wuu = None
         self.Wum = None
         self.Wmm = None
+        #: ``C^T`` and ``W_um^T`` as matrices of their own (:data:`DIRECT_TRANSPOSES`), or None
+        self.Ct = None
+        self.Wmu = None
         #: the point whose blocks are applied from the kernels, and which variables'
         #: blocks those are (see setLinearizationPoint)
         self._mf_point = None
@@ -920,7 +949,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         One ``gc.collect`` at the end frees the dropped hypre matrices before the
         next point's blocks exist, which lowers the memory peak.
         """
-        self.C = self.Wuu = self.Wum = self.Wmm = None
+        self.C = self.Wuu = self.Wum = self.Wmm = self.Ct = self.Wmu = None
         self._release_operators("solver_fwd_inc", "solver_adj_inc")
         self.A = self.At = None
         self._lin_point = None
@@ -1257,7 +1286,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # The previous point's blocks are replaced below; dropping them first keeps
         # the peak at one set of blocks rather than two (the Jacobian and the solvers
         # are handled the same way in ``_jacobian`` when the point has moved).
-        self.C = self.Wuu = self.Wum = self.Wmm = None
+        self.C = self.Wuu = self.Wum = self.Wmm = self.Ct = self.Wmu = None
         self._mf_slots = _matrix_free_slots(matrix_free)
         self._mf_point = self._lin_point if self._mf_slots else None
         if not self._jacobian_is_current(x):
@@ -1286,7 +1315,15 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # (tdofassemble.SINGLE_BLOCKS: the blocks as matrices of the single-precision hypre)
         single = self._single_blocks()
         streamed = None
-        if len(need) > 1 and SHARE_HESSIAN_PASS and self._stream_shared_pass():
+        trans = self._transposes_to_assemble(need)
+        if trans:
+            # The transposes come from the same pass, a chunk at a time, into plans of
+            # their own (whatever the size of the batch: the streamed scatter takes a
+            # whole batch as one chunk).
+            with single():
+                streamed = self._blocks_streamed(need, loc, ess, trans)
+            mats = None
+        elif len(need) > 1 and SHARE_HESSIAN_PASS and self._stream_shared_pass():
             # One pass, a chunk at a time, straight into every block's scatter:
             # nothing larger than a chunk is ever resident, where gluing the blocks
             # first (what element_matrices_many does) would make the glued arrays
@@ -1319,11 +1356,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             else:
                 with single():
                     blocks[ij] = self._block(ij[0], ij[1], x, mats=mats[ij], loc=loc, **kw)
+        for _, t in trans:
+            blocks[t] = streamed[t]
         del mats, streamed
         for ij in ((ADJOINT, PARAMETER), (STATE, PARAMETER)):
             # the two that every CG iteration applies transposed: a single-precision one
-            # keeps its transpose from the first such product on, as MFEM's do
-            if hasattr(blocks.get(ij), "keep_transpose"):
+            # keeps its transpose from the first such product on, as MFEM's do, where it
+            # was not assembled as a matrix of its own
+            if hasattr(blocks.get(ij), "keep_transpose") and (ij[1], ij[0]) not in blocks:
                 blocks[ij].keep_transpose = True
         # The attributes alone hold the blocks: anything else keeping them would
         # keep every linearization point's blocks alive for the life of the problem.
@@ -1331,6 +1371,8 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         self.Wuu = blocks.get((STATE, STATE))
         self.Wum = blocks.get((STATE, PARAMETER))
         self.Wmm = blocks.get((PARAMETER, PARAMETER))
+        self.Ct = blocks.get((PARAMETER, ADJOINT))
+        self.Wmu = blocks.get((PARAMETER, STATE))
         del blocks
         fwd = self._get_solver("solver_fwd_inc")
         adj = self._get_solver("solver_adj_inc")
@@ -1375,8 +1417,25 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 return td.single_target
         return contextlib.nullcontext
 
-    def _blocks_streamed(self, need, loc, ess):
-        """The blocks of a linearization point from one streamed pass."""
+    def _transposes_to_assemble(self, need):
+        """``[(block, its transpose)]`` of the blocks in ``need`` whose transposes are
+        assembled as matrices of their own (:data:`DIRECT_TRANSPOSES`).  The same on every
+        rank: the setting, the problem and where hypre runs are."""
+        if DIRECT_TRANSPOSES == "0" or self.facet_kernel is not None:
+            return []
+        if DIRECT_TRANSPOSES == "auto":
+            from .. import _jaxconfig
+
+            if not _jaxconfig.hypre_on_device():
+                return []
+        return [(ij, (ij[1], ij[0])) for ij in ((ADJOINT, PARAMETER), (STATE, PARAMETER))
+                if ij in need]
+
+    def _blocks_streamed(self, need, loc, ess, transposes=()):
+        """The blocks of a linearization point from one streamed pass, and the
+        ``transposes`` (``[(block, its transpose)]``) from the transposed element matrices
+        of the same chunks, with the essential columns eliminated where the block has the
+        rows."""
 
         spec = {(ADJOINT, PARAMETER): (ess, "one"), (STATE, STATE): (ess, "zero"),
                 (STATE, PARAMETER): (ess, "one"), (PARAMETER, PARAMETER): (None, "one")}
@@ -1387,8 +1446,22 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                                    self.batches.groups, test_ess=e, diag_policy=pol)
             # (the defect of the row sums is for a Jacobian's solver: of no use to a block)
             plans[ij].row_sums = False
+        for ij, t in transposes:
+            e, pol = spec[ij]
+            plans[t] = plan_block(self.Vh[t[0]], self.Vh[t[1]], self.batches.groups,
+                                  trial_ess=e, diag_policy=pol)
+            plans[t].row_sums = False
         finite = _FiniteFlag()
-        chunks = finite.wrap(lambda: self.kernel.element_matrix_chunks_many(need, loc))
+        base = finite.wrap(lambda: self.kernel.element_matrix_chunks_many(need, loc))
+
+        def chunks():
+            for g, a, bnd, mats in base():
+                if transposes:
+                    mats = dict(mats)
+                    for ij, t in transposes:
+                        mats[t] = _swap_element_axes(mats[ij])
+                yield g, a, bnd, mats
+
         accs = scatter_many(plans, chunks())
         finite.check(self.comm, "linearization point")
         if self.bdr_kernel is not None:
@@ -1399,7 +1472,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 if not self._boundary_vanishes(bmats[ij]):
                     accs[ij] = add_boundary_entries(
                         plans[ij], accs[ij], self._boundary_arrays(ij[0], ij[1], bmats[ij]))
-        return {ij: finish_block(plans[ij], accs[ij]) for ij in need}
+                    for src, t in transposes:
+                        if src == ij:
+                            accs[t] = add_boundary_entries(
+                                plans[t], accs[t],
+                                self._boundary_arrays(t[0], t[1], _swap_element_axes(bmats[ij])))
+        return {ij: finish_block(plans[ij], accs[ij]) for ij in plans}
 
     def solveIncremental(self, out, rhs, is_adj, rel_tolerance=None):
         """Solve the incremental forward or adjoint system.  ``rel_tolerance`` replaces
@@ -1465,10 +1543,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             (ADJOINT, STATE): (self.A, False),
             (STATE, ADJOINT): (self.A, True),
             (ADJOINT, PARAMETER): (self.C, False),
-            (PARAMETER, ADJOINT): (self.C, True),
+            (PARAMETER, ADJOINT): ((self.Ct, False) if self.Ct is not None else (self.C, True)),
             (STATE, STATE): (self.Wuu, False),
             (STATE, PARAMETER): (self.Wum, False),
-            (PARAMETER, STATE): (self.Wum, True),
+            (PARAMETER, STATE): ((self.Wmu, False) if self.Wmu is not None else (self.Wum, True)),
             (PARAMETER, PARAMETER): (self.Wmm, False),
         }
         if (i, j) not in KKT:
