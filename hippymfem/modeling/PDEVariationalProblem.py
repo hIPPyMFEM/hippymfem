@@ -25,7 +25,7 @@ the matrices, ``apply_ij`` is a plain matrix product with no masking.
 import inspect
 import gc
 import os
-from ..config import env_flag, env_tristate
+from ..config import env_choice, env_flag, env_tristate
 
 import numpy as np
 from mpi4py import MPI
@@ -921,7 +921,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
     #: double-precision Jacobian and its hierarchy fit beside what the device holds, on
     #: every rank (:meth:`_double_fits`), and the second where they do not; with hypre
     #: in host memory, or where the runtime does not say, it does the first.
-    SINGLE_GIVE_UP = os.environ.get("HIPPYMFEM_SINGLE_GIVE_UP", "").strip().lower() or "auto"
+    #: (checked at import, as the other settings read from the environment: a misspelt
+    #: value was found only when a forward solve gave up, as a ValueError that a line
+    #: search does not take for a failed trial)
+    SINGLE_GIVE_UP = env_choice("HIPPYMFEM_SINGLE_GIVE_UP", "auto", ("auto", "double", "raise"))
     #: Bytes of the double-precision Jacobian and its hierarchy that ``"auto"`` counts for
     #: each nonzero of the single-precision Jacobian: about 43 with quadratic hexahedra on
     #: Frontier (36 GiB for some 0.9 billion nonzeros, 120^3 elements a GCD), with a margin.

@@ -1284,6 +1284,10 @@
     the result is whole.
 
   `test_vectors` checks both.
+- **A misspelt `HIPPYMFEM_SINGLE_GIVE_UP` was accepted at import.** It was found only when a
+  forward solve gave up, as a `ValueError` that a line search does not take for a failed
+  trial. It is now read with `config.env_choice`, as the other settings of the environment
+  are, and stops `import hippymfem` (checked by `test_vectors` in a fresh interpreter).
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

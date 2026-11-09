@@ -469,6 +469,37 @@ def test_device_auto_without_gpu():
     check("auto without a visible GPU runs on the host", ok, COMM.bcast(detail, root=0))
 
 
+def test_give_up_checked_at_import():
+    """A misspelt ``HIPPYMFEM_SINGLE_GIVE_UP`` stops ``import hippymfem``, as the other
+    settings read from the environment do; it was found only when a forward solve gave up.
+    In a fresh interpreter on rank 0, a plain process on the host (as above)."""
+    import os
+    import subprocess
+    import sys
+
+    if RANK == 0:
+        print("HIPPYMFEM_SINGLE_GIVE_UP checked at import")
+    ok, detail = True, ""
+    if RANK == 0:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_",
+                                    "PALS_"))}
+        for k in ("HIPPYMFEM_DEVICE", "HIPPYMFEM_HYPRE_DEVICE", "HIPPYMFEM_HYPRE_SINGLE"):
+            env.pop(k, None)
+        env.update(HIPPYMFEM_SINGLE_GIVE_UP="dobule", CUDA_VISIBLE_DEVICES="",
+                   ROCR_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
+        try:
+            r = subprocess.run([sys.executable, "-c", "import hippymfem"], env=env,
+                               capture_output=True, text=True, timeout=900)
+            said = "HIPPYMFEM_SINGLE_GIVE_UP must be one of auto, double, raise" in r.stderr
+            ok = r.returncode != 0 and said
+            detail = "(exit %d%s)" % (r.returncode, "" if said else ": " + r.stderr[-300:])
+        except Exception as e:                                       # noqa: BLE001
+            ok, detail = False, "(%s)" % e
+    ok = bool(COMM.bcast(ok, root=0))
+    check("a misspelt HIPPYMFEM_SINGLE_GIVE_UP stops the import", ok, COMM.bcast(detail, root=0))
+
+
 def test_comgr_cache_of_the_node():
     """AMD's code object manager gets a cache of this node, and one it was given is kept.
 
@@ -891,6 +922,7 @@ if __name__ == "__main__":
     test_config_explicit_and_spellings()
     test_abort_hook()
     test_device_auto_without_gpu()
+    test_give_up_checked_at_import()
     test_comgr_cache_of_the_node()
     if RANK == 0:
         print("-" * 70)
