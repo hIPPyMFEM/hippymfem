@@ -4,6 +4,11 @@
 
 ### Added
 
+- **Every suite on a GPU.**  `DEVICE_SUITES=1 ./run_tests.sh 1 2` runs every suite once
+  more with the element kernels and hypre on the card (`HIPPYMFEM_DEVICE=gpu
+  HIPPYMFEM_HYPRE_DEVICE=1`), as a GPU user runs a script.  The checks that compare two
+  routes for identical results allow round-off there (`hippymfem/test/_device.py`), and
+  the checks that read MFEM vectors through raw host views synchronize them first.
 - **An initial density for time-dependent problems.**
   `TimeDependentPDEVariationalProblem(..., init_varf=rho0)` defines the initial state by a
   weak equation of its own, `R_0(u_0, m; p) = integral of rho0(u0, m, p, x) = 0`, written
@@ -849,6 +854,23 @@
 
 ### Changed
 
+- **One reading of the on/off settings.**  Every on/off `HIPPYMFEM_*` variable is read by
+  `config.parse_flag`, at import and by its `hm.config` setter alike: 1, yes, true, on and
+  0, no, false, off in any case, an empty value for the default, and anything else refused
+  with the variable's name.  The auto/on/off ones (`HIPPYMFEM_TDOF_IDENTITY`,
+  `_DEVICE_BRIDGE`, `_DEVICE_VECTORS`, `_DIRECT_TRANSPOSES`) are read by
+  `config.parse_tristate`.  Before, an empty `HIPPYMFEM_SINGLE_ROW_SUMS` or
+  `HIPPYMFEM_AFFINE_GEOMETRY` turned the setting off although both are on by default, an
+  unknown word was read as on by some modules and as off by others, and
+  `HIPPYMFEM_DEVICE_VECTORS=off` left the device vectors on.
+- **A knob set through `hm.config` outranks a profile.**  `hm.config.use_profile` applied
+  afterwards no longer overrides it, and `hm.config.show()` reports it as `set` instead of
+  `default`.
+- **`benchmarks/perf_check.py` keeps one record per configuration.**  A record's
+  configuration is every `HIPPYMFEM_*` variable but those that only say where things are
+  or what to print, `XLA_FLAGS`, and the benchmark's options; a run is compared only with
+  the record of its own configuration and rank count.  With none to compare with it exits
+  with 2, which the GPU workflow reports as a warning instead of passing without a word.
 - **Defaults from the scaling work on Frontier.**  The compact geometry of affine element
   groups (`HIPPYMFEM_AFFINE_GEOMETRY`) is on: one inverse Jacobian an element where every
   element of a group is mapped affinely, which on a node of eight MI250X took two
@@ -1199,6 +1221,14 @@
 
 ### Fixed
 
+- **A chunked assembly of a space with a dof transformation failed.**  Second-order Nedelec
+  elements on tetrahedra carry MFEM's `DofTransformation`, one matrix per element; an
+  assembly split into chunks applied the whole group's transformations to each chunk and
+  stopped with a shape mismatch.  Each chunk now takes its own.
+- **`box_mesh` refused coarse meshes its levels allow.**  It limited the cut of a coarse
+  element to eight a side before counting the halvings of `levels` (24^3 from 2^3 with two
+  halvings), and with `levels` and no `coarse` it kept a default coarse mesh that the
+  halvings do not divide (16^3 with three).  A default that was valid is kept.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
