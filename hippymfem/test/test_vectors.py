@@ -631,6 +631,19 @@ def _test_config_profiles():
     check("with one named, gpu asks for mixed precision and single-precision tangents",
           env.get("HIPPYMFEM_PRECISION") == "mixed" and env.get("HIPPYMFEM_AD_WORKING_SET") == "8")
     check("the default profile changes nothing", cfg.apply_profile_env("default", {}) == {})
+    # gpu gives the CG solvers the l1-Jacobi weight 1.8 where hypre runs on the card only,
+    # and leaves a setting of the user's
+    on = cfg.apply_profile_env("gpu", {"HIPPYMFEM_HYPRE_DEVICE": "1"})
+    off = cfg.apply_profile_env("gpu", {"HIPPYMFEM_HYPRE_DEVICE": "0"})
+    unset = cfg.apply_profile_env("gpu", {})
+    mine = {"HIPPYMFEM_HYPRE_DEVICE": "1", "HIPPYMFEM_AMG_CG": "relax_wt=1.5"}
+    kept = cfg.apply_profile_env("gpu", mine)
+    check("gpu sets HIPPYMFEM_AMG_CG=relax_wt=1.8 with hypre on the card only, and keeps the user's",
+          on.get("HIPPYMFEM_AMG_CG") == "relax_wt=1.8" and "HIPPYMFEM_AMG_CG" not in off
+          and "HIPPYMFEM_AMG_CG" not in unset and "HIPPYMFEM_AMG_CG" not in kept
+          and mine["HIPPYMFEM_AMG_CG"] == "relax_wt=1.5",
+          "(%r, %r, %r)" % (on.get("HIPPYMFEM_AMG_CG"), off.get("HIPPYMFEM_AMG_CG"),
+                            mine["HIPPYMFEM_AMG_CG"]))
     # an entry asked for under a variable that is set to a spelling of off is not applied
     cfg.PROFILES["_cond"] = ("a test", {"HIPPYMFEM_PMG_H": ("3", "HIPPYMFEM_HYPRE_DEVICE")})
     try:

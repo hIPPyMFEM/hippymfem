@@ -866,6 +866,13 @@
 
 ### Changed
 
+- **The `gpu` profile gives the CG solvers BoomerAMG with l1-Jacobi weight 1.8 where hypre
+  runs on the card** (`HIPPYMFEM_AMG_CG=relax_wt=1.8`, an entry conditioned on
+  `HIPPYMFEM_HYPRE_DEVICE`).  On one L40S with hypre on the card it took 21 to 31 % of the
+  iterations and 9 to 24 % of the time of a solve with its set-up off twelve symmetric
+  positive definite operators, the same on two cards with twice the elements (the sciml2
+  session's check); it never reaches GMRES, which it stalled on convection-dominated
+  advection-diffusion.  On the host it gained nothing and is not set.
 - **The `gpu-large` profile's AMG settings reach CG solvers only**
   (`HIPPYMFEM_AMG_CG=relax_wt=1.8,pmax=6`, before `HIPPYMFEM_AMG`, which every solver
   reads).  With that weight GMRES stalls on convection-dominated advection-diffusion (mesh

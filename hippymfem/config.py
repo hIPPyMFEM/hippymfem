@@ -480,10 +480,14 @@ PROFILES = {
     "gpu": ("element Hessians at the quadrature points (faster on a GPU) and, where a "
             "single-precision hypre is named in HIPPYMFEM_HYPRE_SINGLE, the Jacobians and their "
             "solves in single precision with the chunk planner set for single-precision "
-            "tangents",
+            "tangents, and where hypre runs on the card (HIPPYMFEM_HYPRE_DEVICE) BoomerAMG with "
+            "l1-Jacobi weight 1.8 for the CG solvers (HIPPYMFEM_AMG_CG; on an L40S 21 to 31 % "
+            "fewer iterations and 9 to 24 % less time a solve with its set-up on twelve "
+            "symmetric positive definite operators; GMRES keeps MFEM's settings)",
             {"HIPPYMFEM_HESSIAN": "quadrature",
              "HIPPYMFEM_PRECISION": ("mixed", "HIPPYMFEM_HYPRE_SINGLE"),
-             "HIPPYMFEM_AD_WORKING_SET": ("8", "HIPPYMFEM_HYPRE_SINGLE")}),
+             "HIPPYMFEM_AD_WORKING_SET": ("8", "HIPPYMFEM_HYPRE_SINGLE"),
+             "HIPPYMFEM_AMG_CG": ("relax_wt=1.8", "HIPPYMFEM_HYPRE_DEVICE")}),
     "gpu-large": ("'gpu' and the solver settings of the weak-scaling series on Frontier to 4096 "
                   "GPUs: BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a row "
                   "for the CG solvers (HIPPYMFEM_AMG_CG; GMRES keeps MFEM's settings, with "

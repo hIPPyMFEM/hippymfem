@@ -78,7 +78,12 @@ all of it.
 **Profiles.**  ``HIPPYMFEM_PROFILE=gpu``, set before ``import hippymfem``, takes the element
 Hessians at the quadrature points and, where ``HIPPYMFEM_HYPRE_SINGLE`` names a
 single-precision hypre, the Jacobians and their solves in single precision with the chunk
-planner set for single-precision tangents.  ``HIPPYMFEM_PROFILE=gpu-large`` adds the
+planner set for single-precision tangents, and where hypre runs on the card
+(``HIPPYMFEM_HYPRE_DEVICE=1``) gives the CG solvers BoomerAMG with l1-Jacobi weight 1.8
+(``HIPPYMFEM_AMG_CG=relax_wt=1.8``): on one L40S that took 21 to 31 % of the iterations
+and 9 to 24 % of the time of a solve with its set-up off twelve symmetric positive
+definite operators, the same on two cards, and GMRES keeps MFEM's settings.
+``HIPPYMFEM_PROFILE=gpu-large`` adds the
 solver settings of the weak-scaling runs on Frontier (BoomerAMG with l1-Jacobi weight 1.8
 and six interpolation entries a row for the CG solvers, ``HIPPYMFEM_AMG_CG``; in the
 single-precision solves the p-multigrid over
