@@ -1308,6 +1308,13 @@
     once. The library's own priors always name the ordering.
 
   `test_solvers.test_systems_ordering` checks both.
+- **The square root of a Laplacian prior was slower with the compact affine geometry.** It
+  contracted the inverse Jacobians repeated at every quadrature point (`full_Jinv`, a view
+  of stride zero), which numpy's optimized `einsum` copies out for its products. On
+  13,824 linear hexahedra, `S^T` took 12.9 ms where it takes 7.8 ms without the compact
+  geometry. On an affine group the compact array (one inverse Jacobian an element) is now
+  contracted as it is: 8.0 ms for `S^T`, and 4.3 ms for `S` where it took 5.8, with the
+  same results to the last digit (`prior._jinv_operand`).
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
