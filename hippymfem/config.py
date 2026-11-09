@@ -159,6 +159,14 @@ _KNOBS = [
           "a named set of defaults that fills in what the environment leaves unset: default, "
           "gpu, gpu-large (hm.config.profiles() describes them; hm.config.use_profile after import)",
           lambda: _ACTIVE_PROFILE[0], when="import"),
+    _Knob("abort_on_error", "HIPPYMFEM_ABORT_ON_ERROR",
+          "on several ranks, an uncaught exception on one of them aborts every rank (default) "
+          "instead of leaving the others waiting in a collective",
+          lambda: _bool(os.environ.get("HIPPYMFEM_ABORT_ON_ERROR", "1")), when="import"),
+    _Knob("jax_cache", "HIPPYMFEM_JAX_CACHE",
+          "a directory for JAX's persistent compilation cache (off when unset); on a file "
+          "system every rank can write",
+          _env_only("HIPPYMFEM_JAX_CACHE", ""), when="import"),
     _Knob("petsc", "HIPPYMFEM_PETSC",
           "import petsc4py before PyMFEM so the PETSc solvers are available",
           lambda: _bool(os.environ.get("HIPPYMFEM_PETSC", "")), when="import"),

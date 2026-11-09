@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Robustness on many ranks and a faster start.**  On more than one rank, `import
+  hippymfem` wraps `sys.excepthook` so that one rank's uncaught exception prints its
+  traceback and aborts every rank (`HIPPYMFEM_ABORT_ON_ERROR=0` keeps the old behavior):
+  the other ranks used to wait in their next collective until the job's time limit.
+  `HIPPYMFEM_JAX_CACHE=<directory>` turns on JAX's persistent compilation cache, so that a
+  run of a problem compiled before takes its element kernels from it (programs that
+  compiled in under `HIPPYMFEM_JAX_CACHE_MIN_SECONDS`, 1 s, are not kept).  The mesh that
+  every rank builds its own part of, from a coarse mesh it partitions and cuts, is the
+  library's: `hm.box_mesh(n, comm, coarse=None, levels=0)` (from the geothermal
+  application's `cube_mesh`, which stays as a name): 0.7 s and 0.3 GB a rank at 256^3 on 32
+  ranks where `ParMesh(comm, Mesh.MakeCartesian3D(...))` takes 42 s and 10 GB, and with
+  `levels` the meshes between for the p-multigrid's geometric levels.
 - **Profiles: named sets of defaults** (`HIPPYMFEM_PROFILE=gpu|gpu-large` before `import
   hippymfem`, or `hm.config.use_profile(name)` after it; `hm.config.profiles()` describes
   them).  A profile fills in the environment variables it names that the environment leaves

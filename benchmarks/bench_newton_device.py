@@ -230,7 +230,7 @@ def main():
     ap.add_argument("--coarse", type=int, default=None,
                     help="build the mesh in parallel: every rank builds a mesh of COARSE^3 elements and cuts "
                          "its own part into (n / COARSE)^3, in equal boxes when the ranks make a grid "
-                         "(applications.geothermal.model.cube_mesh); 0 chooses COARSE.  Without it every "
+                         "(hippymfem.fem.meshes.box_mesh); 0 chooses COARSE.  Without it every "
                          "rank builds and partitions the whole mesh, 635 bytes an element")
     ap.add_argument("--amg", default=None,
                     help="BoomerAMG settings of the problem's solves alone, such as \"relax_wt=1.8,pmax=6\" "
@@ -295,7 +295,7 @@ def main():
     t_launch = since_launch()
     serial = None
     if args.coarse is not None:
-        from applications.geothermal.model import cube_mesh
+        from hippymfem.fem.meshes import box_mesh as cube_mesh
 
         h_cuts = [int(f) for f in str(args.h_levels).split(",") if f.strip()]
         h_cuts = h_cuts if len(h_cuts) > 1 else [2] * (h_cuts[0] if h_cuts else 0)

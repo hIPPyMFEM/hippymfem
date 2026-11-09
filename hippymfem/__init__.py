@@ -62,6 +62,11 @@ from .common.mfemconfig import auto_configure_device as _auto_configure_device  
 _auto_configure_device()
 from .utils import nb                 # noqa: F401  (plotting helpers for notebooks)
 
+# On several ranks, an uncaught exception on one of them aborts all (HIPPYMFEM_ABORT_ON_ERROR)
+from .common import abort as _abort  # noqa: E402
+
+_abort.install()
+
 #: The UFL-flavoured helpers of :mod:`hippymfem.fem.jaxops` (``inner``, ``dot``, ``div``,
 #: ...).  Listed here so ``hm.inner`` and ``from hippymfem import *`` work, but resolved
 #: lazily by ``__getattr__`` below, so that ``import hippymfem`` does not import JAX

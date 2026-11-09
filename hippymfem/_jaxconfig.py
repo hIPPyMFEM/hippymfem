@@ -154,6 +154,26 @@ if "jax" in sys.modules:
     except Exception as e:                                        # noqa: BLE001
         PLATFORMS_LATE = str(e)
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+#: A directory for JAX's persistent compilation cache (``HIPPYMFEM_JAX_CACHE``), so that a run
+#: of a problem compiled before takes its element kernels from the cache instead of
+#: compiling them again; off by default.  Put it on a file system every rank can read and
+#: write (scratch on a cluster, not a home directory that compute nodes see through a
+#: projection layer).  Programs that compiled in less than ``HIPPYMFEM_JAX_CACHE_MIN_SECONDS``
+#: (default 1 s) are not kept.
+JAX_CACHE = os.environ.get("HIPPYMFEM_JAX_CACHE", "").strip()
+if JAX_CACHE:
+    os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", JAX_CACHE)
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                          os.environ.get("HIPPYMFEM_JAX_CACHE_MIN_SECONDS", "1.0"))
+    if "jax" in sys.modules:                 # (imported before hippymfem: set it directly)
+        try:
+            import jax
+
+            jax.config.update("jax_compilation_cache_dir", os.environ["JAX_COMPILATION_CACHE_DIR"])
+            jax.config.update("jax_persistent_cache_min_compile_time_secs",
+                              float(os.environ["JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS"]))
+        except Exception:                                         # noqa: BLE001
+            pass
 if "rocm" in os.environ["JAX_PLATFORMS"] and "command_buffer" not in os.environ.get("XLA_FLAGS", ""):
     # XLA's command buffers (ROCm's counterpart of CUDA graphs) segfault inside
     # libamdhip64 once an element batch passes a block-dependent size, so no chunk size

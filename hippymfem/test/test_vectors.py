@@ -448,6 +448,34 @@ def test_comgr_cache_of_the_node():
     check("a directory that AMD_COMGR_CACHE_DIR names is kept", kept)
 
 
+def test_abort_hook():
+    """On several ranks ``import hippymfem`` wraps ``sys.excepthook`` so that one rank's
+    uncaught exception aborts all (``HIPPYMFEM_ABORT_ON_ERROR``); on one rank it does not;
+    and with ``HIPPYMFEM_JAX_CACHE`` set, JAX's persistent cache is that directory."""
+    import sys
+
+    from hippymfem import _jaxconfig
+    from hippymfem.common import abort
+
+    size = MPI.COMM_WORLD.Get_size()
+    want = size > 1 and abort.ABORT_ON_ERROR
+    check("the abort hook is in place on several ranks, and only there",
+          abort.installed() == want and ((sys.excepthook is abort._INSTALLED[0][0]) if want else True),
+          "(%d ranks, installed %s)" % (size, abort.installed()))
+    if want:
+        hook = abort._INSTALLED[0][0]
+        abort.uninstall()
+        ok = sys.excepthook is not hook and not abort.installed()
+        abort.install()
+        check("it can be taken out and put back", ok and abort.installed())
+    if _jaxconfig.JAX_CACHE:
+        import jax
+
+        check("HIPPYMFEM_JAX_CACHE is JAX's persistent compilation cache",
+              jax.config.jax_compilation_cache_dir == _jaxconfig.JAX_CACHE,
+              "(%r)" % (jax.config.jax_compilation_cache_dir,))
+
+
 def test_config_profiles():
     """Profiles (``HIPPYMFEM_PROFILE``, ``hm.config.use_profile``) fill in what the
     environment leaves unset: an explicit setting wins, mixed precision comes only with a
@@ -669,6 +697,7 @@ if __name__ == "__main__":
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
     test_config_profiles()
+    test_abort_hook()
     test_device_auto_without_gpu()
     test_comgr_cache_of_the_node()
     if RANK == 0:

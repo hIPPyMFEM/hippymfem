@@ -1897,6 +1897,41 @@ def test_coordinates_and_project():
           "(max abs diff %.1e)" % worst)
 
 
+def test_box_mesh():
+    """``hm.box_mesh``: every rank builds its part of the n^3 cube from a coarse mesh, the
+    elements of the lattice of ``MakeCartesian3D`` with the same boundary faces, and the
+    mesh before the last cut kept for the p-multigrid's geometric levels."""
+    from hippymfem.fem import ptransfer
+
+    n = 8
+    pmesh, n0, grid = hp.box_mesh(n, COMM, coarse=4, levels=1)
+    vol = COMM.allreduce(sum(pmesh.GetElementVolume(i) for i in range(pmesh.GetNE())))
+    verts = np.array([pmesh.GetVertexArray(i) for i in range(pmesh.GetNV())]).reshape(-1, 3)
+    off = float(np.abs(verts * n - np.round(verts * n)).max()) if verts.size else 0.0
+    off = COMM.allreduce(off, op=MPI.MAX)
+    attrs = np.array([pmesh.GetBdrAttribute(i) for i in range(pmesh.GetNBE())], dtype=int)
+    counts = COMM.allreduce(np.bincount(attrs, minlength=7)[1:7] if attrs.size else np.zeros(6, int))
+    serial = mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON)
+    ref_attrs = np.array([serial.GetBdrAttribute(i) for i in range(serial.GetNBE())], dtype=int)
+    ref_counts = np.bincount(ref_attrs, minlength=7)[1:7]
+    kept = ptransfer.coarser_meshes(pmesh)
+    check("box_mesh: n^3 elements of unit volume on the lattice, with the boundary faces of "
+          "MakeCartesian3D",
+          pmesh.GetGlobalNE() == n ** 3 and abs(vol - 1.0) < 1e-12 and off < 1e-12
+          and np.array_equal(np.asarray(counts), ref_counts) and n0 == 4,
+          "(%d elements, volume %.15f, off the lattice %.1e, faces %s against %s)"
+          % (pmesh.GetGlobalNE(), vol, off, list(counts), list(ref_counts)))
+    check("box_mesh keeps the mesh before its last cut for the geometric levels",
+          kept is not None and len(kept) == 1 and kept[0].GetGlobalNE() == 4 ** 3,
+          "(%s)" % (None if kept is None else [m.GetGlobalNE() for m in kept]))
+    try:
+        hp.box_mesh(n, COMM, coarse=3)
+        refused = False
+    except ValueError:
+        refused = True
+    check("box_mesh refuses a coarse mesh that does not divide n", refused)
+
+
 def main():
     test_blocks_identical()
     test_sortfree_pattern()
@@ -1927,6 +1962,7 @@ def main():
     test_no_leak()
     test_operator_reset_frees()
     test_no_gpu_context()
+    test_box_mesh()
     test_speed()
     COMM.Barrier()
     if RANK == 0:

@@ -70,8 +70,10 @@ from .csrassemble import (
     get_pattern,
 )
 
+from .meshes import box_mesh  # noqa: E402
+
 __all__ = [
-    "FunctionSpace", "as_space", "ElementGroup", "MeshBatches", "SpaceTables",
+    "FunctionSpace", "as_space", "ElementGroup", "MeshBatches", "SpaceTables", "box_mesh",
     "default_quadrature_degree", "get_batches", "DirichletBC", "BCSet",
     "as_bcset", "assemble_matrix", "assemble_vector", "assemble_scalar",
     "assemble_native_matrix", "own", "group_tables",
