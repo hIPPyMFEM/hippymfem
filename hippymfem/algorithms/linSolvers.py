@@ -514,6 +514,25 @@ class KrylovSolver(_SolverBase):
         self._held = (S, self._pc)
         return self
 
+    def _gmres_verdict(self, final, b, tol, atol):
+        """hypre's GMRES verdict, checked against its own final relative residual.
+
+        hypre's GMRES can report convergence where the residual it reports is far above
+        the tolerance it was given: on a nearly singular operator (diffusion and
+        convection with a mass term of 1e-6, a smooth right-hand side) it stopped after
+        20 iterations as converged with a relative residual of 3.6 for a tolerance of
+        1e-5.  The residual of right-preconditioned GMRES is the true one in the
+        Euclidean norm, relative to ``b``: a verdict is kept where it is below the
+        relative tolerance hypre was given or, times ``|b|``, below the absolute one.
+        The norm of ``b`` is a collective, taken only where the first test fails, which
+        it does on every rank alike (``final`` is hypre's global value)."""
+        from .singlesolve import SINGLE_TOL_FLOOR
+
+        slack = 1.01                                 # (hypre reports it in single precision)
+        if final <= slack * max(float(tol), SINGLE_TOL_FLOOR):
+            return True
+        return atol > 0.0 and final * b.norm("l2") <= slack * atol
+
     def _solve_single(self, x, b):
         from .singlesolve import AMG_OPTIONS
 
@@ -522,14 +541,18 @@ class KrylovSolver(_SolverBase):
             raise ValueError("a single-precision solve starts from zero: its matrix cannot "
                              "form the residual of a double-precision guess")
         tol, atol, most = p["rel_tolerance"], float(p["abs_tolerance"]), int(p["max_iter"])
+        gmres = self.method == "gmres"
         self.iterations, final = self._pc.solve(x.hypre, b.hypre, tol, atol, most)
         # Not the count.  With a preconditioner that is not positive definite (BoomerAMG
         # with plain Jacobi relaxation outside the meshes that suit it) the squared
         # residual in the preconditioner's norm turns negative: hypre's test takes that
         # for converged after a few iterations and returns a residual that is not a
         # number, with the true one of order one.  So: hypre's verdict, and a residual
-        # that is a number.
+        # that is a number; for GMRES also one below the tolerance (_gmres_verdict).
         self.converged = bool(self._pc.converged) and math.isfinite(final)
+        stalled = False
+        if self.converged and gmres and not self._gmres_verdict(final, b, tol, atol):
+            self.converged, stalled = False, True
         size = 1.0
         if not self.converged and self.iterations < most:
             # hypre's PCG stopped by itself.  It works with squares, <C b, b> and
@@ -541,33 +564,46 @@ class KrylovSolver(_SolverBase):
             # in which its size is near one (a power of two, so that only exponents
             # change).  A preconditioner that is not positive definite fails again.
             size = b.norm("l2")
-            if size < 1e-300:
-                x.zero()                       # zero (or nothing a double can scale)
-                self.iterations, final, size, self.converged = 0, 0.0, 0.0, True
+            if size < 1e-300 or size <= atol:
+                # zero, nothing a double can scale, or below the absolute tolerance,
+                # which the zero guess meets as it does for the double-precision solvers
+                # (hypre's GMRES takes such a right-hand side for zero and does not
+                # iterate, without a verdict)
+                x.zero()
+                self.iterations, final, self.converged, stalled = 0, 0.0, True, False
             elif math.isfinite(size):
                 power = math.frexp(size)[1]
                 unit = b.copy().scale(math.ldexp(1.0, -power))
-                self.iterations, final = self._pc.solve(x.hypre, unit.hypre, tol,
-                                                        math.ldexp(atol, -power), most)
+                uatol = math.ldexp(atol, -power)
+                self.iterations, final = self._pc.solve(x.hypre, unit.hypre, tol, uatol, most)
                 x.scale(math.ldexp(1.0, power))
                 self.converged = bool(self._pc.converged) and math.isfinite(final)
+                if self.converged and gmres and not self._gmres_verdict(final, unit, tol, uatol):
+                    self.converged, stalled = False, True
         # the norm over all ranks: one that judged its own part would raise alone
         if self.converged and not math.isfinite(x.norm("l2")):
             self.converged = False
+        #: hypre's final relative residual of the last single-precision solve (in the
+        #: preconditioner's norm for PCG, the Euclidean one for GMRES)
+        self.final_rel_norm = final
         if not self.converged and p["error_on_nonconvergence"]:
             why = ""
             if not math.isfinite(size):
                 why = ": the right-hand side is not a number"
+            elif stalled:
+                why = (": hypre's GMRES reported convergence with a residual above the "
+                       "tolerance")
             elif math.isnan(final):
-                why = ": the preconditioner is not positive definite on this matrix"
+                why = (": hypre's GMRES broke down" if gmres else
+                       ": the preconditioner is not positive definite on this matrix")
                 if AMG_OPTIONS:
                     why += " (BoomerAMG with %s)" % ", ".join(
                         "%s=%s" % kv for kv in AMG_OPTIONS.items())
             elif self.iterations < most:
-                why = ": hypre's PCG broke off"
+                why = ": hypre's %s broke off" % ("GMRES" if gmres else "PCG")
             raise RuntimeError(
-                "cg(amg) in single precision failed to converge in %d iterations "
-                "(final rel. norm %.3e)%s" % (self.iterations, final, why))
+                "%s(amg) in single precision failed to converge in %d iterations "
+                "(final rel. norm %.3e)%s" % (self.method, self.iterations, final, why))
         return self.iterations
 
     def _mfem_cg(self):

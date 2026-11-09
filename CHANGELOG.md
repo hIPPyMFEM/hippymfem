@@ -1229,6 +1229,33 @@
   element to eight a side before counting the halvings of `levels` (24^3 from 2^3 with two
   halvings), and with `levels` and no `coarse` it kept a default coarse mesh that the
   halvings do not divide (16^3 with three).  A default that was valid is kept.
+- **Single-precision GMRES: its verdict, small right-hand sides, and which problems use it.**
+  - hypre's GMRES can report convergence with a final relative residual far above its
+    tolerance. On a nearly singular operator it stopped after 20 iterations with 3.6 for a
+    tolerance of 1e-5, and the solver took the result. `KrylovSolver` now takes such a
+    solve for converged only where hypre's own final residual is below the relative
+    tolerance (or below the absolute one, times `|b|`). Otherwise the solve fails as a
+    single-precision PCG that breaks off does: the forward and adjoint solves fall back on
+    double precision (`SINGLE_GIVE_UP`), and the error names GMRES. The final residual is
+    kept in `KrylovSolver.final_rel_norm`.
+  - A right-hand side below the absolute tolerance gives zero, as in double precision.
+    hypre's GMRES took it for zero and returned without a verdict, and the solve raised
+    an error about a preconditioner that is not positive definite.
+  - With `HIPPYMFEM_HYPRE_SINGLE` named, a Jacobian found symmetric went to single
+    precision also where its solvers are GMRES, as they are by default (`spd_jacobian`
+    unset). The Hessian actions of such a problem then dropped from about 3e-10 to 3e-5
+    against finite differences. As before GMRES could run there, a symmetric Jacobian
+    goes to the single-precision hypre only where all three of its solvers are CG;
+    GMRES solvers take it only for a Jacobian that is not symmetric. A symmetric verdict
+    is kept from one assembly to the next only where the Jacobian goes to single
+    precision. Otherwise it is probed again, as without a single-precision hypre.
+  - The adjoint's solver, cloned from the forward solver for a Jacobian of that library
+    that is not symmetric, was cloned once. It now follows settings made on the forward
+    solver after its first solve, as the forward solver does when it solves the adjoint
+    itself. A `solver_adj` the user sets is left as it is.
+
+  New checks in `single_case` (run by `test_solvers` and `test_device` with a
+  single-precision hypre named) cover each of these.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

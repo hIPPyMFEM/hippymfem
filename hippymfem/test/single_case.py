@@ -427,6 +427,8 @@ def run(check, COMM=MPI.COMM_WORLD):
     _rank_without_coarse_rows(check, COMM)
     _single_blocks(check, COMM)
     _nonsymmetric(check, COMM)
+    _symmetric_default_gmres(check, COMM)
+    _gmres_verdicts(check, COMM)
 
 
 def _nonsymmetric(check, COMM):
@@ -471,6 +473,13 @@ def _nonsymmetric(check, COMM):
                   and getattr(pde.solver_adj, "_pc", None) is not None else "-")
         single_A, single_At = pvp._is_single(A), pvp._is_single(At) and At is not A
         del A, At
+        if single:
+            # the adjoint's solver, made here from the forward one, follows a setting of
+            # the forward solver made after its first solve
+            pde.solver.parameters["max_iter"] = 499
+            pde.solveAdj(p, [u, m, None], rhs)
+            follows = pde.solver_adj.parameters["max_iter"] == 499
+            pde.solver.parameters["max_iter"] = 500
         # the incremental solves of a linearization point, with A and its transpose there
         pde.setLinearizationPoint([u, m, p])
         df, da = pde.generate_state(), pde.generate_state()
@@ -492,6 +501,120 @@ def _nonsymmetric(check, COMM):
     ef, ea = rel(out[True][5], out[False][5]), rel(out[True][6], out[False][6])
     check("its incremental forward and adjoint solves agree to the accuracy of single precision",
           ef < 1e-4 and ea < 1e-4, "(%.1e, %.1e)" % (ef, ea))
+    check("the adjoint's GMRES, made from the forward solver's, follows a later setting of it",
+          follows)
+
+
+def _symmetric_default_gmres(check, COMM):
+    """A symmetric problem left with the default solvers (GMRES, ``spd_jacobian`` unset)
+    stays in double precision with a single-precision hypre named, as it did before GMRES
+    could run there; with CG solvers its Jacobian goes to the single-precision hypre."""
+    import importlib
+
+    import jax.numpy as jnp
+
+    pvp = importlib.import_module("hippymfem.modeling.PDEVariationalProblem")
+    n = 6
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
+    Vu, Vm = hp.FunctionSpace.H1(pmesh, 2), hp.FunctionSpace.H1(pmesh, 1)
+    bc = hp.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * hp.inner(u.grad, p.grad) - p.val
+
+    m = Vm.vector()
+    hp.parRandom.set_seed(5)
+    hp.parRandom.normal(0.3, m)
+    out = {}
+    for kind in ("double", "default", "cg"):
+        pde = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(),
+                                       is_fwd_linear=True)
+        pde.single_solves = kind != "double"
+        if kind == "cg":
+            for attr in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+                sol = hp.KrylovSolver(COMM, "cg", "amg")
+                sol.parameters["rel_tolerance"] = 1e-12
+                sol.parameters["max_iter"] = 500
+                setattr(pde, attr, sol)
+        u = pde.generate_state()
+        pde.solveFwd(u, [u, m, None])
+        A, _ = pde._jacobian([u, m, None])
+        out[kind] = (u, pvp._is_single(A), pde._get_solver("solver").method)
+        del A
+        pde.invalidate_jacobian()
+    eu = (out["default"][0].copy().axpy(-1.0, out["double"][0]).norm("l2")
+          / max(out["double"][0].norm("l2"), 1e-300))
+    check("a symmetric problem with the default solvers (GMRES) stays in double precision "
+          "with a single-precision hypre named",
+          out["default"][2] == "gmres" and not out["default"][1] and eu < 1e-11,
+          "(solver %s, Jacobian in the single-precision hypre: %s; the state against double "
+          "precision %.1e)" % (out["default"][2], out["default"][1], eu))
+    check("with CG solvers the same Jacobian goes to the single-precision hypre", out["cg"][1])
+
+
+def _gmres_verdicts(check, COMM):
+    """The verdict of a single-precision GMRES (``KrylovSolver._solve_single``): taken for
+    converged only where hypre's own final relative residual is below the tolerance, which
+    hypre's GMRES does not ensure on a nearly singular operator; and a right-hand side
+    below the absolute tolerance gives zero, as in double precision, where hypre's GMRES
+    returns without a verdict."""
+    from hippymfem.algorithms import singlesolve
+
+    lib = singlesolve.library()
+    n = 64
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian2D(n, n, mfem.Element.QUADRILATERAL))
+    V = hp.FunctionSpace.H1(pmesh, 1)
+    vel = mfem.Vector([1.0, 0.7])
+    # diffusion and convection with a mass term of 1e-6, no boundary condition: nearly
+    # singular, and a smooth right-hand side (the mass matrix on the constant) excites
+    # the near null space
+    A = hp.assemble_native_matrix(V, [mfem.DiffusionIntegrator(mfem.ConstantCoefficient(1.0)),
+                                      mfem.ConvectionIntegrator(mfem.VectorConstantCoefficient(vel)),
+                                      mfem.MassIntegrator(mfem.ConstantCoefficient(1e-6))])
+    blocks = singlesolve.matrix_blocks(A, COMM)
+    S = singlesolve.SingleParMatrix.from_pattern(blocks, blocks.values, lib)
+    one, b = V.vector(), V.vector()
+    one._host_write()[:] = 1.0
+    M = hp.assemble_native_matrix(V, [mfem.MassIntegrator()])
+    M.Mult(one.hypre, b.hypre)
+    tol = 1e-5
+    s = hp.KrylovSolver(COMM, "gmres", "amg")
+    s.parameters["rel_tolerance"] = tol
+    s.parameters["max_iter"] = 500
+    s.parameters["error_on_nonconvergence"] = False
+    s.set_operator(S)
+    x = V.vector()
+    # hypre's own verdict, from the engine, and the solver's
+    its0, final0 = s._pc.solve(x.hypre, b.hypre, tol, 1e-20, 500)
+    said0 = bool(s._pc.converged)
+    stalled = said0 and final0 > 1.01 * tol
+    s.solve(x, b)
+    ok = (not s.converged) or s.final_rel_norm <= 1.01 * tol
+    raised = ""
+    if stalled:
+        s.parameters["error_on_nonconvergence"] = True
+        try:
+            s.solve(x, b)
+        except RuntimeError as e:
+            raised = str(e)
+        s.parameters["error_on_nonconvergence"] = False
+        ok = ok and raised.startswith("gmres(amg)") and "above the tolerance" in raised
+    check("a single-precision GMRES is taken for converged only below its tolerance", ok,
+          "(hypre: %s after %d iterations at %.1e; the solver: %s at %.1e%s)"
+          % ("converged" if said0 else "not converged", its0, final0,
+             "converged" if s.converged else "not converged", s.final_rel_norm,
+             "; raised: " + raised[:60] if raised else ""))
+    # a right-hand side below the absolute tolerance (1e-20)
+    tiny = b.copy().scale(1e-22 / b.norm("l2"))
+    s.parameters["error_on_nonconvergence"] = True
+    said = ""
+    try:
+        s.solve(x, tiny)
+    except RuntimeError as e:
+        said = str(e)
+    check("a right-hand side below the absolute tolerance is solved in single precision "
+          "without an error", not said and s.converged,
+          "(%s)" % (said[:80] or "%d iterations, |x| = %.1e" % (s.iterations, x.norm("l2"))))
 
 
 def _row_sums(check, COMM, pde, Vu, m, rhs, got):

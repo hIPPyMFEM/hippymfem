@@ -563,16 +563,23 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         # solves with its transpose, or symmetrically once it is known to be symmetric.
         single = _kernel.matrix_precision() == "fp32"
         # With a single-precision hypre the Jacobian is assembled into it and exists
-        # there alone, once it is known to be symmetric: CG is the solver there.
+        # there alone, once it is known to be symmetric, where its solvers are CG.
         to_single = self._wants_single()
-        known = (self.symmetric_jacobian if self.symmetric_jacobian != "auto"
-                 else (self._symmetric_verdict if (single or to_single) else None))
         # A Jacobian known not to be symmetric goes there too where its solvers there are
-        # GMRES (_single_gmres), and its transpose with it (below), unless the adjoint is
-        # to be solved without a transpose (transpose_free_adjoint): no wrapper of a
-        # matrix of that library exists.
-        ns_single = (to_single and known is not None and not known and self._single_gmres()
-                     and not self.transpose_free_adjoint)
+        # GMRES, and its transpose with it (below): _wants_single_nonsymmetric.
+        ns_ok = self._wants_single_nonsymmetric()
+        if self.symmetric_jacobian != "auto":
+            known = self.symmetric_jacobian
+        elif single or to_single:
+            known = self._symmetric_verdict
+        elif ns_ok and self._symmetric_verdict is False:
+            # Kept only where it sends the Jacobian to the single-precision hypre: a
+            # symmetric verdict for a Jacobian that stays in double precision is probed
+            # again at every assembly, as without a single-precision hypre.
+            known = False
+        else:
+            known = None
+        ns_single = ns_ok and known is not None and not known
 
         def assemble(consistent, in_single):
             kw = dict(test_ess=self.bc0.ess_tdof, diag_policy="one", consistent=consistent)
@@ -587,10 +594,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             return self._block(ADJOINT, STATE, xx, **kw)
 
         A = assemble(("symmetric" if known else "two-sided") if single else None,
-                     to_single and (bool(known) or ns_single))
+                     (to_single and bool(known)) or ns_single)
         if self.symmetric_jacobian == "auto":
             symmetric = self._probe_symmetry(A) if known is None else known
-            if (single or to_single) and known is None:
+            if (single or to_single or ns_ok) and known is None:
                 # Kept: a symmetrized matrix would pass the probe whatever the form
                 # is.  The matrix just probed was made consistent from both sides and
                 # is symmetric to 1e-7 only, which the adjoint and the Hessian must
@@ -598,9 +605,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 # the single-precision hypre, if that is where it is to live).
                 self._symmetric_verdict = symmetric
                 if symmetric:
-                    del A
-                    A = assemble("symmetric" if single else None, to_single)
-                elif to_single and self._single_gmres() and not self.transpose_free_adjoint:
+                    if single or to_single:
+                        del A
+                        A = assemble("symmetric" if single else None, to_single)
+                elif ns_ok:
                     del A
                     A = assemble("two-sided" if single else None, True)
             elif (known and not single and _is_single(A) and not self._probe_symmetry(
@@ -817,9 +825,12 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         return s is None or (isinstance(s, krylov) and s.method == "gmres" and s.can_solve_single())
 
     def _wants_single(self):
-        """Whether the Jacobian is to be assembled into the single-precision hypre: such
-        a library is named and loads, and the three solvers that would hold the
-        Jacobian are CG with BoomerAMG."""
+        """Whether a symmetric Jacobian is to be assembled into the single-precision
+        hypre: such a library is named and loads, and the three solvers that would hold
+        the Jacobian are CG with BoomerAMG.  Solvers that are GMRES take that library only
+        for a Jacobian that is not symmetric (:meth:`_wants_single_nonsymmetric`): a
+        symmetric problem left with the default solvers (GMRES, :attr:`spd_jacobian`
+        unset) stays in double precision, its Hessian actions included."""
         from ..algorithms import singlesolve
 
         if not (self.single_solves and singlesolve.HYPRE_SINGLE):
@@ -827,8 +838,23 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         krylov = _krylov_class()
         for attr in ("solver", "solver_fwd_inc", "solver_adj_inc"):
             solver = self._get_solver(attr)
-            if not (isinstance(solver, krylov) and solver.can_solve_single()):
+            if not (isinstance(solver, krylov) and solver.method == "cg"
+                    and solver.can_solve_single()):
                 return False
+        return singlesolve.library() is not None
+
+    def _wants_single_nonsymmetric(self):
+        """Whether a Jacobian that is known not to be symmetric is to be assembled into the
+        single-precision hypre, with its transpose: such a library is named and loads,
+        its solvers there are GMRES with BoomerAMG (:meth:`_single_gmres`), and the
+        adjoint is not to be solved without a transpose (:attr:`transpose_free_adjoint`:
+        no wrapper of a matrix of that library exists)."""
+        from ..algorithms import singlesolve
+
+        if not (self.single_solves and singlesolve.HYPRE_SINGLE):
+            return False
+        if self.transpose_free_adjoint or not self._single_gmres():
+            return False
         return singlesolve.library() is not None
 
     #: relative tolerance of the symmetry probe, and how many vector pairs it uses
@@ -1139,9 +1165,16 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # the transpose of a Jacobian of the single-precision hypre that is not symmetric:
             # a solver of its own (GMRES like the forward one's), so that the forward solver's
             # set-up on A does not have to make way for it
+            fwd = self._get_solver("solver")
             if self.solver_adj is None:
-                self.solver_adj = self._clone_solver(self._get_solver("solver"))
+                self.solver_adj = self._adj_clone = self._clone_solver(fwd)
             solver = self.solver_adj
+            if solver is getattr(self, "_adj_clone", None):
+                # A clone made here follows the forward solver's settings as they are now,
+                # as the forward solver itself does where it solves the adjoint (in double
+                # precision); one the user set is left as it is.
+                for k in fwd.parameters.keys():
+                    solver.parameters[k] = fwd.parameters[k]
             _set_operator_once(solver, At)
         else:
             solver = self._get_solver("solver")
