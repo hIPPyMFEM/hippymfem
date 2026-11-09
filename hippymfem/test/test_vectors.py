@@ -396,8 +396,17 @@ def test_device_auto_without_gpu():
     import subprocess
     import sys
 
+    from hippymfem.common.mfemconfig import mfem_has
+
     if RANK == 0:
         print("HIPPYMFEM_DEVICE=auto without a visible GPU")
+    if mfem_has("MFEM_USE_CUDA"):
+        # The child imports this process's PyMFEM, and a CUDA build of hypre cannot
+        # start without a visible card (hypre reports CUDA error 35 at its
+        # initialization), whatever the library decides; a HIP build can.
+        if RANK == 0:
+            print("  skipped: this PyMFEM is a CUDA build, whose hypre needs a visible card")
+        return
     ok, detail = True, ""
     if RANK == 0:
         # PALS_ is how Slurm tells HPE Cray's PMI that srun launched it: left in, the
