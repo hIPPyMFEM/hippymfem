@@ -59,8 +59,9 @@ def petsc_available():
 def _wanted():
     if "petsc4py" in sys.modules:
         return True
-    return os.environ.get("HIPPYMFEM_PETSC", "").lower() not in (
-        "", "0", "no", "false", "off")
+    from .config import env_flag
+
+    return env_flag("HIPPYMFEM_PETSC", False)
 
 
 if _wanted():

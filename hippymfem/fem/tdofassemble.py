@@ -49,7 +49,7 @@ import mfem.par as mfem
 from ..common.identitycache import IdentityCache
 from ..common.linalg import own
 from ..common.parvector import _HYPRE_BIGINT, bigint_array, bigint_view
-from ..config import env_choice
+from ..config import env_choice, env_flag
 from . import pattern as _pattern, patternbuild
 from .devsort import unique_inverse
 from .pattern import host_writable
@@ -123,8 +123,7 @@ def _unpin_buffers(addresses):
 #: the rows adds up coherently, and without it the refined solves need more passes and
 #: the incremental solves lose accuracy as the mesh grows (from 64 GCDs on in the scaling
 #: series on Frontier).  ``HIPPYMFEM_SINGLE_ROW_SUMS=0`` switches it off.
-SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "1").lower() in (
-    "1", "yes", "true", "on")
+SINGLE_ROW_SUMS = env_flag("HIPPYMFEM_SINGLE_ROW_SUMS", True)
 
 
 #: Whether the blocks of a linearization point (``C`` and the ``W`` blocks of the reduced
@@ -141,8 +140,7 @@ SINGLE_ROW_SUMS = os.environ.get("HIPPYMFEM_SINGLE_ROW_SUMS", "1").lower() in (
 #: the default, since every identity of the blocks then holds to single precision only
 #: (``<C dm, dp> = <dm, C^T dp>``, a symmetric Hessian, matrix-free against assembled);
 #: the profile ``gpu-large`` sets it where a single-precision hypre is named.
-SINGLE_BLOCKS = os.environ.get("HIPPYMFEM_SINGLE_BLOCKS", "0").lower() in (
-    "1", "yes", "true", "on")
+SINGLE_BLOCKS = env_flag("HIPPYMFEM_SINGLE_BLOCKS", False)
 
 
 @contextlib.contextmanager

@@ -12,6 +12,7 @@ CSR graph, the slot of every element entry, the masks and the device copies) and
 
 import copy
 import os
+from ..config import env_flag
 import time
 import warnings
 
@@ -28,8 +29,7 @@ from .prolongation import _BOOLEAN_P, _ESS_LDOF, _IDENTITY_P
 #: When true, the device-side scatter gathers into each CSR slot in a fixed order
 #: instead of using atomics, so repeated GPU assemblies are bit-identical.  Costs
 #: ``nnz * maxc`` doubles of working memory.  Set ``HIPPYMFEM_GPU_DETERMINISTIC=1``.
-DETERMINISTIC = os.environ.get("HIPPYMFEM_GPU_DETERMINISTIC", "").lower() not in (
-    "", "0", "no", "false", "off")
+DETERMINISTIC = env_flag("HIPPYMFEM_GPU_DETERMINISTIC", False)
 
 
 #: Keep the ``nnz``-sized accumulator of a fused assembly and reset it in place
@@ -42,8 +42,7 @@ DETERMINISTIC = os.environ.get("HIPPYMFEM_GPU_DETERMINISTIC", "").lower() not in
 #: Buffers are kept per (device, ``nnz``) and borrowed, so what is held is the peak an
 #: assembly needs at once, never more.  Set ``HIPPYMFEM_FUSED_KEEP=0`` to allocate per
 #: assembly.
-FUSED_KEEP = os.environ.get("HIPPYMFEM_FUSED_KEEP", "1").lower() not in (
-    "0", "no", "false", "off")
+FUSED_KEEP = env_flag("HIPPYMFEM_FUSED_KEEP", True)
 
 #: Share of JAX's arena above which an accumulator is kept.  Only the large ones are
 #: worth it: a small buffer is one the allocator can fit in the holes it already has,
@@ -63,8 +62,7 @@ FUSED_KEEP_SHARE = float(os.environ.get("HIPPYMFEM_FUSED_KEEP_SHARE", "0.25") or
 #: and 0.54 GB of JAX's arena, and it saves 0.11 s of a 0.55 s forward solve on an H100.
 #: Off by default, since device memory is the scarcer resource.  Set
 #: ``HIPPYMFEM_DEVICE_PATTERN=1``.
-DEVICE_PATTERN = os.environ.get("HIPPYMFEM_DEVICE_PATTERN", "0").lower() in (
-    "1", "true", "yes", "on")
+DEVICE_PATTERN = env_flag("HIPPYMFEM_DEVICE_PATTERN", False)
 
 
 #: The scatter map of a fused assembly in a compact form: for every element and test dof
@@ -93,8 +91,7 @@ COMPACT_PATTERN = os.environ.get("HIPPYMFEM_COMPACT_PATTERN", "1").lower() not i
 #: quadratic hexahedra on a rank the index tables of a Newton step then take 13 GiB of
 #: host memory instead of 30, and their builds 3 GiB more instead of 12.  The arrays are
 #: the same.  ``HIPPYMFEM_PATTERN_LEAN=0`` builds and keeps them as before.
-LEAN = os.environ.get("HIPPYMFEM_PATTERN_LEAN", "1").lower() not in (
-    "0", "false", "no", "off")
+LEAN = env_flag("HIPPYMFEM_PATTERN_LEAN", True)
 #: A map is given up only where it is worth it: from this many entries.
 LEAN_MIN_ENTRIES = 1 << 24
 
@@ -1073,8 +1070,7 @@ class ScatterPattern(KeepAlive):
 #: 256^3 linearization point took on 8 H100), and which phase carries it depends on
 #: where the sort runs, so it is worth being able to ask.  Set
 #: ``HIPPYMFEM_PATTERN_TIMING=1``.
-PATTERN_TIMING = os.environ.get("HIPPYMFEM_PATTERN_TIMING", "").lower() in (
-    "1", "true", "yes", "on")
+PATTERN_TIMING = env_flag("HIPPYMFEM_PATTERN_TIMING", False)
 
 
 def _say_phase(what, seconds, n):

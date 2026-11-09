@@ -97,8 +97,68 @@ class _Knob(object):
             name, env, doc, get, put, when)
 
 
-def _bool(v):
-    return str(v).lower() in ("1", "yes", "true", "on") if not isinstance(v, bool) else v
+#: the spellings of an on/off setting, in any case
+FLAG_TRUE = ("1", "yes", "true", "on")
+FLAG_FALSE = ("0", "no", "false", "off")
+
+
+def parse_flag(value, default, name="the setting"):
+    """The one reading of an on/off setting, at import and by the setters alike: ``True``
+    for 1, yes, true or on, ``False`` for 0, no, false or off (any case, spaces around
+    ignored), ``default`` for an empty value or ``None``.  Anything else raises, naming
+    ``name``, so that a mistyped value does not quietly select one of the two."""
+    if isinstance(value, bool):
+        return value
+    v = "" if value is None else str(value).strip().lower()
+    if v == "":
+        return bool(default)
+    if v in FLAG_TRUE:
+        return True
+    if v in FLAG_FALSE:
+        return False
+    raise ValueError("%s must be one of %s, or empty for the default, not %r"
+                     % (name, ", ".join(FLAG_TRUE + FLAG_FALSE), value))
+
+
+def env_flag(name, default):
+    """:func:`parse_flag` of the environment variable ``name``."""
+    return parse_flag(os.environ.get(name), default, name)
+
+
+def parse_tristate(value, name="the setting"):
+    """``"auto"``, ``"1"`` or ``"0"`` for a setting that is on, off, or left to the library:
+    auto or an empty value, a spelling of on, a spelling of off (:func:`parse_flag`'s).
+    Anything else raises, naming ``name``."""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    v = "" if value is None else str(value).strip().lower()
+    if v in ("", "auto"):
+        return "auto"
+    if v in FLAG_TRUE:
+        return "1"
+    if v in FLAG_FALSE:
+        return "0"
+    raise ValueError("%s must be auto, one of %s, or empty for auto, not %r"
+                     % (name, ", ".join(FLAG_TRUE + FLAG_FALSE), value))
+
+
+def env_tristate(name):
+    """:func:`parse_tristate` of the environment variable ``name``."""
+    return parse_tristate(os.environ.get(name), name)
+
+
+def _flag(name, default):
+    """The setter's cast of an on/off knob: :func:`parse_flag`, empty for the default."""
+    def cast(value):
+        return parse_flag(value, default, name)
+    return cast
+
+
+def _tristate(name):
+    """The setter's cast of an auto/on/off knob: :func:`parse_tristate`."""
+    def cast(value):
+        return parse_tristate(value, name)
+    return cast
 
 
 def _int(v):
@@ -145,13 +205,13 @@ _KNOBS = [
           _module_call("_jaxconfig", "hypre_on_device"), when="import"),
     _Knob("auto_device", "HIPPYMFEM_AUTO_DEVICE",
           "configure MFEM's device at import when hypre_device is set (0 to call configure_device yourself)",
-          lambda: _bool(os.environ.get("HIPPYMFEM_AUTO_DEVICE", "1")), when="import"),
+          lambda: env_flag("HIPPYMFEM_AUTO_DEVICE", True), when="import"),
     _Knob("gpu_mem_fraction", "HIPPYMFEM_GPU_MEM_FRACTION",
           "JAX's share of each card (default 0.90 per rank on the card, 0.45 when hypre shares it)",
           _env_only("HIPPYMFEM_GPU_MEM_FRACTION", "(default)"), when="import"),
     _Knob("pin_gpu", "HIPPYMFEM_PIN_GPU",
           "restrict each rank to one card before CUDA initializes (needs import before mpi4py/MFEM)",
-          lambda: _bool(os.environ.get("HIPPYMFEM_PIN_GPU", "1")), when="import"),
+          lambda: env_flag("HIPPYMFEM_PIN_GPU", True), when="import"),
     _Knob("node_gpus", "HIPPYMFEM_NODE_GPUS",
           "how many cards the node has, when the launcher hid all but one (set by mpirun_pinned.sh)",
           _env_only("HIPPYMFEM_NODE_GPUS", "(from the visible devices)"), when="import"),
@@ -162,14 +222,14 @@ _KNOBS = [
     _Knob("abort_on_error", "HIPPYMFEM_ABORT_ON_ERROR",
           "on several ranks, an uncaught exception on one of them aborts every rank (default) "
           "instead of leaving the others waiting in a collective",
-          lambda: _bool(os.environ.get("HIPPYMFEM_ABORT_ON_ERROR", "1")), when="import"),
+          lambda: env_flag("HIPPYMFEM_ABORT_ON_ERROR", True), when="import"),
     _Knob("jax_cache", "HIPPYMFEM_JAX_CACHE",
           "a directory for JAX's persistent compilation cache (off when unset); on a file "
           "system every rank can write",
           _env_only("HIPPYMFEM_JAX_CACHE", ""), when="import"),
     _Knob("petsc", "HIPPYMFEM_PETSC",
           "import petsc4py before PyMFEM so the PETSc solvers are available",
-          lambda: _bool(os.environ.get("HIPPYMFEM_PETSC", "")), when="import"),
+          lambda: env_flag("HIPPYMFEM_PETSC", False), when="import"),
     # ------------------------------------------------------------------ assembly
     _Knob("parmat", "HIPPYMFEM_PARMAT",
           "how the parallel matrix is built: auto (true-dof route where P is boolean), tdof, mfem",
@@ -180,8 +240,7 @@ _KNOBS = [
     _Knob("tdof_identity", "HIPPYMFEM_TDOF_IDENTITY",
           "true-dof route also where the prolongations are the identity (one rank): auto (with hypre on a device), 1, 0",
           _module_attr("fem.csrassemble", "TDOF_IDENTITY"),
-          _module_assign("fem.csrassemble", "TDOF_IDENTITY",
-                         _choice("auto", "1", "true", "yes", "on", "0", "false", "no", "off"))),
+          _module_assign("fem.csrassemble", "TDOF_IDENTITY", _tristate("HIPPYMFEM_TDOF_IDENTITY"))),
     _Knob("device_bridge", "HIPPYMFEM_DEVICE_BRIDGE",
           "with the kernels and hypre on one GPU, matrix values and assembled vectors cross between "
           "JAX's memory and MFEM's on the device instead of through the host: auto, 1, 0",
@@ -195,28 +254,34 @@ _KNOBS = [
     _Knob("device_pattern", "HIPPYMFEM_DEVICE_PATTERN",
           "keep a pattern's index arrays on the device (4 bytes per element-matrix entry and per "
           "nonzero) so that an assembly uploads nothing but the row pointers",
-          _module_attr("fem.pattern", "DEVICE_PATTERN"), _module_setter("fem.pattern", "set_device_pattern", _bool)),
+          _module_attr("fem.pattern", "DEVICE_PATTERN"), _module_setter("fem.pattern", "set_device_pattern",
+                                                         _flag("HIPPYMFEM_DEVICE_PATTERN", False))),
     _Knob("fold_elimination", "HIPPYMFEM_FOLD_ELIMINATION",
           "fold the essential-dof elimination into the scatter (default) or use MFEM's calls after",
           _module_attr("fem.elimination", "FOLD_ELIMINATION"),
-          _module_setter("fem.elimination", "set_fold_elimination", _bool)),
+          _module_setter("fem.elimination", "set_fold_elimination",
+                         _flag("HIPPYMFEM_FOLD_ELIMINATION", True))),
     _Knob("gpu_deterministic", "HIPPYMFEM_GPU_DETERMINISTIC",
           "device scatter in a fixed order instead of atomics (bit-identical repeats, more memory)",
-          _module_attr("fem.pattern", "DETERMINISTIC"), _module_setter("fem.pattern", "set_deterministic", _bool)),
+          _module_attr("fem.pattern", "DETERMINISTIC"), _module_setter("fem.pattern", "set_deterministic",
+                                                        _flag("HIPPYMFEM_GPU_DETERMINISTIC", False))),
     _Knob("keep_geometric_factors", "HIPPYMFEM_KEEP_GEOMETRIC_FACTORS",
           "keep MFEM's GeometricFactors alive after the batches are built",
           _module_attr("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS"),
-          _module_assign("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS", _bool)),
+          _module_assign("fem.elementbatch", "KEEP_GEOMETRIC_FACTORS",
+                         _flag("HIPPYMFEM_KEEP_GEOMETRIC_FACTORS", False))),
     _Knob("direct_transposes", "HIPPYMFEM_DIRECT_TRANSPOSES",
           "C^T and W_um^T assembled as matrices of their own from the transposed element matrices "
           "instead of formed by MFEM at the first transposed product: auto (with hypre on a "
           "device, default), 1, 0",
           _module_attr("modeling.PDEVariationalProblem", "DIRECT_TRANSPOSES"),
-          _module_assign("modeling.PDEVariationalProblem", "DIRECT_TRANSPOSES", _choice("auto", "1", "0"))),
+          _module_assign("modeling.PDEVariationalProblem", "DIRECT_TRANSPOSES",
+                         _tristate("HIPPYMFEM_DIRECT_TRANSPOSES"))),
     _Knob("share_hessian", "HIPPYMFEM_SHARE_HESSIAN",
           "one differentiation pass for all blocks of a linearization point (default)",
           _module_attr("modeling.PDEVariationalProblem", "SHARE_HESSIAN_PASS"),
-          _module_setter("modeling.PDEVariationalProblem", "set_share_hessian_pass", _bool)),
+          _module_setter("modeling.PDEVariationalProblem", "set_share_hessian_pass",
+                         _flag("HIPPYMFEM_SHARE_HESSIAN", True))),
     # ------------------------------------------------------------------- kernels
     _Knob("precision", "HIPPYMFEM_PRECISION",
           "precision of the element kernels: fp64 (default), mixed (matrices in single "
@@ -253,7 +318,7 @@ _KNOBS = [
           "group's geometry stays on the card): on by default; the element arrays change at "
           "round-off; for the batches built afterwards",
           _module_attr("fem.elementbatch", "AFFINE_GEOMETRY"),
-          _module_assign("fem.elementbatch", "AFFINE_GEOMETRY", _bool)),
+          _module_assign("fem.elementbatch", "AFFINE_GEOMETRY", _flag("HIPPYMFEM_AFFINE_GEOMETRY", True))),
     _Knob("geometry_slice", "HIPPYMFEM_GEOMETRY_SLICE",
           "elements per slice when the quadrature geometry is built here rather than by "
           "MFEM's batched call; a positive value also forces that path",
@@ -263,7 +328,7 @@ _KNOBS = [
           "keep a large assembly accumulator and zero it in place, rather than allocating one "
           "per assembly",
           _module_attr("fem.pattern", "FUSED_KEEP"),
-          _module_assign("fem.pattern", "FUSED_KEEP", _bool)),
+          _module_assign("fem.pattern", "FUSED_KEEP", _flag("HIPPYMFEM_FUSED_KEEP", True))),
     _Knob("fused_keep_share", "HIPPYMFEM_FUSED_KEEP_SHARE",
           "share of JAX's arena above which an accumulator is worth keeping",
           _module_attr("fem.pattern", "FUSED_KEEP_SHARE"),
@@ -284,7 +349,8 @@ _KNOBS = [
           "build a large pattern's index tables from the dof tables and row by row, and keep "
           "no map twice: half the host memory of a rank (the maps are the same; one given up "
           "is made again when asked for)",
-          _module_attr("fem.pattern", "LEAN"), _module_assign("fem.pattern", "LEAN", _bool)),
+          _module_attr("fem.pattern", "LEAN"), _module_assign("fem.pattern", "LEAN",
+                                                          _flag("HIPPYMFEM_PATTERN_LEAN", True))),
     _Knob("pattern_threads", "HIPPYMFEM_PATTERN_THREADS",
           "threads for a sort-free pattern build; 0 takes this rank's share of the node",
           _module_attr("fem.patternbuild", "THREADS"),
@@ -311,7 +377,7 @@ _KNOBS = [
     _Knob("pattern_timing", "HIPPYMFEM_PATTERN_TIMING",
           "print what each phase of a sparsity-pattern build took, on rank 0",
           _module_attr("fem.pattern", "PATTERN_TIMING"),
-          _module_assign("fem.pattern", "PATTERN_TIMING", _bool)),
+          _module_assign("fem.pattern", "PATTERN_TIMING", _flag("HIPPYMFEM_PATTERN_TIMING", False))),
     # ------------------------------------------------------------------- solvers
     _Knob("hypre_spmv", "HIPPYMFEM_HYPRE_SPMV",
           "hypre's matrix-vector kernel on a GPU: auto (its own on several ranks of a CUDA build), vendor, hypre",
@@ -375,7 +441,7 @@ _KNOBS = [
           "the blocks of a linearization point are matrices of the single-precision hypre where it is "
           "loaded: two thirds of their memory, products to single precision (in gpu-large)",
           _module_attr("fem.tdofassemble", "SINGLE_BLOCKS"),
-          _module_assign("fem.tdofassemble", "SINGLE_BLOCKS", _bool)),
+          _module_assign("fem.tdofassemble", "SINGLE_BLOCKS", _flag("HIPPYMFEM_SINGLE_BLOCKS", False))),
     _Knob("single_amg", "HIPPYMFEM_SINGLE_AMG",
           "BoomerAMG settings of the single-precision solves by hypre's names, such as "
           "pmax=8,interp=18 (applied after HIPPYMFEM_AMG)",
@@ -384,7 +450,7 @@ _KNOBS = [
           "a Jacobian of the single-precision hypre keeps the defect of its row sums for its solver "
           "to add in every product (default; the rounding of a uniform mesh's rows adds up)",
           _module_attr("fem.tdofassemble", "SINGLE_ROW_SUMS"),
-          _module_assign("fem.tdofassemble", "SINGLE_ROW_SUMS", _bool)),
+          _module_assign("fem.tdofassemble", "SINGLE_ROW_SUMS", _flag("HIPPYMFEM_SINGLE_ROW_SUMS", True))),
     _Knob("single_give_up", "HIPPYMFEM_SINGLE_GIVE_UP",
           "a forward solve that single precision cannot carry: auto (default: solved again in "
           "double precision where that Jacobian fits on the device, raised for the line search "
@@ -436,6 +502,9 @@ PROFILES = {
 #: The profile in force and the environment variables it set (``show`` marks them).
 _ACTIVE_PROFILE = ["default"]
 PROFILE_SET = {}
+#: The environment variables of the knobs set through ``hippymfem.config`` in this process:
+#: a profile applied afterwards leaves them, and ``show`` reports them as set.
+EXPLICIT = set()
 
 
 def _profile(name):
@@ -488,6 +557,8 @@ class Config(object):
                 "%s is read before the import (set %s in the environment, before "
                 "importing hippymfem)" % (name, knob.env))
         knob.put(value)
+        EXPLICIT.add(knob.env)
+        PROFILE_SET.pop(knob.env, None)
 
     def __dir__(self):
         return sorted(_BY_NAME) + ["show", "as_dict", "knobs"]
@@ -520,9 +591,10 @@ class Config(object):
 
     def use_profile(self, name):
         """Apply a profile after ``import hippymfem``: each runtime knob it names that the
-        environment leaves unset (or that another profile set) takes its value; an
-        import-time knob is left as it is, with a warning, since it is read before.
-        Returns ``{knob: value}`` of what was set."""
+        environment leaves unset (or that another profile set), and that was not set
+        through ``hippymfem.config``, takes its value; an import-time knob is left as it
+        is, with a warning, since it is read before.  Returns ``{knob: value}`` of what
+        was set."""
         import warnings
 
         key, values = _profile(name)
@@ -533,7 +605,7 @@ class Config(object):
                 val, need = val
             if need and not os.environ.get(need, ""):
                 continue
-            if os.environ.get(var, "") != "" and var not in PROFILE_SET:
+            if var in EXPLICIT or (os.environ.get(var, "") != "" and var not in PROFILE_SET):
                 continue                         # set by the user: an explicit setting wins
             knob = _BY_ENV.get(var)
             if knob is None or knob.put is None or knob.when == "import":
@@ -548,15 +620,17 @@ class Config(object):
         return out
 
     def show(self, file=None, load=True):
-        """Print every knob: value, its environment variable (marked when set), when it
-        is read, and what it does.  Put the output in a bug report."""
+        """Print every knob: its value; where the value comes from (``set`` through this
+        object, ``profile <name>``, ``env`` or ``default``); when it is read; what it
+        does; and its environment variable.  Put the output in a bug report."""
         import sys
 
         vals = self.as_dict(load=load)
         out = file if file is not None else sys.stdout
         print("hippymfem configuration", file=out)
         for k in _KNOBS:
-            src = ("profile %s" % PROFILE_SET[k.env] if k.env in PROFILE_SET
+            src = ("set" if k.env in EXPLICIT
+                   else "profile %s" % PROFILE_SET[k.env] if k.env in PROFILE_SET
                    else "env" if os.environ.get(k.env) not in (None, "") else "default")
             print("  %-24s = %-14r [%s, %s] %s" % (k.name, vals[k.name], src, k.when, k.doc),
                   file=out)

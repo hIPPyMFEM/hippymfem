@@ -24,6 +24,7 @@ one group at a time.
 """
 
 import os
+from ..config import env_flag
 
 import numpy as np
 
@@ -40,8 +41,7 @@ from .spaces import as_space
 #: been copied out.  Off by default, since nothing in hIPPyMFEM reads them again;
 #: set ``HIPPYMFEM_KEEP_GEOMETRIC_FACTORS=1`` if your own code holds a pointer from
 #: ``mesh.GetGeometricFactors`` on a mesh hIPPyMFEM also batches.
-KEEP_GEOMETRIC_FACTORS = os.environ.get(
-    "HIPPYMFEM_KEEP_GEOMETRIC_FACTORS", "0").lower() in ("1", "yes", "true", "on")
+KEEP_GEOMETRIC_FACTORS = env_flag("HIPPYMFEM_KEEP_GEOMETRIC_FACTORS", False)
 
 #: Keep the inverse Jacobians of a group once an element instead of once a quadrature
 #: point where every element of the group is mapped affinely (straight simplices,
@@ -62,8 +62,7 @@ KEEP_GEOMETRIC_FACTORS = os.environ.get(
 #: round-off.  On by default since November 2026; ``HIPPYMFEM_AFFINE_GEOMETRY=0`` keeps
 #: one inverse Jacobian a quadrature point everywhere, as before (for the batches built
 #: afterwards).  A group with any element that is not affine keeps them all anyway.
-AFFINE_GEOMETRY = os.environ.get(
-    "HIPPYMFEM_AFFINE_GEOMETRY", "1").lower() in ("1", "yes", "true", "on")
+AFFINE_GEOMETRY = env_flag("HIPPYMFEM_AFFINE_GEOMETRY", True)
 
 #: How far the inverse Jacobians of an element may differ between its quadrature
 #: points, relative to their largest entry, for its map to count as affine.

@@ -52,6 +52,7 @@ is what pays off in an inverse problem, where a Newton-CG run reassembles ``A``,
 """
 
 import os
+from ..config import env_tristate
 import numpy as np
 from .spaces import as_space
 from .prolongation import (  # noqa: F401  (re-exported, see below)
@@ -130,7 +131,7 @@ __all__ = [
 #: (171 ms for 17 million entries), where the true-dof route hands MFEM hypre's two
 #: blocks as they are (0.6 to 1.3 us).  ``"auto"`` takes the true-dof route on a
 #: device only; ``"1"`` always, ``"0"`` never.  Set ``HIPPYMFEM_TDOF_IDENTITY``.
-TDOF_IDENTITY = os.environ.get("HIPPYMFEM_TDOF_IDENTITY", "auto").lower()
+TDOF_IDENTITY = env_tristate("HIPPYMFEM_TDOF_IDENTITY")
 
 
 def _tdof_identity():

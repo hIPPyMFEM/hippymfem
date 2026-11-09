@@ -27,6 +27,7 @@ everything then takes the route through the host.
 
 import ctypes
 import os
+from ..config import env_tristate
 import warnings
 
 import numpy as np
@@ -37,7 +38,7 @@ __all__ = ["available", "why_not", "jax_address", "copy_from_jax", "copy_from_ho
 
 #: ``"auto"`` (use the bridge when :func:`available`), ``"0"`` (never), or ``"1"``
 #: (as ``auto``, but say why when it cannot be used).  ``HIPPYMFEM_DEVICE_BRIDGE``.
-DEVICE_BRIDGE = os.environ.get("HIPPYMFEM_DEVICE_BRIDGE", "auto").lower()
+DEVICE_BRIDGE = env_tristate("HIPPYMFEM_DEVICE_BRIDGE")
 
 _H2D, _D2H, _D2D = 1, 2, 3          # cudaMemcpyKind and hipMemcpyKind agree on these
 

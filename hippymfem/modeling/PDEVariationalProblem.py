@@ -25,6 +25,7 @@ the matrices, ``apply_ij`` is a plain matrix product with no masking.
 import inspect
 import gc
 import os
+from ..config import env_flag, env_tristate
 
 import numpy as np
 from mpi4py import MPI
@@ -58,12 +59,9 @@ from ..fem import kernel as _kernel
 #: host MFEM multiplies with the transpose without forming it, and a second matrix would only
 #: take memory.  ``auto`` (default): with hypre on a device, ``1`` always, ``0`` never
 #: (``HIPPYMFEM_DIRECT_TRANSPOSES``).  A problem with interior-facet terms keeps MFEM's.
-DIRECT_TRANSPOSES = os.environ.get("HIPPYMFEM_DIRECT_TRANSPOSES", "auto").strip().lower() or "auto"
-if DIRECT_TRANSPOSES not in ("auto", "1", "0"):
-    raise ValueError("HIPPYMFEM_DIRECT_TRANSPOSES must be auto, 1 or 0, not %r" % DIRECT_TRANSPOSES)
+DIRECT_TRANSPOSES = env_tristate("HIPPYMFEM_DIRECT_TRANSPOSES")
 
-SHARE_HESSIAN_PASS = os.environ.get("HIPPYMFEM_SHARE_HESSIAN", "1").lower() not in (
-    "0", "no", "false", "off")
+SHARE_HESSIAN_PASS = env_flag("HIPPYMFEM_SHARE_HESSIAN", True)
 
 
 def set_share_hessian_pass(flag=True):

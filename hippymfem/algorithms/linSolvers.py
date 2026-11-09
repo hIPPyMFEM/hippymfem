@@ -30,6 +30,7 @@ memory.
 
 import math
 import os
+from ..config import env_flag
 
 import numpy as np
 from mpi4py import MPI
@@ -145,7 +146,7 @@ def KrylovSolver_ParameterList():
 #: level; MFEM zeroes the vector without saying so.  With l1-Jacobi relaxation on a GPU
 #: that is one product of four per iteration: a solve of 2.1 million dofs to 1e-12 took
 #: 0.103 s and 0.089 s on an H100, 0.274 s and 0.227 s on an L40S (24 iterations each).
-HYPRE_PCG = os.environ.get("HIPPYMFEM_HYPRE_PCG", "1").strip().lower() not in ("0", "off", "false", "no")
+HYPRE_PCG = env_flag("HIPPYMFEM_HYPRE_PCG", True)
 
 #: preconditioners that are hypre solvers, which hypre's PCG can call itself
 _HYPRE_SOLVER_PCS = ("amg", "ilu", "parasails", "euclid")

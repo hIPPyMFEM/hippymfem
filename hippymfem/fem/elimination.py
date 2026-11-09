@@ -7,6 +7,7 @@ boolean (``HIPPYMFEM_FOLD_ELIMINATION``), through MFEM's own calls otherwise.
 """
 
 import os
+from ..config import env_flag
 import numpy as np
 from ..common.linalg import _local_diag, own, set_diagonal_entries, take_ownership
 from .prolongation import _boolean_prolongation
@@ -17,8 +18,7 @@ from .prolongation import _boolean_prolongation
 #: ``EliminateRowsCols``, which is a large share of a GPU assembly.
 #: ``HIPPYMFEM_FOLD_ELIMINATION=0`` uses MFEM's calls instead; the test suite
 #: compares the two entry by entry.
-FOLD_ELIMINATION = os.environ.get("HIPPYMFEM_FOLD_ELIMINATION", "1").lower() not in (
-    "0", "no", "false", "off")
+FOLD_ELIMINATION = env_flag("HIPPYMFEM_FOLD_ELIMINATION", True)
 
 
 def set_fold_elimination(flag=True):

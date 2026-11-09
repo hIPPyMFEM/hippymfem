@@ -558,6 +558,85 @@ def test_config_profiles():
         cfg._ACTIVE_PROFILE[:] = kept_active
 
 
+def test_config_explicit_and_spellings():
+    """A knob set through ``hm.config`` outranks a profile applied afterwards, and ``show``
+    says it was set there (a profile overrode it, and ``show`` called it the default).  An
+    on/off setting reads the same at import and through its setter: empty is the default,
+    1/yes/true/on and 0/no/false/off in any case, anything else is refused by name (an
+    empty HIPPYMFEM_SINGLE_ROW_SUMS turned the row sums off at import, and an unknown word
+    was read as one of the two)."""
+    import io
+    import os
+    import subprocess
+    import sys
+    from contextlib import redirect_stdout
+
+    import importlib
+
+    cfg = importlib.import_module("hippymfem.config")
+    kept = os.environ.get("HIPPYMFEM_PMG_H")
+    kept_explicit, kept_set = set(cfg.EXPLICIT), dict(cfg.PROFILE_SET)
+    kept_active = list(cfg._ACTIVE_PROFILE)
+    cfg.PROFILES["_test2"] = ("a test", {"HIPPYMFEM_PMG_H": "3"})
+    try:
+        os.environ.pop("HIPPYMFEM_PMG_H", None)
+        hp.config.pmg_h = 2
+        got = hp.config.use_profile("_test2")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            hp.config.show(load=False)
+        line = [x for x in buf.getvalue().splitlines() if x.strip().startswith("pmg_h ")]
+        check("a profile applied later leaves a knob set through hm.config",
+              got == {} and int(hp.config.pmg_h) == 2, "(%r, pmg_h %r)" % (got, hp.config.pmg_h))
+        check("show() reports such a knob as set", bool(line) and "[set," in line[0],
+              "(%s)" % (line[0].strip()[:80] if line else "no line"))
+    finally:
+        del cfg.PROFILES["_test2"]
+        if kept is None:
+            os.environ.pop("HIPPYMFEM_PMG_H", None)
+        else:
+            os.environ["HIPPYMFEM_PMG_H"] = kept
+        cfg.EXPLICIT.clear()
+        cfg.EXPLICIT.update(kept_explicit)
+        cfg.PROFILE_SET.clear()
+        cfg.PROFILE_SET.update(kept_set)
+        cfg._ACTIVE_PROFILE[:] = kept_active
+
+    readings = [cfg.parse_flag(v, d) for v, d in (("", True), ("", False), (" Off ", True),
+                                                   ("YES", False), (0, True), (True, False))]
+    refused = []
+    for parse in (lambda: cfg.parse_flag("bogus", True, "HIPPYMFEM_X"),
+                  lambda: cfg.parse_tristate("sometimes", "HIPPYMFEM_Y")):
+        try:
+            parse()
+            refused.append(False)
+        except ValueError as e:
+            refused.append("HIPPYMFEM_" in str(e))
+    tri = [cfg.parse_tristate(v) for v in ("", "AUTO", "on", "no")]
+    check("one reading of on/off: empty is the default, any spelling, unknown refused",
+          readings == [True, False, False, True, False, True] and all(refused)
+          and tri == ["auto", "auto", "1", "0"], "(%r %r %r)" % (readings, refused, tri))
+
+    ok, detail = True, ""
+    if RANK == 0:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("OMPI_", "PMIX_", "PMI_", "MPI_", "MV2_", "SLURM_", "PALS_"))}
+        env.update(HIPPYMFEM_SINGLE_ROW_SUMS="", HIPPYMFEM_FOLD_ELIMINATION="Off",
+                   HIPPYMFEM_DEVICE_VECTORS="no", HIPPYMFEM_DEVICE="cpu", JAX_PLATFORMS="cpu")
+        env.pop("HIPPYMFEM_HYPRE_DEVICE", None)
+        code = ("import hippymfem as hm\nc = hm.config\n"
+                "print(c.single_row_sums, c.fold_elimination, c.device_vectors)")
+        try:
+            r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                               text=True, timeout=900)
+            last = (r.stdout.strip().splitlines() or [""])[-1]
+            ok = r.returncode == 0 and last == "True False 0"
+            detail = "(%r)" % (last if ok else (last or r.stderr[-300:]))
+        except Exception as e:                                       # noqa: BLE001
+            ok, detail = False, "(%s)" % e
+    check("the same spellings at import", bool(COMM.bcast(ok, root=0)), COMM.bcast(detail, root=0))
+
+
 def test_config_knobs():
     """Every knob of ``hm.config`` reads, and a written value arrives as the type it names.
 
@@ -706,6 +785,7 @@ if __name__ == "__main__":
     test_host_build_warns_for_device_hypre()
     test_config_knobs()
     test_config_profiles()
+    test_config_explicit_and_spellings()
     test_abort_hook()
     test_device_auto_without_gpu()
     test_comgr_cache_of_the_node()

@@ -46,6 +46,7 @@ double-precision rate, which varies a hundredfold between cards:
 """
 
 import os
+from .config import env_flag
 import stat
 import sys
 import tempfile
@@ -385,8 +386,9 @@ def hypre_on_device():
     ``HIPPYMFEM_HYPRE_DEVICE=1`` before importing hippymfem to run the solves on the
     card too (see :func:`~hippymfem.common.mfemconfig.configure_device`).
     """
-    return os.environ.get("HIPPYMFEM_HYPRE_DEVICE", "").lower() not in (
-        "", "0", "no", "false", "off")
+    from .config import env_flag
+
+    return env_flag("HIPPYMFEM_HYPRE_DEVICE", False)
 
 
 def _mem_fraction():
@@ -417,9 +419,9 @@ if _want_gpu():
     # The memory fraction first, while the whole device list is still visible: it
     # divides by how many ranks share a card.
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(_mem_fraction()))
-    if os.environ.get("HIPPYMFEM_PIN_GPU", "1").lower() not in ("0", "no", "false", "off"):
+    if env_flag("HIPPYMFEM_PIN_GPU", True):
         PINNED_DEVICE = _pin_visible_device()
-elif (os.environ.get("HIPPYMFEM_PIN_GPU", "1").lower() not in ("0", "no", "false", "off")
+elif (env_flag("HIPPYMFEM_PIN_GPU", True)
       and not any(v in os.environ for v in _VISIBLE_VARS) and not hypre_on_device()
       and not any(m in sys.modules for m in ("mpi4py.MPI", "mfem._par.mfem", "mfem.par"))):
     # A run that asked for no device holds none: the platform list keeps JAX off the

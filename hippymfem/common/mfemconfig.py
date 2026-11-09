@@ -12,6 +12,7 @@ directly and without side effects.
 
 import math
 import os
+from ..config import env_flag
 import re
 import time
 import warnings
@@ -1138,7 +1139,7 @@ def auto_configure_device():
     configured.
     """
 
-    if os.environ.get("HIPPYMFEM_AUTO_DEVICE", "1").lower() in ("0", "no", "false", "off"):
+    if not env_flag("HIPPYMFEM_AUTO_DEVICE", True):
         return None
 
     if not hypre_on_device() or _DEVICE:
