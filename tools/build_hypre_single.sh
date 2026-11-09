@@ -101,6 +101,16 @@ cat >> "$INIT" <<EOT
 set(HYPRE_ENABLE_SINGLE "ON" CACHE STRING "" FORCE)
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,-Bsymbolic" CACHE STRING "" FORCE)
 EOT
+# hypre's own CUDA architecture: HYPRE_CUDA_SM if it is given, else the
+# CMAKE_CUDA_ARCHITECTURES of the old build (what PyMFEM asked for).  Not the old
+# HYPRE_CUDA_SM: hypre's default of 70, where the build did not pass it (patch 5 of
+# tools/build_pymfem_cuda.sh), which gave libraries of sm_70 code and PTX only.
+SM=${HYPRE_CUDA_SM:-$(awk -F= '/^CMAKE_CUDA_ARCHITECTURES:/ {print $2}' "$OLD/CMakeCache.txt" | grep -E '^[0-9]+$')}
+if [ -n "$SM" ] && grep -q '^HYPRE_CUDA_SM:' "$OLD/CMakeCache.txt"; then
+  printf 'set(HYPRE_CUDA_SM "%s" CACHE STRING "" FORCE)\nset(CMAKE_CUDA_ARCHITECTURES "%s" CACHE STRING "" FORCE)\n' \
+      "$SM" "$SM" >> "$INIT"
+  echo "hypre's CUDA architecture: sm_$SM"
+fi
 cmake -C "$INIT" -S "$SRC" -B "$NEW/build" > "$NEW/configure.log" 2>&1 || { tail -20 "$NEW/configure.log"; exit 1; }
 grep -q "define HYPRE_SINGLE 1" "$NEW/build/HYPRE_config.h" || { echo "HYPRE_SINGLE did not reach HYPRE_config.h"; exit 1; }
 cmake --build "$NEW/build" -j "${JOBS:-12}" > "$NEW/build.log" 2>&1 || { tail -30 "$NEW/build.log"; exit 1; }

@@ -104,6 +104,16 @@ while IFS= read -r line; do
   printf 'set(%s "%s" CACHE STRING "" FORCE)\n' "$name" "$value" >> "$INIT"
 done < <(grep -E '^(CMAKE_BUILD_TYPE|CMAKE_C_COMPILER|CMAKE_CXX_COMPILER|CMAKE_CUDA_COMPILER|CMAKE_CUDA_ARCHITECTURES|CMAKE_CUDA_FLAGS|CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CUDA_TOOLKIT_ROOT_DIR|HYPRE_ENABLE_[A-Z_]+|HYPRE_WITH_[A-Z_]+|HYPRE_CUDA_SM):' "$OLD/CMakeCache.txt" \
            | grep -vE '^(HYPRE_WITH_GPU_AWARE_MPI|HYPRE_WITH_MPI):')
+# hypre's own CUDA architecture: HYPRE_CUDA_SM if it is given, else the
+# CMAKE_CUDA_ARCHITECTURES of the old build (what PyMFEM asked for), not the old
+# HYPRE_CUDA_SM, hypre's default of 70 where the build did not pass it
+# (tools/build_pymfem_cuda.sh, patch 5)
+SM=${HYPRE_CUDA_SM:-$(awk -F= '/^CMAKE_CUDA_ARCHITECTURES:/ {print $2}' "$OLD/CMakeCache.txt" | grep -E '^[0-9]+$')}
+if [ -n "$SM" ] && grep -q '^HYPRE_CUDA_SM:' "$OLD/CMakeCache.txt"; then
+  printf 'set(HYPRE_CUDA_SM "%s" CACHE STRING "" FORCE)\nset(CMAKE_CUDA_ARCHITECTURES "%s" CACHE STRING "" FORCE)\n' \
+      "$SM" "$SM" >> "$INIT"
+  echo "hypre's CUDA architecture: sm_$SM"
+fi
 cat >> "$INIT" <<EOF
 set(HYPRE_WITH_MPI "ON" CACHE STRING "" FORCE)
 set(HYPRE_WITH_GPU_AWARE_MPI "$([ $AWARE = 1 ] && echo ON || echo OFF)" CACHE STRING "" FORCE)

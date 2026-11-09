@@ -173,6 +173,28 @@ print("  patched", p)
 EOF
 done
 
+echo "=== patch 5: hypre's own CUDA architecture (HYPRE_CUDA_SM) ==="
+# hypre 2.32 sets CMAKE_CUDA_ARCHITECTURES from HYPRE_CUDA_SM, 70 unless it is given, so
+# the architecture that PyMFEM passes reached MFEM only: every hypre built by this script
+# held sm_70 code and PTX, compiled for the card by the driver at each start.
+$PY - "$SRC" <<'EOF'
+import sys, os
+p = os.path.join(sys.argv[1], "_build_system", "build_hypre.py")
+s = open(p).read()
+old = "            cmake_opts['DCMAKE_CUDA_ARCHITECTURES'] = bglb.cuda_arch\n"
+new = old + "            cmake_opts['DHYPRE_CUDA_SM'] = bglb.cuda_arch\n"
+if "DHYPRE_CUDA_SM" in s:
+    print("  already fine")
+elif old in s:
+    open(p, "w").write(s.replace(old, new, 1))
+    print("  patched", p)
+else:
+    sys.exit("  build_hypre.py does not set CMAKE_CUDA_ARCHITECTURES as expected: pass "
+             "HYPRE_CUDA_SM to hypre's cmake by hand")
+EOF
+# a stale hypre cache keeps HYPRE_CUDA_SM=70
+rm -rf "$SRC/external/hypre/src/cmbuild"
+
 echo "=== configure and build ==="
 MPI_INC=$("$MPICXX_BIN" -showme:incdirs 2>/dev/null | tr ' ' '\n' | sed 's#^#-I#' | tr '\n' ' ')
 export MPICXX="$MPICXX_BIN"

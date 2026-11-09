@@ -1335,6 +1335,18 @@
   (`HIPPYMFEM_FOLD_ELIMINATION=0`, or a diagonal policy of `"keep"`) took the symmetric
   branch, which eliminates by `test_ess`, and returned the matrix untouched
   (`elimination._eliminate`; `test_assembly.test_trial_ess_only_both_routes`).
+- **Every CUDA hypre held sm_70 code.** hypre 2.32 sets `CMAKE_CUDA_ARCHITECTURES` from its
+  own `HYPRE_CUDA_SM`, 70 unless it is given, so the architecture that
+  `tools/build_pymfem_cuda.sh` passes reached MFEM only. The library held sm_70 code and
+  PTX, which the driver compiles for the card at each start: every NVIDIA run so far ran
+  hypre that way. `build_hypre_single.sh` and `rebuild_hypre.sh` copied `HYPRE_CUDA_SM`
+  from that build and inherited the 70.
+  - `build_pymfem_cuda.sh` now passes `HYPRE_CUDA_SM` as well (patch 5 of PyMFEM's
+    `build_hypre.py`), and removes a stale hypre build first.
+  - The other two take `HYPRE_CUDA_SM` from the environment, or else the
+    `CMAKE_CUDA_ARCHITECTURES` of the build they copy.
+
+  Rebuilt this way, both libraries of an L40S stack hold sm_89 code (`cuobjdump`).
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
