@@ -49,8 +49,9 @@ def box_mesh(n, comm, coarse=None, levels=0):
 
     Every rank builds and partitions a mesh of ``coarse^3`` elements and cuts the elements
     of its part into ``(n / coarse)^3``.  The vertices are the lattice of
-    ``Mesh.MakeCartesian3D(n, n, n)`` to the last bit and the boundary attributes the same
-    faces (1 the bottom, 6 the top).  The parts are unions of coarse elements; METIS leaves
+    ``Mesh.MakeCartesian3D(n, n, n)``, to the last bit where every cut is a power of two
+    and within a few units in the last place where one is not (3e-16 with a cut in three
+    or five), and the boundary attributes the same faces (1 the bottom, 6 the top).  The parts are unions of coarse elements; METIS leaves
     the largest of them 3 % above the mean, and the slowest card sets the pace, so the
     coarse mesh is cut into equal boxes where the ranks make a grid (:func:`rank_grid`:
     4 x 8 x 8 on 256 ranks) and by METIS where they do not.
@@ -74,16 +75,23 @@ def box_mesh(n, comm, coarse=None, levels=0):
         if any(f < 2 or f > MAX_FACTOR for f in cuts):
             raise ValueError("the cuts of a mesh are 2 to %d a side each: not %s" % (MAX_FACTOR, cuts))
         levels = len(cuts)
-    product = int(np.prod(cuts)) if cuts else 1
+    product = int(np.prod(cuts)) if cuts else 2 ** max(int(levels or 0), 0)
     if cuts and coarse is None:
         if n % product:
             raise ValueError("the cuts %s make %d of a coarse element's side: not a divisor of %d"
                              % (cuts, product, n))
         coarse = n // product
-    n0 = coarse_size(n, comm.size) if coarse is None else int(coarse)
-    if n0 < 1 or n % n0 or (n // n0 > MAX_FACTOR and not cuts):
-        raise ValueError("the coarse mesh of a %d^3 mesh has n / f elements a side, f a divisor "
-                         "of n up to %d: not %d" % (n, MAX_FACTOR, n0))
+    if coarse is None:
+        n0 = coarse_size(n, comm.size)
+        # with levels, a default whose side the halvings do not divide (or leave more than
+        # MAX_FACTOR of) gives way to the coarse mesh of the mesh before them
+        if ((n // n0) % product or (n // n0) // product > MAX_FACTOR) and n % product == 0:
+            n0 = coarse_size(n // product, comm.size)
+    else:
+        n0 = int(coarse)
+    if n0 < 1 or n % n0:
+        raise ValueError("the coarse mesh of a %d^3 mesh has a divisor of n elements a side: "
+                         "not %d" % (n, n0))
     serial = mfem.Mesh.MakeCartesian3D(n0, n0, n0, mfem.Element.HEXAHEDRON)
     grid = rank_grid(comm.size, n0) if n0 < n else None
     if grid is None:
@@ -96,8 +104,8 @@ def box_mesh(n, comm, coarse=None, levels=0):
         cuts = [2] * max(levels, 0)
         product = 2 ** max(levels, 0)
     if (n // n0) % product or (n // n0) // product > MAX_FACTOR:
-        raise ValueError("the cuts %s make %d of a coarse element's side, and the %d^3 mesh has "
-                         "%d: not a multiple of it by 1 to %d" % (cuts, product, n, n // n0, MAX_FACTOR))
+        raise ValueError("a %d^3 mesh is %d times its %d^3 coarse mesh a side, which must be %d "
+                         "(the cuts %s) times 1 to %d" % (n, n // n0, n0, product, cuts, MAX_FACTOR))
     first = (n // n0) // product
     if first > 1:
         pmesh = mfem.ParMesh.MakeRefined(pmesh, first, mfem.BasisType.ClosedUniform)

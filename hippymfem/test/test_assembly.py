@@ -1957,6 +1957,21 @@ def test_box_mesh():
     except ValueError:
         refused = True
     check("box_mesh refuses a coarse mesh that does not divide n", refused)
+    # combinations it refused: 24 = 2 x 2^2 x 3, more than MAX_FACTOR times the coarse mesh
+    # before the halvings; and 16 with three halvings, where the default coarse mesh (8 a
+    # side on one rank, 16 on two) leaves too few of them
+    got = []
+    for n_, coarse_, levels_ in ((24, 2, 2), (16, None, 3)):
+        try:
+            pm_, n0_, _ = hp.box_mesh(n_, COMM, coarse=coarse_, levels=levels_)
+            kept_ = ptransfer.coarser_meshes(pm_)
+            got.append(pm_.GetGlobalNE() == n_ ** 3 and kept_ is not None
+                       and len(kept_) == levels_ and (n_ // n0_) % 2 ** levels_ == 0)
+            del pm_, kept_
+        except ValueError as e:
+            got.append(str(e)[:60])
+    check("box_mesh takes a coarse mesh more than eight times smaller than the levels allow, "
+          "and finds one for levels by default", got == [True, True], "(%r)" % (got,))
 
 
 def main():

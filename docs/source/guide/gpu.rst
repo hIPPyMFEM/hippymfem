@@ -1585,8 +1585,9 @@ What does grow with the ranks in the code's own hands is BoomerAMG's hierarchy o
 linear elements: 0.28 s a set-up on one node and 0.35 to 0.45 s on 512 to 4096 GPUs, an
 iteration of the Jacobian's solves from 30.5 ms on one node to 35.1 ms on 4096, and one
 level more for every eight times the ranks, the newest of a few rows a rank and with
-its exchanges all the same.  With the geometric levels in its place (:ref:`gpu-pmg-h`; the
-mesh from one element a rank by cuts in 5, 3, 2, 2, 2 a side, ``HIPPYMFEM_PMG_H=7``) a
+its exchanges all the same.  With the geometric levels in its place (:ref:`described above
+<gpu-pmg-h>`; the mesh from one element a rank by cuts in 5, 3, 2, 2, 2 a side,
+``HIPPYMFEM_PMG_H=7``) a
 set-up is 0.07 s on one GPU, 0.12 to 0.13 s on 8 to 512 and 0.16 s on 4096 (0.38 s
 there), a forward linearized solve takes 4.1 iterations on 4096 GPUs where it took 7.0
 and the same 0.17 s from one node on, and the operations of two Newton-CG steps take
@@ -1604,7 +1605,7 @@ card, and the prior's preconditioner (0.05 s a CG iteration on one node, 0.09 s 
 whose cycles are BoomerAMG's.
 
 With the small levels in host memory and the prior's cycles over the meshes
-(``HIPPYMFEM_PMG_H_HOST=5000``, ``HIPPYMFEM_PRIOR_H=7``; :ref:`gpu-pmg-h`; the eighth
+(``HIPPYMFEM_PMG_H_HOST=5000``, ``HIPPYMFEM_PRIOR_H=7``; :ref:`described above <gpu-pmg-h>`; the eighth
 series, one job on 512 nodes that afternoon) the operations take 17.0, 17.7, 17.7 and
 19.0 s on 8, 64, 512 and 4096 GPUs: 3.0 % less on 512 and 1.9 % less on 4096, where two
 steps at 1920\ :sup:`3` take 15.1 s and keep 89 % of one node (88 % above).  An

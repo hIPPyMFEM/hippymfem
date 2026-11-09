@@ -166,17 +166,17 @@ for completeness:
                                             new solvers, for spaces of order two or more
 ``pmg_h``                   0               under the linear elements of a p-multigrid, a
                                             V-cycle over up to this many of the meshes that
-                                            the mesh was refined from (:ref:`gpu-pmg-h`)
+                                            the mesh was refined from (:ref:`geometric levels <gpu-pmg-h>`)
 ``pmg_h_host``              0               with hypre on a device, the levels of those meshes
                                             of at most this many rows a rank live in host
                                             memory, with everything under them, where the
                                             gathered last matrix has no more rows than that
-                                            in all (:ref:`gpu-pmg-h`)
+                                            in all (:ref:`geometric levels <gpu-pmg-h>`)
 ``prior_h``                 0               the multigrid cycles of a prior's Hessian
                                             preconditioner go over up to this many of the
                                             meshes that its mesh was refined from, in the
                                             single-precision hypre, where the mesh was last
-                                            cut in two (:ref:`gpu-pmg-h`)
+                                            cut in two (:ref:`geometric levels <gpu-pmg-h>`)
 ``single_blocks``           off             the blocks of a linearization point are matrices
                                             of the single-precision hypre where it is loaded:
                                             two thirds of their memory, products to single
