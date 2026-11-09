@@ -472,17 +472,18 @@ class KrylovSolver(_SolverBase):
         return 0.0
 
     def can_solve_single(self):
-        """Whether this solver could run in the single-precision hypre: CG with a plain
-        BoomerAMG, the only combination set up there."""
-        return bool(self.method == "cg" and self.precond_type == "amg"
+        """Whether this solver could run in the single-precision hypre: CG or GMRES with a
+        plain BoomerAMG, the combinations set up there (GMRES for a Jacobian that is not
+        symmetric, and for its transpose)."""
+        return bool(self.method in ("cg", "gmres") and self.precond_type == "amg"
                     and not self.systems_dim and int(self.parameters["pc_reuse"]) == 0)
 
     def _set_single(self, S, engine=None):
-        from .singlesolve import PMGEngine, SingleEngine
+        from .singlesolve import PMGEngine, SingleEngine, SingleGMRESEngine
 
         if not self.can_solve_single():
-            raise ValueError("a single-precision matrix is solved by cg with a plain amg "
-                             "preconditioner, not by %s with %s" % (self.method, self.precond_type))
+            raise ValueError("a single-precision matrix is solved by cg or gmres with a plain "
+                             "amg preconditioner, not by %s with %s" % (self.method, self.precond_type))
         self._solver = None
         self._pc = None
         self._held = None
@@ -493,8 +494,12 @@ class KrylovSolver(_SolverBase):
         # vector made from a local size gathers every rank's at each new operator)
         self._template = ParVector(self.comm, S.Height(), layout=Layout.of_range(
             self.comm, int(S.row_starts[0]), int(S.row_starts[1]), int(S.global_rows)))
-        if isinstance(engine, SingleEngine) and engine.matrix is S:
+        gmres = self.method == "gmres"
+        if (isinstance(engine, SingleEngine) and engine.matrix is S
+                and isinstance(engine, SingleGMRESEngine) == gmres):
             self._pc = engine
+        elif gmres:
+            self._pc = SingleGMRESEngine(S, self.parameters)
         else:
             # a p-multigrid where the solver asks for one and the matrix came with the
             # interpolation for it (PDEVariationalProblem._p_transfer)

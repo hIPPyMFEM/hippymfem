@@ -105,8 +105,9 @@ and the blocks of a linearization point in single precision, are on without a pr
   solve was 1.29 times faster on an H100, 1.51 times on an L40S and 1.81 times on a
   Blackwell instance, and at 128\ :sup:`3` on four L40S 1.57 times, with 11 % less memory
   on the busiest card (:ref:`single-precision`).  The single-precision solves need a
-  Jacobian that is symmetric and solved by CG with BoomerAMG; other problems keep their
-  double-precision solves.
+  Jacobian solved by CG with BoomerAMG where it is symmetric, or by GMRES with BoomerAMG
+  where it is not (its transpose is then assembled in single precision too, for the
+  adjoint); other solvers keep their double-precision solves.
 * On a GPU, ``HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`` (Jacobi relaxation and six
   interpolation entries a row in the BoomerAMG of the single-precision solves) took the
   Newton-CG solve at 64\ :sup:`3` from 38.5 to 29.0 s on a Blackwell instance and from

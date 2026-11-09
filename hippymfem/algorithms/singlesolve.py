@@ -35,8 +35,9 @@ offsets that ``tools/hypre_offsets.c``, compiled against the headers of that ver
 wrote next to the library.
 
 ``HIPPYMFEM_HYPRE_SINGLE`` names the library and turns the mode on
-(``hm.config.hypre_single``).  CG with BoomerAMG on a symmetric Jacobian only; anything
-else keeps the double-precision solve.  On a GPU it runs with CUDA and with HIP builds
+(``hm.config.hypre_single``).  CG with BoomerAMG on a symmetric Jacobian, and GMRES with
+BoomerAMG on one that is not symmetric (its transpose, for the adjoint, assembled into the
+library as well); anything else keeps the double-precision solve.  On a GPU it runs with CUDA and with HIP builds
 (NVIDIA and AMD cards); on any other device the library is refused before it is loaded
 (:func:`unsupported`), with a warning, and the solves stay in double precision.  The
 library has four-byte values and four-byte indices within a rank, and global indices
@@ -233,6 +234,18 @@ class _Library:
             "HYPRE_PCGGetFinalRelativeResidualNorm": ([p, P(r)], i),
             "hypre_Free": ([p, i], None),
         }
+        # hypre's GMRES, for a Jacobian that is not symmetric (SingleGMRESEngine)
+        sig.update({
+            "HYPRE_ParCSRGMRESCreate": ([C, P(p)], i), "HYPRE_ParCSRGMRESDestroy": ([p], i),
+            "HYPRE_GMRESSetKDim": ([p, i], i), "HYPRE_GMRESSetMaxIter": ([p, i], i),
+            "HYPRE_GMRESSetTol": ([p, r], i), "HYPRE_GMRESSetAbsoluteTol": ([p, r], i),
+            "HYPRE_GMRESSetPrintLevel": ([p, i], i), "HYPRE_GMRESSetLogging": ([p, i], i),
+            "HYPRE_GMRESSetPrecond": ([p, p, p, p], i),
+            "HYPRE_ParCSRGMRESSetup": ([p, p, p, p], i), "HYPRE_ParCSRGMRESSolve": ([p, p, p, p], i),
+            "HYPRE_GMRESGetNumIterations": ([p, P(i)], i),
+            "HYPRE_GMRESGetConverged": ([p, P(i)], i),
+            "HYPRE_GMRESGetFinalRelativeResidualNorm": ([p, P(r)], i),
+        })
         for name, (args, res) in sig.items():
             fn = getattr(H, name)
             fn.argtypes, fn.restype = args, res
@@ -1412,6 +1425,74 @@ _PRECOND = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctyp
 #: a product as hypre's Krylov solvers call it: (its data, alpha, the matrix, x, beta, y)
 _MATVEC = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_float, ctypes.c_void_p,
                            ctypes.c_void_p, ctypes.c_float, ctypes.c_void_p)
+
+
+class SingleGMRESEngine(SingleEngine):
+    """hypre's GMRES with BoomerAMG on a :class:`SingleParMatrix` that need not be
+    symmetric: the forward Jacobian of a problem whose solvers are GMRES, or its transpose
+    for the adjoint solves (``PDEVariationalProblem._jacobian`` assembles both into the
+    single-precision hypre).  Set up once and shared by the solvers of that matrix.  The
+    product is hypre's own: the defect of the row sums that the PCG adds
+    (:class:`RowDefect`) is left to the refinement against double-precision residuals."""
+
+    def __init__(self, S, parameters):
+        self.matrix, self.lib = S, S.lib
+        H, lib = S.lib.H, S.lib
+        self.amg = self.pcg = self.gmres = self._product = None
+        self.converged, self.refused, self.error = False, False, 0
+        self.b, self.x = S.vector(), S.vector(columns=True)
+        self.amg = amg = _boomeramg(lib, parameters)
+        gmres = ctypes.c_void_p()
+        lib.check(H.HYPRE_ParCSRGMRESCreate(lib.comm(S.comm), ctypes.byref(gmres)),
+                  "ParCSRGMRESCreate", S.comm)
+        self.gmres = gmres
+        kdim = int(parameters["kdim"]) if "kdim" in parameters else 50
+        H.HYPRE_GMRESSetKDim(gmres, max(kdim, 1))
+        H.HYPRE_GMRESSetPrintLevel(gmres, 0)
+        H.HYPRE_GMRESSetLogging(gmres, 0)
+        H.HYPRE_GMRESSetPrecond(gmres, ctypes.cast(H.HYPRE_BoomerAMGSolve, ctypes.c_void_p),
+                                ctypes.cast(H.HYPRE_BoomerAMGSetup, ctypes.c_void_p), amg)
+        mfemconfig.hypre_pool_open()
+        try:
+            lib.check(H.HYPRE_ParCSRGMRESSetup(gmres, S.par, self.b.par, self.x.par), "GMRESSetup",
+                      S.comm)
+            if lib.device:
+                bridge.synchronize()
+        finally:
+            mfemconfig.hypre_pool_close()
+
+    def solve(self, x, b, rel_tol, abs_tol, max_iter):
+        """``x = A^{-1} b`` for two of MFEM's vectors, from a zero guess; returns the
+        iterations and the final relative residual.  :attr:`converged`, :attr:`error` and
+        :attr:`refused` as for :meth:`SingleEngine.solve`."""
+        H = self.lib.H
+        H.HYPRE_GMRESSetTol(self.gmres, max(float(rel_tol), SINGLE_TOL_FLOOR))
+        H.HYPRE_GMRESSetAbsoluteTol(self.gmres, float(abs_tol))
+        H.HYPRE_GMRESSetMaxIter(self.gmres, int(max_iter))
+        self.b.set(b)
+        self.x.zero()
+        rc = H.HYPRE_ParCSRGMRESSolve(self.gmres, self.matrix.par, self.b.par, self.x.par)
+        if rc:
+            H.HYPRE_ClearAllErrors()
+        self.x.get(x)
+        its, norm, conv = ctypes.c_int(), ctypes.c_float(), ctypes.c_int()
+        H.HYPRE_GMRESGetNumIterations(self.gmres, ctypes.byref(its))
+        H.HYPRE_GMRESGetFinalRelativeResidualNorm(self.gmres, ctypes.byref(norm))
+        H.HYPRE_GMRESGetConverged(self.gmres, ctypes.byref(conv))
+        self.converged, self.error, self.refused = bool(conv.value), int(rc), False
+        if not conv.value:
+            failed = _allreduce(self.matrix.comm, 1 if rc & HYPRE_ERROR_CONV else 0, MPI.MAX)
+            self.refused = not failed
+        if self.refused:
+            return 0, float("nan")
+        return int(its.value), float(norm.value)
+
+    def destroy(self):
+        H = self.lib.H
+        if getattr(self, "gmres", None) is not None:
+            H.HYPRE_ParCSRGMRESDestroy(self.gmres)
+            self.gmres = None
+        SingleEngine.destroy(self)
 
 
 class PTransfer:

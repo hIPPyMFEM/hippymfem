@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Single-precision solves for Jacobians that are not symmetric.**  Where the solvers of a
+  problem are GMRES with BoomerAMG, a Jacobian that the symmetry probe (or
+  `symmetric_jacobian=False`) finds not symmetric is assembled into the single-precision
+  hypre as well, and so is its transpose, from the (state, adjoint) block of the same
+  residual; each is solved by hypre's GMRES with a BoomerAMG of its own there
+  (`singlesolve.SingleGMRESEngine`), the adjoint by a solver of its own (`solver_adj`,
+  cloned from the forward solver where it is not set).  The forward and the adjoint solve
+  are refined against double-precision residuals as in the symmetric case.  Before, such a
+  Jacobian went back to double precision.  The defect of the row sums that the
+  single-precision PCG adds is left to the refinement.
 - **The transposed blocks of a linearization point as matrices of their own.**  With hypre on
   a device, `C^T` and `W_um^T`, which every CG iteration applies, are assembled from the
   transposed element matrices of the same differentiation pass into a pattern of their own,

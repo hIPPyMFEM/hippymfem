@@ -422,6 +422,72 @@ def run(check, COMM=MPI.COMM_WORLD):
     _prior_cycle(check, COMM)
     _rank_without_coarse_rows(check, COMM)
     _single_blocks(check, COMM)
+    _nonsymmetric(check, COMM)
+
+
+def _nonsymmetric(check, COMM):
+    """A Jacobian that is not symmetric (advection and diffusion) whose solvers are GMRES with
+    BoomerAMG: it is assembled into the single-precision hypre together with its transpose,
+    each with a GMRES of its own there, and the forward and the adjoint solve, refined
+    against double-precision residuals, agree with the solves in double precision."""
+    import importlib
+
+    import jax.numpy as jnp
+
+    pvp = importlib.import_module("hippymfem.modeling.PDEVariationalProblem")
+    n = 8
+    pmesh = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(n, n, n, mfem.Element.HEXAHEDRON))
+    Vu, Vm = hp.FunctionSpace.H1(pmesh, 2), hp.FunctionSpace.H1(pmesh, 1)
+    bc = hp.DirichletBC(Vu, lambda x: x[2], bdr_attributes=[1, 6])
+    wind = jnp.array([3.0, 1.0, 0.0])
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * hp.inner(u.grad, p.grad) + jnp.dot(wind, u.grad) * p.val
+
+    out = {}
+    for single in (False, True):
+        pde = hp.PDEVariationalProblem([Vu, Vm, Vu], varf, bc, bc.homogeneous(), is_fwd_linear=True)
+        for attr in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            sol = hp.KrylovSolver(COMM, "gmres", "amg")
+            sol.parameters["rel_tolerance"] = 1e-12
+            sol.parameters["max_iter"] = 500
+            setattr(pde, attr, sol)
+        pde.single_solves = single
+        m = Vm.vector()
+        hp.parRandom.set_seed(3)
+        hp.parRandom.normal(0.3, m)
+        u = pde.generate_state()
+        pde.solveFwd(u, [u, m, None])
+        A, At = pde._jacobian([u, m, None])
+        rhs = Vu.vector()
+        hp.parRandom.normal(1.0, rhs)
+        p = pde.generate_state()
+        pde.solveAdj(p, [u, m, None], rhs)
+        engine = (type(pde.solver_adj._pc).__name__ if pde.solver_adj is not None
+                  and getattr(pde.solver_adj, "_pc", None) is not None else "-")
+        single_A, single_At = pvp._is_single(A), pvp._is_single(At) and At is not A
+        del A, At
+        # the incremental solves of a linearization point, with A and its transpose there
+        pde.setLinearizationPoint([u, m, p])
+        df, da = pde.generate_state(), pde.generate_state()
+        pde.solveIncremental(df, rhs, False)
+        pde.solveIncremental(da, rhs, True)
+        out[single] = (u, p, single_A, single_At, engine, df, da)
+        pde.release_linearization_point()
+
+    def rel(a, b):
+        return a.copy().axpy(-1.0, b).norm("l2") / max(b.norm("l2"), 1e-300)
+
+    eu, ep = rel(out[True][0], out[False][0]), rel(out[True][1], out[False][1])
+    check("a Jacobian that is not symmetric, solved by GMRES, is assembled into the "
+          "single-precision hypre with its transpose, each with a GMRES there",
+          out[True][2] and out[True][3] and not out[False][2] and out[True][4] == "SingleGMRESEngine",
+          "(A %s, its transpose %s, the adjoint's engine %s)" % out[True][2:5])
+    check("its forward and adjoint solves, refined against double-precision residuals, agree "
+          "with double precision", eu < 1e-8 and ep < 1e-8, "(%.1e, %.1e)" % (eu, ep))
+    ef, ea = rel(out[True][5], out[False][5]), rel(out[True][6], out[False][6])
+    check("its incremental forward and adjoint solves agree to the accuracy of single precision",
+          ef < 1e-4 and ea < 1e-4, "(%.1e, %.1e)" % (ef, ea))
 
 
 def _row_sums(check, COMM, pde, Vu, m, rhs, got):
