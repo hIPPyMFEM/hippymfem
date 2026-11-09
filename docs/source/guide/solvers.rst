@@ -46,7 +46,9 @@ indefinite Jacobian fails where GMRES converges.
 :class:`~hippymfem.algorithms.linSolvers.KrylovSolver` wraps MFEM's CG, GMRES,
 FGMRES, BiCGSTAB and MINRES with BoomerAMG, ILU, Jacobi, Gauss-Seidel, ParaSails or
 Euclid.  For vector-valued problems pass ``systems_dim`` (and ``elasticity=True``
-with the space) so BoomerAMG uses its systems-of-PDEs mode.  BoomerAMG also has to know
+with the space) so BoomerAMG uses its systems-of-PDEs mode.  The elasticity options exist
+with hypre on the host only: on a GPU MFEM has none, and the solver keeps the systems
+options with a warning.  BoomerAMG also has to know
 which row belongs to which component, and it is told: component after component
 (``systems_bynodes``, the default, which is the ordering of this library's spaces unless
 another is asked for; read from the space where one is given) or interleaved

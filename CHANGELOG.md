@@ -1242,6 +1242,14 @@
 
 ### Fixed
 
+- **`KrylovSolver(elasticity=True)` with hypre on a GPU stopped the process.** MFEM has no
+  elasticity options for a hypre built with GPU support:
+  `HypreBoomerAMG::SetElasticityOptions` aborts when hypre runs on the device. The solver
+  now keeps the systems options there (`systems_dim`, the ordering of the space) and says
+  so once with a `RuntimeWarning`; on the host nothing changes. Nothing in the tests or
+  the applications passed `elasticity=True` before; `test_solvers`
+  (`test_elasticity_options`) now solves with it on the host and, in the device pass,
+  with the warning.
 - **A chunked assembly of a space with a dof transformation failed.**  Second-order Nedelec
   elements on tetrahedra carry MFEM's `DofTransformation`, one matrix per element; an
   assembly split into chunks applied the whole group's transformations to each chunk and

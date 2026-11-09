@@ -229,6 +229,16 @@ class _SolverBase(KeepAlive):
         return self
 
 
+def _hypre_on_gpu():
+    """Whether hypre runs on a GPU in this process: a PyMFEM built for CUDA or HIP whose
+    device is configured, MFEM's own condition (``HypreUsingGPU`` in a hypre built with
+    GPU support) for refusing BoomerAMG's elasticity options by stopping the process."""
+    from ..common.mfemconfig import mfem_gpu_backend
+    from ..common.parvector import device_active
+
+    return mfem_gpu_backend() is not None and device_active()
+
+
 class KrylovSolver(_SolverBase):
     """MFEM Krylov solver with a hypre preconditioner.
 
@@ -242,7 +252,8 @@ class KrylovSolver(_SolverBase):
         this for vector-valued (elasticity-like) operators, where scalar AMG
         converges poorly.
     elasticity : bool
-        Turn on BoomerAMG's elasticity interpolation (needs ``systems_dim``).
+        Turn on BoomerAMG's elasticity interpolation (needs ``systems_dim``).  With hypre
+        on a GPU, where MFEM has none, the systems options alone, with a warning.
     systems_bynodes : bool, optional
         How the unknowns of the components are ordered, which BoomerAMG has to be told
         to pair the rows of one component: component after component
@@ -258,6 +269,8 @@ class KrylovSolver(_SolverBase):
 
     #: whether the warning about an ordering left to the default has been given
     _warned_ordering = False
+    #: whether the warning about elasticity options with hypre on a GPU has been given
+    _warned_elasticity = False
 
     def __init__(self, comm, method="cg", precond="amg", systems_dim=None,
                  elasticity=False, fes=None, systems_bynodes=None):
@@ -355,7 +368,19 @@ class KrylovSolver(_SolverBase):
                                      "(systems_bynodes) needs the rows of every rank to be "
                                      "that many times its nodes" % dim)
                 pc.SetSystemsOptions(dim, bynodes)
-                if self.elasticity:
+                if self.elasticity and _hypre_on_gpu():
+                    # MFEM has no elasticity options with hypre on a GPU and stops the
+                    # process when asked for them ("not supported in hypre built with GPU
+                    # support"): the systems options alone, said once
+                    if not KrylovSolver._warned_elasticity:
+                        KrylovSolver._warned_elasticity = True
+                        import warnings
+
+                        warnings.warn(
+                            "KrylovSolver(elasticity=True): BoomerAMG has no elasticity "
+                            "options with hypre on a GPU (MFEM would stop the process); the "
+                            "systems options alone are used", RuntimeWarning, stacklevel=2)
+                elif self.elasticity:
                     pc.SetElasticityOptions(self._mfem_space())
                 # (Before the solver's own settings, which follow.  With the components MFEM
                 # writes settings of its own, no aggressive levels and a strength threshold

@@ -1256,6 +1256,47 @@ def test_systems_ordering():
           (not odd) or "systems_bynodes" in said, "(%s)" % (said[:70] if odd else "skipped: every rank's rows divide"))
 
 
+def test_elasticity_options():
+    """BoomerAMG's elasticity options (``KrylovSolver(elasticity=True)``: nodal coarsening
+    and the rigid-body modes of the space in the interpolation) where hypre runs on the
+    host.  With hypre on a GPU MFEM has none and stopped the process when asked for them;
+    the solver keeps the systems options there and says so once."""
+    if RANK == 0:
+        print("BoomerAMG's elasticity options, and the systems options alone with hypre on a GPU")
+    import warnings
+    from hippymfem.algorithms import linSolvers as ls
+
+    pm = mfem.ParMesh(COMM, mfem.Mesh.MakeCartesian3D(8, 8, 8, mfem.Element.HEXAHEDRON))
+    V = hp.FunctionSpace.H1(pm, 1, vdim=3)
+    lam, mu, small = (mfem.ConstantCoefficient(c) for c in (1.0, 1.0, 1e-2))
+    A = hp.assemble_native_matrix(V, [mfem.ElasticityIntegrator(lam, mu),
+                                      mfem.VectorMassIntegrator(small)])
+    b = V.vector()
+    hp.parRandom.set_seed(9)
+    hp.parRandom.normal(1.0, b)
+    gpu = ls._hypre_on_gpu()
+    took = []
+    hp.KrylovSolver._warned_elasticity = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for elastic in (False, True, True):
+            ks = hp.KrylovSolver(COMM, "cg", "amg", systems_dim=3, elasticity=elastic, fes=V)
+            ks.parameters["rel_tolerance"] = 1e-10
+            ks.parameters["max_iter"] = 500
+            ks.set_operator(A)
+            x = V.vector()
+            its = ks.solve(x, b)
+            took.append((its, residual(A, x, b)))
+    said = [str(w.message) for w in caught if "elasticity" in str(w.message)]
+    worst = float(np.max([r for _, r in took]))
+    check("elasticity=True solves with BoomerAMG's elasticity options on the host, and with the systems "
+          "options alone and one warning where hypre runs on a GPU",
+          worst < 1e-8 and len(said) == (1 if gpu else 0),
+          "(hypre on %s; %d, %d and %d iterations without and with them; worst residual %.1e; "
+          "%d warning(s))" % ("a GPU" if gpu else "the host", took[0][0], took[1][0], took[2][0],
+                              worst, len(said)))
+
+
 def test_chebyshev_solver():
     """A fixed polynomial of multigrid cycles in place of a Krylov solve
     (``ChebyshevSolver``): its error against the exact solve is within its bound, and it
@@ -1854,6 +1895,7 @@ def main():
     test_hypre_pcg_verdict()
     test_solve_mode_setups()
     test_systems_ordering()
+    test_elasticity_options()
     test_chebyshev_solver()
     test_index_widths()
     test_single_precision_solves()
