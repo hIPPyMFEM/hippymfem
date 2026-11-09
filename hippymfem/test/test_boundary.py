@@ -354,7 +354,10 @@ def test_blocks_with_boundary():
     H.mult(b, Hb)
     num = abs(b.inner(Ha) - a.inner(Hb))
     den = max(abs(b.inner(Ha)), 1e-300)
-    check("Hessian is symmetric with the boundary term", num / den < 1e-9,
+    # (with a single-precision hypre the Krylov solves stop near its floor)
+    from hippymfem.algorithms.singlesolve import action_tolerance
+
+    check("Hessian is symmetric with the boundary term", num / den < action_tolerance(1e-9),
           "(rel %.3e)" % (num / den))
 
 
@@ -425,6 +428,12 @@ def test_dirichlet_plus_robin():
     pde.solveFwd(u, [u, m, None])
     x = [u, m, pde.generate_adjoint()]
     A, _ = pde._jacobian(x)
+    from hippymfem.modeling.PDEVariationalProblem import _is_single
+
+    if _is_single(A):
+        # (a Jacobian of the single-precision hypre has no entries to read here: the same
+        # block in double precision, through the same elimination)
+        A = pde._block(ADJOINT, STATE, x, test_ess=pde.bc0.ess_tdof, diag_policy="one")
     ess = pde.bc0.ess
     D = to_dense(A, COMM)
     lo = Vu.vector().owner_range[0]

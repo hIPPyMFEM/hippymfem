@@ -27,7 +27,9 @@
   cloned from the forward solver where it is not set).  The forward and the adjoint solve
   are refined against double-precision residuals as in the symmetric case.  Before, such a
   Jacobian went back to double precision.  The defect of the row sums that the
-  single-precision PCG adds is left to the refinement.
+  single-precision PCG adds is left to the refinement.  A problem that asks for
+  `transpose_free_adjoint=True` keeps such a Jacobian in double precision: there is no
+  transpose wrapper of a matrix of the single-precision hypre.
 - **The transposed blocks of a linearization point as matrices of their own.**  With hypre on
   a device, `C^T` and `W_um^T`, which every CG iteration applies, are assembled from the
   transposed element matrices of the same differentiation pass into a pattern of their own,

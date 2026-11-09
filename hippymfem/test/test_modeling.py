@@ -676,7 +676,8 @@ def test_model_verify_nonlinear_inhomogeneous_bc():
     hm.parRandom.normal(1.0, yy)
     a, b = H.inner(yy, xx), H.inner(xx, yy)
     rel = 2 * abs(a - b) / abs(a + b) if (a + b) != 0.0 else abs(a - b)
-    check("reduced Hessian is symmetric", rel < 1e-10, "(%.2e)" % rel)
+    # (on two ranks the Krylov solves of a single-precision hypre stop near its floor)
+    check("reduced Hessian is symmetric", rel < action_tolerance(1e-10), "(%.2e)" % rel)
 
 
 def test_third_dir():

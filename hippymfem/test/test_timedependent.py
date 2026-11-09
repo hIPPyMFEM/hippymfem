@@ -586,9 +586,13 @@ def test_initial_density():
     gd, hd = gradient_and_action(hm.Model(make(lambda u0, m, p, x: (u0.val - m.val) * p.val),
                                           prior, misfit))
     eg, eh = rel(gd, gw), rel(hd, hw)
+    from hippymfem.algorithms.singlesolve import action_tolerance
+
+    # (the Hessian actions to the precision of the incremental solves: single precision's
+    # where a single-precision hypre takes the Krylov solves)
     check("an initial density (u0 - m) p gives the gradient and the Hessian action of the "
           "hand-written initial-condition problem at the interior dofs",
-          eg < 1e-8 and eh < 1e-8, "(%.1e, %.1e)" % (eg, eh))
+          eg < 1e-8 and eh < action_tolerance(1e-8), "(%.1e, %.1e)" % (eg, eh))
 
     model = hm.Model(make(lambda u0, m, p, x: (u0.val - 0.5 * jnp.tanh(m.val)) * p.val),
                      prior, misfit)

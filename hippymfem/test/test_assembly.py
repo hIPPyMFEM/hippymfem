@@ -732,12 +732,19 @@ def test_transpose_free_adjoint():
         outs[flag] = (x[ADJOINT].copy(), g.copy(), Hv.copy(), pde.At, pde.solver_adj)
     def rel(a, b):
         return a.copy().axpy(-1.0, b).norm("l2") / max(b.norm("l2"), 1e-300)
+    from hippymfem.algorithms.singlesolve import action_tolerance
+    from hippymfem.modeling.PDEVariationalProblem import _is_single
+
     ea, eg, eh = (rel(outs[True][i], outs[False][i]) for i in range(3))
+    # (with a single-precision hypre the explicit transpose lives there, with a GMRES of
+    # its own, and its Hessian action is single precision's; the transpose-free adjoint
+    # keeps its Jacobian in double precision)
     check("adjoint, gradient and Hessian action agree with the explicit transpose "
-          "(%.1e, %.1e, %.1e)" % (ea, eg, eh), ea < 1e-9 and eg < 1e-9 and eh < 1e-8)
+          "(%.1e, %.1e, %.1e)" % (ea, eg, eh),
+          ea < 1e-9 and eg < 1e-9 and eh < action_tolerance(1e-8))
     check("the transpose is a wrapper of A and the adjoint solver shares the forward hierarchy",
           getattr(outs[True][3], "transposed_of", None) is not None and outs[True][4] is not None
-          and outs[False][4] is None)
+          and (outs[False][4] is None or _is_single(outs[False][3])))
 
 
 def test_element_chunking():
@@ -1302,10 +1309,24 @@ def test_release_linearization_on_move():
     check("and keeps it otherwise", keep.C is not None and keep.A is not None)
     for flag, pde in probs.items():
         pde.setLinearizationPoint([xs[flag], m1, p0], gauss_newton_approx=False)
+    from hippymfem.modeling.PDEVariationalProblem import _is_single
+
+    probe = Vh[0].vector()
+    hp.parRandom.normal(1.0, probe)
+
+    def values(M):
+        # (a Jacobian of the single-precision hypre has no entries to read here: its
+        # product with a fixed vector, which two identical matrices give bit for bit)
+        if _is_single(M):
+            y = Vh[0].vector()
+            M.Mult(probe.hypre, y.hypre)
+            return np.asarray(y.array).copy()
+        return to_dense(M, COMM)
+
     worst = 0.0
     for name in ("A", "C", "Wum", "Wmm"):
-        a = to_dense(getattr(keep, name), COMM)
-        b = to_dense(getattr(rel, name), COMM)
+        a = values(getattr(keep, name))
+        b = values(getattr(rel, name))
         worst = largest([worst, float(np.abs(a - b).max())])
     check("the next point's blocks are identical", worst == 0.0, "(%.3e)" % worst)
 

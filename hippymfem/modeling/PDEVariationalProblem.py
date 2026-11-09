@@ -242,7 +242,10 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         #: accepts ``A``'s V-cycle as a preconditioner for ``A^T``; it is as good as
         #: the asymmetry is small (for example the ``k'(u)`` term of a
         #: temperature-dependent conductivity).  Krylov adjoint solvers only; a
-        #: direct solver keeps the explicit transpose.
+        #: direct solver keeps the explicit transpose.  A Jacobian that is not symmetric
+        #: then stays in double precision also where a single-precision hypre is loaded:
+        #: there is no transpose wrapper of a matrix of that library, and it would need
+        #: the transpose and a second hierarchy that this setting is asked to avoid.
         self.transpose_free_adjoint = bool(transpose_free_adjoint)
         self.comm = self.Vh[STATE].comm
         self.mesh = self.Vh[STATE].mesh
@@ -567,8 +570,11 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         known = (self.symmetric_jacobian if self.symmetric_jacobian != "auto"
                  else (self._symmetric_verdict if (single or to_single) else None))
         # A Jacobian known not to be symmetric goes there too where its solvers there are
-        # GMRES (_single_gmres), and its transpose with it (below).
-        ns_single = to_single and known is not None and not known and self._single_gmres()
+        # GMRES (_single_gmres), and its transpose with it (below), unless the adjoint is
+        # to be solved without a transpose (transpose_free_adjoint): no wrapper of a
+        # matrix of that library exists.
+        ns_single = (to_single and known is not None and not known and self._single_gmres()
+                     and not self.transpose_free_adjoint)
 
         def assemble(consistent, in_single):
             kw = dict(test_ess=self.bc0.ess_tdof, diag_policy="one", consistent=consistent)
@@ -596,7 +602,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                 if symmetric:
                     del A
                     A = assemble("symmetric" if single else None, to_single)
-                elif to_single and self._single_gmres():
+                elif to_single and self._single_gmres() and not self.transpose_free_adjoint:
                     del A
                     A = assemble("two-sided" if single else None, True)
             elif (known and not single and _is_single(A) and not self._probe_symmetry(
