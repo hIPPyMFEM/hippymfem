@@ -73,8 +73,30 @@ GitHub Actions runs on every push to `main` and on every pull request:
 - **applications** runs each application on small inputs, on 1 and 2 ranks;
 - **docs** builds the documentation without PyMFEM, as Read the Docs does.
 
-The GPU suites (`test_gpu`, `test_device`) need hardware that CI does not have. Run them
-with `run_tests.sh` on a machine with a GPU (see `INSTALL.md`).
+The GPU suites (`test_gpu`, `test_device`) need hardware that the hosted runners do not
+have. Run them with `run_tests.sh` on a machine with a GPU (see `INSTALL.md`);
+`DEVICE_SUITES=1 ./run_tests.sh 1 2` also runs every other suite with the element kernels
+and hypre on the GPU, as a GPU user runs a script.
+
+The **GPU** workflow (`.github/workflows/gpu.yml`) runs those suites and
+`benchmarks/perf_check.py` on a self-hosted runner with the labels `self-hosted`, `linux`
+and `gpu`, on pushes to `main`, once a week and by hand; never on pull requests. Its
+header lists the repository variables it reads (`HIPPYMFEM_GPU_ENV` may hold
+`DEVICE_SUITES=1`).
+
+A self-hosted runner runs whatever a workflow file asks of it, and a pull request from a
+fork brings its own workflow files: one that changes `ci.yml`, which runs on pull
+requests, to `runs-on: [self-hosted, linux, gpu]` would run its code on the GPU machine.
+Two settings of the repository's owners close that:
+
+1. Put the runner in a runner group of the organization (Settings > Actions > Runner
+   groups) that only the workflow `.github/workflows/gpu.yml` of `refs/heads/main` may
+   use, where the organization's plan offers groups beyond the default one. A job of
+   any other workflow file, or of that file on another branch, then never gets the
+   runner.
+2. Require approval before a workflow of a pull request from a fork runs (Settings >
+   Actions > General, "Require approval for all outside collaborators"), so that an
+   owner reads such a pull request before any of its code runs.
 
 ## Developer's Certificate of Origin 1.1
 

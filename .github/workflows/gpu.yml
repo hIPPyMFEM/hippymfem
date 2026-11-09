@@ -7,6 +7,9 @@ name: GPU
 #   HIPPYMFEM_CUDA_PYMFEM  the site-packages of the GPU build of PyMFEM (CUDA or HIP)
 #   HIPPYMFEM_GPU_ENV      optional: more variables for the runs, as "A=1 B=2"
 # It never runs on pull requests: those from forks would run their code on that machine.
+# A fork's pull request can still change another workflow file to ask for this runner, so
+# the runner belongs in a runner group that only this file on main may use, and fork pull
+# requests need an owner's approval before they run (CONTRIBUTING.md, "Automated testing").
 on:
   push:
     branches: [main]
