@@ -478,9 +478,11 @@ def test_forward_uq():
     mu = m0.copy().axpy(1e-2, u0)
     dfull = tay.eval(mu, order=2) - tay.eval(mu, order=1)
     dlow = tay.eval_lowrank(mu, order=2) - tay.eval_lowrank(mu, order=1)
+    # (to the accuracy of a Hessian action: single-precision solves stop near 1e-5, and on
+    # two ranks of a GPU the two models then differed by more than 1e-6)
+    rel = abs(dlow - dfull) / max(abs(dfull), 1e-300)
     check("low-rank Taylor model exact along a kept eigenvector",
-          abs(dlow - dfull) < 1e-6 * max(abs(dfull), 1e-300),
-          "(%.3e vs %.3e)" % (dlow, dfull))
+          rel < action_tolerance(1e-6), "(%.6e vs %.6e, rel %.1e)" % (dlow, dfull, rel))
 
     # Monte Carlo with the Taylor control variate
     res = hm.varianceReductionMC(prior, p2q, tay, 150, order=2)
