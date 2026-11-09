@@ -468,7 +468,7 @@ class SpaceTables(KeepAlive):
 
         return ev
 
-    def transform_dual_matrix(self, mats, trial_tables):
+    def transform_dual_matrix(self, mats, trial_tables, elements=None):
         """Map element matrices from the reference dof basis to the global one.
 
         A no-op for H1/L2, where the two coincide; H(curl) on simplices needs

@@ -561,6 +561,65 @@ def test_vector_bc_values():
     check("a wrong number of components is refused", raised)
 
 
+def test_chunked_dof_transformation():
+    """An assembly split into chunks, with a space whose elements carry a transformation.
+
+    Second-order Nedelec elements on tetrahedra have MFEM's ``DofTransformation``, one
+    matrix per element.  A batch split into chunks hands each chunk's element matrices
+    to the transformation, which once took the whole group's matrices and failed on the
+    first chunk.  The split assembly must be the unsplit one, to round-off.
+    """
+    if RANK == 0:
+        print("a chunked assembly of a space with a dof transformation")
+    from hippymfem.fem import kernel as kern
+
+    pm = mfem.ParMesh(COMM, mk("tet", 2))
+    V = FunctionSpace.ND(pm, 2)
+    Vm = FunctionSpace.H1(pm, 1)
+    b = MeshBatches(pm, 6, COMM)
+
+    def varf(u, m, p, x):
+        return jnp.exp(m.val) * jnp.dot(u.curl, p.curl) + jnp.dot(u.val, p.val)
+
+    K = QuadratureKernel(varf, [V, Vm, V], b)
+    hp.parRandom.set_seed(13)
+    m = Vm.vector()
+    hp.parRandom.normal(0.3, m)
+    loc = [V.local_values(V.vector()), Vm.local_values(m), V.local_values(V.vector())]
+    ne = pm.GetNE()
+    has_T = any(getattr(gk.tables[STATE], "T", None) is not None for gk in K.group_kernels)
+
+    def forget():
+        for gk in K.group_kernels:
+            gk._chunk.clear()
+
+    saved = kern.ELEMENT_CHUNK
+    try:
+        kern.ELEMENT_CHUNK = max(1, ne // 3)
+        forget()
+        split = K.will_chunk(max(gk._slot_weight(STATE) for gk in K.group_kernels))
+        outs = {}
+        for name, (i, j) in (("A", (ADJOINT, STATE)), ("C", (ADJOINT, PARAMETER))):
+            outs[name] = to_dense(assemble_matrix(
+                V, (V if j == STATE else Vm), b.groups,
+                K.element_matrices_or_chunks(i, j, loc), ne), COMM)
+        kern.ELEMENT_CHUNK = 0
+        forget()
+        worst = 0.0
+        for name, (i, j) in (("A", (ADJOINT, STATE)), ("C", (ADJOINT, PARAMETER))):
+            whole = to_dense(assemble_matrix(
+                V, (V if j == STATE else Vm), b.groups,
+                K.element_matrices(i, j, loc), ne), COMM)
+            scale = max(float(np.abs(whole).max()), 1e-300)
+            worst = max(worst, float(np.abs(outs[name] - whole).max()) / scale)
+    finally:
+        kern.ELEMENT_CHUNK = saved
+        forget()
+    check("the batch is split and the space has a transformation (the case tested)",
+          split and has_T, "(%d elements, chunks of %d)" % (ne, max(1, ne // 3)))
+    check("the split assembly is the unsplit one", worst < 1e-13, "(rel %.2e)" % worst)
+
+
 def main():
     test_vs_mfem()
     test_coefficient_and_derivatives()
@@ -569,6 +628,7 @@ def main():
     test_hcurl_inverse_problem()
     test_mixed_formulation_blocks()
     test_poroelasticity_blocks()
+    test_chunked_dof_transformation()
     COMM.Barrier()
     if RANK == 0:
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""), flush=True)

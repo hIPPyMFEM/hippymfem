@@ -469,7 +469,7 @@ class FacetSpaceTables(KeepAlive):
         arr = local_array if hasattr(local_array, "device") else _put(local_array)
         return jnp.take(arr, e, axis=0) * s
 
-    def transform_dual_matrix(self, mats, trial_tables):
+    def transform_dual_matrix(self, mats, trial_tables, elements=None):
         """No reference-to-global map: the facet kernels cover H1 and L2 spaces."""
         return mats
 

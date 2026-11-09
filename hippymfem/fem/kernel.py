@@ -2009,7 +2009,7 @@ class QuadratureKernel:
             # that is exactly when keeping all of it resident is what hurts
             for a, bnd, out in gk.in_chunks(fn, dofs, gk.mapped(streaming=True), pr):
                 yield g, a, bnd, gk.tables[i].transform_dual_matrix(
-                    _result(out), gk.tables[j])
+                    _result(out), gk.tables[j], elements=(a, bnd))
 
     def element_matrix_chunks_many(self, pairs, local_arrays, params=()):
         """Yield ``(group, start, stop, {(i, j): array})`` from one differentiation.
@@ -2030,7 +2030,7 @@ class QuadratureKernel:
             for a, bnd, H in gk.in_chunks(fn, dofs, gk.mapped(streaming=True), pr):
                 yield g, a, bnd, {
                     (i, j): gk.tables[i].transform_dual_matrix(
-                        _result(H[i][cols.index(j)]), gk.tables[j])
+                        _result(H[i][cols.index(j)]), gk.tables[j], elements=(a, bnd))
                     for (i, j) in pairs}
 
     def element_matrices_many(self, pairs, local_arrays, params=()):

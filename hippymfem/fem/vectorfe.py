@@ -283,16 +283,20 @@ class VectorSpaceTables(KeepAlive):
             self._devT[d] = None if self.T is None else _put(self.T)
         return self._devT[d]
 
-    def transform_dual_matrix(self, mats, trial_tables):
+    def transform_dual_matrix(self, mats, trial_tables, elements=None):
         """``A_global = T_test^T A_ref T_trial``, MFEM's ``TransformDual``.
 
         Applied on whichever side the element matrices already live, so a device
-        result is not brought to the host just to be multiplied.
+        result is not brought to the host just to be multiplied.  ``elements``, a
+        ``(start, stop)`` pair, says that ``mats`` holds that stretch of the group's
+        elements only, a chunk of an assembly that does not fit whole, and the
+        transformations are taken for it alone.
         """
         Tt = self.T
         Tr = getattr(trial_tables, "T", None)
         if Tt is None and Tr is None:
             return mats
+        cut = slice(None) if elements is None else slice(int(elements[0]), int(elements[1]))
         host = isinstance(mats, np.ndarray)
         if host:
             ein, out = np.einsum, mats
@@ -304,9 +308,9 @@ class VectorSpaceTables(KeepAlive):
             Tt_ = None if Tt is None else self._dev_T()
             Tr_ = None if Tr is None else trial_tables._dev_T()
         if Tt_ is not None:
-            out = ein("eki,ekl->eil", Tt_, out)
+            out = ein("eki,ekl->eil", Tt_[cut], out)
         if Tr_ is not None:
-            out = ein("eil,elj->eij", out, Tr_)
+            out = ein("eil,elj->eij", out, Tr_[cut])
         return out
 
     def transform_dual_vector(self, vecs):

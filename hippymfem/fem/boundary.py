@@ -273,7 +273,7 @@ class BoundarySpaceTables(KeepAlive):
 
         return ev
 
-    def transform_dual_matrix(self, mats, trial_tables):
+    def transform_dual_matrix(self, mats, trial_tables, elements=None):
         return mats
 
     def transform_dual_vector(self, vecs):
