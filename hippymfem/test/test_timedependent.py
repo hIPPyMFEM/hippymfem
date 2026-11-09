@@ -514,6 +514,93 @@ def test_scalar_parameters_integrate():
               "(%.15g, exact %.15g)" % (total, exact))
 
 
+def test_initial_density():
+    """An initial density (``init_varf``): the initial state from a weak equation of its
+    own, differentiated like the steps.  With ``(u0 - m) p`` it is the hand-written
+    wrapper of the tests above (``_ICProblem``) away from the boundary: the same gradient
+    and Hessian action at the interior dofs.  (The wrapper sets ``u0 = m`` and zeroes its
+    essential dofs, so the parameter's boundary values do nothing; the density solves for
+    ``u0`` with the state's conditions, and the boundary values of ``m`` enter the rows
+    next to the boundary through the mass matrix.)  With a nonlinear map,
+    ``(u0 - tanh(m) / 2) p``, the finite-difference checks of the gradient and of the
+    Hessian action are first order."""
+    if RANK == 0:
+        print("initial density (init_varf)")
+    pmesh, Vh, pde_w = build_ad_diff(nx=10, nt=5)
+    Vu = Vh[STATE]
+
+    def solvers(problem):
+        for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            if NP == 1:
+                setattr(problem, a, hm.LUSolver(COMM))
+            else:
+                sol = hm.KrylovSolver(COMM, "gmres", "amg")
+                sol.parameters["rel_tolerance"] = 1e-13
+                setattr(problem, a, sol)
+
+    def make(init):
+        pde = hm.TimeDependentPDEVariationalProblem(
+            Vh, pde_w.varf, pde_w.bc, pde_w.bc0, None, pde_w.t_init, pde_w.t_final, pde_w.dt,
+            is_fwd_linear=True, quadrature_degree=pde_w.quadrature_degree, init_varf=init)
+        solvers(pde)
+        solvers(pde.init_problem)
+        return pde
+
+    rng = np.random.default_rng(7)
+    B = hm.assemblePointwiseObservation(Vu, rng.uniform(0.1, 0.9, size=(60, 2)))
+    misfits = [None] * pde_w.times.size
+    for k in range(1, pde_w.times.size):
+        d = B.createVecLeft()
+        d.array[:] = rng.standard_normal(d.local_size) * 0.01
+        misfits[k] = hm.DiscreteStateObservation(B, d, 1e-4)
+    misfit = hm.MisfitTD(misfits, pde_w.times)
+    gamma, delta = hm.BiLaplacianComputeCoefficients(0.25, 0.15, 2)
+    prior = hm.BiLaplacianPrior(Vu, gamma, delta, solver_type="lu" if NP == 1 else "krylov")
+    m0 = Vu.project(lambda x: 0.3 * np.exp(-40.0 * ((x[0] - 0.4) ** 2 + (x[1] - 0.4) ** 2)))
+    pde_w.bc.zero(m0)
+    dm = Vu.vector()
+    dm.array[:] = rng.standard_normal(dm.local_size)
+    pde_w.bc.zero(dm)
+
+    def gradient_and_action(model):
+        x = model.generate_vector()
+        x[PARAMETER] = m0.copy()
+        model.solveFwd(x[STATE], x)
+        model.solveAdj(x[ADJOINT], x)
+        g = model.generate_vector(PARAMETER)
+        model.evalGradientParameter(x, g, misfit_only=True)
+        model.setPointForHessianEvaluations(x)
+        H = hm.ReducedHessian(model, misfit_only=True)
+        h = model.generate_vector(PARAMETER)
+        H.mult(dm, h)
+        return g, h
+
+    def rel(a, b):
+        # at the interior dofs (see the docstring)
+        a, b = a.copy(), b.copy()
+        pde_w.bc0.zero(a)
+        pde_w.bc0.zero(b)
+        return a.axpy(-1.0, b).norm("l2") / max(b.norm("l2"), 1e-300)
+
+    gw, hw = gradient_and_action(hm.Model(_ICProblem(pde_w), prior, misfit))
+    gd, hd = gradient_and_action(hm.Model(make(lambda u0, m, p, x: (u0.val - m.val) * p.val),
+                                          prior, misfit))
+    eg, eh = rel(gd, gw), rel(hd, hw)
+    check("an initial density (u0 - m) p gives the gradient and the Hessian action of the "
+          "hand-written initial-condition problem at the interior dofs",
+          eg < 1e-8 and eh < 1e-8, "(%.1e, %.1e)" % (eg, eh))
+
+    model = hm.Model(make(lambda u0, m, p, x: (u0.val - 0.5 * jnp.tanh(m.val)) * p.val),
+                     prior, misfit)
+    eps = np.power(2.0, -np.arange(2, 18))
+    e, er_g, er_h = hm.modelVerify(model, m0, is_quadratic=False, misfit_only=False,
+                                   verbose=False, eps=eps)
+    sg, sh = hm.best_slope(e, er_g), hm.best_slope(e, er_h)
+    check("with a nonlinear initial density the gradient and the Hessian action are first "
+          "order in finite differences", 0.8 < sg < 1.3 and 0.8 < sh < 1.3,
+          "(slopes %.3f, %.3f)" % (sg, sh))
+
+
 def test_td_boundary_density():
     """A Robin condition as a boundary density of the one-step residual.
 
@@ -657,6 +744,7 @@ if __name__ == "__main__":
     test_nonlinear_time_dependent_hessian()
     test_scalar_parameters_integrate()
     test_td_boundary_density()
+    test_initial_density()
     if RANK == 0:
         print("-" * 74)
         print("FAILURES: %d %s" % (len(FAILS), FAILS if FAILS else ""))

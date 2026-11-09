@@ -4,6 +4,20 @@
 
 ### Added
 
+- **An initial density for time-dependent problems.**
+  `TimeDependentPDEVariationalProblem(..., init_varf=rho0)` defines the initial state by a
+  weak equation of its own, `R_0(u_0, m; p) = integral of rho0(u0, m, p, x) = 0`, written
+  as a density like the step's: `(u0.val - m.val) * p.val` sets the initial state to the
+  parameter, `(u0.val - g(m.val)) * p.val` to a map of it, and any density JAX can
+  differentiate twice is allowed (`init_linear=False` for one that is nonlinear in `u0`).
+  It is solved and differentiated by a `PDEVariationalProblem` of its own (`init_problem`,
+  with the state's conditions), and its terms join those of the steps in the solves, the
+  gradient and every Hessian block.  The hand-written wrapper of the tests and of
+  `applications/ad_diff` (`u0 = m` with the boundary values zeroed) is no longer needed;
+  the wrapper ignores the parameter's boundary values, where the density's projection
+  keeps them, and the two agree at the interior dofs to round-off.  `test_timedependent`
+  checks that agreement and the first-order finite-difference checks of the gradient and
+  the Hessian action for `(u0 - tanh(m) / 2) p`.
 - **Single-precision solves for Jacobians that are not symmetric.**  Where the solvers of a
   problem are GMRES with BoomerAMG, a Jacobian that the symmetry probe (or
   `symmetric_jacobian=False`) finds not symmetric is assembled into the single-precision

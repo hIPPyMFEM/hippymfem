@@ -127,7 +127,20 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         Quadrature degree on the boundary; ``quadrature_degree`` by default.
     bc, bc0 : boundary conditions on the state, with data and homogeneous.
     u0 : ParVector
-        Initial condition at ``t_init``.
+        Initial condition at ``t_init``, fixed; ``None`` with ``init_varf``.
+    init_varf : callable, optional
+        ``init_varf(u0, m, p, x) -> scalar``: the *initial density*, the integrand of a
+        weak equation for the initial state, ``r_0(u_0, m; p) = 0``, so that the initial
+        state may depend on the parameter: ``(u0.val - g(m.val, x)) * p.val`` is the
+        projection of a pointwise map ``g`` (the parameter as the initial state where it
+        is ``m.val``).  Every operator of that equation (its Jacobian, its coupling to the
+        parameter and its second derivatives) comes from automatic differentiation like
+        those of the steps; the adjoint, the gradient and the Hessian then reach back to
+        the initial level.  It is a :class:`~.PDEVariationalProblem.PDEVariationalProblem`
+        of its own, :attr:`init_problem`, with the state's boundary conditions (its
+        solvers can be set there).
+    init_linear : bool
+        The initial density is linear in ``u0`` (default), as a projection is.
     t_init, t_final, dt : float
     is_fwd_linear : bool
         The step residual is linear in ``u_n``; one Newton step is then exact.
@@ -141,7 +154,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
 
     def __init__(self, Vh, varf_handler, bc, bc0, u0, t_init, t_final, dt,
                  is_fwd_linear=False, quadrature_degree=None, spd_jacobian=False,
-                 bdr_varf=None, bdr_attributes="all", bdr_quadrature_degree=None):
+                 bdr_varf=None, bdr_attributes="all", bdr_quadrature_degree=None,
+                 init_varf=None, init_linear=True):
         if len(Vh) != NVAR:
             raise ValueError("Vh must have %d entries" % NVAR)
         #: see :attr:`~.PDEProblem.PDEProblem.spd_jacobian`
@@ -211,6 +225,17 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         #: the step Jacobian of the last *linear* forward solve, keyed on the parameter
         self._fwd_jac = None
         self._probe_rng = None
+        #: the problem of the initial level, where an initial density is given
+        self.init_problem = None
+        if init_varf is not None:
+            from .PDEVariationalProblem import PDEVariationalProblem
+
+            self.init_problem = PDEVariationalProblem(
+                [self.Vh[STATE], self.Vh[PARAMETER], self.Vh[ADJOINT]], init_varf,
+                self.bc if self.bc else None, self.bc0 if self.bc0 else None,
+                is_fwd_linear=bool(init_linear), quadrature_degree=self.quadrature_degree)
+        elif u0 is None:
+            raise ValueError("an initial state u0 or an initial density init_varf is needed")
 
     # ------------------------------------------------------------------ shapes
     def generate_state(self):
@@ -361,8 +386,9 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         m = x[PARAMETER]
         require_finite(m, "the parameter passed to solveFwd")
         out.zero()
-        out.store(self.u0, self.times[0])
-        u_old = self.u0.copy()
+        u0 = self._initial_state(m)
+        out.store(u0, self.times[0])
+        u_old = u0.copy()
         u = self.Vh[STATE].vector()
         p0 = self.Vh[ADJOINT].vector()
         du = self.Vh[STATE].vector()
@@ -428,6 +454,22 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         if jac is not None and jac[1]:
             self._fwd_jac = (m.copy(), jac[0])
         return out
+
+    def _initial_state(self, m):
+        """The state at ``t_init``: :attr:`u0`, or the solution of the initial density's
+        equation at the parameter ``m``."""
+        if self.init_problem is None:
+            return self.u0
+        u0 = self.init_problem.generate_state()
+        self.init_problem.solveFwd(u0, [u0, m, None])
+        return u0
+
+    def _level0(self, x):
+        """``[u_0, m, p_0]`` of the point ``x`` (a zero adjoint where it has none)."""
+        t0 = self.times[0]
+        p0 = (x[ADJOINT].view(t0) if (len(x) > ADJOINT and x[ADJOINT] is not None)
+              else self.Vh[ADJOINT].vector())
+        return [x[STATE].view(t0), x[PARAMETER], p0]
 
     # -------------------------------------------------------------- trajectory
     def _trajectory(self, x, extra=()):
@@ -553,6 +595,17 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             solver.solve(p, rhs)
             out.store(p, t)
             p_next.assign(p)
+        if self.init_problem is not None:
+            # the initial level: A_0^T p_0 = rhs_0 - B_1^T p_1
+            t0 = self.times[0]
+            rhs.assign(adj_rhs.view(t0))
+            if self.nt > 1:
+                tr["B"][1].MultTranspose(p_next.hypre, coupling.hypre)
+                rhs.axpy(-1.0, coupling)
+            self.bc0.zero(rhs)
+            p.zero()
+            self.init_problem.solveAdj(p, self._level0(x)[:2] + [None], rhs)
+            out.store(p, t0)
         return out
 
     def evalGradientParameter(self, x, out):
@@ -565,6 +618,10 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                                     x[STATE].view(self.times[k - 1]), m,
                                     x[ADJOINT].view(t), t)
             out.axpy(1.0, g)
+        if self.init_problem is not None:
+            g0 = self.Vh[PARAMETER].vector()
+            self.init_problem.evalGradientParameter(self._level0(x), g0)
+            out.axpy(1.0, g0)
         return out
 
     # ----------------------------------------------------- linearization point
@@ -582,6 +639,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         for k in range(1, self.nt):
             self._step_solver(tr, "fwd_inc", k)
             self._step_solver(tr, "adj_inc", k)
+        if self.init_problem is not None:
+            self.init_problem.setLinearizationPoint(self._level0(x), self.gauss_newton_approx)
         return self
 
     def _blocks(self, k):
@@ -598,12 +657,13 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         r"""Solve the space-time incremental system.
 
         Forward (``is_adj=False``): march :math:`A_n \hat u_n = \text{rhs}_n -
-        B_n \hat u_{n-1}` from :math:`\hat u_0 = 0` (the initial condition does
-        not depend on the parameter).
+        B_n \hat u_{n-1}` from :math:`\hat u_0 = 0` for a fixed initial state, or from
+        the solution of :math:`A_0 \hat u_0 = \text{rhs}_0` with an initial density.
 
         Adjoint (``is_adj=True``): march
         :math:`A_n^{\!\top}\hat p_n = \text{rhs}_n - B_{n+1}^{\!\top}\hat p_{n+1}`
-        backward.  The solvers were pointed at their operators by
+        backward, and with an initial density end with
+        :math:`A_0^{\!\top}\hat p_0 = \text{rhs}_0 - B_1^{\!\top}\hat p_1`.  The solvers were pointed at their operators by
         :meth:`setLinearizationPoint`; nothing is set up here.
         """
         tr = self._traj
@@ -614,8 +674,14 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         r = self.Vh[STATE].vector()
         if not is_adj:
             self.n_calls["incremental_forward"] += 1
-            prev = self.Vh[STATE].vector()          # u_hat_0 = 0
+            prev = self.Vh[STATE].vector()          # u_hat_0 = 0 for a fixed initial state
             cur = self.Vh[STATE].vector()
+            if self.init_problem is not None:
+                # A_0 u_hat_0 = rhs_0, where the initial state depends on the parameter
+                r.assign(rhs.view(self.times[0]))
+                self.bc0.zero(r)
+                self.init_problem.solveIncremental(prev, r, False)
+                out.store(prev, self.times[0])
             for k in range(1, self.nt):
                 r.assign(rhs.view(self.times[k]))
                 tr["B"][k].Mult(prev.hypre, work.hypre)
@@ -639,6 +705,16 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                 self._step_solver(tr, "adj_inc", k).solve(cur, r)
                 out.store(cur, self.times[k])
                 nxt.assign(cur)
+            if self.init_problem is not None:
+                # A_0^T p_hat_0 = rhs_0 - B_1^T p_hat_1
+                r.assign(rhs.view(self.times[0]))
+                if self.nt > 1:
+                    tr["B"][1].MultTranspose(nxt.hypre, work.hypre)
+                    r.axpy(-1.0, work)
+                self.bc0.zero(r)
+                cur.zero()
+                self.init_problem.solveIncremental(cur, r, True)
+                out.store(cur, self.times[0])
         return out
 
     # --------------------------------------------------------------- blocks
@@ -647,6 +723,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         out.zero()
         for k in range(1, self.nt):
             self._blocks(k)["C"].Mult(dm.hypre, out.view(self.times[k]).hypre)
+        if self.init_problem is not None:
+            self.init_problem.apply_ij(ADJOINT, PARAMETER, dm, out.view(self.times[0]))
         return out
 
     def applyCt(self, dp, out):
@@ -656,6 +734,9 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         for k in range(1, self.nt):
             self._blocks(k)["C"].MultTranspose(dp.view(self.times[k]).hypre,
                                                tmp.hypre)
+            out.axpy(1.0, tmp)
+        if self.init_problem is not None:
+            self.init_problem.apply_ij(PARAMETER, ADJOINT, dp.view(self.times[0]), tmp)
             out.axpy(1.0, tmp)
         return out
 
@@ -679,7 +760,12 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             out.view(t_prev).axpy(1.0, work)
             blk["Woo"].Mult(do.hypre, work.hypre)
             out.view(t_prev).axpy(1.0, work)
-        out.view(self.times[0]).zero()       # the initial condition is fixed
+        if self.init_problem is None:
+            out.view(self.times[0]).zero()   # the initial condition is fixed
+        else:
+            # the initial level is a variable: its rows stay, with the initial density's
+            self.init_problem.apply_ij(STATE, STATE, du.view(self.times[0]), work)
+            out.view(self.times[0]).axpy(1.0, work)
         return out
 
     def applyWum(self, dm, out):
@@ -694,7 +780,11 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             out.view(self.times[k]).axpy(1.0, work)
             blk["Wom"].Mult(dm.hypre, work.hypre)
             out.view(self.times[k - 1]).axpy(1.0, work)
-        out.view(self.times[0]).zero()
+        if self.init_problem is None:
+            out.view(self.times[0]).zero()
+        else:
+            self.init_problem.apply_ij(STATE, PARAMETER, dm, work)
+            out.view(self.times[0]).axpy(1.0, work)
         return out
 
     def applyWmu(self, du, out):
@@ -709,6 +799,9 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
             out.axpy(1.0, tmp)
             blk["Wom"].MultTranspose(du.view(self.times[k - 1]).hypre, tmp.hypre)
             out.axpy(1.0, tmp)
+        if self.init_problem is not None:
+            self.init_problem.apply_ij(PARAMETER, STATE, du.view(self.times[0]), tmp)
+            out.axpy(1.0, tmp)
         return out
 
     def applyWmm(self, dm, out):
@@ -718,6 +811,9 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         tmp = self.Vh[PARAMETER].vector()
         for k in range(1, self.nt):
             self._blocks(k)["Wmm"].Mult(dm.hypre, tmp.hypre)
+            out.axpy(1.0, tmp)
+        if self.init_problem is not None:
+            self.init_problem.apply_ij(PARAMETER, PARAMETER, dm, tmp)
             out.axpy(1.0, tmp)
         return out
 
@@ -747,6 +843,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         self._traj = None
         self.linearize_x = None
         self._release_operators("solver_adj", "solver_fwd_inc", "solver_adj_inc")
+        if self.init_problem is not None:
+            self.init_problem.release_linearization_point()
         return self
 
     # ------------------------------------------------------------------ output

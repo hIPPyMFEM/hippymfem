@@ -13,9 +13,19 @@ and the parameter is the initial condition, observed only at later times.  This
 exercises the whole time-dependent machinery: a forward march, an adjoint march
 backwards in time, and a space-time reduced Hessian.
 
+The parameter enters through the initial condition in one of two ways.  By default the
+hand-written :class:`InitialConditionProblem` below sets ``u(0) = m`` with the boundary
+values zeroed.  With ``--initial-density`` the library does it from an initial density,
+``(u0 - m) p``: ``u(0)`` is the projection of ``m`` with the state's boundary conditions,
+and its derivatives come from automatic differentiation like those of the steps.  The two
+agree away from the boundary; the projection also lets the boundary values of ``m``
+reach the rows next to the boundary.  Any density JAX differentiates twice may replace
+it, ``(u0 - g(m)) p`` for a map ``g`` of the parameter, say.
+
 Run::
 
     python applications/ad_diff/model_ad_diff.py
+    python applications/ad_diff/model_ad_diff.py --initial-density
     mpirun -n 4 python applications/ad_diff/model_ad_diff.py
 """
 
@@ -131,6 +141,9 @@ def main():
     ap.add_argument("--neig", type=int, default=30)
     ap.add_argument("--cg-max-iter", type=int, default=400)
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--initial-density", action="store_true",
+                    help="u(0) = m from the initial density (u0 - m) p, differentiated by "
+                         "the library, instead of the hand-written InitialConditionProblem")
     ap.add_argument("--out", default="applications/ad_diff/results")
     args = ap.parse_args()
 
@@ -156,19 +169,28 @@ def main():
                 + kappa * hm.inner(u.grad, p.grad)
                 + jnp.dot(vel, u.grad) * p.val)
 
+    def init_varf(u0, m, p, x):
+        """The initial density: u(0) = m in the weak sense."""
+        return (u0.val - m.val) * p.val
+
     bc = hm.DirichletBC(Vu, 0.0, bdr_attributes="all")
+    density = args.initial_density
     pde = hm.TimeDependentPDEVariationalProblem(
-        Vh, varf, bc, bc.homogeneous(), Vu.vector(), 0.0, args.t_final, dt,
-        is_fwd_linear=True, quadrature_degree=2 * args.order + 2)
+        Vh, varf, bc, bc.homogeneous(), None if density else Vu.vector(), 0.0,
+        args.t_final, dt, is_fwd_linear=True, quadrature_degree=2 * args.order + 2,
+        init_varf=init_varf if density else None)
     # By problem size, not rank count: see the note in poisson/model_subsurf.py.
-    for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
-        s = hm.auto_solver(Vu, comm, method="gmres")
-        if isinstance(s, hm.KrylovSolver):
-            s.parameters["rel_tolerance"] = 1e-13
-        setattr(pde, a, s)
+    for problem in (pde, pde.init_problem) if density else (pde,):
+        for a in ("solver", "solver_fwd_inc", "solver_adj_inc"):
+            s = hm.auto_solver(Vu, comm, method="gmres")
+            if isinstance(s, hm.KrylovSolver):
+                s.parameters["rel_tolerance"] = 1e-13
+            setattr(problem, a, s)
     log("Linear solver: %s" % type(pde.solver).__name__)
 
-    prob = InitialConditionProblem(pde)
+    prob = pde if density else InitialConditionProblem(pde)
+    log("Initial condition: %s" % ("the initial density (u0 - m) p" if density
+                                   else "InitialConditionProblem (u0 = m)"))
     log(SEP + "Time-dependent advection-diffusion" + SEP)
     log("dofs per level: %d ; time levels: %d ; dt = %g"
         % (Vu.GlobalTrueVSize(), pde.nt, dt))

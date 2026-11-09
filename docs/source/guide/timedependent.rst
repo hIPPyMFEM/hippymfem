@@ -16,7 +16,36 @@ parameter and the adjoint.
                + jnp.exp(m.val) * jnp.dot(g, p.grad))
 
    pde = hm.TimeDependentPDEVariationalProblem(
-       [Vu, Vm, Vu], varf, bc, bc0, t_init=0.0, t_final=1.0, dt=0.01)
+       [Vu, Vm, Vu], varf, bc, bc0, u0, t_init=0.0, t_final=1.0, dt=0.01)
+
+where ``u0`` is the initial state, a vector of ``Vu``.
+
+The initial state
+-----------------
+
+The initial state may instead depend on the parameter through a weak equation of its
+own, given by an **initial density** ``init_varf(u0, m, p, x)`` in place of ``u0``:
+
+.. code-block:: python
+
+   def init_varf(u0, m, p, x):                       # u(0) = m
+       return (u0.val - m.val) * p.val
+
+   pde = hm.TimeDependentPDEVariationalProblem(
+       [Vu, Vu, Vu], varf, bc, bc0, None, t_init=0.0, t_final=1.0, dt=0.01,
+       init_varf=init_varf)
+
+A stationary problem of its own, ``pde.init_problem``, solves the initial equation with
+the state's boundary conditions and differentiates it like the steps; its terms join
+theirs in the forward and adjoint marches, the gradient and every block of the Hessian.
+The parameter may therefore set the initial state through any map that JAX
+differentiates twice, ``(u0.val - g(m.val)) * p.val``; ``init_linear=False`` declares a
+density that is nonlinear in ``u0``, which Newton's method then solves.  Set the solvers
+of ``pde.init_problem`` as for any stationary problem.  ``applications/ad_diff`` runs
+its initial-condition inversion with a hand-written wrapper or, with
+``--initial-density``, with this density.  With essential conditions the two differ at
+the boundary: the wrapper zeroes the parameter's boundary values, while the projection
+lets them reach the rows next to the boundary.
 
 Why the previous level is a differentiation slot
 ------------------------------------------------
