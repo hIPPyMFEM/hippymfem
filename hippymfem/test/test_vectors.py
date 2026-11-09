@@ -486,6 +486,21 @@ def test_abort_hook():
 
 
 def test_config_profiles():
+    """(Run with a clean record of the knobs set through hm.config, which it sets and
+    restores itself, and that record restored afterwards: such a knob outranks a profile.)"""
+    import importlib
+
+    cfg = importlib.import_module("hippymfem.config")
+    kept = set(cfg.EXPLICIT)
+    cfg.EXPLICIT.clear()
+    try:
+        _test_config_profiles()
+    finally:
+        cfg.EXPLICIT.clear()
+        cfg.EXPLICIT.update(kept)
+
+
+def _test_config_profiles():
     """Profiles (``HIPPYMFEM_PROFILE``, ``hm.config.use_profile``) fill in what the
     environment leaves unset: an explicit setting wins, mixed precision comes only with a
     single-precision hypre named, an unknown name is refused, an import-time knob is left
@@ -638,6 +653,21 @@ def test_config_explicit_and_spellings():
 
 
 def test_config_knobs():
+    """(Run with a clean record of the knobs set through hm.config, which it sets and
+    restores itself, and that record restored afterwards: such a knob outranks a profile.)"""
+    import importlib
+
+    cfg = importlib.import_module("hippymfem.config")
+    kept = set(cfg.EXPLICIT)
+    cfg.EXPLICIT.clear()
+    try:
+        _test_config_knobs()
+    finally:
+        cfg.EXPLICIT.clear()
+        cfg.EXPLICIT.update(kept)
+
+
+def _test_config_knobs():
     """Every knob of ``hm.config`` reads, and a written value arrives as the type it names.
 
     Two knobs did not: ``gpu_mem_reserve`` is in GiB but was cast to ``int`` and described
