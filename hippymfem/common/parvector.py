@@ -112,16 +112,20 @@ def allreduce(comm, value, op=MPI.SUM):
     up a tree of the ranks and down again: two dozen hops one after the other on 4096
     ranks, where the library's collective is a fraction of that.  Every inner product
     and norm of a Newton-CG iteration ends in one.
+
+    Every rank's value goes as a double, whatever its type: the type of a buffer is
+    each rank's own choice, and an integer on one rank reduced with doubles on the
+    others reduced their bits (``0`` on rank 0 and ``1.5`` on rank 1 summed to
+    4609434218613702656 on rank 0).  Integers up to 2^53 are exact; an integer comes
+    back where ``value`` was one and the result is whole.
     """
-    if isinstance(value, (bool, int, np.integer)):
-        buf = np.array([int(value)], dtype=np.int64)
-        out = np.empty(1, dtype=np.int64)
-        comm.Allreduce(buf, out, op=op)
-        return int(out[0])
     buf = np.array([float(value)], dtype=np.float64)
     out = np.empty(1, dtype=np.float64)
     comm.Allreduce(buf, out, op=op)
-    return float(out[0])
+    result = float(out[0])
+    if isinstance(value, (bool, int, np.integer)) and result.is_integer():
+        return int(result)
+    return result
 
 
 def allreduce_extreme(comm, loc, op):
@@ -160,10 +164,8 @@ class Layout:
     *later*, unrelated collective would receive the wrong message.  Constructing a
     layout from a local size always communicates; only reuse is free.
 
-    :meth:`of_range` makes one without a message, from what a matrix or a space already
-    knows of this rank's range.  Its :attr:`offsets` of every rank are then gathered at
-    their first read, which has to be a read on every rank (the gather of a whole
-    vector, which is one collective anyway).
+    :meth:`of_range` makes one from what a matrix or a space already knows of this rank's
+    range, with one gather of the sizes by MPI's own collective on a buffer.
     """
 
     __slots__ = ("comm", "local_size", "_offsets", "global_size", "col_starts")
@@ -182,18 +184,22 @@ class Layout:
     def of_range(cls, comm, first, last, global_size):
         """The layout of a vector whose entries on this rank are the global indices
         ``first`` to ``last - 1`` of ``global_size``, as the caller knows them on every
-        rank (the rows of a matrix, the true dofs of a space): no message."""
+        rank (the rows of a matrix, the true dofs of a space).
+
+        The offsets of every rank are gathered here, by MPI's own collective on a
+        buffer (0.13 ms on 4096 ranks, once for a solver's operator, where every rank
+        makes the layout).  Gathered at their first read instead, they hung a read made
+        on one rank only, as a debugging print makes."""
         self = cls.__new__(cls)
         self.comm, self.local_size = comm, int(last) - int(first)
-        self._offsets, self.global_size = None, int(global_size)
+        self._offsets, _ = partition(comm, self.local_size)
+        self.global_size = int(global_size)
         self.col_starts = np.array([int(first), int(last), int(global_size)], dtype=_HYPRE_BIGINT)
         return self
 
     @property
     def offsets(self):
         """The first global index of every rank, and the global size at the end."""
-        if self._offsets is None:
-            self._offsets, _ = partition(self.comm, self.local_size)
         return self._offsets
 
 

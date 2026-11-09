@@ -967,8 +967,8 @@
   each rank's succeeded, an agreement on a failure at every single-precision solve, and a
   gather of every rank's size for each vector made without a layout.  They are now
   reductions on buffers; a vector made for a matrix takes its layout from the matrix's
-  row range without a message (the offsets of all ranks are gathered when something
-  reads them); and an agreement reduces one flag and gathers the messages only when a
+  row range, with one gather of the sizes on a buffer; and an agreement reduces one flag
+  and gathers the messages only when a
   rank has failed.  On 4096 ranks a pickled gather takes 1.64 ms where MPI's own takes
   0.13 ms, and the pickled calls of two steps came to 0.11 s.
 - **The vectors of a Newton step stay on the device** (`CGSolverSteihaug._solve`,
@@ -1270,6 +1270,20 @@
 
   `abort.handled_elsewhere` makes the decision. `test_vectors` checks it with a recorder
   in place of the abort.
+- **Reading `ParVector.offsets` on one rank hung, and `parvector.allreduce` could reduce
+  bits.**
+  - A layout made from a matrix's row range (`Layout.of_range`, the vectors of a solver)
+    gathered every rank's offsets at their first read. A read made on one rank only, as a
+    debugging print makes, waited forever for the others. The offsets are now gathered
+    when the layout is made, by one collective on a buffer (0.13 ms on 4096 ranks, once
+    for an operator).
+  - `allreduce` chose the MPI type from each rank's own value. An integer on one rank,
+    such as 0 from an empty sum, beside doubles on the others summed their bits:
+    4609434218613702656 on rank 0 for 0 and 1.5. Every value now goes as a double, which
+    is exact for integers up to 2^53. An integer comes back where the value was one and
+    the result is whole.
+
+  `test_vectors` checks both.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and

@@ -120,6 +120,36 @@ def test_nan_reductions():
     check("finite values reduce as before", ok)
 
 
+def test_layout_of_range_and_reduce():
+    """A layout made from a range (a solver's vectors, ``Layout.of_range``) knows the
+    offsets of every rank when it is made, so that a read of ``offsets`` on one rank only
+    needs no message (one gathered at its first read hung there).  ``allreduce`` gives
+    the same value on every rank where one rank holds an integer and the others doubles
+    (it reduced their bits)."""
+    from hippymfem.common.parvector import Layout, allreduce, partition
+
+    if RANK == 0:
+        print("layouts from a range, and reductions of mixed types")
+    local = 3 + RANK
+    offs, n = partition(COMM, local)
+    lay = Layout.of_range(COMM, int(offs[RANK]), int(offs[RANK + 1]), n)
+    known = COMM.allreduce(int(lay._offsets is not None), op=MPI.MIN) == 1
+    alone = None
+    if known and RANK == 0:
+        # (only where it is known on every rank: a read that gathers would hang here)
+        alone = list(ParVector(COMM, local, layout=lay).offsets)
+    check("a layout from a range knows every rank's offsets when it is made",
+          known and (RANK != 0 or alone == list(offs)), "(%s)" % (alone,))
+    mixed = allreduce(COMM, 0 if RANK == 0 else 1.5, MPI.SUM)
+    whole = allreduce(COMM, 1, MPI.SUM)
+    flag = allreduce(COMM, int(RANK == NP - 1), MPI.MAX)
+    ok = (mixed == 1.5 * (NP - 1) and whole == NP and isinstance(whole, int)
+          and flag == 1 and isinstance(flag, int))
+    ok = COMM.allreduce(int(ok), op=MPI.MIN) == 1
+    check("allreduce of an integer on one rank and doubles on the others",
+          ok, "(%r, %r, %r)" % (mixed, whole, flag))
+
+
 def test_partition_matches_mfem():
     """The crux: our allgather partition must equal MFEM's tdof partition."""
     if RANK == 0:
@@ -849,6 +879,7 @@ if __name__ == "__main__":
         print("=" * 70)
     test_parvector()
     test_nan_reductions()
+    test_layout_of_range_and_reduce()
     test_partition_matches_mfem()
     test_operators()
     test_multivector()
