@@ -603,7 +603,8 @@ def test_newton_cg():
 def test_newton_cg_reorthogonalized():
     """Newton-CG whose CG keeps its residuals orthogonal explicitly: the same MAP point
     in no more Hessian actions, and the same count when the incremental solves of the
-    Hessian action stop at 1e-5 instead of at round-off."""
+    Hessian action stop at 1e-5 instead of at round-off, or at the default 1e-6 of the
+    Newton solver (``cg_incremental_tolerance``)."""
     if RANK == 0:
         print("ReducedSpaceNewtonCG with a reorthogonalized CG")
     model, Vh, mtrue, B = build_problem(n=16, order=2, ntargets=50)
@@ -617,7 +618,7 @@ def test_newton_cg_reorthogonalized():
             inc_its[0] += int(self.iterations)
             return n
 
-    def run(reorth, inc_tol=None, prec_tol=0.0, relax=0.0, cycles=0):
+    def run(reorth, inc_tol=None, prec_tol=0.0, relax=0.0, cycles=0, inc_default=0.0):
         inc_its[0] = 0
         if inc_tol is not None:
             for a in ("solver_fwd_inc", "solver_adj_inc"):
@@ -637,6 +638,7 @@ def test_newton_cg_reorthogonalized():
         params["cg_preconditioner_tolerance"] = prec_tol
         params["cg_hessian_relaxation"] = relax
         params["cg_preconditioner_cycles"] = cycles
+        params["cg_incremental_tolerance"] = inc_default
         solver = hm.ReducedSpaceNewtonCG(model, params)
         x = solver.solve([None, model.prior.mean.copy(), None])
         return solver, x[PARAMETER].copy()
@@ -720,6 +722,49 @@ def test_newton_cg_reorthogonalized():
           "solves against %d; MAP differs by %.1e)"
           % (relaxed.it, relaxed.total_cg_iter, loose.it, loose.total_cg_iter, its_relaxed,
              its_loose, e_relaxed))
+    # The default of the Newton solver (the runs above are with the solves as they are):
+    # the incremental solves of a Hessian action stop at cg_incremental_tolerance = 1e-6
+    # in the CG of a Newton step where their own tolerance is tighter, at most a
+    # thousandth of that CG's tolerance, with the orthogonalized CG only and not under
+    # cg_hessian_relaxation, whose CG asks for an accuracy of its own.
+    def rule(tolcg, **kw):
+        prm = hm.ReducedSpaceNewtonCG_ParameterList()
+        for k, v in kw.items():
+            prm[k] = v
+        return hm.ReducedSpaceNewtonCG(model, prm)._incremental_accuracy(tolcg)
+
+    default_tol = hm.ReducedSpaceNewtonCG_ParameterList()["cg_incremental_tolerance"]
+    check("the incremental solves of a Newton step: 1e-6 by default, at most 1e-3 of the CG's tolerance",
+          default_tol == 1e-6 and rule(0.5) == 1e-6 and math.isclose(rule(1e-4), 1e-7)
+          and rule(0.5, cg_reorthogonalize=False) is None
+          and rule(0.5, cg_incremental_tolerance=0.0) is None
+          and rule(0.5, cg_hessian_relaxation=1e-2) is None,
+          "(%r, %r at the CG tolerances 0.5 and 1e-4)" % (rule(0.5), rule(1e-4)))
+    # Against the same solvers at 1e-12: the same Newton count, the CG count to a few, the
+    # same MAP point, far fewer iterations of the incremental solves, and the solvers'
+    # own tolerance back after the solve.
+    tight, m_tight = run(True, inc_tol=1e-12)
+    its_tight = inc_its[0]
+    dflt, m_dflt = run(True, inc_tol=1e-12, inc_default=default_tol)
+    its_dflt = inc_its[0]
+    e_dflt = m_dflt.copy().axpy(-1.0, m_tight).norm("l2") / scale
+    kept = [float(getattr(pde, a).parameters["rel_tolerance"])
+            for a in ("solver_fwd_inc", "solver_adj_inc")]
+    # (solves of the single-precision hypre stop at its floor, 1e-5, whatever they are
+    # asked: nothing to loosen there, and the same iterations)
+    floor = max(float(getattr(getattr(pde, a), "tolerance_floor", 0.0))
+                for a in ("solver_fwd_inc", "solver_adj_inc"))
+    fewer = (its_dflt < 0.8 * its_tight if floor < default_tol
+             else abs(its_dflt - its_tight) <= max(2, its_tight // 20))
+    check("the default incremental tolerance leaves the MAP point and the count, in fewer solver iterations",
+          dflt.converged and e_dflt < 1e-5 and dflt.it == tight.it
+          and abs(dflt.total_cg_iter - tight.total_cg_iter) <= max(2, tight.total_cg_iter // 20)
+          and fewer and kept == [1e-12, 1e-12],
+          "(%d Newton and %d CG iterations, %d and %d with the solves at 1e-12; %d iterations "
+          "of the incremental solves against %d%s; MAP differs by %.1e; solvers left at %s)"
+          % (dflt.it, dflt.total_cg_iter, tight.it, tight.total_cg_iter, its_dflt, its_tight,
+             "" if floor < default_tol else ", single precision with its floor %.0e" % floor,
+             e_dflt, kept))
 
 
 def test_map_recovers_smooth_truth():

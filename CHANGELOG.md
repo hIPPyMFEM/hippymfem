@@ -1073,6 +1073,27 @@
   the index arrays on the device (`HIPPYMFEM_DEVICE_PATTERN=1`); L40S 46.1 -> 43.2 ->
   32.4 s; in double precision on the H100 29.9 -> 27.6 s. **This default changes the times
   of every Newton-CG run, not its counts.**
+- **The incremental solves of a Hessian action stop at 1e-6 in the CG of a Newton step**
+  (`cg_incremental_tolerance` of `ReducedSpaceNewtonCG`, the default; never more than a
+  thousandth of that CG's tolerance; their own tolerance where it is the looser; `0`
+  leaves them as they are; the line search with `cg_reorthogonalize` only, and not with
+  `cg_hessian_relaxation`, which sets its own). The GPU guide recommended setting this by
+  hand; it is now what Newton-CG does, through `ReducedHessian.set_accuracy`, so the
+  solvers keep their tolerance outside the Newton steps (a Laplace approximation at the
+  MAP point included) and the forward and adjoint solves, which give the gradient, are not
+  touched. The model problem of the paper's listing (quadratic hexahedra, 200
+  observations, Newton-CG to 1e-6 from the prior mean), the same Newton and CG counts and
+  the cost to ten digits: 48^3 on one L40S with the kernels and hypre on the card
+  (912,673 state dofs, 14 Newton and 141 CG iterations) 62.6 -> 39.6 s; 64^3 on two L40S
+  (2,146,689 state dofs, 15 Newton and 182 CG iterations on both) 136.3 and 119.8 s ->
+  74.3 and 74.2 s, interleaved; 20^3 on four host ranks 60.5 -> 35.6 s; 12^3 on one
+  27.5 -> 17.5 s. `test_optimization` checks the same MAP point and counts as with the
+  solves at 1e-12, half their iterations (1575 against 3058; the same iterations where
+  they run in the single-precision hypre), and the solvers' tolerance kept. The
+  single-precision solves, which stop near 1e-5 whatever they are asked, and
+  time-dependent problems, whose `solveIncremental` takes no tolerance, are not
+  affected. **This default changes the times of a Newton-CG run in double precision,
+  not its counts.**
 - **A streamed geometry is copied to the device at the rate of the bus**
   (`HIPPYMFEM_PINNED_STREAM`, on, where the device bridge can be used). A group whose
   geometry is too large to stay on the card (`HIPPYMFEM_GEOMETRY_STREAM`) had JAX move

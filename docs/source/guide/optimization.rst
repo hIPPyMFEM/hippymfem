@@ -52,18 +52,17 @@ at ``1e-6``.  The cost is ``k`` inner products and updates of parameter vectors 
 iteration ``k`` and two stored vectors per iteration, nothing next to a Hessian action.
 
 Two consequences.  The incremental solves of a Hessian action need a loose tolerance
-only, which halves their iterations:
-
-.. code-block:: python
-
-   pde.set_solvers(hm.auto_solver, Vu, comm, max_direct=0, rel_tolerance=1e-12)
-   for name in ("solver_fwd_inc", "solver_adj_inc"):
-       getattr(pde, name).parameters["rel_tolerance"] = 1e-6
-
-The forward and adjoint solves keep their tolerance: they give the gradient, which must
-be exact for Newton to converge to the MAP point, while the Hessian only shapes the
-steps.  Newton-CG to a relative gradient norm of ``1e-6`` on that problem, the same
-twelve Newton steps and the same cost functional to nine digits in every column:
+only, which halves their iterations, and Newton-CG stops them at ``1e-6`` in the CG of a
+Newton step (``cg_incremental_tolerance``, the default): never more than a thousandth of
+that CG's tolerance, and their own tolerance where that is the looser.  The forward and
+adjoint solves keep their tolerance: they give the gradient, which must be exact for
+Newton to converge to the MAP point, while the Hessian only shapes the steps.  The
+solvers keep theirs outside the Newton steps as well, so the Hessian of a Laplace
+approximation at the MAP point has the accuracy of the solvers;
+``cg_incremental_tolerance = 0`` keeps it in the Newton steps too.  Newton-CG to a
+relative gradient norm of ``1e-6`` on that problem, the same twelve Newton steps and the
+same cost functional to nine digits in every column (the second row is
+``cg_incremental_tolerance = 0`` with the solvers at ``1e-12``, the third the default):
 
 ==============================================  ========  ========  =====================
 ..                                              H100      L40S      Blackwell instance
@@ -76,7 +75,7 @@ and incremental solves to 1e-6                  32.0 s    73.3 s    83.8 s
 (one GPU each, or one MIG instance of an RTX PRO 6000 Blackwell, with MFEM's CG for the
 solves in all three rows; hypre's own PCG, :doc:`solvers`, takes another 7 to 12 % off
 the last.  At ``1e-4`` the H100 took 27.8 s, but one of the three GPUs then needed a
-thirteenth Newton step, so ``1e-6`` is the tolerance to use.)  And single precision becomes usable for those
+thirteenth Newton step, so ``1e-6`` is the default.)  And single precision becomes usable for those
 solves (:ref:`single-precision` in the GPU guide), since their rounding no longer
 disturbs the iteration.
 

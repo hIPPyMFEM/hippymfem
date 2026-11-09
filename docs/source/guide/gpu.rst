@@ -93,13 +93,14 @@ single precision, whose identities then hold to single precision only.
 **The MAP point.**
 
 * The defaults need no change: the CG of a Newton step keeps its residuals orthogonal,
-  CG with a hypre preconditioner runs in hypre's own PCG, and the prior's solves that
-  precondition that CG stop at 1e-6 (:doc:`optimization`, :doc:`solvers`).
-* Stop the two incremental solvers at 1e-6 and leave the forward and the adjoint solver
-  at their tolerance.  With the orthogonalized residuals the Newton and CG counts stay
-  those of incremental solves to 1e-12, and at 64\ :sup:`3` on an H100 the solve took
-  32.0 s instead of the 63.8 s of the recurrence with incremental solves to 1e-12.
-  1e-4 is too loose: one of three GPUs then took a thirteenth Newton step.
+  CG with a hypre preconditioner runs in hypre's own PCG, the prior's solves that
+  precondition that CG stop at 1e-6, and so do the incremental solves of its Hessian
+  actions, while the forward and the adjoint solves keep their tolerance
+  (:doc:`optimization`, :doc:`solvers`).  With the orthogonalized residuals the Newton
+  and CG counts stay those of incremental solves to 1e-12, and at 64\ :sup:`3` on an
+  H100 the solve took 32.0 s instead of the 63.8 s of the recurrence with incremental
+  solves to 1e-12.  Loosen them no further (``cg_incremental_tolerance``): at 1e-4 one
+  of three GPUs took a thirteenth Newton step.
 * Set ``HIPPYMFEM_PRECISION=mixed`` together with ``HIPPYMFEM_HYPRE_SINGLE``, the path of
   a single-precision build of hypre (:ref:`hypre-single-install`).  The Newton and CG
   counts and the cost functional stay those of double precision; at 64\ :sup:`3` the
@@ -156,8 +157,7 @@ L40S; matrix-free linearization points last (:ref:`gpu-memory`).
    # HIPPYMFEM_DEVICE=gpu HIPPYMFEM_HYPRE_DEVICE=1 HIPPYMFEM_PRECISION=mixed
    # HIPPYMFEM_HYPRE_SINGLE=/path/to/libHYPRE_single.so
    pde.set_solvers(hm.auto_solver, Vu, comm, max_direct=0, rel_tolerance=1e-12)
-   for name in ("solver_fwd_inc", "solver_adj_inc"):
-       getattr(pde, name).parameters["rel_tolerance"] = 1e-6
+   # (Newton-CG stops the incremental solves at 1e-6 itself: cg_incremental_tolerance)
    x = hm.ReducedSpaceNewtonCG(model, params).solve([None, prior.mean.copy(), None])
 
    model.setPointForHessianEvaluations(x)   # the Laplace approximation: single-precision solves
