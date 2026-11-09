@@ -1433,7 +1433,9 @@ class SingleGMRESEngine(SingleEngine):
     for the adjoint solves (``PDEVariationalProblem._jacobian`` assembles both into the
     single-precision hypre).  Set up once and shared by the solvers of that matrix.  The
     product is hypre's own: the defect of the row sums that the PCG adds
-    (:class:`RowDefect`) is left to the refinement against double-precision residuals."""
+    (:class:`RowDefect`) is left to the refinement against double-precision residuals,
+    and these matrices do not keep it (``tdofassemble.single_target(row_sums=False)``).
+    The incremental solves, which are not refined, carry the rounding of the rows."""
 
     def __init__(self, S, parameters):
         self.matrix, self.lib = S, S.lib

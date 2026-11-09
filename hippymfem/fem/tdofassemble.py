@@ -67,6 +67,8 @@ DEVICE_PARMAT = env_choice("HIPPYMFEM_PARMAT_DEVICE", "block", ("block", "copy")
 #: hypre (:func:`single_target`), which a PDE problem asks for around the assembly of
 #: its Jacobian.
 _SINGLE_TARGET = [False]
+#: whether such a matrix keeps the defect of its row sums (:func:`single_target`)
+_ROW_SUMS = [True]
 
 #: A matrix for the single-precision hypre is accumulated in single precision on the
 #: device: the accumulator, the largest allocation of an assembly, is half as large,
@@ -144,18 +146,29 @@ SINGLE_BLOCKS = env_flag("HIPPYMFEM_SINGLE_BLOCKS", False)
 
 
 @contextlib.contextmanager
-def single_target():
+def single_target(row_sums=True):
     """Within this block a complete matrix (its elimination folded into the scatter) is
-    finished as a :class:`~hippymfem.algorithms.singlesolve.SingleParMatrix`."""
-    old, _SINGLE_TARGET[0] = _SINGLE_TARGET[0], True
+    finished as a :class:`~hippymfem.algorithms.singlesolve.SingleParMatrix`.  With
+    ``row_sums=False`` it keeps no defect of its row sums (:data:`SINGLE_ROW_SUMS`): for
+    a matrix whose solver does not add it, the GMRES of a Jacobian that is not symmetric
+    and of its transpose (``PDEVariationalProblem._jacobian``), which would compute and
+    keep it for nothing."""
+    old = _SINGLE_TARGET[0], _ROW_SUMS[0]
+    _SINGLE_TARGET[0], _ROW_SUMS[0] = True, bool(row_sums)
     try:
         yield
     finally:
-        _SINGLE_TARGET[0] = old
+        _SINGLE_TARGET[0], _ROW_SUMS[0] = old
 
 
 def single_requested():
     return _SINGLE_TARGET[0]
+
+
+def row_sums_wanted():
+    """Whether a matrix finished now for the single-precision hypre keeps the defect of
+    its row sums: :data:`SINGLE_ROW_SUMS`, unless :func:`single_target` says otherwise."""
+    return bool(SINGLE_ROW_SUMS and _ROW_SUMS[0])
 
 
 def device_finish():

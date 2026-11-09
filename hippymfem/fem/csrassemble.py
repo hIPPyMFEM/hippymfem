@@ -247,7 +247,7 @@ def finish_block(p, acc):
         from . import tdofassemble as td
 
         A = p.tpat.finish(acc, diagonal, single=bool(p.fold and single_requested()),
-                          row_sums=bool(td.SINGLE_ROW_SUMS and p.row_sums))
+                          row_sums=bool(td.row_sums_wanted() and p.row_sums))
         if p.fold:
             return A
     else:
@@ -278,7 +278,7 @@ def _accumulator_dtype(p, host):
     from . import tdofassemble as td
 
     if (not host and p.tpat is not None and p.fold and td.single_requested()
-            and td.SINGLE_ACCUMULATE and not (td.SINGLE_ROW_SUMS and p.row_sums)):
+            and td.SINGLE_ACCUMULATE and not (td.row_sums_wanted() and p.row_sums)):
         return np.float32
     return None
 
@@ -391,7 +391,7 @@ def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem
         # in the accumulator of a split batch: sums made in single precision have their
         # rounding in them, and no defect is left to keep.
         wide = (p.tpat is not None and p.fold and td.single_requested()
-                and td.SINGLE_ROW_SUMS and p.row_sums)
+                and td.row_sums_wanted() and p.row_sums)
         acc = p.target.data(element_matrices, zero_slots=p.zero, host=host,
                             dtype=np.float64 if wide else None)
     if boundary is not None:

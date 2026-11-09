@@ -1256,6 +1256,14 @@
 
   New checks in `single_case` (run by `test_solvers` and `test_device` with a
   single-precision hypre named) cover each of these.
+- **The GMRES route of the single-precision hypre computed a defect of the row sums that it
+  does not use.** hypre's GMRES adds no correction of the row sums to its products, as the
+  CG route does, so the Jacobian that is not symmetric and its transpose computed and kept
+  the defect for nothing. They no longer do, and their assembly no longer needs the
+  double-precision accumulator it took for it (`tdofassemble.single_target(row_sums=False)`).
+  The forward and adjoint solves of that route are refined against double-precision
+  residuals. Its incremental solves, which are not, carry the rounding of the rows, as the
+  GPU guide now says.
 - **The abort hook ended runs it had no reason to end.**  `sys.excepthook` also receives
   errors that are handled where they are shown, and errors that are only reported. In
   each of the following cases the hook now prints the traceback as before and does not

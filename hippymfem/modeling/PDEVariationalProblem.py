@@ -592,12 +592,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             known = None
         ns_single = ns_ok and known is not None and not known
 
-        def assemble(consistent, in_single):
+        def assemble(consistent, in_single, row_sums=True):
+            # (row_sums=False for the GMRES route: hypre's GMRES does not add the defect of
+            # the row sums, so it is neither computed nor kept there)
             kw = dict(test_ess=self.bc0.ess_tdof, diag_policy="one", consistent=consistent)
             if in_single:
                 from ..fem.tdofassemble import single_target
 
-                with single_target():
+                with single_target(row_sums=row_sums):
                     T = self._element_products()
                     if T is not None:
                         return self._jacobian_with_products(xx, consistent, T)
@@ -605,7 +607,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             return self._block(ADJOINT, STATE, xx, **kw)
 
         A = assemble(("symmetric" if known else "two-sided") if single else None,
-                     (to_single and bool(known)) or ns_single)
+                     (to_single and bool(known)) or ns_single, row_sums=not ns_single)
         if self.symmetric_jacobian == "auto":
             symmetric = self._probe_symmetry(A) if known is None else known
             if (single or to_single or ns_ok) and known is None:
@@ -621,7 +623,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
                         A = assemble("symmetric" if single else None, to_single)
                 elif ns_ok:
                     del A
-                    A = assemble("two-sided" if single else None, True)
+                    A = assemble("two-sided" if single else None, True, row_sums=False)
             elif (known and not single and _is_single(A) and not self._probe_symmetry(
                     A, self.SYMMETRY_PROBE_TOL_SINGLE_PRODUCTS / np.sqrt(A.GetGlobalNumRows()))):
                 # The verdict kept from an earlier Jacobian, checked on this one: from
@@ -644,7 +646,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
             # and columns of A's, for the adjoint's GMRES and its own hierarchy
             from ..fem.tdofassemble import single_target
 
-            with single_target():
+            with single_target(row_sums=False):
                 At = self._block(STATE, ADJOINT, xx, test_ess=self.bc0.ess_tdof, diag_policy="one",
                                  consistent="two-sided" if single else None)
         elif self.transpose_free_adjoint and isinstance(self._get_solver("solver"), _krylov_class()):

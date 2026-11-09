@@ -472,6 +472,9 @@ def _nonsymmetric(check, COMM):
         engine = (type(pde.solver_adj._pc).__name__ if pde.solver_adj is not None
                   and getattr(pde.solver_adj, "_pc", None) is not None else "-")
         single_A, single_At = pvp._is_single(A), pvp._is_single(At) and At is not A
+        if single:
+            # (hypre's GMRES does not add the defect of the row sums: it is not kept)
+            defects = (getattr(A, "row_defect", None), getattr(At, "row_defect", None))
         del A, At
         if single:
             # the adjoint's solver, made here from the forward one, follows a setting of
@@ -503,6 +506,8 @@ def _nonsymmetric(check, COMM):
           ef < 1e-4 and ea < 1e-4, "(%.1e, %.1e)" % (ef, ea))
     check("the adjoint's GMRES, made from the forward solver's, follows a later setting of it",
           follows)
+    check("the matrices of the GMRES route keep no defect of their row sums",
+          defects == (None, None), "(%s)" % (tuple(type(d).__name__ for d in defects),))
 
 
 def _symmetric_default_gmres(check, COMM):

@@ -108,7 +108,10 @@ single precision, whose identities then hold to single precision only.
   on the busiest card (:ref:`single-precision`).  The single-precision solves need a
   Jacobian solved by CG with BoomerAMG where it is symmetric, or by GMRES with BoomerAMG
   where it is not (its transpose is then assembled in single precision too, for the
-  adjoint); other solvers keep their double-precision solves.
+  adjoint); other solvers keep their double-precision solves.  The GMRES route adds no
+  correction of the row sums, as the CG route does in every product: its forward and
+  adjoint solves are refined against double-precision residuals, and its incremental
+  solves, which are not, carry the rounding of the matrix's rows.
 * On a GPU, ``HIPPYMFEM_SINGLE_AMG="relax=7,pmax=6"`` (Jacobi relaxation and six
   interpolation entries a row in the BoomerAMG of the single-precision solves) took the
   Newton-CG solve at 64\ :sup:`3` from 38.5 to 29.0 s on a Blackwell instance and from
