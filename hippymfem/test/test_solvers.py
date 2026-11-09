@@ -686,6 +686,44 @@ def test_boomeramg_options():
     except ValueError:
         raised = True
     check("and a mistyped one stops the solver's setup", raised)
+    # settings for CG solvers alone (HIPPYMFEM_AMG_CG), after those of every solver
+    # (HIPPYMFEM_AMG): a CG solver takes both, the later winning; a GMRES solver never
+    # reads the variable; a solver's own amg_options replace both
+    import os
+
+    saved = {k: os.environ.get(k) for k in ("HIPPYMFEM_AMG", "HIPPYMFEM_AMG_CG")}
+    got, said, gmres_made = {}, "", False
+    try:
+        os.environ["HIPPYMFEM_AMG"] = "pmax=5,theta=0.3"
+        os.environ["HIPPYMFEM_AMG_CG"] = "pmax=7"
+        for method in ("cg", "gmres"):
+            ks = hp.KrylovSolver(COMM, method, "amg")
+            ks.set_operator(A)
+            got[method] = (read(ks._pc, "HYPRE_BoomerAMGGetPMaxElmts", ctypes.c_int),
+                           read(ks._pc, "HYPRE_BoomerAMGGetStrongThreshold", ctypes.c_double))
+        ks = hp.KrylovSolver(COMM, "cg", "amg")
+        ks.parameters["amg_options"] = "pmax=3"
+        ks.set_operator(A)
+        got["own"] = read(ks._pc, "HYPRE_BoomerAMGGetPMaxElmts", ctypes.c_int)
+        os.environ["HIPPYMFEM_AMG_CG"] = "pmaxx=7"
+        hp.KrylovSolver(COMM, "gmres", "amg")
+        gmres_made = True
+        try:
+            hp.KrylovSolver(COMM, "cg", "amg")
+        except ValueError as e:
+            said = str(e)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    check("HIPPYMFEM_AMG_CG reaches CG solvers alone, after HIPPYMFEM_AMG, and a solver's own amg_options "
+          "replace both; a mistyped name is refused by the variable's name, by CG solvers only",
+          got.get("cg") == (7, 0.3) and got.get("gmres") == (5, 0.3) and got.get("own") == 3
+          and gmres_made and "HIPPYMFEM_AMG_CG" in said,
+          "(CG %s, GMRES %s, own %s; %s)" % (got.get("cg"), got.get("gmres"), got.get("own"),
+                                            said[:60] or "nothing refused"))
 
     # A hierarchy ended at a level of a few rows, which one process finishes, gathered
     # (seq_threshold).  hypre's own code does it on the host; with hypre on a device it

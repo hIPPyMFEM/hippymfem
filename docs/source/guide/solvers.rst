@@ -61,6 +61,20 @@ SPD operator on L40S cards, on one card and on four alike, with half the CG
 iterations.  It is not the default because it needs an SPD operator (the geothermal
 model's Jacobian is not) and the gain is a constant, not a change in scaling.
 
+``parameters["amg_options"]`` takes further BoomerAMG settings by hypre's names
+(``HIPPYMFEM_AMG`` for every new solver).  ``HIPPYMFEM_AMG_CG`` (``hm.config.amg_cg``)
+adds settings for new CG solvers alone, after those: the operator of a CG solve is
+symmetric positive definite, where l1-Jacobi with any weight below two converges, so
+``HIPPYMFEM_AMG_CG=relax_wt=1.8`` is safe there.  It saved 21 to 31 % of the iterations
+of twelve SPD operators on one L40S with hypre on the card: the model problem, a
+coefficient contrast of 1e6, anisotropy of 1e-3 aligned with the mesh and rotated, a
+mesh stretched twenty times, quadratic tetrahedra, linear elasticity with systems AMG up
+to a Poisson ratio of 0.45, and the prior's operator.  The savings were the same on two
+cards with twice the elements.  The same weight in ``HIPPYMFEM_AMG``, which reaches
+GMRES too, stalled GMRES on advection-diffusion at a mesh Peclet number of 5 to 6
+(1000 iterations with the residual at 0.3 to 0.6, where MFEM's settings converged in 150
+to 192).
+
 CG with a hypre preconditioner runs in hypre's own PCG (MFEM's ``HyprePCG``), not in
 MFEM's ``CGSolver`` (``HIPPYMFEM_HYPRE_PCG=0`` or ``hm.config.hypre_pcg = False`` for the
 latter).  The two make the same iteration: the same iterates, counts and stopping test

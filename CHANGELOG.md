@@ -4,6 +4,18 @@
 
 ### Added
 
+- **BoomerAMG settings for CG solvers alone** (`HIPPYMFEM_AMG_CG`, `hm.config.amg_cg`):
+  added to the `amg_options` of a new CG solver after `HIPPYMFEM_AMG`, the later winning,
+  and read by no other method; a solver's own `amg_options` replace both. The operator
+  of a CG solve is symmetric positive definite, where l1-Jacobi with a weight below two
+  converges: `relax_wt=1.8` saved 21 to 31 % of the iterations of twelve SPD operators on
+  one L40S with hypre on the card (the model problem, a 1e6 contrast, aligned and
+  rotated anisotropy, a mesh stretched twenty times, quadratic tetrahedra, elasticity
+  with systems AMG, the prior's operator), the same on two cards with twice the
+  elements, where in `HIPPYMFEM_AMG` it stalled GMRES on advection-diffusion at a mesh
+  Peclet number of 5 to 6. An unknown name is refused by the variable's name.
+  `test_solvers` checks the order, that a GMRES solver never reads the variable, and
+  that a solver's own settings replace both.
 - **Every suite on a GPU.**  `DEVICE_SUITES=1 ./run_tests.sh 1 2` runs every suite once
   more with the element kernels and hypre on the card (`HIPPYMFEM_DEVICE=gpu
   HIPPYMFEM_HYPRE_DEVICE=1`), as a GPU user runs a script.  The checks that compare two

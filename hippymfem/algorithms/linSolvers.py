@@ -92,7 +92,8 @@ def KrylovSolver_ParameterList():
                         "hypre's own interface, which has more of them than MFEM's class: a "
                         "list such as \"relax_wt=1.8,pmax=6\" of the names in "
                         "mfemconfig.BOOMERAMG_SETTERS (\"print=1\" has hypre print the "
-                        "hierarchy it builds)"],
+                        "hierarchy it builds); a CG solver adds HIPPYMFEM_AMG_CG after "
+                        "HIPPYMFEM_AMG, settings for symmetric positive definite operators"],
         "pc_reuse": [_env_default("HIPPYMFEM_PC_REUSE", int, 0),
                      "keep the preconditioner for this many further operators before "
                      "rebuilding it.  A preconditioner changes the iteration count, never "
@@ -300,6 +301,19 @@ class KrylovSolver(_SolverBase):
                         "systems_bynodes=False: BoomerAMG would pair rows of different "
                         "components." % int(systems_dim), RuntimeWarning, stacklevel=2)
         self.systems_bynodes = bool(systems_bynodes)
+        if method == "cg":
+            # Settings for CG solvers alone (HIPPYMFEM_AMG_CG), after those of every solver
+            # (HIPPYMFEM_AMG), the later winning.  The operator of a CG solve is symmetric
+            # positive definite, where l1-Jacobi with a weight below two converges; GMRES on
+            # a convection-dominated Jacobian stalled with relax_wt=1.8.  A solver's own
+            # amg_options, set afterwards, replace both.
+            cg_only = os.environ.get("HIPPYMFEM_AMG_CG", "").strip()
+            if cg_only:
+                from ..common import mfemconfig as _mc
+
+                _mc.parse_boomeramg_options(cg_only, "HIPPYMFEM_AMG_CG")  # an unknown name
+                own = str(self.parameters["amg_options"] or "").strip()
+                self.parameters["amg_options"] = ",".join(x for x in (own, cg_only) if x)
         self._solver = None
         self._pc = None
         self._template = None

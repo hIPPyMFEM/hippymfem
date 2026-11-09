@@ -415,6 +415,11 @@ _KNOBS = [
           "further BoomerAMG settings of new solvers by hypre's names, such as relax_wt=1.8,pmax=6 "
           "(mfemconfig.BOOMERAMG_SETTERS); empty keeps MFEM's",
           _env_only("HIPPYMFEM_AMG", ""), _env_setter("HIPPYMFEM_AMG")),
+    _Knob("amg_cg", "HIPPYMFEM_AMG_CG",
+          "further BoomerAMG settings of new CG solvers alone, after HIPPYMFEM_AMG: for symmetric "
+          "positive definite operators, such as relax_wt=1.8 (GMRES on a convection-dominated "
+          "Jacobian stalls with it); empty adds none",
+          _env_only("HIPPYMFEM_AMG_CG", ""), _env_setter("HIPPYMFEM_AMG_CG")),
     _Knob("pc_reuse", "HIPPYMFEM_PC_REUSE",
           "default for reusing a solver's AMG hierarchy across operators (0: rebuild each time)",
           _env_only("HIPPYMFEM_PC_REUSE", "0"), _env_setter("HIPPYMFEM_PC_REUSE", _int)),
