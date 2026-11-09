@@ -80,14 +80,15 @@ Hessians at the quadrature points and, where ``HIPPYMFEM_HYPRE_SINGLE`` names a
 single-precision hypre, the Jacobians and their solves in single precision with the chunk
 planner set for single-precision tangents.  ``HIPPYMFEM_PROFILE=gpu-large`` adds the
 solver settings of the weak-scaling runs on Frontier (BoomerAMG with l1-Jacobi weight 1.8
-and six interpolation entries a row; in the single-precision solves the p-multigrid over
+and six interpolation entries a row for the CG solvers, ``HIPPYMFEM_AMG_CG``; in the
+single-precision solves the p-multigrid over
 up to seven meshes of a uniformly refined mesh, with its small levels in host memory; the
-prior's cycles over the meshes).  Those AMG settings are for problems whose Jacobian is
-symmetric positive definite, solved by CG, where the weight saved 21 to 31 % of the
+prior's cycles over the meshes).  Those AMG settings reach CG solvers only, whose
+operator is symmetric positive definite: there the weight saved 21 to 31 % of the
 iterations in twelve cases (contrast, anisotropy, stretched elements, tetrahedra,
-elasticity, the prior): they reach every new solver, and with that weight GMRES stalls on
-convection-dominated advection-diffusion (a mesh Peclet number of 5 or 6, where MFEM's
-settings converge in 150 to 190 iterations).  A profile fills in only what the environment leaves
+elasticity, the prior), while in ``HIPPYMFEM_AMG``, which every solver reads, it stalled
+GMRES on convection-dominated advection-diffusion (a mesh Peclet number of 5 or 6, where
+MFEM's settings converge in 150 to 190 iterations; :doc:`solvers`).  A profile fills in only what the environment leaves
 unset, and ``hm.config.show()`` marks what it set; ``hm.config.use_profile(name)`` applies
 the runtime part after import.  The tolerances and the Newton-CG parameters below remain
 the script's, as does a lumped prior mass, which changes the discrete problem.  The
@@ -484,7 +485,10 @@ instead of 31 at 512\ :sup:`3` on 512, and two Newton-CG steps there 10.8 s inst
 14.3 s (plain Jacobi with the same six entries: 14 iterations at 128\ :sup:`3` on eight,
 where this takes 17).  With a parameter three times as large it converged in 22
 iterations at 64\ :sup:`3` against 32 with MFEM's settings, where plain Jacobi's solves
-ended after 10.  It is not the default either.
+ended after 10.  It is not the default either.  That bound needs a symmetric positive
+definite matrix: give the weight to CG solvers alone with ``HIPPYMFEM_AMG_CG``, as the
+``gpu-large`` profile does, since GMRES with it stalled on convection-dominated
+advection-diffusion where MFEM's settings converge (:doc:`solvers`).
 
 .. _gpu-pmg:
 

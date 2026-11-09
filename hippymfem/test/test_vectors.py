@@ -617,12 +617,12 @@ def _test_config_profiles():
 
     cfg = importlib.import_module("hippymfem.config")    # (the module; hp.config is its object)
 
-    env = {"HIPPYMFEM_AMG": "relax_wt=1.0"}
+    env = {"HIPPYMFEM_AMG_CG": "relax_wt=1.0"}
     got = cfg.apply_profile_env("gpu-large", env)
     check("gpu-large fills in the unset variables and leaves an explicit one",
-          env["HIPPYMFEM_AMG"] == "relax_wt=1.0" and env.get("HIPPYMFEM_PMG_H") == "7"
+          env["HIPPYMFEM_AMG_CG"] == "relax_wt=1.0" and env.get("HIPPYMFEM_PMG_H") == "7"
           and env.get("HIPPYMFEM_PMG") == "1" and env.get("HIPPYMFEM_HESSIAN") == "quadrature"
-          and "HIPPYMFEM_AMG" not in got,
+          and "HIPPYMFEM_AMG_CG" not in got and "HIPPYMFEM_AMG" not in env,
           "(%r)" % (sorted(got),))
     check("without a single-precision hypre named, no profile asks for mixed precision",
           "HIPPYMFEM_PRECISION" not in env and "HIPPYMFEM_AD_WORKING_SET" not in env)

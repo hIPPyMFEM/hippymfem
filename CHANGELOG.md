@@ -866,11 +866,11 @@
 
 ### Changed
 
-- **The `gpu-large` profile says that its AMG settings are for symmetric positive definite
-  problems.**  They reach every new solver (`HIPPYMFEM_AMG=relax_wt=1.8,pmax=6`), and with
-  that weight GMRES stalls on convection-dominated advection-diffusion (mesh Peclet number 5
-  or 6) where MFEM's settings converge; in twelve SPD cases solved by CG the weight saved 21
-  to 31 % of the iterations (tested on L40S cards by the sciml2 session).  A profile entry
+- **The `gpu-large` profile's AMG settings reach CG solvers only**
+  (`HIPPYMFEM_AMG_CG=relax_wt=1.8,pmax=6`, before `HIPPYMFEM_AMG`, which every solver
+  reads).  With that weight GMRES stalls on convection-dominated advection-diffusion (mesh
+  Peclet number 5 or 6) where MFEM's settings converge; in twelve SPD cases solved by CG the
+  weight saved 21 to 31 % of the iterations (tested on L40S cards by the sciml2 session).  A profile entry
   asked for under a variable is no longer applied where that variable is 0, no, false or off.
 - **One reading of the on/off settings.**  Every on/off `HIPPYMFEM_*` variable is read by
   `config.parse_flag`, at import and by its `hm.config` setter alike: 1, yes, true, on and
