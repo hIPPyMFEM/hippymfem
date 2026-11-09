@@ -489,6 +489,36 @@ def test_abort_hook():
         ok = sys.excepthook is not hook and not abort.installed()
         abort.install()
         check("it can be taken out and put back", ok and abort.installed())
+        # What the hook does with an error that a console shows and goes on (pdb's
+        # interact), and with one that nothing handles; abort._abort is replaced by a
+        # recorder, so that nothing ends here.
+        import code
+        import io
+        import types
+        import weakref
+
+        calls = []
+        saved_abort, saved_err = abort._abort, sys.stderr
+        abort._abort = lambda world: calls.append(world.Get_rank())
+        sys.stderr = io.StringIO()
+        try:
+            code.InteractiveConsole().push("1/0")
+            console = list(calls)
+            try:
+                raise ValueError("a test of the abort hook")
+            except ValueError:
+                sys.excepthook(*sys.exc_info())
+            plain = list(calls)
+        finally:
+            abort._abort, sys.stderr = saved_abort, saved_err
+        rank = MPI.COMM_WORLD.Get_rank()
+        check("an error that a console shows and goes on past does not abort; one that "
+              "nothing handles does", console == [] and plain == [rank],
+              "(after the console %s, after the plain error %s)" % (console, plain))
+        exitfunc = weakref.finalize._exitfunc.__func__
+        check("an exception of a finalizer that weakref.finalize runs at exit is only reported",
+              abort.handled_elsewhere(types.SimpleNamespace(f_code=exitfunc.__code__))
+              and not abort.handled_elsewhere(sys._getframe()))
     if _jaxconfig.JAX_CACHE:
         import jax
 

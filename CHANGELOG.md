@@ -1256,6 +1256,20 @@
 
   New checks in `single_case` (run by `test_solvers` and `test_device` with a
   single-precision hypre named) cover each of these.
+- **The abort hook ended runs it had no reason to end.**  `sys.excepthook` also receives
+  errors that are handled where they are shown, and errors that are only reported. In
+  each of the following cases the hook now prints the traceback as before and does not
+  call `MPI.COMM_WORLD.Abort`.
+  - A console of the standard library (pdb's `interact`, the REPL of Python 3.13) shows
+    an error typed into it through the hook and goes on. One typo there ended every rank.
+  - `weakref.finalize` reports through the hook an exception of a finalizer that it runs
+    at exit. A run that had finished its work then ended with an abort and status 1.
+  - In an interactive session (`python -i`, the REPL), ending the run is the user's call.
+  - After `MPI.Finalize`, `Abort` cannot reach the other ranks, and the traceback was lost
+    in its error.
+
+  `abort.handled_elsewhere` makes the decision. `test_vectors` checks it with a recorder
+  in place of the abort.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
