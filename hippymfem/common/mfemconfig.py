@@ -201,6 +201,13 @@ def configure_device(kind="gpu", comm=None, quiet=False):
     dev.thisown = False
     _DEVICE.append(dev)
     DEVICE_INDEX = idx
+    # (the build's own flag, not the backend that was asked for: a test that fakes the
+    # backend on a host build must not reach MFEM's memory manager at exit; and once)
+    if kind == "cuda" and mfem_has("MFEM_USE_CUDA") and not _TEARDOWN[0]:
+        import atexit
+
+        _TEARDOWN[0] = True
+        atexit.register(_late_teardown)
     set_hypre_spmv(spmv, comm)
     global GPU_AWARE_SOLVES
     want = os.environ.get("HIPPYMFEM_GPU_AWARE_MPI", "").strip().lower()
@@ -428,6 +435,47 @@ def _mfem_library():
     except OSError:
         pass
     return None
+
+
+#: whether :func:`_late_teardown` is registered (once a process)
+_TEARDOWN = [False]
+
+
+def _late_teardown():
+    """Register MFEM's ``Hypre::Finalize`` and ``MemoryManager::Destroy`` as exit handlers
+    of the process, from a Python ``atexit`` handler (CUDA builds, :func:`configure_device`).
+
+    The Device is never freed from Python (above), so MFEM's memory manager lives until
+    the static destructors of the process, which run after the CUDA runtime's own
+    teardown, registered when CUDA started.  Device memory still held by MFEM or hypre
+    is then freed into a runtime that is shutting down: hypre prints "driver shutting
+    down" and MFEM aborts, a finished run ending with status 134 (``test_vectorfe`` on
+    Blackwell cards; HIP tolerates it).  Exit handlers run last registered first, and
+    these are registered during the interpreter's finalization, after everything else:
+    they run after every Python object is gone and before CUDA's teardown.  Afterwards
+    MFEM's own destructors find the manager gone and the library finalized, and do
+    nothing.  A library without these symbols is left as it is."""
+    import ctypes
+
+    lib = _mfem_library()
+    if lib is None:
+        return
+    try:
+        # (a manager already destroyed, by a Device of the script's own, is left alone:
+        # MFEM stops the process on a second Destroy)
+        if not ctypes.c_bool.in_dll(lib, "_ZN4mfem13MemoryManager6existsE").value:
+            return
+        destroy = ctypes.cast(getattr(lib, "_ZN4mfem13MemoryManager7DestroyEv"),
+                              ctypes.c_void_p).value
+        finalize = ctypes.cast(getattr(lib, "_ZN4mfem5Hypre8FinalizeEv"), ctypes.c_void_p).value
+        manager = ctypes.addressof(ctypes.c_char.in_dll(lib, "_ZN4mfem2mmE"))
+        register = ctypes.CDLL(None).__cxa_atexit
+    except (AttributeError, ValueError, OSError):
+        return
+    register.restype = ctypes.c_int
+    register.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    register(destroy, manager, None)        # runs second: MemoryManager::Destroy on mfem::mm
+    register(finalize, None, None)          # runs first: Hypre::Finalize
 
 
 def boomeramg_handle(pc):

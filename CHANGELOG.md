@@ -1315,6 +1315,20 @@
   geometry. On an affine group the compact array (one inverse Jacobian an element) is now
   contracted as it is: 8.0 ms for `S^T`, and 4.3 ms for `S` where it took 5.8, with the
   same results to the last digit (`prior._jinv_operand`).
+- **A finished run on CUDA could end with status 134.** MFEM's Device is never freed from
+  Python, so its memory manager lives until the static destructors of the process. Those
+  run after the CUDA runtime's own teardown, which was registered when CUDA started.
+  Device memory still held then was freed into a runtime that was shutting down: hypre
+  printed "driver shutting down", and MFEM aborted (`test_vectorfe` on Blackwell cards;
+  HIP tolerates it, and `main` did the same). On a CUDA build, `configure_device` now
+  registers a Python `atexit` handler. During the interpreter's finalization it registers
+  MFEM's `Hypre::Finalize` and `MemoryManager::Destroy` as exit handlers of the process
+  (`__cxa_atexit`). Registered last, they run first: after every Python object is gone and
+  before CUDA's teardown. MFEM's destructors then find the manager gone and do nothing
+  (`mfemconfig._late_teardown`). This happens once a process, only on a build of MFEM with
+  CUDA, whatever backend a test fakes, and not where the manager is already gone. MFEM
+  stops the process on a second `Destroy`, as a first version of this change showed in
+  `test_solvers`.
 - **A parameter in the state's own space lost its boundary values in the assembled Hessian
   blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
   two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
