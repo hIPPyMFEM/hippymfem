@@ -1183,6 +1183,28 @@
 
 ### Fixed
 
+- **A parameter in the state's own space lost its boundary values in the assembled Hessian
+  blocks.**  The assembler eliminated a block's essential dofs on both sides whenever its
+  two sides were the same space object, as the Jacobian needs.  With `Vh = [V, V, V]` and
+  essential conditions on the state, that made `C` and `W_um` drop the parameter's columns
+  at the state's essential dofs (and put ones on the diagonal of their essential rows), so
+  the Hessian action ignored the parameter's values there: 10 to 17 % off the matrix-free
+  products in the new check, 38 % off finite differences for a nonlinear initial density.
+  The gradient (assembled as a vector) and the matrix-free products (`apply_ij_at`) were
+  right.  The assembler now eliminates on both sides only where the caller asks
+  (`plan_block`, `assemble_matrix` and `assemble_matrix_csr` take `symmetric=`; the default
+  keeps the old rule).  `PDEVariationalProblem` and the step blocks of
+  `TimeDependentPDEVariationalProblem` pass `symmetric=False` for every block with a
+  parameter side, which keeps the parameter's columns and zeroes the essential rows.  With
+  MFEM's elimination (`HIPPYMFEM_FOLD_ELIMINATION=0`) the directly assembled transposes of
+  such blocks also kept columns they should have lost; they lose them now.  Of the
+  tutorials, `05_HessianSpectrum` was affected (a source term in the state's space and
+  `u = 0` on one edge): its gradient and MAP point were right, but its stored eigenvalues
+  and CG counts came from the old Hessian.  The applications put the parameter in a space of
+  its own, or (`ad_diff`) zero its boundary values in the initial-condition wrapper, and do
+  not change.  `test_modeling` compares the assembled blocks with the matrix-free products
+  for a parameter in the state's space, with the elimination folded and with MFEM's.
+
 - **On AMD cards a program that queued more kernel launches than the runtime's queue holds
   ended in a segmentation fault** (`_jaxconfig`: `ROCPROFILER_REGISTER_ENABLED=0` unless
   the environment says otherwise).  JAX's ROCm plugin is linked with AMD's profiler

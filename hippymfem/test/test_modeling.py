@@ -780,9 +780,18 @@ def test_apply_ij_at():
     Vm = hm.FunctionSpace.H1(pmesh, 1)
     bc = hm.DirichletBC(Vu, 0.0, bdr_attributes=[1, 3])
     Wu = hm.FunctionSpace.L2(pmesh, 1)
+    # (a parameter in the state's own space has no essential dofs: its blocks keep the
+    # columns at the state's, with the elimination folded into the scatter and with
+    # MFEM's calls)
     cases = [("H1, essential dofs and a boundary term", [Vu, Vm, Vu], bc,
-              dict(bdr_varf=bdr)),
-             ("L2 with facets", [Wu, Vm, Wu], None, dict(bdr_varf=fbdr, facet_varf=facet))]
+              dict(bdr_varf=bdr), True),
+             ("H1, the parameter in the state's space", [Vu, Vu, Vu], bc,
+              dict(bdr_varf=bdr), True),
+             ("H1, the parameter in the state's space, MFEM's elimination", [Vu, Vu, Vu], bc,
+              dict(bdr_varf=bdr), False),
+             ("L2 with facets", [Wu, Vm, Wu], None, dict(bdr_varf=fbdr, facet_varf=facet),
+              True)]
+    from hippymfem.fem.elimination import set_fold_elimination
 
     def rand(V):
         v = V.vector()
@@ -791,7 +800,8 @@ def test_apply_ij_at():
 
     pairs = [(ADJOINT, STATE), (STATE, ADJOINT), (ADJOINT, PARAMETER), (PARAMETER, ADJOINT),
              (STATE, STATE), (STATE, PARAMETER), (PARAMETER, STATE), (PARAMETER, PARAMETER)]
-    for name, Vh, b, kw in cases:
+    for name, Vh, b, kw, fold in cases:
+        old_fold = set_fold_elimination(fold)
         pde = hm.PDEVariationalProblem(Vh, varf, b, b.homogeneous() if b else None,
                                        is_fwd_linear=False, **kw)
         x = [rand(Vh[0]), rand(Vh[1]), rand(Vh[2])]
@@ -831,6 +841,7 @@ def test_apply_ij_at():
                 check("matrix-free point (%s%s) = assembled, %s"
                       % ("all" if mode is True else "parameter", ", Gauss-Newton" if gn else "",
                          name), worst < mtol, "(rel %.1e)" % worst)
+        set_fold_elimination(old_fold)
     # the reduced Hessian of an inverse problem at a matrix-free point
     model, Vhm, mtrue, _u, _B = build_inverse_problem(n=8, order=2, ntargets=16)
     xm = model.generate_vector()

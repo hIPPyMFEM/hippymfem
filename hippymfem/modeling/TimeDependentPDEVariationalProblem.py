@@ -271,7 +271,7 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         if self.bdr_kernel is None:
             return assemble_matrix(self.slots[i], self.slots[j], self.batches.groups,
                                    mats, self.nelem, test_ess=test_ess,
-                                   diag_policy=diag_policy)
+                                   diag_policy=diag_policy, symmetric=PARAM not in (i, j))
         bmats = self.bdr_kernel.element_matrices(i, j, loc, (t, self.dt))
         require_finite_arrays(bmats, self.comm,
                               "boundary step block (%d, %d)" % (i, j))
@@ -285,7 +285,8 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
         return assemble_matrix_csr(
             ti, tj, self.batches.groups, mats, self.nelem, test_ess=test_ess,
             diag_policy=diag_policy,
-            boundary=(self.bdr_batches.tables(ti), self.bdr_batches.tables(tj), bmats))
+            boundary=(self.bdr_batches.tables(ti), self.bdr_batches.tables(tj), bmats),
+            symmetric=PARAM not in (i, j))
 
     def _step_blocks(self, names, u_new, u_old, m, p, t):
         """Several blocks of one step from **one** differentiation pass.
@@ -310,7 +311,7 @@ class TimeDependentPDEVariationalProblem(PDEProblem, KeepAlive):
                 out[n] = assemble_matrix(self.slots[ij[0]], self.slots[ij[1]],
                                          self.batches.groups, mats[ij], self.nelem,
                                          test_ess=ess if elim else None,
-                                         diag_policy=policy)
+                                         diag_policy=policy, symmetric=PARAM not in ij)
             else:
                 require_finite_arrays(bmats[ij], self.comm,
                                       "boundary step block %s" % n)

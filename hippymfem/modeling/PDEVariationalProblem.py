@@ -105,6 +105,16 @@ def _swap_element_axes(m):
     return jnp.swapaxes(m, -1, -2)
 
 
+
+def _symmetric(i, j):
+    """Whether block ``(i, j)`` has its essential dofs eliminated on both sides where
+    the two sides share a space: the state and the adjoint have essential dofs, the
+    parameter has none, so a parameter's block keeps every column (its direction
+    keeps its boundary values, as :meth:`PDEVariationalProblem.apply_ij_at` keeps
+    them) and has its essential rows zeroed."""
+    return PARAMETER not in (i, j)
+
+
 class PDEVariationalProblem(PDEProblem, KeepAlive):
     """Forward problem defined by a pointwise residual density.
 
@@ -449,7 +459,7 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         A = ParAdd(A, fac)
         del fac
         return _eliminate(A, self.Vh[i], self.Vh[j], test_ess, None, diag_policy,
-                          self.Vh[i].fes is self.Vh[j].fes)
+                          self.Vh[i].fes is self.Vh[j].fes and _symmetric(i, j))
 
     def _domain_block(self, i, j, x, test_ess=None, diag_policy="one", mats=None,
                       loc=None, consistent=None):
@@ -490,14 +500,15 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         if boundary is None:
             A = assemble_matrix(self.Vh[i], self.Vh[j], self.batches.groups,
                                 mats, self.nelem, test_ess=test_ess,
-                                diag_policy=diag_policy)
+                                diag_policy=diag_policy, symmetric=_symmetric(i, j))
         else:
             # The boundary entries go into the domain block's own slots, so one
             # matrix comes out with the elimination folded in (see
             # csrassemble.add_boundary_entries).
             A = assemble_matrix_csr(self.Vh[i], self.Vh[j], self.batches.groups,
                                     mats, self.nelem, test_ess=test_ess,
-                                    diag_policy=diag_policy, boundary=boundary)
+                                    diag_policy=diag_policy, boundary=boundary,
+                                    symmetric=_symmetric(i, j))
         finite.check(self.comm, "block (%d, %d)" % (i, j))
         return A
 
@@ -1479,13 +1490,14 @@ class PDEVariationalProblem(PDEProblem, KeepAlive):
         for ij in need:
             e, pol = spec[ij]
             plans[ij] = plan_block(self.Vh[ij[0]], self.Vh[ij[1]],
-                                   self.batches.groups, test_ess=e, diag_policy=pol)
+                                   self.batches.groups, test_ess=e, diag_policy=pol,
+                                   symmetric=_symmetric(*ij))
             # (the defect of the row sums is for a Jacobian's solver: of no use to a block)
             plans[ij].row_sums = False
         for ij, t in transposes:
             e, pol = spec[ij]
             plans[t] = plan_block(self.Vh[t[0]], self.Vh[t[1]], self.batches.groups,
-                                  trial_ess=e, diag_policy=pol)
+                                  trial_ess=e, diag_policy=pol, symmetric=_symmetric(*t))
             plans[t].row_sums = False
         finite = _FiniteFlag()
         base = finite.wrap(lambda: self.kernel.element_matrix_chunks_many(need, loc))

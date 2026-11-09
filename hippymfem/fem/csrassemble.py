@@ -155,14 +155,23 @@ class BlockPlan:
     pass over chunks feed several blocks (:func:`scatter_many`).
     """
 
-    __slots__ = ("test_space", "trial_space", "pattern", "same", "test_ess",
+    __slots__ = ("test_space", "trial_space", "pattern", "same", "sym", "test_ess",
                  "trial_ess", "diag_policy", "fold", "kill", "Pt", "Pr", "escapes",
                  "tpat", "target", "zero", "device", "row_sums")
 
 
 def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
-               diag_policy="one"):
-    """The value-independent part of assembling a block; collective."""
+               diag_policy="one", symmetric=None):
+    """The value-independent part of assembling a block; collective.
+
+    ``symmetric``: whether a block whose two sides are the same space has its
+    essential dofs eliminated on both sides (rows and columns by ``test_ess``, the
+    diagonal by ``diag_policy``), as the Jacobian of a state and its adjoint has.
+    ``None`` (the default) says yes for every such block.  ``False`` is for a block
+    whose column variable merely shares the space of the rows: a parameter that
+    lives in the state's space has no essential dofs, so its block keeps every
+    column and has its essential rows zeroed, diagonal included (``trial_ess``
+    still eliminates columns where it is given)."""
     test_space = as_space(test_space)
     trial_space = as_space(trial_space)
     p = BlockPlan()
@@ -174,13 +183,16 @@ def plan_block(test_space, trial_space, groups, test_ess=None, trial_ess=None,
     p.row_sums = test_space.fes is trial_space.fes
     p.pattern = get_pattern(test_space, trial_space, groups)
     p.same = test_space.fes is trial_space.fes
+    # the same space on both sides is a structural fact (one prolongation, one
+    # partition); a symmetric elimination is the caller's (see ``symmetric``)
+    p.sym = p.same and (symmetric is None or bool(symmetric))
     p.fold = _foldable(test_space, trial_space, test_ess, trial_ess, diag_policy,
                        p.same)
     p.kill = None
     if p.fold:
         row_mask = (None if test_ess is None
                     else _ess_ldof_mask(test_space, test_ess))
-        col_mask = (row_mask if p.same and test_ess is not None else
+        col_mask = (row_mask if p.sym and test_ess is not None else
                     None if trial_ess is None
                     else _ess_ldof_mask(trial_space, trial_ess))
         p.kill = p.pattern.masked_slots(row_mask, col_mask)
@@ -225,7 +237,7 @@ def finish_block(p, acc):
         # accumulator, so the matrix is complete when built
         # (TrueDofPattern.diagonal_slots).
         diagonal = None
-        if p.fold and p.same and p.test_ess is not None:
+        if p.fold and p.sym and p.test_ess is not None:
             diagonal = (p.tpat.diagonal_slots(p.test_ess),
                         0.0 if p.diag_policy == "zero" else 1.0)
         # (a complete matrix may be asked for in the single-precision hypre)
@@ -249,12 +261,12 @@ def finish_block(p, acc):
             A = _triple(Aloc, p.Pt, p.Pr, (p.test_space.fes, p.trial_space.fes))
         del Aloc
     if p.fold:
-        if p.same and p.test_ess is not None:
+        if p.sym and p.test_ess is not None:
             _set_eliminated_diagonal(A, p.test_ess,
                                      0.0 if p.diag_policy == "zero" else 1.0)
         return A
     return _eliminate(A, p.test_space, p.trial_space, p.test_ess, p.trial_ess,
-                      p.diag_policy, p.same)
+                      p.diag_policy, p.sym)
 
 
 def _accumulator_dtype(p, host):
@@ -350,7 +362,7 @@ def add_boundary_entries(p, acc, boundary):
 
 def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem,
                         test_ess=None, trial_ess=None, diag_policy="one",
-                        boundary=None):
+                        boundary=None, symmetric=None):
     """Assemble a block from per-group element matrices without the callback.
 
     Signature-compatible with :func:`hippymfem.fem.assemble.assemble_matrix`;
@@ -362,7 +374,7 @@ def assemble_matrix_csr(test_space, trial_space, groups, element_matrices, nelem
     (:func:`add_boundary_entries`).
     """
     p = plan_block(test_space, trial_space, groups, test_ess, trial_ess,
-                   diag_policy)
+                   diag_policy, symmetric=symmetric)
     host = not p.device or boundary is not None
     if callable(element_matrices):
         # A thunk instead of the arrays: the caller is letting the scatter drive

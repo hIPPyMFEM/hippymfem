@@ -31,7 +31,7 @@ def empty_ess():
 
 
 def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
-                    test_ess=None, trial_ess=None, diag_policy="one"):
+                    test_ess=None, trial_ess=None, diag_policy="one", symmetric=None):
     """Assemble a block from per-group element matrices.
 
     Parameters
@@ -53,6 +53,10 @@ def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
         solves work on a right-hand side with zeroed essential entries);
         ``"zero"`` for second-order blocks, which must annihilate the essential
         subspace.
+    symmetric : bool, optional
+        Whether a block with the same space on both sides is eliminated on both
+        (the default); ``False`` for a parameter's block, whose columns stay (see
+        :func:`~hippymfem.fem.csrassemble.plan_block`).
 
     Returns
     -------
@@ -60,7 +64,8 @@ def assemble_matrix(test_space, trial_space, groups, element_matrices, nelem,
     """
     return assemble_matrix_csr(
         test_space, trial_space, groups, element_matrices, nelem,
-        test_ess=test_ess, trial_ess=trial_ess, diag_policy=diag_policy)
+        test_ess=test_ess, trial_ess=trial_ess, diag_policy=diag_policy,
+        symmetric=symmetric)
 
 
 def assemble_vector(space, groups, element_vectors, nelem, ess=None, out=None):
