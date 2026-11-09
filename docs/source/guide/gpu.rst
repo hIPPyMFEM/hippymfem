@@ -82,7 +82,12 @@ planner set for single-precision tangents.  ``HIPPYMFEM_PROFILE=gpu-large`` adds
 solver settings of the weak-scaling runs on Frontier (BoomerAMG with l1-Jacobi weight 1.8
 and six interpolation entries a row; in the single-precision solves the p-multigrid over
 up to seven meshes of a uniformly refined mesh, with its small levels in host memory; the
-prior's cycles over the meshes).  A profile fills in only what the environment leaves
+prior's cycles over the meshes).  Those AMG settings are for problems whose Jacobian is
+symmetric positive definite, solved by CG, where the weight saved 21 to 31 % of the
+iterations in twelve cases (contrast, anisotropy, stretched elements, tetrahedra,
+elasticity, the prior): they reach every new solver, and with that weight GMRES stalls on
+convection-dominated advection-diffusion (a mesh Peclet number of 5 or 6, where MFEM's
+settings converge in 150 to 190 iterations).  A profile fills in only what the environment leaves
 unset, and ``hm.config.show()`` marks what it set; ``hm.config.use_profile(name)`` applies
 the runtime part after import.  The tolerances and the Newton-CG parameters below remain
 the script's, as does a lumped prior mass, which changes the discrete problem.  The

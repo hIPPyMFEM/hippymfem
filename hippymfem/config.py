@@ -480,8 +480,10 @@ PROFILES = {
              "HIPPYMFEM_PRECISION": ("mixed", "HIPPYMFEM_HYPRE_SINGLE"),
              "HIPPYMFEM_AD_WORKING_SET": ("8", "HIPPYMFEM_HYPRE_SINGLE")}),
     "gpu-large": ("'gpu' and the solver settings of the weak-scaling series on Frontier to 4096 "
-                  "GPUs: BoomerAMG with l1-Jacobi weight 1.8 and six interpolation entries a "
-                  "row, in the single-precision solves the p-multigrid over up to seven meshes "
+                  "GPUs, for problems whose Jacobian is symmetric positive definite: BoomerAMG "
+                  "with l1-Jacobi weight 1.8 and six interpolation entries a row for every new "
+                  "solver (with that weight GMRES stalls on convection-dominated "
+                  "advection-diffusion, at a mesh Peclet number of 5), in the single-precision solves the p-multigrid over up to seven meshes "
                   "of a uniformly refined mesh (BoomerAMG where there are none) with its small "
                   "levels in host memory, the prior's cycles over the meshes, and with a "
                   "single-precision hypre the blocks of a linearization point in single "
