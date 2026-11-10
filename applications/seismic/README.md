@@ -91,6 +91,12 @@ HIPPYMFEM_HYPRE_DEVICE=1 python run.py --n 64 --element-chunk 0 --rank 800 --ove
 # its low rank and posterior on several cards, the MAP point being there (five H100: 80 minutes)
 mpirun -n 5 ../../tools/mpirun_pinned.sh python run.py --n 64 --element-chunk 10000 --element-block 524288 \
     --rank 800 --oversample 12 --var-samples 3000 --nsamples 12 --stages eig,post --ensemble --out out/n64
+# the same in two runs, where a node's memory does not hold every rank's copy of the columns: the products
+# as an ensemble (--products-only saves them and stops), then the low rank and the posterior on one card
+mpirun -n 8 ../../tools/mpirun_pinned.sh python run.py --n 64 --element-chunk 10000 --element-block 524288 \
+    --rank 1600 --oversample 12 --stages eig --ensemble --products-only --out out/n64
+HIPPYMFEM_HYPRE_DEVICE=1 python run.py --n 64 --element-chunk 10000 --element-block 524288 \
+    --rank 1600 --oversample 12 --var-samples 3000 --nsamples 12 --stages eig,post --resume --out out/n64
 # how good that low rank is: its eigenpairs, and what its subspace leaves out (8 starts, 10 Lanczos steps; one card)
 SIZE="--n 64 --element-chunk 10000 --element-block 524288 --rank 800 --oversample 12 --out out/n64"
 python tail_check.py out/tail 8 10 $SIZE

@@ -313,7 +313,8 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
 
     ``products``, if given, is a :class:`hippymfem.MultiVector` whose first ``ndone``
     columns already hold ``H Omega`` (a resumed run); ``on_batch(Y, ndone)`` is
-    called after every batch so they can be saved.
+    called after every batch so they can be saved (with ``ensemble``, once, when the
+    ranks have exchanged their columns and every rank holds them all).
 
     ``ensemble``: a communicator whose ranks each hold the whole problem.  Rank ``r``
     then takes the products of the columns ``r, r + size, ...`` (still ``batch`` to a
@@ -345,7 +346,7 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
             outs = H.mult_many([X[i] for i in cols])
             for i, g in zip(cols, outs):
                 Y[i] = g
-            if on_batch is not None and tag == "H Omega":
+            if on_batch is not None and tag == "H Omega" and not shared:
                 on_batch(Y, cols[-1] + 1)
             say("  %s: %d of %d products%s, %.1f s" % (tag, a + len(cols) + (0 if shared else start),
                                                         len(mine) + (0 if shared else start),
@@ -353,6 +354,8 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
                                                         time.time() - t0))
         if shared:
             ensemble_exchange(ensemble, Y)
+            if on_batch is not None and tag == "H Omega" and start < nvec:
+                on_batch(Y, nvec)                # every column is here now: once, for all of them
         return Y
 
     Rinv = hm.Solver2Operator(prior.Rsolver, init_vector=prior.init_vector)

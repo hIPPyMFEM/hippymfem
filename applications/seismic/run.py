@@ -89,6 +89,11 @@ def parse(argv=None):
     g.add_argument("--resume", action="store_true", help="continue from what --out holds")
     g.add_argument("--time-limit", type=float, default=0.0,
                    help="seconds after which a stage stops cleanly at its next checkpoint (0: none)")
+    g.add_argument("--products-only", action="store_true",
+                   help="eig: stop when the Hessian products are saved in --out; a later run with --resume takes "
+                        "the low rank and the posterior from them, on one rank or as an ensemble.  For an "
+                        "ensemble, whose ranks each hold every column from there on, this divides the work "
+                        "between a run on many cards and one that needs the host's memory")
     g.add_argument("--ensemble", action="store_true",
                    help="after the MAP point (read from --out), every rank holds the whole problem and the "
                         "Hessian products, the prior's solves and the variance's samples are divided among the "
@@ -101,8 +106,8 @@ def parse(argv=None):
 
 #: options that say how a run proceeds, not what problem it solves: the others must be the
 #: same when a run is resumed
-RUN_ONLY = ("out", "stages", "resume", "time_limit", "ensemble", "rank", "oversample", "batch", "double_pass",
-            "nsamples", "var_samples", "rtol", "max_newton", "cg_max", "element_chunk", "element_block")
+RUN_ONLY = ("out", "stages", "resume", "time_limit", "ensemble", "products_only", "rank", "oversample", "batch",
+            "double_pass", "nsamples", "var_samples", "rtol", "max_newton", "cg_max", "element_chunk", "element_block")
 
 
 def density(u, a, m, p, x, rho, c0):
@@ -647,18 +652,22 @@ def stage_eig(P, model, x):
 
     def on_batch(Yc, n):
         if (n == r) or P.out_of_time() or (n // a.batch) % 8 == 0:
-            P.write("eig_products.npy", P.canon.gather(Yc.data))
+            # (the ranks of an ensemble each hold the whole problem: the writer alone gathers)
+            if P.ensemble is None or P.writer:
+                P.write("eig_products.npy", P.canon.gather(Yc.data))
             P.write("eig_done.npy", np.array(n))
             P.dump("eig_products.json", dict(done=int(n), directions=mark))
         if P.out_of_time() and n < r:
             raise Stop()
+        if a.products_only and n == r:
+            raise Stop("the %d products are saved, and --products-only ends the run here" % r)
 
     try:
         d, U, Y = low_rank_hessian(model, Omega, k, batch=a.batch, double_pass=a.double_pass,
-                                   products=Y, ndone=ndone, on_batch=on_batch if P.ensemble is None else None,
+                                   products=Y, ndone=ndone, on_batch=on_batch,
                                    log=P.say, ensemble=P.ensemble)
-    except Stop:
-        P.say("eig: stopped at the time limit")
+    except Stop as stop:
+        P.say("eig: %s" % (stop.args[0] if stop.args else "stopped at the time limit"))
         return None, None
     P.write("eigenvectors.npy", P.canon.gather(U.data))
     P.write("eigenvalues.npy", d)                 # last: a resumed run looks for this one
