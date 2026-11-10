@@ -20,6 +20,7 @@ difference in iteration counts is visible rather than folded into the time.
 Run in an environment that has dolfinx and hIPPYlibx::
 
     python benchmarks/bench_newton_hippylibx.py --n 64 --steps 2
+    python benchmarks/bench_newton_hippylibx.py --n 64 --map       # to the MAP point
     mpirun -n 4 python benchmarks/bench_newton_hippylibx.py --n 64 --steps 2
 """
 
@@ -161,9 +162,20 @@ def main():
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--order", type=int, default=2)
     ap.add_argument("--steps", type=int, default=2)
-    ap.add_argument("--cg-max", type=int, default=25)
+    ap.add_argument("--cg-max", type=int, default=None, help="default 25, and 50 with --map")
     ap.add_argument("--cg-tol", type=float, default=1e-6)
-    ap.add_argument("--gn-iter", type=int, default=0)
+    ap.add_argument("--gn-iter", type=int, default=None, help="default 0, and 5 with --map")
+    ap.add_argument("--map", action="store_true",
+                    help="Newton-CG to its tolerance (the MAP point) with the settings of "
+                         "bench_precision.py, instead of --steps iterations: relative gradient "
+                         "--newton-tol, at most --newton-max iterations, five Gauss-Newton iterations "
+                         "first, at most 50 CG iterations in each, the library's own CG tolerance "
+                         "(Eisenstat-Walker), and the incremental solves to --inc-tol")
+    ap.add_argument("--newton-tol", type=float, default=1e-6)
+    ap.add_argument("--newton-max", type=int, default=25)
+    ap.add_argument("--inc-tol", type=float, default=None,
+                    help="relative tolerance of the incremental solves (default 1e-12, and 1e-6 with --map, "
+                         "as bench_precision.py --inc-tol 1e-6)")
     ap.add_argument("--ntargets", type=int, default=200)
     ap.add_argument("--out", default=None)
     ap.add_argument("--load-data", default=None,
@@ -173,6 +185,9 @@ def main():
                     help="keep PETSc's default BoomerAMG settings instead of MFEM's")
     args = ap.parse_args()
     N, ORDER = args.n, args.order
+    cg_max = args.cg_max if args.cg_max is not None else (50 if args.map else 25)
+    gn_iter = args.gn_iter if args.gn_iter is not None else (5 if args.map else 0)
+    inc_tol = args.inc_tol if args.inc_tol is not None else (1e-6 if args.map else 1e-12)
     if not args.petsc_amg:
         opts = PETSc.Options()
         for k, v in MFEM_AMG.items():
@@ -206,8 +221,8 @@ def main():
     bc0 = fem.dirichletbc(u_bdr0, dofs)
     pde = hpx.PDEVariationalProblem(Vh, pde_varf, bc, bc0, is_fwd_linear=True)
     pde.solver = krylov()
-    pde.solver_fwd_inc = krylov()
-    pde.solver_adj_inc = krylov()
+    pde.solver_fwd_inc = krylov(inc_tol)
+    pde.solver_adj_inc = krylov(inc_tol)
 
     prior = hpx.BiLaplacianPrior(Vm, 0.1, 0.5, robin_bc=True, solver_type="krylov")
     # The prior's R-solve is a composite (two A-solves and an M-solve); the PETSc
@@ -295,14 +310,19 @@ def main():
         % (t_fwd, t_adj, t_grad, t_hess, t_hess_warm, t_apply, t_apply_cold))
 
     params = hpx.ReducedSpaceNewtonCG_ParameterList()
-    params["rel_tolerance"] = 1e-9
     params["abs_tolerance"] = 1e-12
-    params["max_iter"] = args.steps
     params["globalization"] = "LS"
-    params["GN_iter"] = args.gn_iter
-    params["cg_max_iter"] = args.cg_max
-    params["cg_coarse_tolerance"] = args.cg_tol
-    params["print_level"] = -1
+    params["GN_iter"] = gn_iter
+    params["cg_max_iter"] = cg_max
+    if args.map:
+        params["rel_tolerance"] = args.newton_tol
+        params["max_iter"] = args.newton_max
+        params["print_level"] = 0          # the trace of the iterations goes to the log (rank 0)
+    else:
+        params["rel_tolerance"] = 1e-9
+        params["max_iter"] = args.steps
+        params["cg_coarse_tolerance"] = args.cg_tol
+        params["print_level"] = -1
     solver = hpx.ReducedSpaceNewtonCG(model, params)
     t_step, xs = timed(lambda: solver.solve([None, prior.mean.copy(), None]))
     diff = mtrue.copy()
@@ -310,9 +330,9 @@ def main():
     err = diff.norm() / max(mtrue.norm(), 1e-300)
     reasons = getattr(solver, "termination_reasons", None)
     reason = reasons[solver.reason] if reasons else str(getattr(solver, "reason", "?"))
-    say("  %d Newton step(s) %.2f s  newton %d  cg %d  J %.8e  |grad| %.4e  err(m) %.8f  (%s)"
-        % (args.steps, t_step, solver.it, solver.total_cg_iter, solver.final_cost,
-           solver.final_grad_norm, err, reason))
+    say("  %s %.2f s  newton %d  cg %d  J %.10e  |grad| %.4e  err(m) %.8f  (%s)"
+        % ("Newton-CG to %.0e" % args.newton_tol if args.map else "%d Newton step(s)" % args.steps,
+           t_step, solver.it, solver.total_cg_iter, solver.final_cost, solver.final_grad_norm, err, reason))
     rec = {"library": "hippylibx", "amg": "petsc-default" if args.petsc_amg else "mfem-default", "host": platform.node(), "ranks": COMM.size, "n": N,
            "order": ORDER, "tdofs": ndof[0], "mdofs": ndof[1], "mfem_device": "host",
            "t_fwd": t_fwd, "t_adj": t_adj, "t_grad": t_grad, "t_hess_blocks": t_hess,
@@ -320,7 +340,12 @@ def main():
            "t_steps": t_step, "newton_it": solver.it, "cg_it": solver.total_cg_iter,
            "J": float(solver.final_cost), "gradnorm": float(solver.final_grad_norm),
            "err_m": float(err), "shared_data": args.load_data,
-           "shared_data_clean_difference": shared_check}
+           "shared_data_clean_difference": shared_check,
+           "map": bool(args.map), "newton_tol": args.newton_tol if args.map else None,
+           "newton_max": args.newton_max if args.map else args.steps, "cg_max": cg_max, "gn_iter": gn_iter,
+           "inc_tol": inc_tol, "converged": bool(getattr(solver, "converged", False)), "reason": reason,
+           "dolfinx": __import__("dolfinx").__version__, "petsc": ".".join(map(str, PETSc.Sys.getVersion())),
+           "hippylibx": getattr(hpx, "__version__", "?")}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:

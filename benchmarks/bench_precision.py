@@ -199,6 +199,13 @@ def main():
     ap.add_argument("--inc-tol", type=float, default=None,
                     help="relative tolerance of the incremental solves of a Hessian action "
                     "(default: --solve-tol)")
+    ap.add_argument("--cg-inc-tol", type=float, default=None,
+                    help="cg_incremental_tolerance of Newton-CG, at which the incremental solves of a "
+                    "Hessian action stop within a Newton-CG iteration with orthogonalized residuals "
+                    "(default: the library's; 0: the solvers' own tolerance, --inc-tol, in every action)")
+    ap.add_argument("--save-data", default=None,
+                    help="write the true parameter and the observations to this .npz file, for "
+                    "bench_newton_hippylibx.py --load-data: both libraries then invert the same data")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     modes = [m for m in args.modes.split(",") if m]
@@ -248,8 +255,13 @@ def main():
     pde.solveFwd(utrue, [utrue, mtrue, None])           # the data, in double precision
     data = B.createVecLeft()
     B.mult(utrue, data)
+    clean = data.copy()
     nstd = args.noise * max(data.norm("linf"), 1e-30)
     B.perturb(data, nstd)
+    if args.save_data:
+        from bench_newton_device import save_problem
+
+        save_problem(args.save_data, N, Vu, Vm, B, mtrue, targets, clean, data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
 
@@ -269,6 +281,8 @@ def main():
                                      if args.cg_relax is None else args.cg_relax),
            "cg_reorthogonalize": bool(hm.ReducedSpaceNewtonCG_ParameterList()["cg_reorthogonalize"]
                                       if args.cg_reorth is None else args.cg_reorth),
+           "cg_incremental_tolerance": float((hm.ReducedSpaceNewtonCG_ParameterList()["cg_incremental_tolerance"]
+                                              if args.cg_inc_tol is None else args.cg_inc_tol) or 0.0),
            "NE_local": NE, "tdofs": Vu.GlobalTrueVSize(), "mdofs": Vm.GlobalTrueVSize(),
            "device": str(km.device()), "mfem_device": args.device, "modes": {}}
     ref = {}
@@ -385,6 +399,8 @@ def main():
                 params["cg_preconditioner_tolerance"] = args.cg_prec_tol
             if args.cg_relax is not None:
                 params["cg_hessian_relaxation"] = args.cg_relax
+            if args.cg_inc_tol is not None:
+                params["cg_incremental_tolerance"] = args.cg_inc_tol
             try:
                 for _ in range(max(1, args.newton_repeats)):
                     pde.invalidate_jacobian()
