@@ -300,8 +300,31 @@ class MisfitHessian:
 
 
 # ------------------------------------------------------- low-rank approximation
+def exchange_columns(ensemble, y, columns_of):
+    """Give every rank of ``ensemble`` the columns of ``y`` that the others computed:
+    ``columns_of(q)`` lists those of rank ``q``.  Each rank holds the whole problem, so
+    the copies of ``y`` have the same local size on every rank."""
+    from mpi4py import MPI
+
+    size, rank = ensemble.size, ensemble.rank
+    d = y.data
+    width = d.shape[1]
+    lists = [list(columns_of(q)) for q in range(size)]
+    counts = [len(c) * width for c in lists]
+    recv = np.empty((sum(len(c) for c in lists), width), dtype=np.float64)
+    ensemble.Allgatherv(np.ascontiguousarray(d[lists[rank]]),
+                        [recv, counts, [sum(counts[:q]) for q in range(size)], MPI.DOUBLE])
+    row = 0
+    for q in range(size):
+        if q != rank and lists[q]:
+            d[lists[q]] = recv[row:row + len(lists[q])]
+        row += len(lists[q])
+    return y
+
+
 def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
-                     ndone=0, on_batch=None, log=None, ensemble=None):
+                     ndone=0, on_batch=None, log=None, ensemble=None, todo=None,
+                     on_columns=None, products_only=False):
     r"""Dominant eigenpairs of :math:`H_{\rm misfit}\,u = \lambda R\,u`, with
     :math:`U^{\top} R U = I`, from products of the Hessian with the random vectors
     ``Omega``, ``batch`` of them per pair of sweeps.
@@ -322,6 +345,14 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
     are exchanged (hIPPyMFEM's ``MatMvMult`` with ``ensemble=``), so every rank returns
     the same eigenpairs; the orthogonalization is done by every rank.
 
+    ``todo``: the columns of ``products`` that are still to be taken, where those on hand
+    are not its first ``ndone`` (a run that continues from the columns that every rank of
+    an earlier ensemble saved for itself); rank ``r`` of an ensemble takes every
+    ``size``-th of them from its ``r``-th on.  ``on_columns(Y, cols)`` is called by the
+    rank that took a batch, with its columns, so that it can save them.  With
+    ``products_only`` the function returns ``(None, None, Y)`` when the rank's own
+    products are taken: nothing is exchanged, and the ranks need not finish together.
+
     Returns ``(d, U, Y)``.
     """
     prior = model.prior
@@ -333,9 +364,12 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
 
     shared = ensemble is not None and ensemble.size > 1
 
-    def products_of(X, Y, start=0, tag="H Omega"):
+    def products_of(X, Y, start=0, tag="H Omega", todo=None, exchange=True):
         t0 = time.time()
-        if shared:
+        if todo is not None:
+            todo = [int(i) for i in todo]
+            mine = todo[ensemble.rank::ensemble.size] if shared else todo
+        elif shared:
             from hippymfem.algorithms.multivector import ensemble_columns, ensemble_exchange
 
             mine = [i for i in ensemble_columns(ensemble, nvec) if i >= start]
@@ -346,21 +380,28 @@ def low_rank_hessian(model, Omega, k, batch=8, double_pass=False, products=None,
             outs = H.mult_many([X[i] for i in cols])
             for i, g in zip(cols, outs):
                 Y[i] = g
-            if on_batch is not None and tag == "H Omega" and not shared:
+            if on_columns is not None and tag == "H Omega":
+                on_columns(Y, cols)
+            if on_batch is not None and tag == "H Omega" and not shared and todo is None:
                 on_batch(Y, cols[-1] + 1)
             say("  %s: %d of %d products%s, %.1f s" % (tag, a + len(cols) + (0 if shared else start),
                                                         len(mine) + (0 if shared else start),
                                                         " on each of %d ranks" % ensemble.size if shared else "",
                                                         time.time() - t0))
-        if shared:
-            ensemble_exchange(ensemble, Y)
-            if on_batch is not None and tag == "H Omega" and start < nvec:
+        if shared and exchange:
+            if todo is not None:
+                exchange_columns(ensemble, Y, lambda q: todo[q::ensemble.size])
+            else:
+                ensemble_exchange(ensemble, Y)
+            if on_batch is not None and tag == "H Omega" and (start < nvec if todo is None else bool(todo)):
                 on_batch(Y, nvec)                # every column is here now: once, for all of them
         return Y
 
     Rinv = hm.Solver2Operator(prior.Rsolver, init_vector=prior.init_vector)
     Y = products if products is not None else hm.MultiVector(Omega[0], nvec)
-    products_of(Omega, Y, int(ndone) if products is not None else 0)
+    products_of(Omega, Y, int(ndone) if products is not None else 0, todo=todo, exchange=not products_only)
+    if products_only:
+        return None, None, Y
     Q = hm.MultiVector(Omega[0], nvec)
     if shared:
         from hippymfem.algorithms.multivector import MatMvMult

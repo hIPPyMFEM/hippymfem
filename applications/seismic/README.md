@@ -92,7 +92,8 @@ HIPPYMFEM_HYPRE_DEVICE=1 python run.py --n 64 --element-chunk 0 --rank 800 --ove
 mpirun -n 5 ../../tools/mpirun_pinned.sh python run.py --n 64 --element-chunk 10000 --element-block 524288 \
     --rank 800 --oversample 12 --var-samples 3000 --nsamples 12 --stages eig,post --ensemble --out out/n64
 # the same in two runs, where a node's memory does not hold every rank's copy of the columns: the products
-# as an ensemble (--products-only saves them and stops), then the low rank and the posterior on one card
+# as an ensemble (--products-only: each rank saves its columns after every batch, in out/n64/eig_parts, and
+# stops), then the low rank and the posterior on one card, which also takes any columns that are missing
 mpirun -n 8 ../../tools/mpirun_pinned.sh python run.py --n 64 --element-chunk 10000 --element-block 524288 \
     --rank 1600 --oversample 12 --stages eig --ensemble --products-only --out out/n64
 HIPPYMFEM_HYPRE_DEVICE=1 python run.py --n 64 --element-chunk 10000 --element-block 524288 \

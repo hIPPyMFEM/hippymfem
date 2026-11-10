@@ -91,8 +91,9 @@ def parse(argv=None):
                    help="seconds after which a stage stops cleanly at its next checkpoint (0: none)")
     g.add_argument("--products-only", action="store_true",
                    help="eig: stop when the Hessian products are saved in --out; a later run with --resume takes "
-                        "the low rank and the posterior from them, on one rank or as an ensemble.  For an "
-                        "ensemble, whose ranks each hold every column from there on, this divides the work "
+                        "the low rank and the posterior from them.  The ranks of an ensemble each save their own "
+                        "columns after every batch (eig_parts/) and exchange nothing, so a rank that is slow or "
+                        "fails costs its own columns only, which the later run takes; and the work is divided "
                         "between a run on many cards and one that needs the host's memory")
     g.add_argument("--ensemble", action="store_true",
                    help="after the MAP point (read from --out), every rank holds the whole problem and the "
@@ -646,9 +647,41 @@ def stage_eig(P, model, x):
         else:
             P.say("eig: the products on file were taken along other random directions (another number of "
                   "ranks or seed); a single pass needs its own, so they are taken again")
+    # the columns that the ranks of an ensemble saved, each for itself, a file a batch
+    # (--products-only): whatever is there is taken, and the rest is still to do
+    parts, todo = P.path("eig_parts"), None
+    names = comm.bcast(sorted(n for n in os.listdir(parts) if n.startswith("part_") and n.endswith(".npz"))
+                       if P.rank0 and os.path.isdir(parts) else [])
+    if a.resume and names and not a.double_pass:
+        have = np.zeros(r, dtype=bool)
+        have[:ndone] = True
+        if Y is None:
+            Y = hm.MultiVector(P.Vm.vector(), r)
+        aside = 0
+        for name in names:
+            z = np.load(os.path.join(parts, name)) if P.rank0 else None
+            cols = comm.bcast((z["cols"] if int(z["nvec"]) == r and abs(float(z["mark"]) - mark)
+                               <= 1e-9 * max(abs(mark), 1.0) else None) if P.rank0 else None)
+            if cols is None:
+                aside += 1
+                continue
+            Y.data[cols] = P.canon.scatter(z["rows"] if P.rank0 else None)
+            have[cols] = True
+        todo = [int(i) for i in np.flatnonzero(~have)]
+        P.say("eig: %d of %d products on file (%d files of single batches%s); %d to take"
+              % (int(have.sum()), r, len(names) - aside,
+                 ", %d of other directions left aside" % aside if aside else "", len(todo)))
 
     class Stop(Exception):
         pass
+
+    def on_columns(Yc, cols):
+        rows = P.canon.gather(np.asarray(Yc.data[cols]))
+        if P.ensemble is not None or P.writer:      # (each rank of an ensemble is its own writer here)
+            os.makedirs(parts, exist_ok=True)
+            tmp = os.path.join(parts, "tmp_%05d_%d.npz" % (cols[0], os.getpid()))
+            np.savez(tmp, cols=np.array(cols, dtype=np.int64), rows=rows, mark=mark, nvec=r)
+            os.replace(tmp, os.path.join(parts, "part_%05d.npz" % cols[0]))
 
     def on_batch(Yc, n):
         if (n == r) or P.out_of_time() or (n // a.batch) % 8 == 0:
@@ -665,9 +698,15 @@ def stage_eig(P, model, x):
     try:
         d, U, Y = low_rank_hessian(model, Omega, k, batch=a.batch, double_pass=a.double_pass,
                                    products=Y, ndone=ndone, on_batch=on_batch,
-                                   log=P.say, ensemble=P.ensemble)
+                                   log=P.say, ensemble=P.ensemble, todo=todo,
+                                   on_columns=on_columns if (a.products_only or todo is not None) else None,
+                                   products_only=bool(a.products_only and P.ensemble is not None))
     except Stop as stop:
         P.say("eig: %s" % (stop.args[0] if stop.args else "stopped at the time limit"))
+        return None, None
+    if d is None:
+        P.say("eig: this rank's products are saved in %s, a file a batch, and --products-only ends the run here"
+              % parts)
         return None, None
     P.write("eigenvectors.npy", P.canon.gather(U.data))
     P.write("eigenvalues.npy", d)                 # last: a resumed run looks for this one
