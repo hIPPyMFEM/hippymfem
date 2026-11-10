@@ -151,9 +151,12 @@ _KERNELS = []
 #: to the fields' values and gradients (one tangent per such feature), skips the parts
 #: of that pointwise Hessian that are identically zero, and contracts the rest with the
 #: basis values and physical gradients; it is exact too, since the fields are linear in
-#: the dofs.  On a GPU it is the faster route from P2 up (a Jacobian 1.6 to 4.4 times
-#: faster on an L40S); on P1 the element route stays the faster, and so it does on the
-#: host, except for vector-valued Jacobians.  ``auto`` times both once per kernel program,
+#: the dofs.  Which route is the faster on a GPU depends on the element, the size of the
+#: mesh and the card: for the Jacobian of a scalar diffusion density on meshes that fill
+#: the card, an assembly by this route took 0.9 to 2.7 times as long as by the element
+#: route for degree two and higher (L40S, H100, MI250X), where on small meshes it had
+#: been 1.6 to 4.4 times faster on an L40S.  On P1 the element route is the faster, and so
+#: it is on the host, except for vector-valued Jacobians.  ``auto`` times both once per kernel program,
 #: column slot and device and keeps the faster (:data:`_ROUTES`), so every kernel built
 #: alike takes the same route in a run, while which one a run takes, and its round-off,
 #: can differ from run to run.  Spaces with a Piola map and interior facets always take

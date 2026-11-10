@@ -290,7 +290,8 @@ _KNOBS = [
           _module_attr("fem.kernel", "PRECISION"), _module_setter("fem.kernel", "set_precision")),
     _Knob("hessian", "HIPPYMFEM_HESSIAN",
           "how element Hessians are differentiated: element (default), quadrature "
-          "(second derivatives at the quadrature points, faster on a GPU) or auto",
+          "(second derivatives at the quadrature points; faster or slower on a GPU with the "
+          "element and the card) or auto (times both and keeps the faster)",
           _module_attr("fem.kernel", "HESSIAN_MODE"), _module_setter("fem.kernel", "set_hessian_mode")),
     _Knob("element_chunk", "HIPPYMFEM_ELEMENT_CHUNK",
           "elements per kernel launch; 0 (default) plans the chunk from the device's free memory",
@@ -477,7 +478,7 @@ _BY_ENV = {k.env: k for k in _KNOBS}
 #: not in a profile: see the GPU guide's "Recommended settings".
 PROFILES = {
     "default": ("the library's own defaults", {}),
-    "gpu": ("element Hessians at the quadrature points (faster on a GPU) and, where a "
+    "gpu": ("element Hessians at the quadrature points and, where a "
             "single-precision hypre is named in HIPPYMFEM_HYPRE_SINGLE, the Jacobians and their "
             "solves in single precision with the chunk planner set for single-precision "
             "tangents, and where hypre runs on the card (HIPPYMFEM_HYPRE_DEVICE) BoomerAMG with "

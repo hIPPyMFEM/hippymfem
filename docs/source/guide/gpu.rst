@@ -73,7 +73,9 @@ What to set, with the sections that have the measurements.  The numbers are for 
 model problem of this guide (``exp(m)`` diffusion on second-order hexahedra, a
 BiLaplacian prior, pointwise observations), its MAP point computed by Newton-CG to a
 relative gradient norm of 1e-6.  ``applications/precision/model_subsurf_single.py`` does
-all of it.
+all of it.  Where a quantity was measured again with version 0.1.0 in November 2026, on
+Frontier and on single cards of a cluster, that measurement is the one given; the other
+numbers are those of October 2026.
 
 **Profiles.**  ``HIPPYMFEM_PROFILE=gpu``, set before ``import hippymfem``, takes the element
 Hessians at the quadrature points and, where ``HIPPYMFEM_HYPRE_SINGLE`` names a
@@ -82,7 +84,12 @@ planner set for single-precision tangents, and where hypre runs on the card
 (``HIPPYMFEM_HYPRE_DEVICE=1``) gives the CG solvers BoomerAMG with l1-Jacobi weight 1.8
 (``HIPPYMFEM_AMG_CG=relax_wt=1.8``): on one L40S that took 21 to 31 % of the iterations
 and 9 to 24 % of the time of a solve with its set-up off twelve symmetric positive
-definite operators, the same on two cards, and GMRES keeps MFEM's settings.
+definite operators, the same on two cards, and GMRES keeps MFEM's settings.  With the
+profile and the Jacobian's systems solved by CG, the MAP point at 64\ :sup:`3` in double
+precision took 49.1 s instead of 59.4 s on an L40S and 21.9 s instead of 25.4 s on an H100,
+with the same 12 Newton and 131 CG iterations.  The element Hessians at the quadrature
+points are the part of the profile whose gain depends on the card and on the element
+(`Where the device loses`_).
 ``HIPPYMFEM_PROFILE=gpu-large`` adds the
 solver settings of the weak-scaling runs on Frontier (BoomerAMG with l1-Jacobi weight 1.8
 and six interpolation entries a row for the CG solvers, ``HIPPYMFEM_AMG_CG``; in the
@@ -108,16 +115,20 @@ single precision, whose identities then hold to single precision only.
   precondition that CG stop at 1e-6, and so do the incremental solves of its Hessian
   actions, while the forward and the adjoint solves keep their tolerance
   (:doc:`optimization`, :doc:`solvers`).  With the orthogonalized residuals the Newton
-  and CG counts stay those of incremental solves to 1e-12, and at 64\ :sup:`3` on an
-  H100 the solve took 32.0 s instead of the 63.8 s of the recurrence with incremental
-  solves to 1e-12.  Loosen them no further (``cg_incremental_tolerance``): at 1e-4 one
+  and CG counts stay those of incremental solves to 1e-12, and at 64\ :sup:`3` the solve
+  took 25.4 s on an H100, 59.4 s on an L40S and 46 s on a GPU of Frontier (one die of an
+  AMD MI250X), instead of the 56.8, 134.6 and 103 s of the recurrence with incremental
+  solves to 1e-12 (:ref:`single-precision` has the table).  Loosen them no further (``cg_incremental_tolerance``): at 1e-4 one
   of three GPUs took a thirteenth Newton step.
 * Set ``HIPPYMFEM_PRECISION=mixed`` together with ``HIPPYMFEM_HYPRE_SINGLE``, the path of
   a single-precision build of hypre (:ref:`hypre-single-install`).  The Newton and CG
   counts and the cost functional stay those of double precision; at 64\ :sup:`3` the
-  solve was 1.29 times faster on an H100, 1.51 times on an L40S and 1.81 times on a
-  Blackwell instance, and at 128\ :sup:`3` on four L40S 1.57 times, with 11 % less memory
-  on the busiest card (:ref:`single-precision`).  The single-precision solves need a
+  solve was 1.25 times faster on an H100, 1.51 times on an L40S and 1.27 times on a GPU
+  of Frontier, and at 128\ :sup:`3` on the eight GPUs of a Frontier node 1.25 times
+  (73.6 s instead of 91.9 s).  The gain grows with the load of a GPU: at 64\ :sup:`3` on
+  those eight GPUs, with 0.27 million state dofs each, it was 1.08.  With the version of
+  October 2026 it was 1.57 at 128\ :sup:`3` on four L40S, with 11 % less memory on the
+  busiest card (:ref:`single-precision`).  The single-precision solves need a
   Jacobian solved by CG with BoomerAMG where it is symmetric, or by GMRES with BoomerAMG
   where it is not (its transpose is then assembled in single precision too, for the
   adjoint); other solvers keep their double-precision solves.  The GMRES route adds no
@@ -212,7 +223,68 @@ The kernels alone are worth 1.3x on the two steps, the kernels and the solves 31
 **Two Newton-CG steps of the benchmark problem** (P2 hexahedra for the state and the
 adjoint, P1 for the parameter, CG with BoomerAMG for every solve;
 ``benchmarks/bench_newton_device.py``, and ``benchmarks/bench_newton_hippylibx.py`` for
-the hIPPYlibx rows):
+the hIPPYlibx rows).  With version 0.1.0, in November 2026, every linear solve converged
+to 1e-12 (``--cg-inc-tol 0``), medians of three runs or more.  First one node of
+Frontier, its GPUs against its CPU cores:
+
+==============  =========  ===========================  =======  =======  =======  ==========
+mesh            unknowns   where it runs                forward  Hessian  Hessian  two Newton
+                                                        solve    blocks   apply    steps
+==============  =========  ===========================  =======  =======  =======  ==========
+64\ :sup:`3`    4.6 M      8 GPUs of Frontier           0.26 s   0.05 s   0.16 s   3.68 s
+64\ :sup:`3`    4.6 M      56 host ranks                4.11 s   0.60 s   2.87 s   51.9 s
+64\ :sup:`3`    4.6 M      hIPPYlibx, 56 host ranks     3.56 s   1.12 s   3.26 s   54.3 s
+128\ :sup:`3`   36 M       8 GPUs of Frontier           1.06 s   0.26 s   0.57 s   10.4 s
+128\ :sup:`3`   36 M       56 host ranks                27.3 s   5.93 s   27.3 s   382 s
+128\ :sup:`3`   36 M       hIPPYlibx, 56 host ranks     29.2 s   8.28 s   28.7 s   401 s
+==============  =========  ===========================  =======  =======  =======  ==========
+
+A node of Frontier has four AMD MI250X, each of which the system presents as two GPUs
+with 64 GB, and 56 CPU cores that jobs can use.  The host rows ran one MPI rank bound to
+each core, with a CPU-only build of MFEM and hypre.  The hIPPYlibx rows are the same
+problem (mesh, spaces, PDE, prior, Newton-CG settings) solved by
+`hIPPYlibx <https://github.com/hIPPyMFEM/hippylibx>`_ 4.1.0 on DOLFINx 0.10, with PETSc's
+CG and BoomerAMG given the same BoomerAMG options, on the same data: hIPPyMFEM writes its
+true parameter and its observations (``--save-data``) and hIPPYlibx reads them
+(``--load-data``).  Every run takes 2 Newton-CG and 8 CG iterations, and the costs agree
+to seven digits.  The eight GPUs apply the Hessian 20 and 51 times faster than hIPPYlibx
+on the 56 cores and run the two steps 15 and 39 times faster; against hIPPyMFEM on the
+cores the factors are 18 and 48, and 14 and 37.  On the cores the two libraries are within
+a factor of 1.2 of each other, except in the assembly of the Hessian blocks, where
+hIPPyMFEM is 1.4 to 1.9 times faster.
+
+Then single GPUs, and more GPUs of Frontier:
+
+==============  =========  ===========================  =======  =======  =======  ==========
+mesh            unknowns   where it runs                forward  Hessian  Hessian  two Newton
+                                                        solve    blocks   apply    steps
+==============  =========  ===========================  =======  =======  =======  ==========
+64\ :sup:`3`    4.6 M      1 H200                       0.34 s   0.13 s   0.18 s   4.0 s
+64\ :sup:`3`    4.6 M      1 H100                       0.36 s   0.14 s   0.19 s   4.3 s
+64\ :sup:`3`    4.6 M      1 GPU of Frontier            --       --       --       8.3 s
+64\ :sup:`3`    4.6 M      1 AMD MI210                  0.82 s   0.24 s   0.38 s   8.8 s
+64\ :sup:`3`    4.6 M      1 L40S                       0.88 s   0.28 s   0.49 s   10.3 s
+64\ :sup:`3`    4.6 M      16 GPUs of Frontier          --       --       --       3.3 s
+128\ :sup:`3`   36 M       1 H100                       2.32 s   1.08 s   1.28 s   23.1 s
+128\ :sup:`3`   36 M       4 L40S                       2.24 s   0.59 s   1.35 s   23.0 s
+128\ :sup:`3`   36 M       2 GPUs of Frontier           --       --       --       34.6 s
+128\ :sup:`3`   36 M       64 GPUs of Frontier          --       --       --       4.6 s
+256\ :sup:`3`   287 M      16 GPUs of Frontier          --       --       --       46.7 s
+256\ :sup:`3`   287 M      64 GPUs of Frontier          --       --       --       15.1 s
+==============  =========  ===========================  =======  =======  =======  ==========
+
+The H200, the H100, the L40S and the MI210 are cards of a cluster, the NVIDIA ones with a
+hypre compiled for the card's architecture; the H100's time is 4.2 to 4.4 s over
+five runs on two nodes, and the four L40S are those of one node.  At 128\ :sup:`3` on one
+H100, on four L40S and on two GPUs of Frontier, and at 256\ :sup:`3` on 16 GPUs, the
+previous linearization point is released before the next one is assembled
+(``release_linearization_on_move``), which is what lets 8.5 million state dofs fit on a
+64 GB GPU.  `Several GPUs`_ has the efficiencies.
+
+The table below is the record of October 2026, with the version of that time.  It has
+configurations that were not measured again (several L40S or MI210, MIG slices of RTX PRO
+6000 Blackwell cards, a billion unknowns), and its host rows are a device swap at a fixed
+rank count, not a whole node:
 
 ==============  =========  ===========================  =======  =======  =======  ==========
 mesh            unknowns   where it runs                forward  Hessian  Hessian  two Newton
@@ -250,10 +322,8 @@ slices of two Blackwell cards are 29 and 50 times faster at 64\ :sup:`3` and
 faster than 32 host ranks.  The cost functional is the same to seven digits and the CG
 counts are the same.
 
-The hIPPYlibx rows are the same problem (mesh, spaces, PDE, data model, prior,
-Newton-CG settings) solved by `hIPPYlibx <https://github.com/hIPPyMFEM/hippylibx>`_ on
-dolfinx 0.10, with PETSc's CG and BoomerAMG given the same BoomerAMG options.  The two
-libraries draw different random data, so their CG counts differ at the two smaller
+In that table the hIPPYlibx rows drew their own random data, so their CG counts differ
+from hIPPyMFEM's at the two smaller
 sizes (11 and 6 against 8): two Blackwell cards are 65 and 95 times faster as measured,
 and 58 and 105 times when hIPPYlibx is charged the same CG counts (four L40S 82 and 114
 times as measured).  At 256\ :sup:`3` every run takes 9 CG iterations, and the GPUs are
@@ -283,19 +353,29 @@ rank, twice as fast at 1 024 and 8 to 13 times faster from 4 096.  Above about
 :math:`10^4` elements per rank the device wins on every case measured.
 
 **The speedup depends on the card.**  Element kernels are double precision unless asked
-otherwise (:ref:`single-precision`), and they run 2.3 to 6.3 times faster on an H100 than
-on an L40S.  The library therefore does not promise a speedup;
+otherwise (:ref:`single-precision`), and they run 3.1 to 6.9 times faster on an H100 than
+on an L40S.  Over one CPU core of the same node, the kernels of ten element types on
+meshes that fill the card were 23 to 102 times faster on an L40S, 81 to 548 times on an
+H100 and 28 to 120 times on a GPU of Frontier (:doc:`performance`).  The library therefore does not promise a speedup;
 :mod:`hippymfem.test.test_gpu` measures one for whatever card is present.
 
-**From P2 up, differentiate at the quadrature points.**  ``HIPPYMFEM_HESSIAN=quadrature``
-(or ``hm.config.hessian = "quadrature"``) builds each element Hessian block from the
-density's second derivatives at the quadrature points, contracted with the basis, where
-the default pushes one forward tangent per element dof through the whole element.  The
-blocks agree with the default's to round-off, and on a GPU a Jacobian assembles 1.6 to
-4.4 times faster for P2 and Q2 elements (and slower for P1).  ``auto`` times both routes
-once per column slot and keeps the faster.  The default stays ``element``: its results
-are reproducible bit for bit, and on a host it is the faster route except for
-vector-valued Jacobians.
+**Differentiating at the quadrature points: measure it on your problem.**
+``HIPPYMFEM_HESSIAN=quadrature`` (or ``hm.config.hessian = "quadrature"``) builds each
+element Hessian block from the density's second derivatives at the quadrature points,
+contracted with the basis, where the default pushes one forward tangent per element dof
+through the whole element.  The blocks agree with the default's to round-off.  Whether
+it is faster depends on the element, on the size of the mesh and on the card.  For the
+Jacobian of the benchmark's density on meshes of 0.03 to 2 million elements
+(``benchmarks/bench_assembly_sweep.py``, November 2026), an assembly with it took 0.90 to
+1.34 times as long as the default's on an L40S, 1.0 to 1.3 times on a GPU of Frontier and
+0.98 to 2.65 times on an H100 for elements of degree two to four, and 1.3 to 2.9 times as
+long for linear elements on the three cards.  For the quadratic hexahedra of the
+benchmark problem itself the factors were 0.98, 1.25 and 1.27.  On small meshes it had
+been 1.6 to 4.4 times faster on an L40S (82,944 quadratic tetrahedra, and elasticity on
+4,096 quadratic hexahedra, with hypre on the host).  ``auto`` times both routes once per
+column slot and keeps the faster, which is the setting to take where the assembly
+matters.  The default stays ``element``: its results are reproducible bit for bit, and
+on a host it is the faster route except for vector-valued Jacobians.
 
 .. _single-precision:
 
@@ -306,6 +386,28 @@ Two things can run in single precision, each on its own switch, and a third swit
 loose tolerance on the incremental solves, is what makes the second usable.  None of
 the three changes what is computed: the state, the adjoint, the gradient and the MAP
 point come out as in double precision.  :ref:`gpu-recommended` says what to set.
+
+What the switches give together, for the MAP point of the benchmark problem at
+64\ :sup:`3` on one GPU (Newton-CG from the prior mean to a relative gradient norm of
+1e-6, ``benchmarks/bench_precision.py``; version 0.1.0, November 2026, medians of the
+warm solves):
+
+=================================================  ===============  =======  =======
+Newton-CG to 1e-6 at 64\ :sup:`3`                  GPU of Frontier  L40S     H100
+=================================================  ===============  =======  =======
+recurrence alone, incremental solves to 1e-12      103 s            134.6 s  56.8 s
+orthogonal residuals, incremental solves to 1e-12  71 s             92.3 s   38.6 s
+orthogonal residuals, incremental solves to 1e-6   46 s             59.4 s   25.4 s
+and the Jacobian's solves in single precision      36 s             39.5 s   20.3 s
+first row over last                                2.8              3.4      2.8
+=================================================  ===============  =======  =======
+
+With orthogonal residuals every solve took 12 Newton and 131 CG iterations and reached
+the same cost functional, on the three cards, in double and in single precision.  With
+the recurrence alone the count varies from one solve to the next, between 195 and 227 CG
+iterations, and with loose incremental solves it needs a thirteenth Newton step and 252
+to 300 CG iterations.  The rows with incremental solves to 1e-12 set
+``cg_incremental_tolerance = 0``; the default is the third row.
 
 **The element matrices** (``HIPPYMFEM_PRECISION=mixed``, ``hm.config.precision``).
 The matrix kernels run in single precision and the vector kernels (residuals, gradients,
@@ -922,6 +1024,19 @@ hardly faster than one (1.47 against 1.55 s for two Newton steps) and at 64\ :su
 four L40S 2.2 times, while at 128\ :sup:`3` four L40S are twice as fast as two, and
 sixteen Blackwell cards at 256\ :sup:`3` 2.1 times as fast as eight.
 
+On Frontier with version 0.1.0 (November 2026, medians of three runs) the picture is the
+same on up to 64 GPUs.  The two steps at 128\ :sup:`3` fell from 34.6 s on two GPUs to
+4.6 s on 64 and at 256\ :sup:`3` from 46.7 s on 16 to 15.1 s on 64, while at
+64\ :sup:`3` they fell only from 8.3 s on one GPU to 3.3 s on 16, and at 32\ :sup:`3` two
+and four GPUs were slower than one.  With 2.1 million state dofs on every GPU the
+parallel efficiency of a Hessian application was 73, 67, 63, 57, 55 and 51 % on 2, 4, 8,
+16, 32 and 64 GPUs; with the same 2.1 million divided among the GPUs it was 63, 45, 28
+and 15 % on 2, 4, 8 and 16.  The number of Krylov iterations of an incremental solve hardly grows, from
+26 on one GPU to 28 on 64: the loss is in the time of an iteration, 7.4 ms on one GPU
+and 12.8 ms on 64 at that load, and still 2.9 ms on 16 GPUs at 64\ :sup:`3`, where an
+ideal division would give 0.5 ms.  The assembly of the Hessian blocks loses less, with
+75 % on 64 GPUs.
+
 Three settings matter on several cards.  Their defaults are the ones to use:
 
 * ``HIPPYMFEM_HYPRE_SPMV=auto``.  hypre keeps a parallel matrix as a diagonal and an
@@ -1021,9 +1136,13 @@ How large a problem fits
 ------------------------
 
 A Newton step holds about 2 kB of device memory per unknown (state, parameter and
-adjoint together): the assembled blocks and the AMG hierarchies.  That puts
-128\ :sup:`3` (36 M unknowns) on four 45 GB L40S at 20 GiB per card, on two of them at
-34 GiB, or on one 80 GB H100 at 58 GiB; a Newton-CG run to its tolerance peaked there at
+adjoint together): the assembled blocks and the AMG hierarchies.  With version 0.1.0 two
+Newton steps at 128\ :sup:`3` (36 M unknowns) peaked at 62.8 GiB on one 80 GB H100, 1.9 kB
+per unknown, with ``release_linearization_on_move``; a 64 GB GPU of Frontier holds 8.5
+million state dofs in this way and 4.2 million when both linearization points are held
+(the release added 1.6 % to the time at 128\ :sup:`3` on four GPUs).  With the version of
+October 2026, 128\ :sup:`3` took 20 GiB per card on four 45 GB L40S, 34 GiB on two of
+them, or 58 GiB on one H100; a Newton-CG run to its tolerance peaked there at
 64.1 GiB in double precision (253.8 s) and at 58.4 GiB with single-precision element
 matrices and solves (197.7 s), both with ``release_linearization_on_move``.  At
 400\ :sup:`3` a 48 GB slice holds 37 GiB.  What decides whether a given run fits:
@@ -1039,7 +1158,11 @@ size the chunks from, and its card peak was higher.
 
 **Matrix-free linearization points.**  ``setLinearizationPoint(x, matrix_free=True)``
 leaves ``C``, ``W_um`` and ``W_mm`` unassembled and computes their products at every
-Hessian application instead: 1.5 GiB per card for 8 % more time in the same run.  With
+Hessian application instead.  It saves little in a problem like this one, because the
+Jacobian and its hierarchy remain: with version 0.1.0 at 128\ :sup:`3` on one H100 the
+peak fell from 62.8 to 57.5 GiB for 20 % more time in two Newton steps, and on four L40S
+the two steps took 9 % longer.  In October 2026 it was 1.5 GiB per card for 8 % more time
+on four L40S.  With
 the lower share as well it is 3.2 GiB for 50 %, so it is for a run that still does not
 fit.
 
@@ -1219,6 +1342,10 @@ prior solves can run at 1e-8 for these stages: the eigenvalues move by 6e-6 at m
 the eigensolver is 1.4x faster.  At 128\ :sup:`3` the whole workflow, MAP included,
 runs in 10.4 minutes on four L40S (two on each of two nodes, as above), and in 8.3 minutes
 with the incremental solves of the MAP point stopped at 1e-6 (:ref:`gpu-recommended`).
+With version 0.1.0 on the eight GPUs of one node of Frontier it runs in 4.8 minutes
+(``bench_laplace.py --n 128 --release-linearization --map-inc-tol 1e-6``): the set-up,
+the MAP point from the prior mean in 1.9 minutes, the eigensolver in 1.1, the samples,
+the pointwise variance and the traces.
 
 **Several GPUs: an ensemble instead of a domain decomposition.**  Every one of these
 stages is a set of independent solves (140 Hessian applications in the eigensolver, one
@@ -1248,7 +1375,10 @@ pointwise variance, Monte Carlo, n = 64     4.0 s     2.6 s                0.7 s
 all stages                                  73.3 s    40.8 s               16.4 s
 ==========================================  ========  ===================  ===========
 
-The eigenvalues of the ensemble agree with those of one slice to 2e-8.  What an
+The eigenvalues of the ensemble agree with those of one slice to 2e-8.  On Frontier
+with version 0.1.0 the eigensolver at 64\ :sup:`3` took 40 s on one GPU, 25 s on four and
+21 s on eight with a domain decomposition, and 12 s on four and 7.5 s on eight as an
+ensemble, with eigenvalues that agreed with those of the one GPU to 1.4e-8.  What an
 ensemble does not speed up: the orthogonalizations, which are sequential in the columns
 and which every rank repeats, and the MAP point, whose CG iterations depend on one
 another.  Every rank also has to set the problem up and hold it, so the mesh has to fit
@@ -1290,9 +1420,13 @@ benchmark above:
 ===========================================  ======  ======  ======
 two Newton-CG steps                          MI210   H100    L40S
 ===========================================  ======  ======  ======
-:math:`64^{3}`, one GPU                      9.2 s   4.7 s   10.9 s
-:math:`128^{3}`, four GPUs                   19.6 s  --      23.4 s
+:math:`64^{3}`, one GPU                      8.8 s   4.3 s   10.3 s
+:math:`128^{3}`, four GPUs                   19.6 s  --      23.0 s
 ===========================================  ======  ======  ======
+
+These are the times of version 0.1.0 (November 2026), except that of four MI210, which is
+of October 2026.  One GPU of Frontier, a die of an MI250X, takes 8.3 s at
+:math:`64^{3}`.
 
 The answers are the NVIDIA ones: the same cost functional to seven digits and the same CG
 counts at every size.  ``run_tests.sh 1 2`` with the HIP build passes every suite,

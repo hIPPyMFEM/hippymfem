@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The documentation quotes the measurements of version 0.1.0.**  The README and the GPU
+  and performance guides give the numbers of November 2026: one node of Frontier, its
+  eight GPUs against its 56 CPU cores, with hIPPYlibx and hIPPyMFEM inverting the same
+  data; the scaling to 64 GPUs of Frontier; single H200, H100, MI210 and L40S cards; the
+  MAP point at 64^3 with and without orthogonal residuals, loose incremental solves and
+  single precision on three GPUs; and the memory of two Newton steps at 128^3 on one
+  H100.  The tables of October 2026 stay in the GPU guide as the record of the version of
+  that time.  The README's comparison chart is drawn from the node table, and its
+  "Citing" section names the paper.
+- **The quadrature-point element Hessians are described as measured.**  The guides, the
+  description of `hm.config.hessian` and that of the `gpu` profile said that
+  `HIPPYMFEM_HESSIAN=quadrature` is faster on a GPU from P2 up.  On meshes that fill a card
+  an assembly of the benchmark's Jacobian with it took 0.9 to 2.7 times as long as with
+  the element route for degree two and higher, on an L40S, an H100 and an MI250X; the
+  earlier factor of 1.6 to 4.4 was measured on small meshes.  The texts now say so and
+  point to `auto`.  No setting and no default changes.
+- **Two pitfalls of measuring on a host** are in the performance guide: binding a rank
+  to its cores, and `NUMPY_MADVISE_HUGEPAGE=0` on a machine whose fragmented memory makes
+  numpy's large allocations stall.
+
 ## Version 0.1.0, released on November 10, 2026
 
 The version tagged `v0.1.0`.  It takes the place of the first public version of

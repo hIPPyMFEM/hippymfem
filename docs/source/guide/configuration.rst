@@ -68,8 +68,9 @@ The settings a run may want to change:
 ``hm.config``               default       what it decides
 ==========================  ============  ==================================================
 ``hessian``                 ``element``   how element Hessian blocks are differentiated:
-                                          ``quadrature`` is faster on a GPU from P2 up,
-                                          ``auto`` times both (:ref:`smallest-kernel`)
+                                          ``quadrature`` is faster for some elements and
+                                          cards, ``auto`` times both and keeps the faster
+                                          (:ref:`smallest-kernel`)
 ``precision``               ``fp64``      precision of the element kernels: ``mixed`` puts
                                           the element matrices in single precision and
                                           refines the solves (:ref:`single-precision`);

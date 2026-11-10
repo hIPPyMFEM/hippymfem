@@ -45,38 +45,46 @@ Newton solve, a table lookup, and its derivatives stay exact.
 | | |
 |---|---|
 | **One function, every derivative** | The residual, Jacobian, adjoint and every Hessian block come from one JAX function by automatic differentiation; no derivative is coded by hand. The blocks agree with MFEM's own integrators to 10⁻¹⁵. |
-| **161 times faster than hIPPYlibx** | Two Newton-CG steps at 287 million unknowns take 38 s on 16 GPUs, against 6187 s for [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on 32 CPU cores, at the same CG count. |
-| **A billion unknowns** | Two Newton-CG steps at 1.09 billion unknowns (400³ P2 hexahedra) take 134 s on 24 RTX PRO 6000 Blackwell GPUs. |
-| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 10 minutes on four GPUs. |
+| **A node's GPUs against its CPU cores** | On one node of Frontier the eight GPUs run two Newton-CG steps 15 to 39 times faster than [hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) on the node's 56 CPU cores, and apply the Hessian 20 to 51 times faster, on the same data with the same CG count. |
+| **120 billion unknowns** | Weak scaling on Frontier reaches 1920³ P2 hexahedra, 56.7 billion state unknowns and 120 billion unknowns in all, on 4096 GPUs, with a weak-scaling efficiency of 81 % against one GPU. |
+| **The whole Bayesian workflow on GPUs** | MAP point, low-rank Laplace posterior, samples and pointwise variance for a 36-million-unknown problem in 4.8 minutes on the eight GPUs of one node. |
 | **Cross-validated against hIPPYlibx** | On a shared discrete problem the misfit Hessian's spectrum agrees with hIPPYlibx's to 3.7 × 10⁻¹³ and the MAP cost to 1.3 × 10⁻¹⁴. |
-| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 9.2 s on one AMD MI210 and 4.7 s on one NVIDIA H100, with the same cost and CG counts. |
+| **NVIDIA and AMD** | The same scripts run on either: the 64³ benchmark takes 4.3 s on one NVIDIA H100, 8.3 s on one GPU of Frontier (half an AMD MI250X) and 8.8 s on one AMD MI210, with the same cost and CG counts. |
 
 ## How it compares
 
-<p align="center"><img src="docs/images/speedup.png" alt="Two Newton-CG steps at four mesh sizes: hIPPYlibx and hIPPyMFEM on CPU ranks, and hIPPyMFEM on as many GPU ranks, 24 to 161 times faster than hIPPYlibx and 10 to 74 times faster than hIPPyMFEM on CPU ranks" width="760"></p>
+<p align="center"><img src="docs/images/speedup.png" alt="One node of Frontier: one Hessian action and two Newton-CG steps at two mesh sizes, by hIPPYlibx and hIPPyMFEM on the node's 56 CPU cores and by hIPPyMFEM on its eight GPUs. The GPUs are 20 and 51 times faster than hIPPYlibx for a Hessian action and 15 and 39 times faster for the two steps, and 18, 48, 14 and 37 times faster than hIPPyMFEM on the cores" width="760"></p>
 
-*Two Newton-CG steps of a P2 hexahedral benchmark, rank for rank, with the same PDE, prior and
-BoomerAMG settings in both libraries ([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is
-hIPPYlib on FEniCSx). The GPUs are RTX PRO 6000 Blackwell cards, each split into two 48 GB MIG
-slices with one MPI rank per slice: four CPU ranks against four slices (two GPUs) up to 128³,
-and 32 CPU ranks against 32 slices (16 GPUs) at 256³. The bars and the ratios are measured wall
-times.*
+*One Hessian action and two Newton-CG steps of a P2 hexahedral benchmark on one node of
+Frontier, with the same PDE, prior, data and BoomerAMG settings in both libraries
+([hIPPYlibx](https://github.com/hIPPyMFEM/hippylibx) is hIPPYlib on FEniCSx). Both libraries
+ran on the node's 56 CPU cores with one MPI rank bound to each core, and hIPPyMFEM on its
+eight GPUs (four AMD MI250X, each of which the system presents as two GPUs). Every run took the
+same 2 Newton-CG and 8 CG iterations; the bars are medians of three runs. To the MAP point at
+64³, hIPPyMFEM took 22.5 s on the eight GPUs and hIPPYlibx 573 s on the 56 cores.*
 
 ## How it scales
 
 | mesh | unknowns | GPUs | two Newton-CG steps |
 |---|---|---|---|
-| 64³ | 4.57 M | 1 L40S | 10.9 s |
-| 128³ | 36.1 M | 4 L40S | 23.4 s |
-| 128³ | 36.1 M | 4 AMD Instinct MI210 | 19.6 s |
-| 128³ | 36.1 M | 8 RTX PRO 6000 Blackwell | 10.9 s |
-| 256³ | 287 M | 8 RTX PRO 6000 Blackwell | 82.6 s |
-| 256³ | 287 M | 16 RTX PRO 6000 Blackwell | 38.5 s |
-| 400³ | 1.09 B | 24 RTX PRO 6000 Blackwell | 134 s |
+| 64³ | 4.57 M | 1 NVIDIA H200 | 4.0 s |
+| 64³ | 4.57 M | 1 NVIDIA H100 | 4.3 s |
+| 64³ | 4.57 M | 1 GPU of Frontier | 8.3 s |
+| 64³ | 4.57 M | 1 AMD Instinct MI210 | 8.8 s |
+| 64³ | 4.57 M | 1 NVIDIA L40S | 10.3 s |
+| 128³ | 36.1 M | 8 GPUs of Frontier (one node) | 10.4 s |
+| 128³ | 36.1 M | 64 GPUs of Frontier | 4.6 s |
+| 256³ | 287 M | 64 GPUs of Frontier | 15.1 s |
+| 1024³ | 18.3 B | 1024 GPUs of Frontier | 44.3 s |
+| 1920³ | 120 B | 4096 GPUs of Frontier | 15.1 s |
 
-The Blackwell GPUs were split into two 48 GB MIG slices each, one MPI rank per slice. The
-[GPU guide](https://hippymfem.readthedocs.io/en/latest/guide/gpu.html) has the per-stage
-times, the memory per rank, and what they depend on.
+A GPU of Frontier is one of the two 64 GB dies of an AMD MI250X, driven by one MPI rank. The
+rows up to 1024³ are in double precision with BoomerAMG and every linear solve converged to
+10⁻¹²; the last row uses the single-precision configuration of the GPU guide (loose incremental
+solves and a p-multigrid in a single-precision hypre). The runs on different meshes take
+different numbers of CG iterations, so these times are not a scaling curve: the
+[GPU guide](https://hippymfem.readthedocs.io/en/latest/guide/gpu.html) has the scaling of each
+stage, the memory per GPU, and what they depend on.
 
 ## How it works
 
@@ -264,17 +272,34 @@ The user guide, the rendered tutorials and the API reference are at
 
 ## Citing
 
-If you use hIPPyMFEM, please cite it ([CITATION.cff](CITATION.cff)). A paper describing the
-method and the measurements is in preparation.
+If you use hIPPyMFEM, please cite the paper that describes the method and the measurements:
+
+> P. Chen. *hIPPyMFEM: Billion-Scale Hessian-Based Bayesian Inversion via Automatic
+> Differentiation on GPUs.* 2026.
+
+```bibtex
+@unpublished{chen2026hippymfem,
+  author = {Chen, Peng},
+  title  = {{hIPPyMFEM}: Billion-Scale {H}essian-Based {B}ayesian Inversion via Automatic
+            Differentiation on {GPU}s},
+  year   = {2026},
+  note   = {Preprint}
+}
+```
+
+and the software itself with the version you used ([CITATION.cff](CITATION.cff)).
 
 ## Acknowledgments
 
 The inverse-problem layer is adapted from hIPPYlib (U. Villa, N. Petra and O. Ghattas, ACM
 Transactions on Mathematical Software 47(2), 2021), whose interface conventions it keeps, and
 tutorials 1 to 7 are adapted from hIPPYlib's. The finite element machinery is MFEM's, the
-solvers are hypre's and the automatic differentiation is JAX's. Computations used a four-L40S
-node at Georgia Tech and resources of Georgia Tech's Partnership for an Advanced Computing
-Environment (PACE).
+solvers are hypre's and the automatic differentiation is JAX's. Computations used a GPU server
+of the School of Computational Science and Engineering and resources of the Partnership for an
+Advanced Computing Environment (PACE) at the Georgia Institute of Technology. This research
+also used resources of the Oak Ridge Leadership Computing Facility at the Oak Ridge National
+Laboratory, which is supported by the Advanced Scientific Computing Research programs in the
+Office of Science of the U.S. Department of Energy under Contract No. DE-AC05-00OR22725.
 
 ## License
 

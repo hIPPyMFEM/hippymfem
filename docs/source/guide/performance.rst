@@ -66,9 +66,24 @@ tet P2             11.6           0.92           13x
 **The gain is largest where an element does the most work.**  At P1 in 2D an element
 matrix is 4x4 and the kernel is dominated by overheads that a GPU does not remove; at P2
 in 3D it is 27x27 and the batch fills the device.  Inverse problems tend to live at the
-expensive end, because the parameter field is what the mesh has to resolve.  The card
-matters as well: the kernels run 2.3 to 6.3 times faster on an H100 than on an L40S
+expensive end, because the parameter field is what the mesh has to resolve.
+
+The table is a complete assembly on meshes of a few thousand to a hundred thousand
+elements.  On meshes that fill a card (0.03 to 2 million elements, ten element types;
+``benchmarks/bench_assembly_sweep.py``, version 0.1.0, November 2026) the element kernel
+alone ran 23 to 102 times faster on an L40S and 81 to 548 times faster on an H100 than on
+one core of the same node, and 28 to 120 times faster on a GPU of Frontier (one die of
+an AMD MI250X), from linear triangles at the low end to cubic hexahedra at the high end.
+The card matters: the kernels run 3.1 to 6.9 times faster on an H100 than on an L40S.
+At these speeds the kernel is no longer the only cost of an assembly: the scatter into
+the hypre matrix takes 9 to 33 % of it on the GPU of Frontier and 29 to 69 % on the H100
 (:doc:`gpu`).
+
+The reference of these factors, the same generic kernel on one core, is not a slow one.
+For the diffusion operator on quadratic hexahedra with a coefficient given by a
+first-order field, the kernel computed the element matrices in 70 to 105 microseconds an
+element on a core of three machines, 0.66 to 1.0 times what MFEM's ``DiffusionIntegrator``
+took with a ``GridFunctionCoefficient`` and the same quadrature.
 
 On the host a kernel steps through its batch 2 048 elements at a time
 (``hm.config.host_batch``), which keeps its intermediates in cache, and XLA uses about
@@ -108,10 +123,11 @@ elements per rank   CPU       GPU       speedup
 102 400             5.1       0.49      11x
 ==================  ========  ========  =========
 
-With hypre on the device the picture is strong scaling across cards: two Newton-CG
-steps at 64\ :sup:`3` P2 hexahedra (2.1 million state dofs) take 10.9 s on one L40S
-and 4.9 s on four.  :doc:`gpu` has the tables, against host ranks and
-against hIPPYlibx.
+With hypre on the device the picture is strong scaling across cards, for problems that
+are large enough: two Newton-CG steps at 128\ :sup:`3` P2 hexahedra (17 million state
+dofs) take 34.6 s on two GPUs of Frontier and 4.6 s on 64, while at 64\ :sup:`3` (2.1
+million) they take 8.3 s on one and still 3.3 s on 16.  :doc:`gpu` has the tables,
+against host ranks and against hIPPYlibx.
 
 What a linearization point assembles
 ------------------------------------
@@ -136,4 +152,13 @@ Pitfalls worth knowing about when you do:
 * discard the first call, since JAX compiles and the sparsity pattern is built;
 * compare CPU and GPU **in one process** so the mesh, the dof numbering and the
   inputs are the same objects;
-* record what the numbers were measured on.
+* record what the numbers were measured on;
+* bind a host run to the cores it is meant to use (one rank to one core for a per-core
+  time): XLA's threads otherwise use the cores next to it;
+* if the first assembly of a large mesh takes minutes where it took seconds, look at the
+  machine's memory.  numpy asks the kernel for huge pages for large arrays, and on a
+  machine whose memory is full of file cache and fragmented each such allocation can
+  stall for tens of seconds: the sparsity patterns of a 64\ :sup:`3` mesh then took ten
+  minutes instead of one on such a server.  ``NUMPY_MADVISE_HUGEPAGE=0`` in the
+  environment, set before numpy is imported, restores it; the timed stages on a GPU are
+  not affected.
