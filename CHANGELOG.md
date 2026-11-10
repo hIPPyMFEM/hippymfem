@@ -4,6 +4,16 @@
 
 ### Added
 
+- **The two Newton benchmarks can invert the same data.**  `benchmarks/bench_newton_device.py
+  --save-data FILE` writes the true parameter, on the lattice of the mesh's vertices, and
+  the observations; `benchmarks/bench_newton_hippylibx.py --load-data FILE` reads them, so
+  that hIPPyMFEM and hIPPYlibx solve the same inverse problem and take the same Newton-CG
+  path (at 8^3: 2 Newton-CG and 7 CG iterations in both, the cost equal to 8 digits).  The
+  reader reports how far its own clean observations of that truth are from hIPPyMFEM's
+  (1e-6 of the largest, the two libraries' quadrature rules).  `--cg-inc-tol` of
+  `bench_newton_device.py` sets `cg_incremental_tolerance`: with the library's default the
+  incremental solves of the benchmark's Newton-CG stop at 1e-9, and `--cg-inc-tol 0` keeps
+  them at the solvers' 1e-12.
 - **BoomerAMG settings for CG solvers alone** (`HIPPYMFEM_AMG_CG`, `hm.config.amg_cg`):
   added to the `amg_options` of a new CG solver after `HIPPYMFEM_AMG`, the later winning,
   and read by no other method; a solver's own `amg_options` replace both. The operator

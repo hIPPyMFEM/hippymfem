@@ -52,6 +52,38 @@ def say(*a):
         print(*a, flush=True)
 
 
+#: (as in bench_newton_device.py) the function whose observations tell which row of an
+#: observation operator sees which point
+_SHARED_G = (1.0, 2.0 ** 0.5, 3.0 ** 0.5)
+
+
+def rows_to_targets(observed, at_targets):
+    """The target that every row of an observation operator sees, from the operator
+    applied to a function whose values at the targets, ``at_targets``, are distinct."""
+    order = np.argsort(at_targets)
+    sorted_vals = at_targets[order]
+    pos = np.clip(np.searchsorted(sorted_vals, observed), 1, len(sorted_vals) - 1)
+    nearer_left = np.abs(observed - sorted_vals[pos - 1]) <= np.abs(sorted_vals[pos] - observed)
+    perm = order[np.where(nearer_left, pos - 1, pos)]
+    if np.unique(perm).size != perm.size or np.abs(at_targets[perm] - observed).max() > 1e-8:
+        raise RuntimeError("the rows of the observation operator could not be matched to the targets")
+    return perm
+
+
+def _rows(vec):
+    """A distributed PETSc vector, whole, on rank 0 (None elsewhere)."""
+    parts = COMM.gather(np.array(vec.getArray(readonly=True), dtype=np.float64))
+    return np.concatenate(parts) if RANK == 0 else None
+
+
+def _set_rows(vec, values):
+    """Set a distributed PETSc vector from its whole array, known on rank 0."""
+    values = COMM.bcast(values, root=0)
+    lo, hi = vec.getOwnershipRange()
+    vec.setArray(values[lo:hi])
+    vec.assemble()
+
+
 def timed(fn):
     COMM.Barrier()
     t0 = time.perf_counter()
@@ -134,6 +166,9 @@ def main():
     ap.add_argument("--gn-iter", type=int, default=0)
     ap.add_argument("--ntargets", type=int, default=200)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--load-data", default=None,
+                    help="the .npz file of bench_newton_device.py --save-data: the true parameter and "
+                         "the noisy data of hIPPyMFEM's run, so that both libraries invert the same data")
     ap.add_argument("--petsc-amg", action="store_true",
                     help="keep PETSc's default BoomerAMG settings instead of MFEM's")
     args = ap.parse_args()
@@ -185,7 +220,21 @@ def main():
     prior.init_vector(noise, "noise")
     hpx.parRandom.normal(1.0, noise)
     mtrue = prior.mean.copy()
-    prior.sample(noise, mtrue)
+    shared = np.load(args.load_data) if args.load_data else None
+    if shared is None:
+        prior.sample(noise, mtrue)
+    else:
+        # hIPPyMFEM's true parameter, by the vertex of the mesh that each dof sits on
+        if int(shared["n"]) != N or ORDER < 1:
+            raise SystemExit("--load-data: the file is for n = %d, this run has n = %d" % (int(shared["n"]), N))
+        nown = Vm.dofmap.index_map.size_local
+        idx = np.rint(Vm.tabulate_dof_coordinates()[:nown] * N).astype(np.int64)
+        mtrue.setArray(np.ascontiguousarray(shared["mtrue"][idx[:, 0], idx[:, 1], idx[:, 2]]))
+        mtrue.assemble()
+        try:
+            mtrue.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
+        except PETSc.Error:
+            pass                                    # (a vector without ghosts)
 
     rng = np.random.default_rng(1)
     targets = np.column_stack([rng.uniform(0.1, 0.9, args.ntargets) for _ in range(3)])
@@ -194,8 +243,33 @@ def main():
     pde.solveFwd(utrue, [utrue, mtrue, None])
     data = B.createVecLeft()
     B.mult(utrue, data)
-    nstd = 0.01 * max(data.norm(PETSc.NormType.INFINITY), 1e-30)
-    hpx.parRandom.normal_perturb(nstd, data)
+    shared_check = None
+    if shared is None:
+        nstd = 0.01 * max(data.norm(PETSc.NormType.INFINITY), 1e-30)
+        hpx.parRandom.normal_perturb(nstd, data)
+    else:
+        # hIPPyMFEM's noisy data, row by row: which target a row sees is read from the
+        # operator applied to a linear function, and this library's own clean observations
+        # of the loaded truth are compared with hIPPyMFEM's as a check of the transfer
+        if not np.allclose(shared["targets"], targets):
+            raise SystemExit("--load-data: the file has other observation points")
+        g = fem.Function(Vu)
+        g.interpolate(lambda x: _SHARED_G[0] * x[0] + _SHARED_G[1] * x[1] + _SHARED_G[2] * x[2])
+        g.x.scatter_forward()
+        Bg = B.createVecLeft()
+        B.mult(g.x.petsc_vec, Bg)
+        bg, own_clean = _rows(Bg), _rows(data)
+        rows = None
+        if RANK == 0:
+            perm = rows_to_targets(bg, targets @ np.array(_SHARED_G))
+            scale = max(float(np.abs(shared["clean"]).max()), 1e-300)
+            shared_check = float(np.abs(own_clean - shared["clean"][perm]).max()) / scale
+            rows = np.ascontiguousarray(shared["data"][perm])
+        _set_rows(data, rows)
+        shared_check = COMM.bcast(shared_check, root=0)
+        nstd = float(shared["nstd"])
+        say("  truth and data of hIPPyMFEM from %s: this library's clean observations of that truth "
+            "differ from hIPPyMFEM's by %.2e of the largest" % (args.load_data, shared_check))
     misfit = hpx.DiscreteStateObservation(B, data, nstd ** 2)
     model = hpx.Model(pde, prior, misfit)
 
@@ -245,7 +319,8 @@ def main():
            "t_hess_blocks_warm": t_hess_warm, "t_hess_apply": t_apply, "t_hess_apply_cold": t_apply_cold, "steps": args.steps,
            "t_steps": t_step, "newton_it": solver.it, "cg_it": solver.total_cg_iter,
            "J": float(solver.final_cost), "gradnorm": float(solver.final_grad_norm),
-           "err_m": float(err)}
+           "err_m": float(err), "shared_data": args.load_data,
+           "shared_data_clean_difference": shared_check}
     if args.out and RANK == 0:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as f:

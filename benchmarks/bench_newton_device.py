@@ -169,6 +169,53 @@ def spread_summary(table):
     return out
 
 
+#: the function whose observations tell which row of an observation operator sees which
+#: point: linear, so both libraries represent it exactly, and its values at random points
+#: are distinct
+_SHARED_G = (1.0, 2.0 ** 0.5, 3.0 ** 0.5)
+
+
+def rows_to_targets(observed, at_targets):
+    """The target that every row of an observation operator sees, from the operator
+    applied to a function whose values at the targets, ``at_targets``, are distinct:
+    row ``r`` sees the target whose value is ``observed[r]``."""
+    order = np.argsort(at_targets)
+    sorted_vals = at_targets[order]
+    pos = np.clip(np.searchsorted(sorted_vals, observed), 1, len(sorted_vals) - 1)
+    nearer_left = np.abs(observed - sorted_vals[pos - 1]) <= np.abs(sorted_vals[pos] - observed)
+    perm = order[np.where(nearer_left, pos - 1, pos)]
+    if np.unique(perm).size != perm.size or np.abs(at_targets[perm] - observed).max() > 1e-8:
+        raise RuntimeError("the rows of the observation operator could not be matched to the targets")
+    return perm
+
+
+def save_problem(path, n, Vu, Vm, B, mtrue, targets, clean, data, nstd):
+    """Write the inverse problem's truth and data for ``bench_newton_hippylibx.py
+    --load-data``, so that the two libraries invert the same data: the true parameter on the
+    lattice of the mesh's vertices, ``(n+1)^3`` values indexed by the vertex, and the clean
+    and the noisy observations in the order of the targets."""
+    g = Vu.project(lambda x: _SHARED_G[0] * x[0] + _SHARED_G[1] * x[1] + _SHARED_G[2] * x[2])
+    Bg = B.createVecLeft()
+    B.mult(g, Bg)
+    rows = COMM.gather(tuple(np.asarray(v.array, dtype=np.float64).copy() for v in (Bg, clean, data)))
+    idx = np.rint(Vm.coordinates() * n).astype(np.int64)
+    par = COMM.gather((idx, np.asarray(mtrue.array, dtype=np.float64).copy()))
+    if RANK != 0:
+        return
+    bg, cl, da = (np.concatenate([r[k] for r in rows]) for k in range(3))
+    perm = rows_to_targets(bg, targets @ np.array(_SHARED_G))
+    clean_t, data_t = np.empty(len(perm)), np.empty(len(perm))
+    clean_t[perm], data_t[perm] = cl, da
+    lattice = np.full((n + 1,) * 3, np.nan)
+    for i, vals in par:
+        lattice[i[:, 0], i[:, 1], i[:, 2]] = vals
+    if np.isnan(lattice).any():
+        raise RuntimeError("--save-data needs linear elements for the parameter on the n^3 mesh of the unit cube")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np.savez(path, n=n, mtrue=lattice, targets=targets, clean=clean_t, data=data_t, nstd=nstd)
+    say("  wrote the truth and the data of this problem to %s" % path)
+
+
 def timed(fn):
     COMM.Barrier()
     t0 = time.perf_counter()
@@ -266,6 +313,13 @@ def main():
                          "and their spread into the record")
     ap.add_argument("--newton-only", action="store_true",
                     help="skip the separately timed stages; synthetic data, then the Newton steps")
+    ap.add_argument("--save-data", default=None,
+                    help="write the true parameter and the data to this .npz file, for "
+                         "bench_newton_hippylibx.py --load-data: both libraries then invert the same data")
+    ap.add_argument("--cg-inc-tol", type=float, default=None,
+                    help="cg_incremental_tolerance of Newton-CG: the tolerance of the incremental solves of "
+                         "its Hessian actions (0: the solvers' own, 1e-12 here; default: the library's, 1e-6 "
+                         "and at most a thousandth of the CG tolerance)")
     ap.add_argument("--warm-up", action="store_true",
                     help="with --newton-only: build every kernel and pattern once before the step timer, "
                          "as the timed stages of a full run do, so the Newton steps are warm")
@@ -369,7 +423,10 @@ def main():
     data = B.createVecLeft()
     B.mult(utrue, data)
     nstd = 0.01 * max(data.norm("linf"), 1e-30)
+    clean = data.copy()
     B.perturb(data, nstd)
+    if args.save_data:
+        save_problem(args.save_data, args.n, Vu, Vm, B, mtrue, targets, clean, data, nstd)
     misfit = hm.DiscreteStateObservation(B, data, nstd ** 2)
     model = hm.Model(pde, prior, misfit)
     if args.matrix_free:
@@ -470,6 +527,8 @@ def main():
         params["cg_preconditioner_cycles"] = args.cg_prec_cycles
     if args.cg_relax is not None:
         params["cg_hessian_relaxation"] = args.cg_relax
+    if args.cg_inc_tol is not None:
+        params["cg_incremental_tolerance"] = args.cg_inc_tol
     if args.inc_tol is not None:
         for attr in ("solver_fwd_inc", "solver_adj_inc"):
             getattr(pde, attr).parameters["rel_tolerance"] = args.inc_tol
@@ -709,6 +768,7 @@ def main():
            "t_hess_apply": t_apply, "t_hess_apply_cold": t_apply_cold, "steps": args.steps, "t_steps": t_step,
            "newton_it": solver.it, "cg_it": solver.total_cg_iter, "J": solver.final_cost,
            "cg_reorthogonalize": bool(params["cg_reorthogonalize"]), "inc_tol": args.inc_tol,
+           "cg_incremental_tolerance": float(params["cg_incremental_tolerance"] or 0.0),
            "cg_preconditioner_cycles": int(params["cg_preconditioner_cycles"] or 0),
            "cg_preconditioner_interval": list(cheb.interval) if cheb is not None else None,
            "gradnorm": solver.final_grad_norm, "err_m": err,
