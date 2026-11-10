@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## Version 0.1.0, released on November 10, 2026
+
+The version tagged `v0.1.0`.  It takes the place of the first public version of
+September 21, 2026, which had the same number; this section is what was added and
+changed since then.
 
 ### Added
 
@@ -1915,9 +1919,9 @@
   map type, which the element kernels integrated as a VALUE-mapped one; and a rank whose
   matrix has more than 2^31 - 1 nonzeros, where the 32-bit indices of hypre wrapped.
 
-## Version 0.1.0, released on September 21, 2026
+## First public version, September 21, 2026
 
-First public release.
+First public release (it was tagged `v0.1.0` until November 10, 2026).
 
 ### The library
 

@@ -4,7 +4,7 @@ title: "hIPPyMFEM: Differentiable Programming for Infinite-Dimensional Bayesian 
 repository-code: "https://github.com/hIPPyMFEM/hippymfem"
 url: "https://hippymfem.readthedocs.io"
 version: 0.1.0
-date-released: 2026-09-21
+date-released: 2026-11-10
 license: GPL-2.0-only
 authors:
   - family-names: "Chen"
